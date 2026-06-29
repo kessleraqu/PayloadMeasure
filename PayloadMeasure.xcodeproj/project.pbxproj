@@ -14,6 +14,8 @@
 		AC99C6842FF2B226006EBB3A /* MeasurementPoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */; };
 		AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */; };
 		AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */; };
+		AC99C6912FF2C100006EBB3A /* ObjectCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */; };
+		AC99C6932FF2C100006EBB3A /* ObjectCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -24,6 +26,8 @@
 		AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementPoint.swift; sourceTree = "<group>"; };
 		AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementEngine.swift; sourceTree = "<group>"; };
 		AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementMode.swift; sourceTree = "<group>"; };
+		AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectCapture.swift; sourceTree = "<group>"; };
+		AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectCaptureEngine.swift; sourceTree = "<group>"; };
 		ACDB56EE2FF2805400508C46 /* PayloadMeasure.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayloadMeasure.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -58,6 +62,8 @@
 				AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */,
 				AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */,
 				AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */,
+				AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */,
+				AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -150,6 +156,8 @@
 				AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */,
 				AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */,
 				AC99C67C2FF2B088006EBB3A /* ARSessionManager.swift in Sources */,
+				AC99C6912FF2C100006EBB3A /* ObjectCapture.swift in Sources */,
+				AC99C6932FF2C100006EBB3A /* ObjectCaptureEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

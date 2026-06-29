@@ -923,3 +923,71 @@ Build and test on the physical iPhone. Confirm this workflow:
 
 1. With the aimer on a textured surface, tap Add Point twenty times in a row, repositioning between taps. Every tap should produce a marker (subject only to the documented `lastAimerRaycastTransform` fallback when the aimer itself is on a surface).
 2. Tap Reset, confirm both markers and the line disappear, then place two more points to verify the reset path is still wired up.
+
+---
+
+## 2026-06-29 - LiDAR Mesh Object Capture (Scan Mode)
+
+> Implemented on branch `feature/lidar-mesh-object-capture`. This is the first step toward the
+> project's real goal: capture an object's full 3D extent quickly from the LiDAR mesh, building
+> toward later multi-object packing optimisation. Manual Line/Box tools are unchanged.
+
+### Goal
+
+Move from manual point-by-point measurement toward automatic object capture. The app already
+enabled LiDAR scene reconstruction but never read or visualised the mesh. This milestone surfaces
+the mesh and turns it into an automatic oriented bounding box with dimensions and volume.
+
+### What changed
+
+- Added `ObjectCapture.swift`:
+  - `CapturedObject` describes an oriented box (dimensions, center, axes, eight corners, volume, sample count).
+  - `ObjectBoundingBox.make(from:up:)` builds a gravity-aligned oriented box. The vertical axis is gravity (ARKit world Y); the two horizontal axes come from a 2D PCA of the object's footprint, so the box follows the object's orientation instead of the world axes.
+  - `MeshGeometryReader` reads world-space vertices out of `ARMeshAnchor` geometry and isolates an object by support-plane height band plus a horizontal radius.
+- Added `ObjectCaptureEngine.swift`: an `@Observable` engine holding scan state (mesh visibility, captured object, status text) and the request/reset revision counters, mirroring `MeasurementEngine`.
+- Updated `MeasurementMode.swift`: added a `.scan` mode (viewfinder icon).
+- Updated `ARSessionManager`-driven session already enables scene depth and LiDAR mesh; no change needed.
+- Updated `ARCameraView.swift`:
+  - The coordinator now also observes the capture engine and the active mode via `withObservationTracking`.
+  - Scan mode shows the reconstructed mesh through RealityKit's native `.showSceneUnderstanding` debug overlay.
+  - Capture reads the current frame's mesh and plane anchors, isolates object vertices around the live aimer raycast, computes the oriented box, and renders it as thin green 3D bars (visible from any angle).
+- Updated `ContentView.swift` and `MeasurementOverlayView.swift`: a third Scan toggle, a Capture button, a mesh-visibility toggle, and a capture readout (dimensions, volume in litres, sample count).
+
+### How it works
+
+In Scan mode the operator aims the center reticle at an object resting on a floor or table and
+presses Capture. The app finds the highest horizontal plane below the aimed point as the support
+surface, gathers mesh vertices within 0.8 m horizontally and between 2 cm and 1.5 m above that
+surface, and fits a gravity-aligned oriented bounding box to them. The box and its L×W×H + volume
+are displayed; capturing again after moving around the object refines the result.
+
+### Why this design
+
+- Reading the LiDAR mesh directly uses the device's most accurate native 3D sensing, rather than inferring dimensions from a couple of taps.
+- Gravity gives a reliable vertical axis for free; PCA only has to solve the horizontal yaw, which is robust and cheap.
+- Capture is a one-shot button press, so the heavy vertex scan never runs per frame.
+
+### Current limitations
+
+- Object isolation is geometric (support-plane height band + fixed radius). It does not yet use mesh face classification or clustering, so nearby clutter within the radius can be included.
+- The horizontal box uses PCA, not a true minimum-area rectangle; very irregular footprints can be slightly over-sized.
+- A horizontal support plane must be detected; capture asks the operator to scan the surface first if none is found.
+- Switching out of Scan mode clears the rendered box; the last dimensions remain in the readout until the next capture or reset.
+
+### Validation
+
+Build and test on the physical iPhone. Confirm this workflow:
+
+1. Switch to Scan mode and confirm the reconstructed mesh appears as a wireframe overlay.
+2. Toggle the mesh button and confirm the overlay hides/shows.
+3. Scan an object on a table from several angles, aim at it, and press Capture.
+4. Confirm a green oriented box appears around the object with sensible L×W×H and volume.
+5. Move around and capture again; confirm the box updates.
+6. Switch to Line/Box mode and confirm the mesh overlay and box disappear and manual tools still work.
+
+### Next steps in this branch before merging
+
+- Render the eight corners and/or a faint footprint to make the box easier to read.
+- Improve isolation (mesh classification or connected-component clustering) so the radius is not a hard limit.
+- Consider a minimum-area rectangle fit for the horizontal footprint.
+- Persist captured objects so multiple payloads can be collected — the input for the later packing-optimisation milestone.

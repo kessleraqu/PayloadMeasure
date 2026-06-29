@@ -10,18 +10,21 @@ import SwiftUI
 struct ContentView: View {
     @State private var sessionManager = ARSessionManager()
     @State private var measurementEngine = MeasurementEngine()
+    @State private var captureEngine = ObjectCaptureEngine()
 
     var body: some View {
         ZStack {
             ARCameraView(
                 sessionManager: sessionManager,
-                measurementEngine: measurementEngine
+                measurementEngine: measurementEngine,
+                captureEngine: captureEngine
             )
             .ignoresSafeArea()
 
             MeasurementOverlayView(
                 sessionManager: sessionManager,
-                measurementEngine: measurementEngine
+                measurementEngine: measurementEngine,
+                captureEngine: captureEngine
             )
         }
     }

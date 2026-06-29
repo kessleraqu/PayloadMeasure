@@ -82,6 +82,9 @@ final class MeasurementEngine {
             formattedDistance
         case .boundingBox:
             formattedBoundingBoxDimensions
+        case .scan:
+            // Scan mode is presented by ObjectCaptureEngine; MeasurementEngine stays idle here.
+            "--"
         }
     }
 
@@ -95,6 +98,8 @@ final class MeasurementEngine {
             }
 
             return String(format: "Volume %.3f m³", volume)
+        case .scan:
+            return nil
         }
     }
 
@@ -196,6 +201,8 @@ final class MeasurementEngine {
             "Aim at two points and press Add Point for each."
         case .boundingBox:
             "Aim at two opposite corners and press Add Point for each."
+        case .scan:
+            "Aim at an object on a flat surface, then Capture."
         }
     }
 

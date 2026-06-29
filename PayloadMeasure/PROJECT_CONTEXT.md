@@ -69,8 +69,7 @@ Current milestone:
 
 ✅ Initial ARView embedded inside SwiftUI
 
-Known issue:
-Camera permission (`NSCameraUsageDescription`) still needs to be added before ARKit can access the camera.
+✅ Camera permission (`NSCameraUsageDescription`) configured via build settings (`INFOPLIST_KEY_NSCameraUsageDescription`).
 
 ---
 

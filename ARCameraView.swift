@@ -13,11 +13,13 @@ import UIKit
 struct ARCameraView: UIViewRepresentable {
     let sessionManager: ARSessionManager
     let measurementEngine: MeasurementEngine
+    let captureEngine: ObjectCaptureEngine
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             sessionManager: sessionManager,
-            measurementEngine: measurementEngine
+            measurementEngine: measurementEngine,
+            captureEngine: captureEngine
         )
     }
 
@@ -53,28 +55,44 @@ struct ARCameraView: UIViewRepresentable {
         // Bright UI-white for measurement visuals. `applyPostProcessToneMap: false` keeps the color
         // from being darkened by RealityKit's tone mapper, matching the on-screen SwiftUI aimer.
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
+        // A distinct green for a captured object's box so it never reads as a manual measurement.
+        fileprivate static let captureMaterial = UnlitMaterial(color: .systemGreen, applyPostProcessToneMap: false)
 
         private let sessionManager: ARSessionManager
         private let measurementEngine: MeasurementEngine
+        private let captureEngine: ObjectCaptureEngine
         private weak var arView: ARView?
         private var contentAnchor: AnchorEntity?
         private var placedPoints: [PlacedPoint] = []
         private var measurementEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
+        private var captureEntities: [ModelEntity] = []
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
+        private var observedMode: MeasurementMode = .line
+        private var observedCaptureRequestRevision = 0
+        private var observedCaptureResetRevision = 0
+        private var observedMeshVisible = true
 
-        init(sessionManager: ARSessionManager, measurementEngine: MeasurementEngine) {
+        init(
+            sessionManager: ARSessionManager,
+            measurementEngine: MeasurementEngine,
+            captureEngine: ObjectCaptureEngine
+        ) {
             self.sessionManager = sessionManager
             self.measurementEngine = measurementEngine
+            self.captureEngine = captureEngine
         }
 
         func attach(to arView: ARView) {
             self.arView = arView
+            observedMode = measurementEngine.mode
+            observedMeshVisible = captureEngine.isMeshVisible
             createContentAnchorIfNeeded(in: arView)
+            updateMeshVisibility()
 
             aimerUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self, weak arView] _ in
                 guard let self, let arView else {
@@ -94,6 +112,7 @@ struct ARCameraView: UIViewRepresentable {
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
             clearMeasurementContent()
+            clearCaptureContent()
 
             if let contentAnchor, let arView {
                 arView.scene.removeAnchor(contentAnchor)
@@ -112,6 +131,10 @@ struct ARCameraView: UIViewRepresentable {
             withObservationTracking {
                 _ = measurementEngine.placementRequestRevision
                 _ = measurementEngine.resetRevision
+                _ = measurementEngine.mode
+                _ = captureEngine.captureRequestRevision
+                _ = captureEngine.resetRevision
+                _ = captureEngine.isMeshVisible
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else {
@@ -124,25 +147,98 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func handleEngineRevisionChange() {
-            let resetRevision = measurementEngine.resetRevision
-            let placementRequestRevision = measurementEngine.placementRequestRevision
-
-            if resetRevision != observedResetRevision {
+            // A mode switch clears whatever the previous tool drew and refreshes the mesh overlay.
+            if measurementEngine.mode != observedMode {
+                observedMode = measurementEngine.mode
                 clearMeasurementContent()
-                observedResetRevision = resetRevision
+                clearCaptureContent()
+                updateMeshVisibility()
             }
 
-            guard placementRequestRevision != observedPlacementRequestRevision else {
-                return
+            if measurementEngine.resetRevision != observedResetRevision {
+                observedResetRevision = measurementEngine.resetRevision
+                clearMeasurementContent()
             }
 
-            observedPlacementRequestRevision = placementRequestRevision
+            if measurementEngine.placementRequestRevision != observedPlacementRequestRevision {
+                observedPlacementRequestRevision = measurementEngine.placementRequestRevision
+                if let arView {
+                    placePointAtTarget(in: arView)
+                }
+            }
 
+            if captureEngine.resetRevision != observedCaptureResetRevision {
+                observedCaptureResetRevision = captureEngine.resetRevision
+                clearCaptureContent()
+            }
+
+            if captureEngine.captureRequestRevision != observedCaptureRequestRevision {
+                observedCaptureRequestRevision = captureEngine.captureRequestRevision
+                if let arView {
+                    performCapture(in: arView)
+                }
+            }
+
+            if captureEngine.isMeshVisible != observedMeshVisible {
+                observedMeshVisible = captureEngine.isMeshVisible
+                updateMeshVisibility()
+            }
+        }
+
+        private func updateMeshVisibility() {
             guard let arView else {
                 return
             }
 
-            placePointAtTarget(in: arView)
+            // The reconstructed mesh overlay is only useful while scanning. RealityKit renders it
+            // natively from the LiDAR scene-reconstruction data already enabled on the session.
+            let shouldShow = measurementEngine.mode == .scan && captureEngine.isMeshVisible
+            if shouldShow {
+                arView.debugOptions.insert(.showSceneUnderstanding)
+            } else {
+                arView.debugOptions.remove(.showSceneUnderstanding)
+            }
+        }
+
+        private func performCapture(in arView: ARView) {
+            guard sessionManager.isTrackingReady else {
+                captureEngine.reportTrackingNotReady()
+                return
+            }
+
+            // Use the live aimer raycast as the seed for where the operator is pointing.
+            guard let aimerTransform = lastAimerRaycastTransform,
+                  let frame = arView.session.currentFrame else {
+                captureEngine.reportNoSupport()
+                return
+            }
+
+            let center = aimerTransform.translation
+            let planes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
+
+            guard let supportHeight = MeshGeometryReader.supportHeight(below: center, planes: planes) else {
+                captureEngine.reportNoSupport()
+                return
+            }
+
+            let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+            let points = MeshGeometryReader.objectVertices(
+                from: meshAnchors,
+                around: center,
+                supportHeight: supportHeight,
+                radius: 0.8,
+                maxHeight: 1.5
+            )
+
+            // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
+            guard let object = ObjectBoundingBox.make(from: points, up: SIMD3<Float>(0, 1, 0)) else {
+                captureEngine.reportNotEnoughMesh()
+                return
+            }
+
+            captureEngine.applyCapture(object)
+            createContentAnchorIfNeeded(in: arView)
+            addCapturedBox(object)
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -379,6 +475,9 @@ struct ARCameraView: UIViewRepresentable {
                 addDashedLine(from: measurementEngine.points[0].position, to: measurementEngine.points[1].position)
             case .boundingBox:
                 addBoundingBox(from: measurementEngine.points[0].position, to: measurementEngine.points[1].position)
+            case .scan:
+                // Scan mode draws its captured box separately; nothing to do for tapped points.
+                break
             }
         }
 
@@ -551,6 +650,69 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             previewMeasurementEntities.removeAll()
+        }
+
+        private func addCapturedBox(_ object: CapturedObject) {
+            clearCaptureContent()
+
+            guard object.corners.count == 8 else {
+                return
+            }
+
+            // Edges for the `i + 2*j + 4*k` corner layout: base face, top face, vertical edges.
+            let edges = [
+                (0, 1), (1, 3), (2, 3), (0, 2),
+                (4, 5), (5, 7), (6, 7), (4, 6),
+                (0, 4), (1, 5), (2, 6), (3, 7)
+            ]
+
+            for edge in edges {
+                addCapturedBoxEdge(from: object.corners[edge.0], to: object.corners[edge.1])
+            }
+        }
+
+        private func addCapturedBoxEdge(from start: SIMD3<Float>, to end: SIMD3<Float>) {
+            let delta = end - start
+            let length = simd_length(delta)
+
+            guard length > 0.001 else {
+                return
+            }
+
+            // A thin 3D bar (rather than a flat strip) so the box reads correctly from any angle as
+            // the operator walks around the captured object.
+            let thickness: Float = 0.006
+            let bar = ModelEntity(
+                mesh: .generateBox(size: SIMD3<Float>(length, thickness, thickness)),
+                materials: [Coordinator.captureMaterial]
+            )
+            bar.position = start + delta / 2
+            bar.orientation = orientation(alongX: delta)
+
+            contentAnchor?.addChild(bar)
+            captureEntities.append(bar)
+        }
+
+        /// A rotation that maps a box's local +X axis onto `direction`, built from a stable
+        /// orthonormal basis. Unlike `simd_quatf(from:to:)` this stays well-defined when the
+        /// direction points opposite the reference axis (e.g. a box edge along world -X).
+        private func orientation(alongX direction: SIMD3<Float>) -> simd_quatf {
+            let xAxis = simd_normalize(direction)
+            var reference = SIMD3<Float>(0, 1, 0)
+            if abs(simd_dot(xAxis, reference)) > 0.99 {
+                reference = SIMD3<Float>(1, 0, 0)
+            }
+            let zAxis = simd_normalize(simd_cross(xAxis, reference))
+            let yAxis = simd_cross(zAxis, xAxis)
+            return simd_quatf(simd_float3x3(columns: (xAxis, yAxis, zAxis)))
+        }
+
+        private func clearCaptureContent() {
+            for entity in captureEntities {
+                entity.removeFromParent()
+            }
+
+            captureEntities.removeAll()
         }
 
         private func stopTrackedRaycasts() {

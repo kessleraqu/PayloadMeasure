@@ -10,6 +10,7 @@ import Foundation
 enum MeasurementMode: String, CaseIterable, Identifiable {
     case line
     case boundingBox
+    case scan
 
     var id: String {
         rawValue
@@ -21,6 +22,8 @@ enum MeasurementMode: String, CaseIterable, Identifiable {
             "Line"
         case .boundingBox:
             "Box"
+        case .scan:
+            "Scan"
         }
     }
 
@@ -30,6 +33,8 @@ enum MeasurementMode: String, CaseIterable, Identifiable {
             "ruler"
         case .boundingBox:
             "cube"
+        case .scan:
+            "viewfinder"
         }
     }
 }
