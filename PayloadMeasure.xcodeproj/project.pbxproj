@@ -6,7 +6,24 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AC99C67C2FF2B088006EBB3A /* ARSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */; };
+		AC99C67E2FF2B088006EBB3A /* ARCameraView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */; };
+		AC99C6802FF2B08A006EBB3A /* MeasurementOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */; };
+		AC99C6822FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md in Resources */ = {isa = PBXBuildFile; fileRef = AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */; };
+		AC99C6842FF2B226006EBB3A /* MeasurementPoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */; };
+		AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */; };
+		AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
+		AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARSessionManager.swift; sourceTree = "<group>"; };
+		AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARCameraView.swift; sourceTree = "<group>"; };
+		AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementOverlayView.swift; sourceTree = "<group>"; };
+		AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = DEVELOPMENT_NOTES.md; sourceTree = "<group>"; };
+		AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementPoint.swift; sourceTree = "<group>"; };
+		AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementEngine.swift; sourceTree = "<group>"; };
+		AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementMode.swift; sourceTree = "<group>"; };
 		ACDB56EE2FF2805400508C46 /* PayloadMeasure.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayloadMeasure.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -34,6 +51,13 @@
 			children = (
 				ACDB56F02FF2805400508C46 /* PayloadMeasure */,
 				ACDB56EF2FF2805400508C46 /* Products */,
+				AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */,
+				AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */,
+				AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */,
+				AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */,
+				AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */,
+				AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */,
+				AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -109,6 +133,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AC99C6822FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -119,6 +144,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AC99C67E2FF2B088006EBB3A /* ARCameraView.swift in Sources */,
+				AC99C6842FF2B226006EBB3A /* MeasurementPoint.swift in Sources */,
+				AC99C6802FF2B08A006EBB3A /* MeasurementOverlayView.swift in Sources */,
+				AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */,
+				AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */,
+				AC99C67C2FF2B088006EBB3A /* ARSessionManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -251,8 +282,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AFT38WQV48;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "PayloadMeasure uses the camera for AR payload measurement and positioning.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -282,8 +315,10 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = AFT38WQV48;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "PayloadMeasure uses the camera for AR payload measurement and positioning.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

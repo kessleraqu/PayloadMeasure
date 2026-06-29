@@ -8,14 +8,22 @@
 import SwiftUI
 
 struct ContentView: View {
+    @State private var sessionManager = ARSessionManager()
+    @State private var measurementEngine = MeasurementEngine()
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
+        ZStack {
+            ARCameraView(
+                sessionManager: sessionManager,
+                measurementEngine: measurementEngine
+            )
+            .ignoresSafeArea()
+
+            MeasurementOverlayView(
+                sessionManager: sessionManager,
+                measurementEngine: measurementEngine
+            )
         }
-        .padding()
     }
 }
 
