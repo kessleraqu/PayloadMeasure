@@ -991,3 +991,51 @@ Build and test on the physical iPhone. Confirm this workflow:
 - Improve isolation (mesh classification or connected-component clustering) so the radius is not a hard limit.
 - Consider a minimum-area rectangle fit for the horizontal footprint.
 - Persist captured objects so multiple payloads can be collected — the input for the later packing-optimisation milestone.
+
+---
+
+## 2026-06-30 - Scan Isolation: Classification + Connected-Component Clustering
+
+### Problem
+
+The first Scan implementation captured a box meters larger than the object. It kept every mesh
+vertex within a fixed 0.8 m radius and a height band, then fit a box around all of it — so the
+box swallowed the table, walls, and surrounding clutter. A fixed radius is the wrong tool: the
+reticle should *seed a segmentation*, not bound a region.
+
+### What changed
+
+- `ARSessionManager.swift`: scene reconstruction now uses `.meshWithClassification` when the device supports it (falling back to `.mesh`), so mesh faces carry floor/wall/ceiling/table labels.
+- `ObjectCapture.swift` was reworked around a real segmentation pipeline (`ObjectCapturePipeline`):
+  1. **Support-plane removal** — find the highest horizontal plane below the aimed point and drop everything within 2 cm of it. This is essential: without it, the object stays connected to the floor and the whole room clusters together.
+  2. **Classification filtering** — `MeshGeometryReader` now reads mesh *faces* and discards those classified as wall/floor/ceiling/window/door before anything else. (Reads handle 2- or 4-byte face indices and skip filtering gracefully when classification is unavailable.)
+  3. **Connected-component clustering** (`VoxelCluster`) — the surviving points are placed in a ~4 cm voxel grid; a breadth-first flood fill over 26-connected occupied voxels grows the component containing (or nearest) the reticle. Only that component is kept, so spatially separate clutter is dropped automatically. The fixed radius is now only a loose 2 m compute bound.
+  4. The oriented box is fit to the cluster as before.
+- `ObjectCaptureEngine.swift`: added a `showsSelectedPoints` toggle.
+- `ARCameraView.swift`: capture now calls `ObjectCapturePipeline.capture(...)` and maps its outcome (`noSupport` / `notEnoughMesh` / `success`) to status messages. On success it renders the green box and, when enabled, cyan markers at the selected cluster's voxel centers (shared marker mesh, count-capped) so the operator can see exactly what was captured.
+- `MeasurementOverlayView.swift`: added a second scan toggle for the selected-point overlay.
+
+### Why this design
+
+Once the support surface is removed, an object resting on it is a spatially disconnected blob.
+Growing a connected component from the aimed voxel is therefore a direct, native, on-device way to
+isolate it — no model, no training, and it stays entirely in metric 3D, which is what the later
+packing milestone needs. Classification pre-strips the big room surfaces so they can never merge
+into the object's component and to cut work.
+
+### Current limitations
+
+- Objects touching a wall rely on classification to separate them; with classification off, contact merges them.
+- Two objects touching each other (closer than ~one voxel) cluster as one.
+- Mesh reads run synchronously on the main actor for a single button press; very large rooms add a brief hitch. Reading ARKit mesh buffers while the session updates them is a known low-probability race to revisit if it ever surfaces.
+- Still PCA for the horizontal footprint (not a minimum-area rectangle).
+
+### Validation
+
+Build and test on the physical iPhone. Confirm this workflow:
+
+1. In Scan mode, sweep the object and its support surface so both are reconstructed.
+2. Aim at the object and Capture. Confirm the cyan selected-points overlay covers the object and not the floor/walls, and the green box now hugs the object.
+3. Toggle the selected-points button on/off and the mesh button on/off independently.
+4. Try an object near (not touching) a wall — confirm the wall is excluded.
+5. Reset and re-capture from another angle to confirm stability.

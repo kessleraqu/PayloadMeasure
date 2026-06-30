@@ -57,6 +57,10 @@ struct ARCameraView: UIViewRepresentable {
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
         // A distinct green for a captured object's box so it never reads as a manual measurement.
         fileprivate static let captureMaterial = UnlitMaterial(color: .systemGreen, applyPostProcessToneMap: false)
+        // Cyan for the selected-cluster debug markers, so it is clearly separate from the box.
+        fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
+        // One shared marker mesh reused by every selection point to avoid regenerating geometry.
+        fileprivate static let selectionMarkerMesh = MeshResource.generateBox(size: 0.02)
 
         private let sessionManager: ARSessionManager
         private let measurementEngine: MeasurementEngine
@@ -67,6 +71,8 @@ struct ARCameraView: UIViewRepresentable {
         private var measurementEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
         private var captureEntities: [ModelEntity] = []
+        private var selectionEntities: [ModelEntity] = []
+        private var lastSelectionPoints: [SIMD3<Float>] = []
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
@@ -76,6 +82,7 @@ struct ARCameraView: UIViewRepresentable {
         private var observedCaptureRequestRevision = 0
         private var observedCaptureResetRevision = 0
         private var observedMeshVisible = true
+        private var observedShowsSelectedPoints = true
 
         init(
             sessionManager: ARSessionManager,
@@ -91,6 +98,7 @@ struct ARCameraView: UIViewRepresentable {
             self.arView = arView
             observedMode = measurementEngine.mode
             observedMeshVisible = captureEngine.isMeshVisible
+            observedShowsSelectedPoints = captureEngine.showsSelectedPoints
             createContentAnchorIfNeeded(in: arView)
             updateMeshVisibility()
 
@@ -135,6 +143,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = captureEngine.captureRequestRevision
                 _ = captureEngine.resetRevision
                 _ = captureEngine.isMeshVisible
+                _ = captureEngine.showsSelectedPoints
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else {
@@ -183,6 +192,11 @@ struct ARCameraView: UIViewRepresentable {
                 observedMeshVisible = captureEngine.isMeshVisible
                 updateMeshVisibility()
             }
+
+            if captureEngine.showsSelectedPoints != observedShowsSelectedPoints {
+                observedShowsSelectedPoints = captureEngine.showsSelectedPoints
+                updateSelectionVisualization()
+            }
         }
 
         private func updateMeshVisibility() {
@@ -213,32 +227,30 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            let center = aimerTransform.translation
+            let seed = aimerTransform.translation
             let planes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
-
-            guard let supportHeight = MeshGeometryReader.supportHeight(below: center, planes: planes) else {
-                captureEngine.reportNoSupport()
-                return
-            }
-
             let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
-            let points = MeshGeometryReader.objectVertices(
-                from: meshAnchors,
-                around: center,
-                supportHeight: supportHeight,
-                radius: 0.8,
-                maxHeight: 1.5
-            )
 
             // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
-            guard let object = ObjectBoundingBox.make(from: points, up: SIMD3<Float>(0, 1, 0)) else {
-                captureEngine.reportNotEnoughMesh()
-                return
-            }
+            let outcome = ObjectCapturePipeline.capture(
+                meshAnchors: meshAnchors,
+                planes: planes,
+                seed: seed,
+                up: SIMD3<Float>(0, 1, 0)
+            )
 
-            captureEngine.applyCapture(object)
-            createContentAnchorIfNeeded(in: arView)
-            addCapturedBox(object)
+            switch outcome {
+            case .noSupport:
+                captureEngine.reportNoSupport()
+            case .notEnoughMesh:
+                captureEngine.reportNotEnoughMesh()
+            case .success(let result):
+                captureEngine.applyCapture(result.object)
+                createContentAnchorIfNeeded(in: arView)
+                addCapturedBox(result.object)
+                lastSelectionPoints = result.selectionPoints
+                updateSelectionVisualization()
+            }
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -713,6 +725,42 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             captureEntities.removeAll()
+            clearSelectionEntities()
+            lastSelectionPoints = []
+        }
+
+        /// Redraws (or hides) the cyan markers showing which voxel cluster the last capture selected.
+        private func updateSelectionVisualization() {
+            clearSelectionEntities()
+
+            guard captureEngine.showsSelectedPoints, !lastSelectionPoints.isEmpty,
+                  let contentAnchor else {
+                return
+            }
+
+            // Keep the marker count bounded so a dense cluster never floods the scene; stride
+            // through the voxel centers when there are more than the cap.
+            let maxMarkers = 1200
+            let step = max(1, lastSelectionPoints.count / maxMarkers)
+            var index = 0
+            while index < lastSelectionPoints.count {
+                let marker = ModelEntity(
+                    mesh: Coordinator.selectionMarkerMesh,
+                    materials: [Coordinator.selectionMaterial]
+                )
+                marker.position = lastSelectionPoints[index]
+                contentAnchor.addChild(marker)
+                selectionEntities.append(marker)
+                index += step
+            }
+        }
+
+        private func clearSelectionEntities() {
+            for entity in selectionEntities {
+                entity.removeFromParent()
+            }
+
+            selectionEntities.removeAll()
         }
 
         private func stopTrackedRaycasts() {

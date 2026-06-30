@@ -24,12 +24,316 @@ struct CapturedObject {
     let corners: [SIMD3<Float>]
     /// Volume in cubic meters.
     let volume: Float
-    /// Number of mesh vertices that contributed to the capture — a rough confidence signal.
+    /// Number of mesh points that contributed to the capture — a rough confidence signal.
     let sampleCount: Int
 
     var widthInMeters: Float { dimensions.x }
     var depthInMeters: Float { dimensions.y }
     var heightInMeters: Float { dimensions.z }
+}
+
+/// The result of a successful capture: the fitted box plus the cluster's voxel centers so the AR
+/// layer can show the operator exactly which points were selected.
+struct CaptureResult {
+    let object: CapturedObject
+    let selectionPoints: [SIMD3<Float>]
+}
+
+/// Outcome of a capture attempt, so the UI can explain failures precisely.
+enum CaptureOutcome {
+    case success(CaptureResult)
+    case noSupport
+    case notEnoughMesh
+}
+
+/// Orchestrates a single object capture from the LiDAR scene mesh:
+/// support-plane removal → classification filtering → connected-component clustering seeded at the
+/// reticle → oriented-box fit. The clustering is what isolates a single object: once the support
+/// surface is removed, an object resting on it becomes a spatially disconnected blob, so growing
+/// the connected component from the aimed point keeps the object and drops everything else.
+enum ObjectCapturePipeline {
+    /// Horizontal voxel/cluster resolution. ~4 cm matches the LiDAR mesh density: large enough to
+    /// bridge gaps across the object's own surface, small enough to keep it separate from nearby
+    /// clutter that is more than one voxel away.
+    static let voxelSize: Float = 0.04
+    /// Loose horizontal bound on candidate points purely to cap work in large rooms. The real
+    /// isolation comes from clustering, so this is far larger than the previous hard radius.
+    static let maxRadius: Float = 2.0
+    /// Tallest object we consider, above the support surface.
+    static let maxHeight: Float = 1.5
+    /// Points within this height of the support surface are treated as the surface and dropped.
+    static let floorClearance: Float = 0.02
+    /// Minimum cluster size before we trust a fit.
+    static let minimumClusterPoints = 24
+
+    static func capture(
+        meshAnchors: [ARMeshAnchor],
+        planes: [ARPlaneAnchor],
+        seed: SIMD3<Float>,
+        up: SIMD3<Float>
+    ) -> CaptureOutcome {
+        guard let supportHeight = MeshGeometryReader.supportHeight(below: seed, planes: planes) else {
+            return .noSupport
+        }
+
+        let candidates = MeshGeometryReader.candidatePoints(
+            from: meshAnchors,
+            around: seed,
+            supportHeight: supportHeight,
+            maxRadius: maxRadius,
+            maxHeight: maxHeight,
+            floorClearance: floorClearance
+        )
+
+        guard candidates.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard let cluster = VoxelCluster.connectedComponent(
+            points: candidates,
+            seed: seed,
+            voxelSize: voxelSize
+        ), cluster.points.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard let object = ObjectBoundingBox.make(from: cluster.points, up: up) else {
+            return .notEnoughMesh
+        }
+
+        return .success(CaptureResult(object: object, selectionPoints: cluster.voxelCenters))
+    }
+}
+
+/// Reads world-space geometry out of ARKit scene-reconstruction mesh anchors.
+enum MeshGeometryReader {
+    /// ARKit mesh-face classifications that belong to the room, not to a placed object.
+    private static func isEnvironment(_ classification: ARMeshClassification) -> Bool {
+        switch classification {
+        case .wall, .floor, .ceiling, .window, .door:
+            return true
+        case .none, .table, .seat:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    /// Collects world-space vertices of mesh faces that:
+    /// - are not classified as room structure (when classification is available),
+    /// - sit above the support surface (dropping the surface itself), below `maxHeight`, and
+    /// - lie within a loose horizontal radius of the seed (a compute bound, not the isolation step).
+    static func candidatePoints(
+        from meshAnchors: [ARMeshAnchor],
+        around seed: SIMD3<Float>,
+        supportHeight: Float,
+        maxRadius: Float,
+        maxHeight: Float,
+        floorClearance: Float
+    ) -> [SIMD3<Float>] {
+        var result: [SIMD3<Float>] = []
+        let radiusSquared = maxRadius * maxRadius
+
+        for anchor in meshAnchors {
+            let geometry = anchor.geometry
+            let vertices = geometry.vertices
+            let faces = geometry.faces
+            let transform = anchor.transform
+
+            let vertexBuffer = vertices.buffer.contents()
+            let vertexStride = vertices.stride
+            let vertexOffset = vertices.offset
+
+            let faceBuffer = faces.buffer.contents()
+            let bytesPerIndex = faces.bytesPerIndex
+            let indicesPerFace = faces.indexCountPerPrimitive
+
+            // Classification is one value per face, present only with `.meshWithClassification`.
+            let classification = geometry.classification
+            let classificationBuffer = classification?.buffer.contents()
+            let classificationStride = classification?.stride ?? 0
+            let classificationOffset = classification?.offset ?? 0
+
+            func worldVertex(_ index: Int) -> SIMD3<Float> {
+                // Read x, y, z as individual floats. ARKit packs the buffer as tightly packed
+                // float3 (stride 12), so reading a 16-byte SIMD3<Float> could overrun the buffer.
+                let pointer = vertexBuffer
+                    .advanced(by: vertexOffset + vertexStride * index)
+                    .assumingMemoryBound(to: Float.self)
+                let local = SIMD3<Float>(pointer[0], pointer[1], pointer[2])
+                let world = transform * SIMD4<Float>(local, 1)
+                return SIMD3<Float>(world.x, world.y, world.z)
+            }
+
+            func faceVertexIndex(_ linearIndex: Int) -> Int {
+                if bytesPerIndex == 2 {
+                    return Int(faceBuffer
+                        .advanced(by: linearIndex * 2)
+                        .assumingMemoryBound(to: UInt16.self)
+                        .pointee)
+                }
+                return Int(faceBuffer
+                    .advanced(by: linearIndex * 4)
+                    .assumingMemoryBound(to: UInt32.self)
+                    .pointee)
+            }
+
+            for faceIndex in 0..<faces.count {
+                if let classificationBuffer {
+                    let raw = classificationBuffer
+                        .advanced(by: classificationOffset + classificationStride * faceIndex)
+                        .assumingMemoryBound(to: UInt8.self)
+                        .pointee
+                    if let classification = ARMeshClassification(rawValue: Int(raw)),
+                       isEnvironment(classification) {
+                        continue
+                    }
+                }
+
+                for corner in 0..<indicesPerFace {
+                    let vertexIndex = faceVertexIndex(faceIndex * indicesPerFace + corner)
+                    let world = worldVertex(vertexIndex)
+
+                    let heightAboveSupport = world.y - supportHeight
+                    guard heightAboveSupport > floorClearance, heightAboveSupport < maxHeight else {
+                        continue
+                    }
+
+                    let deltaX = world.x - seed.x
+                    let deltaZ = world.z - seed.z
+                    guard deltaX * deltaX + deltaZ * deltaZ < radiusSquared else {
+                        continue
+                    }
+
+                    result.append(world)
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Picks the support surface height for an object: the highest horizontal plane that sits
+    /// below the aimed point. Returns `nil` when no horizontal plane has been detected yet.
+    static func supportHeight(below point: SIMD3<Float>, planes: [ARPlaneAnchor]) -> Float? {
+        var support: Float?
+        for plane in planes where plane.alignment == .horizontal {
+            let planeHeight = plane.transform.columns.3.y
+            guard planeHeight <= point.y - 0.02 else {
+                continue
+            }
+            if let current = support {
+                support = max(current, planeHeight)
+            } else {
+                support = planeHeight
+            }
+        }
+        return support
+    }
+}
+
+/// Connected-component extraction over a voxel grid. Occupied voxels are nodes; 26-connected
+/// neighbours are edges. Growing the component from the seed voxel keeps only points that are
+/// spatially connected to the aimed object.
+enum VoxelCluster {
+    private struct Key: Hashable {
+        let x: Int
+        let y: Int
+        let z: Int
+    }
+
+    /// - Returns: the points of the connected component containing (or nearest) the seed, plus the
+    ///   center of each occupied voxel in that component (for lightweight visualization). `nil` when
+    ///   there are no points or no occupied voxel can be found near the seed.
+    static func connectedComponent(
+        points: [SIMD3<Float>],
+        seed: SIMD3<Float>,
+        voxelSize: Float
+    ) -> (points: [SIMD3<Float>], voxelCenters: [SIMD3<Float>])? {
+        guard !points.isEmpty, voxelSize > 0 else {
+            return nil
+        }
+
+        func key(_ point: SIMD3<Float>) -> Key {
+            Key(
+                x: Int(floor(point.x / voxelSize)),
+                y: Int(floor(point.y / voxelSize)),
+                z: Int(floor(point.z / voxelSize))
+            )
+        }
+
+        var voxelToPoints: [Key: [Int]] = [:]
+        for (index, point) in points.enumerated() {
+            voxelToPoints[key(point), default: []].append(index)
+        }
+
+        let occupied = Set(voxelToPoints.keys)
+        guard let seedKey = seedVoxel(for: key(seed), in: occupied) else {
+            return nil
+        }
+
+        // Breadth-first flood fill across occupied 26-neighbours.
+        var visited: Set<Key> = [seedKey]
+        var queue: [Key] = [seedKey]
+        var head = 0
+        while head < queue.count {
+            let voxel = queue[head]
+            head += 1
+            for dx in -1...1 {
+                for dy in -1...1 {
+                    for dz in -1...1 where !(dx == 0 && dy == 0 && dz == 0) {
+                        let neighbour = Key(x: voxel.x + dx, y: voxel.y + dy, z: voxel.z + dz)
+                        if occupied.contains(neighbour), !visited.contains(neighbour) {
+                            visited.insert(neighbour)
+                            queue.append(neighbour)
+                        }
+                    }
+                }
+            }
+        }
+
+        var componentPoints: [SIMD3<Float>] = []
+        var voxelCenters: [SIMD3<Float>] = []
+        for voxel in visited {
+            guard let indices = voxelToPoints[voxel] else {
+                continue
+            }
+            for index in indices {
+                componentPoints.append(points[index])
+            }
+            voxelCenters.append(SIMD3<Float>(
+                (Float(voxel.x) + 0.5) * voxelSize,
+                (Float(voxel.y) + 0.5) * voxelSize,
+                (Float(voxel.z) + 0.5) * voxelSize
+            ))
+        }
+
+        return (componentPoints, voxelCenters)
+    }
+
+    /// The seed voxel if it is occupied, otherwise the nearest occupied voxel within a small ring
+    /// (handles the aimer landing slightly off the object, or on the just-removed support surface).
+    private static func seedVoxel(for key: Key, in occupied: Set<Key>) -> Key? {
+        if occupied.contains(key) {
+            return key
+        }
+
+        let maxRing = 5
+        for ring in 1...maxRing {
+            for dx in -ring...ring {
+                for dy in -ring...ring {
+                    for dz in -ring...ring where max(abs(dx), max(abs(dy), abs(dz))) == ring {
+                        let neighbour = Key(x: key.x + dx, y: key.y + dy, z: key.z + dz)
+                        if occupied.contains(neighbour) {
+                            return neighbour
+                        }
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
 }
 
 /// Builds a gravity-aligned oriented bounding box from a set of world-space points.
@@ -145,79 +449,5 @@ enum ObjectBoundingBox {
             highest = max(highest, projection)
         }
         return (highest - lowest, (lowest + highest) / 2)
-    }
-}
-
-/// Reads world-space vertices out of ARKit scene-reconstruction mesh anchors and isolates the
-/// subset that belongs to an object resting on a support surface.
-enum MeshGeometryReader {
-    /// Collects world-space vertices that fall inside a horizontal radius around `center` and
-    /// within a height band above the support surface. The height band drops the support surface
-    /// itself (via `floorClearance`) and anything taller than `maxHeight`, which isolates a single
-    /// object sitting on a floor or table from its surroundings.
-    static func objectVertices(
-        from meshAnchors: [ARMeshAnchor],
-        around center: SIMD3<Float>,
-        supportHeight: Float,
-        radius: Float,
-        maxHeight: Float,
-        floorClearance: Float = 0.02
-    ) -> [SIMD3<Float>] {
-        var result: [SIMD3<Float>] = []
-        let radiusSquared = radius * radius
-
-        for anchor in meshAnchors {
-            let vertices = anchor.geometry.vertices
-            let buffer = vertices.buffer.contents()
-            let stride = vertices.stride
-            let offset = vertices.offset
-            let transform = anchor.transform
-
-            for index in 0..<vertices.count {
-                // Read x, y, z as individual floats. ARKit packs the vertex buffer as tightly
-                // packed float3 (stride 12), so reading a 16-byte SIMD3<Float> directly could
-                // overrun the buffer on the final vertex.
-                let componentPointer = buffer
-                    .advanced(by: offset + stride * index)
-                    .assumingMemoryBound(to: Float.self)
-                let local = SIMD3<Float>(componentPointer[0], componentPointer[1], componentPointer[2])
-
-                let world4 = transform * SIMD4<Float>(local, 1)
-                let world = SIMD3<Float>(world4.x, world4.y, world4.z)
-
-                let heightAboveSupport = world.y - supportHeight
-                guard heightAboveSupport > floorClearance, heightAboveSupport < maxHeight else {
-                    continue
-                }
-
-                let deltaX = world.x - center.x
-                let deltaZ = world.z - center.z
-                guard deltaX * deltaX + deltaZ * deltaZ < radiusSquared else {
-                    continue
-                }
-
-                result.append(world)
-            }
-        }
-
-        return result
-    }
-
-    /// Picks the support surface height for an object: the highest horizontal plane that sits
-    /// below the aimed point. Returns `nil` when no horizontal plane has been detected yet.
-    static func supportHeight(below point: SIMD3<Float>, planes: [ARPlaneAnchor]) -> Float? {
-        var support: Float?
-        for plane in planes where plane.alignment == .horizontal {
-            let planeHeight = plane.transform.columns.3.y
-            guard planeHeight <= point.y - 0.02 else {
-                continue
-            }
-            if let current = support {
-                support = max(current, planeHeight)
-            } else {
-                support = planeHeight
-            }
-        }
-        return support
     }
 }

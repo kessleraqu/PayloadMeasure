@@ -20,6 +20,7 @@ final class ObjectCaptureEngine {
     private(set) var capturedObject: CapturedObject?
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = true
+    private(set) var showsSelectedPoints = true
     private(set) var isCapturing = false
     private(set) var captureRequestRevision = 0
     private(set) var resetRevision = 0
@@ -59,6 +60,10 @@ final class ObjectCaptureEngine {
 
     func toggleMesh() {
         isMeshVisible.toggle()
+    }
+
+    func toggleSelectedPoints() {
+        showsSelectedPoints.toggle()
     }
 
     func requestCapture() {

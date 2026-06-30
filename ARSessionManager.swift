@@ -117,7 +117,14 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
 
         if isSceneReconstructionSupported {
-            configuration.sceneReconstruction = .mesh
+            // Classification lets the capture pipeline discard floor/wall/ceiling faces before
+            // clustering, which makes object isolation far more reliable. Fall back to a plain
+            // mesh when the device cannot classify.
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+                configuration.sceneReconstruction = .meshWithClassification
+            } else {
+                configuration.sceneReconstruction = .mesh
+            }
             isSceneReconstructionEnabled = true
         } else {
             isSceneReconstructionEnabled = false

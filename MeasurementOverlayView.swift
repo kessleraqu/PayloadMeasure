@@ -61,7 +61,10 @@ struct MeasurementOverlayView: View {
 
                 HStack(alignment: .bottom) {
                     if isScanning {
-                        meshToggleButton
+                        HStack(spacing: 8) {
+                            meshToggleButton
+                            selectionToggleButton
+                        }
                     }
                     Spacer()
                     modeToggle
@@ -222,6 +225,21 @@ struct MeasurementOverlayView: View {
         .foregroundStyle(captureEngine.isMeshVisible ? .yellow : .primary)
         .glassEffect(.regular.interactive(), in: Capsule())
         .accessibilityLabel(captureEngine.isMeshVisible ? "Hide scan mesh" : "Show scan mesh")
+    }
+
+    private var selectionToggleButton: some View {
+        Button {
+            captureEngine.toggleSelectedPoints()
+        } label: {
+            Image(systemName: captureEngine.showsSelectedPoints ? "circle.grid.3x3.fill" : "circle.grid.3x3")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 44, height: 42)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(captureEngine.showsSelectedPoints ? .cyan : .primary)
+        .glassEffect(.regular.interactive(), in: Capsule())
+        .accessibilityLabel(captureEngine.showsSelectedPoints ? "Hide selected points" : "Show selected points")
     }
 
     private var captureButton: some View {
