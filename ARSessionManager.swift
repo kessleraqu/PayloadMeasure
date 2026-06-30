@@ -111,6 +111,11 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
         if isSceneDepthSupported {
             configuration.frameSemantics.insert(.sceneDepth)
+            // Smoothed depth is temporally filtered and noticeably less noisy; the capture pipeline
+            // prefers it when available.
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+                configuration.frameSemantics.insert(.smoothedSceneDepth)
+            }
             isSceneDepthEnabled = true
         } else {
             isSceneDepthEnabled = false

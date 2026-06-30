@@ -191,7 +191,7 @@ struct MeasurementOverlayView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if captureEngine.hasCapture {
+            if captureEngine.canReset {
                 Button {
                     captureEngine.reset()
                 } label: {

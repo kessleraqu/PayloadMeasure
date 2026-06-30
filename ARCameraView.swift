@@ -61,6 +61,8 @@ struct ARCameraView: UIViewRepresentable {
         fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
         // One shared marker mesh reused by every selection point to avoid regenerating geometry.
         fileprivate static let selectionMarkerMesh = MeshResource.generateBox(size: 0.02)
+        // A unit cube reused for every box edge (scaled per edge), since the box is rebuilt live.
+        fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
 
         private let sessionManager: ARSessionManager
         private let measurementEngine: MeasurementEngine
@@ -73,6 +75,10 @@ struct ARCameraView: UIViewRepresentable {
         private var captureEntities: [ModelEntity] = []
         private var selectionEntities: [ModelEntity] = []
         private var lastSelectionPoints: [SIMD3<Float>] = []
+        private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+        private var liveResult: CaptureResult?
+        private var isScanFrozen = false
+        private var scanTickCounter = 0
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
@@ -110,6 +116,7 @@ struct ARCameraView: UIViewRepresentable {
                 Task { @MainActor in
                     self.updateAimerSurface(in: arView)
                     self.updatePlacedPointBillboards(in: arView)
+                    self.updateScanLive(in: arView)
                 }
             }
 
@@ -158,10 +165,15 @@ struct ARCameraView: UIViewRepresentable {
         private func handleEngineRevisionChange() {
             // A mode switch clears whatever the previous tool drew and refreshes the mesh overlay.
             if measurementEngine.mode != observedMode {
+                let wasScanning = observedMode == .scan
                 observedMode = measurementEngine.mode
                 clearMeasurementContent()
-                clearCaptureContent()
+                resetScanState()
                 updateMeshVisibility()
+                if wasScanning {
+                    // Drop any stale captured/preview readout when leaving Scan.
+                    captureEngine.reset()
+                }
             }
 
             if measurementEngine.resetRevision != observedResetRevision {
@@ -178,14 +190,12 @@ struct ARCameraView: UIViewRepresentable {
 
             if captureEngine.resetRevision != observedCaptureResetRevision {
                 observedCaptureResetRevision = captureEngine.resetRevision
-                clearCaptureContent()
+                resetScanState()
             }
 
             if captureEngine.captureRequestRevision != observedCaptureRequestRevision {
                 observedCaptureRequestRevision = captureEngine.captureRequestRevision
-                if let arView {
-                    performCapture(in: arView)
-                }
+                commitScanCapture()
             }
 
             if captureEngine.isMeshVisible != observedMeshVisible {
@@ -214,16 +224,22 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        private func performCapture(in arView: ARView) {
-            guard sessionManager.isTrackingReady else {
-                captureEngine.reportTrackingNotReady()
+        /// Throttled live scanning: accumulate depth around the reticle across frames and keep a
+        /// running cluster + box so the operator sees what will be captured before pressing Capture.
+        private func updateScanLive(in arView: ARView) {
+            guard measurementEngine.mode == .scan, !isScanFrozen else {
                 return
             }
 
-            // Use the live aimer raycast as the seed for where the operator is pointing.
-            guard let aimerTransform = lastAimerRaycastTransform,
-                  let frame = arView.session.currentFrame else {
-                captureEngine.reportNoSupport()
+            // The aimer timer fires at 15 Hz; segment roughly every 5th tick (~3 Hz) to keep cost low.
+            scanTickCounter &+= 1
+            guard scanTickCounter % 5 == 0 else {
+                return
+            }
+
+            guard sessionManager.isTrackingReady,
+                  let frame = arView.session.currentFrame,
+                  let aimerTransform = lastAimerRaycastTransform else {
                 return
             }
 
@@ -231,28 +247,54 @@ struct ARCameraView: UIViewRepresentable {
             let points = DepthPointCloud.worldPoints(
                 from: frame,
                 near: seed,
-                maxRadius: ObjectCapturePipeline.maxRadius
+                maxRadius: ObjectCapturePipeline.accumulationRadius
             )
+
+            guard !points.isEmpty else {
+                return
+            }
+
+            accumulator.add(points)
 
             // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
-            let outcome = ObjectCapturePipeline.capture(
-                points: points,
+            guard case .success(let result) = ObjectCapturePipeline.capture(
+                points: accumulator.points(),
                 seed: seed,
                 up: SIMD3<Float>(0, 1, 0)
-            )
-
-            switch outcome {
-            case .noSupport:
-                captureEngine.reportNoSupport()
-            case .notEnoughMesh:
-                captureEngine.reportNotEnoughMesh()
-            case .success(let result):
-                captureEngine.applyCapture(result.object)
-                createContentAnchorIfNeeded(in: arView)
-                addCapturedBox(result.object)
-                lastSelectionPoints = result.selectionPoints
-                updateSelectionVisualization()
+            ) else {
+                return
             }
+
+            liveResult = result
+            createContentAnchorIfNeeded(in: arView)
+            addCapturedBox(result.object)
+            lastSelectionPoints = result.selectionPoints
+            updateSelectionVisualization()
+            captureEngine.showPreview(result.object)
+        }
+
+        /// Locks in the latest live result as the committed capture and stops live updating.
+        private func commitScanCapture() {
+            guard sessionManager.isTrackingReady else {
+                captureEngine.reportTrackingNotReady()
+                return
+            }
+
+            guard let liveResult else {
+                captureEngine.reportNotEnoughMesh()
+                return
+            }
+
+            isScanFrozen = true
+            captureEngine.applyCapture(liveResult.object)
+            // The box and selection markers are already rendered from the last live tick.
+        }
+
+        private func resetScanState() {
+            clearCaptureContent()
+            accumulator.reset()
+            liveResult = nil
+            isScanFrozen = false
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -694,12 +736,14 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             // A thin 3D bar (rather than a flat strip) so the box reads correctly from any angle as
-            // the operator walks around the captured object.
+            // the operator walks around the captured object. Reuses a shared unit cube, scaled to
+            // length, because the box is rebuilt on every live tick.
             let thickness: Float = 0.006
             let bar = ModelEntity(
-                mesh: .generateBox(size: SIMD3<Float>(length, thickness, thickness)),
+                mesh: Coordinator.unitCubeMesh,
                 materials: [Coordinator.captureMaterial]
             )
+            bar.scale = SIMD3<Float>(length, thickness, thickness)
             bar.position = start + delta / 2
             bar.orientation = orientation(alongX: delta)
 
@@ -740,9 +784,9 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            // Keep the marker count bounded so a dense cluster never floods the scene; stride
-            // through the voxel centers when there are more than the cap.
-            let maxMarkers = 1200
+            // Keep the marker count bounded so a dense cluster never floods the scene (it is
+            // rebuilt on every live tick); stride through the voxel centers when over the cap.
+            let maxMarkers = 500
             let step = max(1, lastSelectionPoints.count / maxMarkers)
             var index = 0
             while index < lastSelectionPoints.count {

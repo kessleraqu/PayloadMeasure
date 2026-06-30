@@ -18,6 +18,7 @@ import simd
 @Observable
 final class ObjectCaptureEngine {
     private(set) var capturedObject: CapturedObject?
+    private(set) var previewObject: CapturedObject?
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = true
     private(set) var showsSelectedPoints = true
@@ -26,20 +27,33 @@ final class ObjectCaptureEngine {
     private(set) var resetRevision = 0
 
     private static let defaultPrompt = "Aim at an object on a flat surface, then Capture."
+    private static let scanningPrompt = "Scanning — move slowly around the object, then Capture."
+
+    /// The committed capture if there is one, otherwise the live preview being built.
+    private var displayObject: CapturedObject? {
+        capturedObject ?? previewObject
+    }
 
     var hasCapture: Bool {
         capturedObject != nil
+    }
+
+    var canReset: Bool {
+        capturedObject != nil || previewObject != nil
     }
 
     var statusHeadline: String {
         if isCapturing {
             return "Capturing"
         }
-        return hasCapture ? "Object captured" : "Scan mode"
+        if capturedObject != nil {
+            return "Object captured"
+        }
+        return previewObject != nil ? "Scanning" : "Scan mode"
     }
 
     var primaryText: String {
-        guard let object = capturedObject else {
+        guard let object = displayObject else {
             return "--"
         }
         return String(
@@ -51,7 +65,7 @@ final class ObjectCaptureEngine {
     }
 
     var secondaryText: String? {
-        guard let object = capturedObject else {
+        guard let object = displayObject else {
             return nil
         }
         // Liters read more naturally than cubic meters at payload scale (1 m³ = 1000 L).
@@ -66,16 +80,28 @@ final class ObjectCaptureEngine {
         showsSelectedPoints.toggle()
     }
 
+    /// Called continuously by the AR layer while live-scanning to show the box being built.
+    func showPreview(_ object: CapturedObject) {
+        guard capturedObject == nil else {
+            return
+        }
+        previewObject = object
+        isCapturing = false
+        if statusText != Self.scanningPrompt {
+            statusText = Self.scanningPrompt
+        }
+    }
+
     func requestCapture() {
         isCapturing = true
-        statusText = "Capturing object mesh…"
         captureRequestRevision += 1
     }
 
     func applyCapture(_ object: CapturedObject) {
         capturedObject = object
+        previewObject = nil
         isCapturing = false
-        statusText = "Captured. Move around the object and capture again to refine."
+        statusText = "Captured. Reset to scan a different object."
     }
 
     func reportNoSupport() {
@@ -95,6 +121,7 @@ final class ObjectCaptureEngine {
 
     func reset() {
         capturedObject = nil
+        previewObject = nil
         isCapturing = false
         statusText = Self.defaultPrompt
         resetRevision += 1

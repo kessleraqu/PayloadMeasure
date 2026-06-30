@@ -1098,3 +1098,57 @@ Build and test on the physical iPhone:
 2. Confirm the cyan selected points now cover just the object and the green box matches its real size.
 3. Check the reported L×W×H against a tape measure.
 4. Toggle mesh and selected-point overlays independently; reset and re-capture from another angle.
+
+---
+
+## 2026-06-30 - Live Preview, Multi-Frame Accumulation, Noise Fixes
+
+### Motivation
+
+On-device the depth capture worked but: (a) the cyan/box only appeared after pressing Capture, with
+no live feedback, and (b) accuracy was rough and sometimes offset, because each capture was a single
+depth snapshot that only saw the faces pointing at the camera.
+
+### What changed
+
+- **Live preview + multi-frame accumulation.** While in Scan mode, a throttled loop (~3 Hz, off the
+  existing 15 Hz aimer timer) back-projects the depth around the reticle each tick and adds it to a
+  `PointAccumulator` — a voxel grid that averages the points falling in each voxel. The segmentation
+  (support removal → connected-component cluster → oriented box) runs on the accumulated cloud every
+  tick, so the green box and cyan selection update live as the operator walks around the object, and
+  coverage improves from multiple viewpoints instead of one. `Capture` simply freezes the latest live
+  result as the committed object; `Reset` clears the accumulator and resumes live scanning.
+- **Noise fixes.**
+  - `ARSessionManager` now also enables `.smoothedSceneDepth`, and `DepthPointCloud` prefers the
+    smoothed depth map (less frame-to-frame noise).
+  - Per-voxel averaging in the accumulator further suppresses noise.
+  - `ObjectBoundingBox` extents are now robust: each axis trims the extreme 2% before taking the
+    span, so a few stray depth points can no longer stretch the box.
+- **Engine/UI.** `ObjectCaptureEngine` gained a `previewObject` (live) distinct from `capturedObject`
+  (committed); the readout shows whichever applies with a "Scanning"/"Object captured" headline, and
+  Reset is available during live scanning. Rendering reuses shared meshes (unit cube for box edges,
+  one marker mesh for selection) and caps live markers, since the visuals are rebuilt each tick.
+
+### Why this design
+
+Accumulating across frames is the real accuracy fix: a single viewpoint can only see ~half the
+object, so the box was biased toward the camera. Averaging in world space (ARKit tracks pose) gives
+full coverage, and combined with smoothed depth and trimmed extents the box is both stable and
+correctly sized. Running the same pipeline continuously is what makes the preview live for free.
+
+### Risks / things to watch
+
+- The live loop rebuilds the box and up to ~500 selection markers ~3×/second; if the feed stutters,
+  toggle the selected-points overlay off (or lower the cadence / marker cap).
+- The accumulator is bounded to a 0.5 m radius around the reticle; wandering far while scanning grows
+  it. Reset clears it.
+- Objects flush against a wall still are not separated (would need the Vision-mask step).
+
+### Validation
+
+Build and test on the physical iPhone:
+
+1. Scan mode, aim at the object — confirm the green box and cyan points appear and refine *before* pressing Capture as you move around it.
+2. Capture freezes the result; confirm the box stops updating and the readout says "Object captured".
+3. Compare L×W×H to a tape measure; confirm it is closer and more stable than the single-shot version.
+4. Reset and confirm live scanning resumes from empty.

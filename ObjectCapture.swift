@@ -58,6 +58,9 @@ enum ObjectCapturePipeline {
     static let voxelSize: Float = 0.02
     /// Horizontal radius of depth points considered around the reticle, in meters.
     static let maxRadius: Float = 1.0
+    /// Horizontal radius gathered each frame while live-scanning and accumulating. Kept tighter
+    /// than `maxRadius` so an orbit around the object accumulates a bounded region.
+    static let accumulationRadius: Float = 0.5
     /// Tallest object we consider, above the support surface.
     static let maxHeight: Float = 1.5
     /// Points within this height of the support surface are treated as the surface and dropped.
@@ -147,7 +150,9 @@ enum DepthPointCloud {
         maxRadius: Float,
         pixelStride: Int = 2
     ) -> [SIMD3<Float>] {
-        guard let sceneDepth = frame.sceneDepth ?? frame.smoothedSceneDepth else {
+        // Prefer the temporally smoothed depth: it is markedly less noisy frame to frame, which
+        // keeps the fitted box from jittering and over-sizing on stray pixels.
+        guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return []
         }
 
@@ -228,6 +233,53 @@ enum DepthPointCloud {
         }
 
         return points
+    }
+}
+
+/// Accumulates depth points across frames into a voxel grid, averaging the points that fall in
+/// each voxel. This gives multi-viewpoint coverage as the operator walks around the object (so the
+/// box is not biased toward the side facing the camera) and averages out per-frame depth noise.
+struct PointAccumulator {
+    private struct Key: Hashable {
+        let x: Int
+        let y: Int
+        let z: Int
+    }
+
+    private var sums: [Key: SIMD3<Float>] = [:]
+    private var counts: [Key: Int] = [:]
+    private let voxelSize: Float
+
+    init(voxelSize: Float) {
+        self.voxelSize = voxelSize
+    }
+
+    var isEmpty: Bool {
+        sums.isEmpty
+    }
+
+    mutating func add(_ points: [SIMD3<Float>]) {
+        for point in points {
+            let key = Key(
+                x: Int(floor(point.x / voxelSize)),
+                y: Int(floor(point.y / voxelSize)),
+                z: Int(floor(point.z / voxelSize))
+            )
+            sums[key, default: SIMD3<Float>(repeating: 0)] += point
+            counts[key, default: 0] += 1
+        }
+    }
+
+    /// One averaged point per occupied voxel.
+    func points() -> [SIMD3<Float>] {
+        sums.map { key, sum in
+            sum / Float(counts[key] ?? 1)
+        }
+    }
+
+    mutating func reset() {
+        sums.removeAll(keepingCapacity: true)
+        counts.removeAll(keepingCapacity: true)
     }
 }
 
@@ -449,19 +501,23 @@ enum ObjectBoundingBox {
         vector - normal * simd_dot(vector, normal)
     }
 
-    /// Projects points onto an axis and returns the span and the midpoint offset from the centroid.
+    /// Projects points onto an axis and returns a robust span and midpoint offset from the
+    /// centroid, trimming the extreme `trim` fraction at each end so a few noisy depth points can
+    /// not stretch the box.
     private static func extent(
         of points: [SIMD3<Float>],
         around centroid: SIMD3<Float>,
-        along axis: SIMD3<Float>
+        along axis: SIMD3<Float>,
+        trim: Float = 0.02
     ) -> (span: Float, mid: Float) {
-        var lowest = Float.greatestFiniteMagnitude
-        var highest = -Float.greatestFiniteMagnitude
-        for point in points {
-            let projection = simd_dot(point - centroid, axis)
-            lowest = min(lowest, projection)
-            highest = max(highest, projection)
-        }
+        var projections = points.map { simd_dot($0 - centroid, axis) }
+        projections.sort()
+
+        let lastIndex = projections.count - 1
+        let lowIndex = min(lastIndex, Int(Float(projections.count) * trim))
+        let highIndex = max(0, lastIndex - lowIndex)
+        let lowest = projections[lowIndex]
+        let highest = projections[highIndex]
         return (highest - lowest, (lowest + highest) / 2)
     }
 }
