@@ -77,6 +77,7 @@ struct ARCameraView: UIViewRepresentable {
         private var lastSelectionPoints: [SIMD3<Float>] = []
         private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
         private var liveResult: CaptureResult?
+        private var accumulationAnchor: SIMD3<Float>?
         private var isScanFrozen = false
         private var scanTickCounter = 0
         private var previewTargetPosition: SIMD3<Float>?
@@ -244,6 +245,22 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             let seed = aimerTransform.translation
+
+            // If the operator has aimed at a clearly different place (farther than the gather
+            // radius), start a fresh accumulation. This keeps the buffer bounded and makes the tool
+            // track the object currently being aimed at instead of piling up the whole scene.
+            if let anchor = accumulationAnchor {
+                let deltaX = seed.x - anchor.x
+                let deltaZ = seed.z - anchor.z
+                let jump = ObjectCapturePipeline.accumulationRadius
+                if deltaX * deltaX + deltaZ * deltaZ > jump * jump {
+                    resetScanState()
+                }
+            }
+            if accumulationAnchor == nil {
+                accumulationAnchor = seed
+            }
+
             let points = DepthPointCloud.worldPoints(
                 from: frame,
                 near: seed,
@@ -294,7 +311,9 @@ struct ARCameraView: UIViewRepresentable {
             clearCaptureContent()
             accumulator.reset()
             liveResult = nil
+            accumulationAnchor = nil
             isScanFrozen = false
+            captureEngine.clearPreview()
         }
 
         private func placePointAtTarget(in arView: ARView) {

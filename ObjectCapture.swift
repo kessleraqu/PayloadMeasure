@@ -249,9 +249,14 @@ struct PointAccumulator {
     private var sums: [Key: SIMD3<Float>] = [:]
     private var counts: [Key: Int] = [:]
     private let voxelSize: Float
+    /// Hard cap on distinct voxels so the buffer can never grow without bound (which would
+    /// eventually exhaust memory and crash). Once reached, existing voxels keep averaging but no
+    /// new ones are added.
+    private let maxVoxels: Int
 
-    init(voxelSize: Float) {
+    init(voxelSize: Float, maxVoxels: Int = 20000) {
         self.voxelSize = voxelSize
+        self.maxVoxels = maxVoxels
     }
 
     var isEmpty: Bool {
@@ -265,8 +270,13 @@ struct PointAccumulator {
                 y: Int(floor(point.y / voxelSize)),
                 z: Int(floor(point.z / voxelSize))
             )
-            sums[key, default: SIMD3<Float>(repeating: 0)] += point
-            counts[key, default: 0] += 1
+            if counts[key] != nil {
+                sums[key, default: SIMD3<Float>(repeating: 0)] += point
+                counts[key]! += 1
+            } else if sums.count < maxVoxels {
+                sums[key] = point
+                counts[key] = 1
+            }
         }
     }
 

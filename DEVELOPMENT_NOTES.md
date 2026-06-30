@@ -1152,3 +1152,37 @@ Build and test on the physical iPhone:
 2. Capture freezes the result; confirm the box stops updating and the readout says "Object captured".
 3. Compare L×W×H to a tape measure; confirm it is closer and more stable than the single-shot version.
 4. Reset and confirm live scanning resumes from empty.
+
+---
+
+## 2026-06-30 - Fix Scan Crash from Unbounded Accumulation
+
+### Problem
+
+The live accumulator grew without bound. Sweeping around — and especially aiming at a new object —
+kept adding the whole swept region into one buffer, so memory and per-tick clustering cost climbed
+until iOS killed the app. (It appeared to "work on the Nth try" only because a fresh object sometimes
+accumulated enough before the buffer became fatal.)
+
+### What changed
+
+- **Hard cap on the accumulator** (`PointAccumulator`): a maximum number of distinct voxels (20000).
+  Once reached, existing voxels keep averaging but no new voxels are added, so memory and compute are
+  bounded no matter how long the session runs.
+- **Auto re-anchor on aim change** (`ARCameraView.updateScanLive`): the accumulation records the
+  world point it started at; if the reticle moves farther than the gather radius (0.5 m), the buffer
+  is cleared and restarted at the new location. So panning to a different object drops the old data
+  and builds the new object, instead of merging everything.
+- `resetScanState` also clears the re-anchor point and the engine's live preview.
+
+### Result
+
+Aiming at one object builds and shows its box/cyan live (improving from multiple viewpoints, as
+before); aiming at a different object seamlessly restarts on that object; the buffer never runs away,
+so it no longer crashes between objects. Capture still freezes the current result; Reset clears.
+
+### Validation
+
+On the physical iPhone: scan one object (box appears), pan to a different object across the table
+(box re-anchors to the new one), repeat many times — confirm no crash and that each object is
+captured on its own. Leave it scanning a while to confirm memory stays flat.

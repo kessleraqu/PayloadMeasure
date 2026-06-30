@@ -92,6 +92,17 @@ final class ObjectCaptureEngine {
         }
     }
 
+    /// Clears the live preview without a full reset (used when the scan re-anchors to a new object).
+    func clearPreview() {
+        guard capturedObject == nil else {
+            return
+        }
+        previewObject = nil
+        if statusText != Self.defaultPrompt {
+            statusText = Self.defaultPrompt
+        }
+    }
+
     func requestCapture() {
         isCapturing = true
         captureRequestRevision += 1
