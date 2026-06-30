@@ -117,14 +117,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
 
         if isSceneReconstructionSupported {
-            // Classification lets the capture pipeline discard floor/wall/ceiling faces before
-            // clustering, which makes object isolation far more reliable. Fall back to a plain
-            // mesh when the device cannot classify.
-            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-                configuration.sceneReconstruction = .meshWithClassification
-            } else {
-                configuration.sceneReconstruction = .mesh
-            }
+            // The mesh drives the optional on-screen wireframe overlay. Object capture itself uses
+            // the dense depth map, not the mesh, so a plain mesh is sufficient here.
+            configuration.sceneReconstruction = .mesh
             isSceneReconstructionEnabled = true
         } else {
             isSceneReconstructionEnabled = false

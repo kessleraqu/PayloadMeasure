@@ -6,9 +6,10 @@
 //
 
 import ARKit
+import CoreVideo
 import simd
 
-/// An object captured from the LiDAR scene mesh.
+/// An object captured from the LiDAR depth map.
 ///
 /// The box is aligned to gravity on the vertical axis (ARKit's world Y, since the session uses
 /// `.gravity` world alignment) and to the object's dominant horizontal footprint direction on the
@@ -24,7 +25,7 @@ struct CapturedObject {
     let corners: [SIMD3<Float>]
     /// Volume in cubic meters.
     let volume: Float
-    /// Number of mesh points that contributed to the capture — a rough confidence signal.
+    /// Number of depth points that contributed to the capture — a rough confidence signal.
     let sampleCount: Int
 
     var widthInMeters: Float { dimensions.x }
@@ -46,44 +47,43 @@ enum CaptureOutcome {
     case notEnoughMesh
 }
 
-/// Orchestrates a single object capture from the LiDAR scene mesh:
-/// support-plane removal → classification filtering → connected-component clustering seeded at the
-/// reticle → oriented-box fit. The clustering is what isolates a single object: once the support
-/// surface is removed, an object resting on it becomes a spatially disconnected blob, so growing
-/// the connected component from the aimed point keeps the object and drops everything else.
+/// Orchestrates a single object capture from a set of world-space depth points:
+/// support-height estimation → support/height gating → connected-component clustering seeded at the
+/// reticle → oriented-box fit. The clustering isolates a single object: once points near the
+/// support surface are dropped, an object resting on it becomes a spatially disconnected blob, so
+/// growing the connected component from the aimed point keeps the object and drops everything else.
 enum ObjectCapturePipeline {
-    /// Horizontal voxel/cluster resolution. ~4 cm matches the LiDAR mesh density: large enough to
-    /// bridge gaps across the object's own surface, small enough to keep it separate from nearby
-    /// clutter that is more than one voxel away.
-    static let voxelSize: Float = 0.04
-    /// Loose horizontal bound on candidate points purely to cap work in large rooms. The real
-    /// isolation comes from clustering, so this is far larger than the previous hard radius.
-    static let maxRadius: Float = 2.0
+    /// Voxel/cluster resolution. ~2 cm suits the dense depth map: fine enough to resolve a small
+    /// object, coarse enough to bridge depth noise across its surface.
+    static let voxelSize: Float = 0.02
+    /// Horizontal radius of depth points considered around the reticle, in meters.
+    static let maxRadius: Float = 1.0
     /// Tallest object we consider, above the support surface.
     static let maxHeight: Float = 1.5
     /// Points within this height of the support surface are treated as the surface and dropped.
     static let floorClearance: Float = 0.02
     /// Minimum cluster size before we trust a fit.
-    static let minimumClusterPoints = 24
+    static let minimumClusterPoints = 30
+    /// Radius around the reticle used to estimate the local support height.
+    private static let supportRadius: Float = 0.35
 
     static func capture(
-        meshAnchors: [ARMeshAnchor],
-        planes: [ARPlaneAnchor],
+        points: [SIMD3<Float>],
         seed: SIMD3<Float>,
         up: SIMD3<Float>
     ) -> CaptureOutcome {
-        guard let supportHeight = MeshGeometryReader.supportHeight(below: seed, planes: planes) else {
+        guard points.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard let supportHeight = estimateSupportHeight(points: points, seed: seed) else {
             return .noSupport
         }
 
-        let candidates = MeshGeometryReader.candidatePoints(
-            from: meshAnchors,
-            around: seed,
-            supportHeight: supportHeight,
-            maxRadius: maxRadius,
-            maxHeight: maxHeight,
-            floorClearance: floorClearance
-        )
+        let candidates = points.filter { point in
+            let heightAboveSupport = point.y - supportHeight
+            return heightAboveSupport > floorClearance && heightAboveSupport < maxHeight
+        }
 
         guard candidates.count >= minimumClusterPoints else {
             return .notEnoughMesh
@@ -97,138 +97,137 @@ enum ObjectCapturePipeline {
             return .notEnoughMesh
         }
 
-        guard let object = ObjectBoundingBox.make(from: cluster.points, up: up) else {
+        // The object rests on the support, so anchor the box's base to the support height rather
+        // than to the lowest clustered point (we dropped the bottom `floorClearance` for isolation).
+        guard let object = ObjectBoundingBox.make(
+            from: cluster.points,
+            up: up,
+            groundHeight: supportHeight
+        ) else {
             return .notEnoughMesh
         }
 
         return .success(CaptureResult(object: object, selectionPoints: cluster.voxelCenters))
     }
+
+    /// Estimates the local support surface height as a low percentile of the heights of points
+    /// near the reticle. This is robust when ARKit has not detected the tabletop as a plane: the
+    /// surface the object rests on is the lowest dense layer of points around it.
+    private static func estimateSupportHeight(points: [SIMD3<Float>], seed: SIMD3<Float>) -> Float? {
+        let radiusSquared = supportRadius * supportRadius
+        var nearbyHeights: [Float] = []
+        for point in points {
+            let deltaX = point.x - seed.x
+            let deltaZ = point.z - seed.z
+            if deltaX * deltaX + deltaZ * deltaZ < radiusSquared {
+                nearbyHeights.append(point.y)
+            }
+        }
+
+        guard nearbyHeights.count >= 20 else {
+            return nil
+        }
+
+        nearbyHeights.sort()
+        let percentileIndex = Int(Float(nearbyHeights.count) * 0.1)
+        return nearbyHeights[min(percentileIndex, nearbyHeights.count - 1)]
+    }
 }
 
-/// Reads world-space geometry out of ARKit scene-reconstruction mesh anchors.
-enum MeshGeometryReader {
-    /// ARKit mesh-face classifications that belong to the room, not to a placed object.
-    private static func isEnvironment(_ classification: ARMeshClassification) -> Bool {
-        switch classification {
-        case .wall, .floor, .ceiling, .window, .door:
-            return true
-        case .none, .table, .seat:
-            return false
-        @unknown default:
-            return false
-        }
-    }
-
-    /// Collects world-space vertices of mesh faces that:
-    /// - are not classified as room structure (when classification is available),
-    /// - sit above the support surface (dropping the surface itself), below `maxHeight`, and
-    /// - lie within a loose horizontal radius of the seed (a compute bound, not the isolation step).
-    static func candidatePoints(
-        from meshAnchors: [ARMeshAnchor],
-        around seed: SIMD3<Float>,
-        supportHeight: Float,
+/// Back-projects the dense LiDAR depth map into world-space points near the reticle.
+enum DepthPointCloud {
+    /// - Parameters:
+    ///   - frame: the current AR frame (must carry scene depth).
+    ///   - seed: world-space reticle position; only points within `maxRadius` horizontally are kept.
+    ///   - maxRadius: horizontal gather radius in meters.
+    ///   - pixelStride: sample every Nth depth pixel to bound the point count.
+    static func worldPoints(
+        from frame: ARFrame,
+        near seed: SIMD3<Float>,
         maxRadius: Float,
-        maxHeight: Float,
-        floorClearance: Float
+        pixelStride: Int = 2
     ) -> [SIMD3<Float>] {
-        var result: [SIMD3<Float>] = []
+        guard let sceneDepth = frame.sceneDepth ?? frame.smoothedSceneDepth else {
+            return []
+        }
+
+        let depthMap = sceneDepth.depthMap
+        let confidenceMap = sceneDepth.confidenceMap
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+
+        // Intrinsics are given at the captured-image resolution; scale them to the depth resolution.
+        let imageResolution = frame.camera.imageResolution
+        let intrinsics = frame.camera.intrinsics
+        let scaleX = Float(width) / Float(imageResolution.width)
+        let scaleY = Float(height) / Float(imageResolution.height)
+        let fx = intrinsics.columns.0.x * scaleX
+        let fy = intrinsics.columns.1.y * scaleY
+        let cx = intrinsics.columns.2.x * scaleX
+        let cy = intrinsics.columns.2.y * scaleY
+
+        guard fx > 0, fy > 0 else {
+            return []
+        }
+
+        let cameraTransform = frame.camera.transform
+
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        if let confidenceMap {
+            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+        }
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            if let confidenceMap {
+                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+            }
+        }
+
+        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
+            return []
+        }
+        let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+        let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0) }
+        let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+
+        var points: [SIMD3<Float>] = []
         let radiusSquared = maxRadius * maxRadius
 
-        for anchor in meshAnchors {
-            let geometry = anchor.geometry
-            let vertices = geometry.vertices
-            let faces = geometry.faces
-            let transform = anchor.transform
+        var row = 0
+        while row < height {
+            let depthRow = depthBase
+                .advanced(by: row * depthRowBytes)
+                .assumingMemoryBound(to: Float32.self)
+            let confidenceRow = confidenceBase?
+                .advanced(by: row * confidenceRowBytes)
+                .assumingMemoryBound(to: UInt8.self)
 
-            let vertexBuffer = vertices.buffer.contents()
-            let vertexStride = vertices.stride
-            let vertexOffset = vertices.offset
+            var column = 0
+            while column < width {
+                let depth = depthRow[column]
 
-            let faceBuffer = faces.buffer.contents()
-            let bytesPerIndex = faces.bytesPerIndex
-            let indicesPerFace = faces.indexCountPerPrimitive
-
-            // Classification is one value per face, present only with `.meshWithClassification`.
-            let classification = geometry.classification
-            let classificationBuffer = classification?.buffer.contents()
-            let classificationStride = classification?.stride ?? 0
-            let classificationOffset = classification?.offset ?? 0
-
-            func worldVertex(_ index: Int) -> SIMD3<Float> {
-                // Read x, y, z as individual floats. ARKit packs the buffer as tightly packed
-                // float3 (stride 12), so reading a 16-byte SIMD3<Float> could overrun the buffer.
-                let pointer = vertexBuffer
-                    .advanced(by: vertexOffset + vertexStride * index)
-                    .assumingMemoryBound(to: Float.self)
-                let local = SIMD3<Float>(pointer[0], pointer[1], pointer[2])
-                let world = transform * SIMD4<Float>(local, 1)
-                return SIMD3<Float>(world.x, world.y, world.z)
-            }
-
-            func faceVertexIndex(_ linearIndex: Int) -> Int {
-                if bytesPerIndex == 2 {
-                    return Int(faceBuffer
-                        .advanced(by: linearIndex * 2)
-                        .assumingMemoryBound(to: UInt16.self)
-                        .pointee)
-                }
-                return Int(faceBuffer
-                    .advanced(by: linearIndex * 4)
-                    .assumingMemoryBound(to: UInt32.self)
-                    .pointee)
-            }
-
-            for faceIndex in 0..<faces.count {
-                if let classificationBuffer {
-                    let raw = classificationBuffer
-                        .advanced(by: classificationOffset + classificationStride * faceIndex)
-                        .assumingMemoryBound(to: UInt8.self)
-                        .pointee
-                    if let classification = ARMeshClassification(rawValue: Int(raw)),
-                       isEnvironment(classification) {
-                        continue
-                    }
-                }
-
-                for corner in 0..<indicesPerFace {
-                    let vertexIndex = faceVertexIndex(faceIndex * indicesPerFace + corner)
-                    let world = worldVertex(vertexIndex)
-
-                    let heightAboveSupport = world.y - supportHeight
-                    guard heightAboveSupport > floorClearance, heightAboveSupport < maxHeight else {
-                        continue
-                    }
+                // Keep only valid, in-range, confident depth samples.
+                if depth > 0.15, depth < 2.5, (confidenceRow?[column] ?? 2) >= 1 {
+                    // Camera space: +x right, +y up, -z forward. Image v grows downward, so y is negated.
+                    let x = (Float(column) - cx) * depth / fx
+                    let y = (Float(row) - cy) * depth / fy
+                    let cameraPoint = SIMD4<Float>(x, -y, -depth, 1)
+                    let world = cameraTransform * cameraPoint
 
                     let deltaX = world.x - seed.x
                     let deltaZ = world.z - seed.z
-                    guard deltaX * deltaX + deltaZ * deltaZ < radiusSquared else {
-                        continue
+                    if deltaX * deltaX + deltaZ * deltaZ < radiusSquared {
+                        points.append(SIMD3<Float>(world.x, world.y, world.z))
                     }
-
-                    result.append(world)
                 }
+
+                column += pixelStride
             }
+
+            row += pixelStride
         }
 
-        return result
-    }
-
-    /// Picks the support surface height for an object: the highest horizontal plane that sits
-    /// below the aimed point. Returns `nil` when no horizontal plane has been detected yet.
-    static func supportHeight(below point: SIMD3<Float>, planes: [ARPlaneAnchor]) -> Float? {
-        var support: Float?
-        for plane in planes where plane.alignment == .horizontal {
-            let planeHeight = plane.transform.columns.3.y
-            guard planeHeight <= point.y - 0.02 else {
-                continue
-            }
-            if let current = support {
-                support = max(current, planeHeight)
-            } else {
-                support = planeHeight
-            }
-        }
-        return support
+        return points
     }
 }
 
@@ -341,8 +340,15 @@ enum ObjectBoundingBox {
     /// - Parameters:
     ///   - points: world-space points belonging to the object.
     ///   - up: world up (gravity) unit vector; height is measured along this axis.
+    ///   - groundHeight: if provided, the box's base along `up` is anchored to this height (the
+    ///     support surface), so the height reflects the full object even though points near the
+    ///     surface were dropped during isolation.
     /// - Returns: the oriented box, or `nil` if there are too few points or the box is degenerate.
-    static func make(from points: [SIMD3<Float>], up: SIMD3<Float>) -> CapturedObject? {
+    static func make(
+        from points: [SIMD3<Float>],
+        up: SIMD3<Float>,
+        groundHeight: Float? = nil
+    ) -> CapturedObject? {
         guard points.count >= 12 else {
             return nil
         }
@@ -385,7 +391,15 @@ enum ObjectBoundingBox {
 
         let widthExtent = extent(of: points, around: centroid, along: widthAxis)
         let depthExtent = extent(of: points, around: centroid, along: depthAxis)
-        let heightExtent = extent(of: points, around: centroid, along: upAxis)
+        var heightExtent = extent(of: points, around: centroid, along: upAxis)
+
+        if let groundHeight {
+            // Projection of the support height onto the up axis, relative to the centroid.
+            let groundProjection = groundHeight - simd_dot(centroid, upAxis)
+            let highest = heightExtent.mid + heightExtent.span / 2
+            let lowest = min(groundProjection, heightExtent.mid - heightExtent.span / 2)
+            heightExtent = (span: highest - lowest, mid: (lowest + highest) / 2)
+        }
 
         let dimensions = SIMD3<Float>(
             widthExtent.span,

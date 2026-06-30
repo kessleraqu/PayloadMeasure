@@ -1039,3 +1039,62 @@ Build and test on the physical iPhone. Confirm this workflow:
 3. Toggle the selected-points button on/off and the mesh button on/off independently.
 4. Try an object near (not touching) a wall — confirm the wall is excluded.
 5. Reset and re-capture from another angle to confirm stability.
+
+---
+
+## 2026-06-30 - Scan Source Switched to Dense Depth (mesh was too coarse)
+
+### Problem
+
+On a real ~20×10×5 cm object the mesh-based capture produced a box meters in size and showed no
+selected points. Two root causes:
+
+1. **The LiDAR scene mesh is too coarse** (faces several cm across). A 5 cm object is fused into the
+   tabletop in the reconstruction, so it never forms a separable connected component — clustering
+   the mesh cannot isolate it.
+2. **Support detection depended on a detected tabletop plane.** When only the floor plane existed,
+   the height band reached 1.5 m above the floor and clustered the whole room.
+
+### What changed
+
+The capture now reads the **dense LiDAR depth map** (`ARFrame.sceneDepth`, 256×192 metric depth,
+far finer than the mesh) instead of mesh vertices:
+
+- `DepthPointCloud` (new in `ObjectCapture.swift`) back-projects depth pixels to world space using
+  the camera intrinsics (scaled to depth resolution) and `frame.camera.transform`, keeping
+  confident, in-range samples within a horizontal radius of the reticle.
+- `ObjectCapturePipeline.capture` now takes those points and estimates the **support height from
+  the points themselves** — a low percentile of the heights near the reticle — so it no longer
+  needs ARKit to have detected the tabletop as a plane.
+- Isolation (support removal → voxel connected-component clustering seeded at the reticle → oriented
+  box) is unchanged, but the voxel size dropped to 2 cm to suit the denser, finer points.
+- `ObjectBoundingBox.make` gained a `groundHeight` parameter: the box base is anchored to the
+  support height, so dropping the bottom `floorClearance` for isolation no longer shortens the
+  reported height.
+- `ARSessionManager` reverted to plain `.mesh` (classification was only useful to the old
+  mesh-clustering path); the mesh now only feeds the optional wireframe overlay.
+
+### Why this design
+
+LiDAR depth resolves small objects that the reconstructed mesh cannot, and back-projecting it keeps
+everything in metric 3D so the existing clustering and oriented-box code apply unchanged. Estimating
+the support from the local point heights removes the brittle dependence on plane detection.
+
+### Risks / things to watch
+
+- The depth→world back-projection relies on the camera-space convention `(x, -y, -depth)` with
+  intrinsics scaled to the depth map. If the box appears mirrored or offset, this is the first thing
+  to check.
+- Support estimate assumes the object rests on a surface visible around it; an object on a very small
+  pedestal (floor visible within 0.35 m) could pick the floor as support.
+- Still PCA for the horizontal footprint; objects flush against a wall are not separated (no
+  appearance-based segmentation yet — that would be the Vision-mask step).
+
+### Validation
+
+Build and test on the physical iPhone:
+
+1. Place the ~20×10×5 cm object on a table, Scan mode, aim at it, Capture.
+2. Confirm the cyan selected points now cover just the object and the green box matches its real size.
+3. Check the reported L×W×H against a tape measure.
+4. Toggle mesh and selected-point overlays independently; reset and re-capture from another angle.

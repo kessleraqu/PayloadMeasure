@@ -228,13 +228,15 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             let seed = aimerTransform.translation
-            let planes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }
-            let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+            let points = DepthPointCloud.worldPoints(
+                from: frame,
+                near: seed,
+                maxRadius: ObjectCapturePipeline.maxRadius
+            )
 
             // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
             let outcome = ObjectCapturePipeline.capture(
-                meshAnchors: meshAnchors,
-                planes: planes,
+                points: points,
                 seed: seed,
                 up: SIMD3<Float>(0, 1, 0)
             )
