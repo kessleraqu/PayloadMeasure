@@ -278,9 +278,16 @@ struct ARCameraView: UIViewRepresentable {
 
             accumulator.add(points)
 
+            // Every ~3 s (at this ~3 Hz cadence), drop voxels seen only once: transient noise that
+            // was never reconfirmed. This bounds the buffer and keeps the box from creeping outward.
+            if scanTickCounter % 45 == 0 {
+                accumulator.pruneTransient(below: 2)
+            }
+
             // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
+            // Only well-observed voxels count toward the fit, so the box converges instead of growing.
             guard case .success(let result) = ObjectCapturePipeline.capture(
-                points: accumulator.points(),
+                points: accumulator.points(minObservations: ObjectCapturePipeline.minObservations),
                 seed: seed,
                 up: SIMD3<Float>(0, 1, 0)
             ) else {

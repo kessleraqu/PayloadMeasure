@@ -66,6 +66,10 @@ enum ObjectCapturePipeline {
     static let floorClearance: Float = 0.02
     /// Minimum cluster size before we trust a fit.
     static let minimumClusterPoints = 30
+    /// How many times a voxel must be observed before it counts toward the box. This is what makes
+    /// the box converge and refine instead of growing: transient depth noise (seen once or twice)
+    /// is ignored, while real surfaces — re-observed as the operator moves around — solidify.
+    static let minObservations = 3
     /// Radius around the reticle used to estimate the local support height.
     private static let supportRadius: Float = 0.35
 
@@ -284,10 +288,26 @@ struct PointAccumulator {
         }
     }
 
-    /// One averaged point per occupied voxel.
-    func points() -> [SIMD3<Float>] {
-        sums.map { key, sum in
-            sum / Float(counts[key] ?? 1)
+    /// One averaged point per occupied voxel that has been observed at least `minObservations` times.
+    func points(minObservations: Int = 1) -> [SIMD3<Float>] {
+        var result: [SIMD3<Float>] = []
+        result.reserveCapacity(sums.count)
+        for (key, sum) in sums {
+            let count = counts[key] ?? 1
+            if count >= minObservations {
+                result.append(sum / Float(count))
+            }
+        }
+        return result
+    }
+
+    /// Drops voxels observed fewer than `minCount` times — transient noise that was never
+    /// reconfirmed. Keeps the buffer lean and stops the box creeping outward from stray points.
+    mutating func pruneTransient(below minCount: Int) {
+        let stale = counts.compactMap { $0.value < minCount ? $0.key : nil }
+        for key in stale {
+            counts[key] = nil
+            sums[key] = nil
         }
     }
 

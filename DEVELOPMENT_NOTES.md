@@ -1203,3 +1203,18 @@ information." Additional fixes:
 - Lowered the accumulator cap to 12000 voxels.
 - **Pooled the selection markers**: the cyan markers are now a reused, enable/disable pool instead of
   hundreds of entities created and destroyed every tick.
+
+### Follow-up - converging box instead of an ever-growing one
+
+After the crash was fixed, the box still only ever grew: pure accumulation takes the max extent and
+never forgets, so depth noise and tracking drift pushed the box outward indefinitely, and the buffer
+trended toward the cap. Made the capture confidence-based so it refines and converges:
+
+- The accumulator counts how many times each voxel is observed. Only voxels seen at least
+  `minObservations` (3) times count toward the box fit, so single-frame noise never enlarges it;
+  real surfaces — re-seen as the operator moves around — solidify and persist.
+- Every ~3 s the accumulator prunes voxels seen only once (un-reconfirmed noise), which keeps the
+  buffer lean and stops the box creeping outward.
+
+Result: for a static object the box settles after ~1 s and stays put; moving around the object only
+extends it to genuinely-new, repeatedly-observed surface (true refinement) rather than ballooning.
