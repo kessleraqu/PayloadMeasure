@@ -56,11 +56,10 @@ enum ObjectCapturePipeline {
     /// Voxel/cluster resolution. ~2 cm suits the dense depth map: fine enough to resolve a small
     /// object, coarse enough to bridge depth noise across its surface.
     static let voxelSize: Float = 0.02
-    /// Horizontal radius of depth points considered around the reticle, in meters.
-    static let maxRadius: Float = 1.0
-    /// Horizontal radius gathered each frame while live-scanning and accumulating. Kept tighter
-    /// than `maxRadius` so an orbit around the object accumulates a bounded region.
-    static let accumulationRadius: Float = 0.5
+    /// 3D radius (a sphere) gathered around the reticle each frame. Kept tight so accumulation only
+    /// covers the aimed object and its immediate surroundings — not a tall column of the whole room,
+    /// which is what previously let the buffer explode.
+    static let accumulationRadius: Float = 0.4
     /// Tallest object we consider, above the support surface.
     static let maxHeight: Float = 1.5
     /// Points within this height of the support surface are treated as the surface and dropped.
@@ -141,13 +140,13 @@ enum ObjectCapturePipeline {
 enum DepthPointCloud {
     /// - Parameters:
     ///   - frame: the current AR frame (must carry scene depth).
-    ///   - seed: world-space reticle position; only points within `maxRadius` horizontally are kept.
-    ///   - maxRadius: horizontal gather radius in meters.
+    ///   - seed: world-space reticle position; only points within `radius` (a 3D sphere) are kept.
+    ///   - radius: 3D gather radius in meters.
     ///   - pixelStride: sample every Nth depth pixel to bound the point count.
     static func worldPoints(
         from frame: ARFrame,
         near seed: SIMD3<Float>,
-        maxRadius: Float,
+        radius: Float,
         pixelStride: Int = 2
     ) -> [SIMD3<Float>] {
         // Prefer the temporally smoothed depth: it is markedly less noisy frame to frame, which
@@ -196,7 +195,7 @@ enum DepthPointCloud {
         let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
 
         var points: [SIMD3<Float>] = []
-        let radiusSquared = maxRadius * maxRadius
+        let radiusSquared = radius * radius
 
         var row = 0
         while row < height {
@@ -220,8 +219,13 @@ enum DepthPointCloud {
                     let world = cameraTransform * cameraPoint
 
                     let deltaX = world.x - seed.x
+                    let deltaY = world.y - seed.y
                     let deltaZ = world.z - seed.z
-                    if deltaX * deltaX + deltaZ * deltaZ < radiusSquared {
+                    let distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ
+                    // Gather a 3D sphere around the reticle, and guard against any non-finite value
+                    // (a NaN/Inf world coordinate would hard-trap the voxel Int() conversion later).
+                    if distanceSquared < radiusSquared,
+                       world.x.isFinite, world.y.isFinite, world.z.isFinite {
                         points.append(SIMD3<Float>(world.x, world.y, world.z))
                     }
                 }
@@ -254,7 +258,7 @@ struct PointAccumulator {
     /// new ones are added.
     private let maxVoxels: Int
 
-    init(voxelSize: Float, maxVoxels: Int = 20000) {
+    init(voxelSize: Float, maxVoxels: Int = 12000) {
         self.voxelSize = voxelSize
         self.maxVoxels = maxVoxels
     }

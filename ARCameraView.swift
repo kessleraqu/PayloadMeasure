@@ -73,7 +73,7 @@ struct ARCameraView: UIViewRepresentable {
         private var measurementEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
         private var captureEntities: [ModelEntity] = []
-        private var selectionEntities: [ModelEntity] = []
+        private var selectionPool: [ModelEntity] = []
         private var lastSelectionPoints: [SIMD3<Float>] = []
         private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
         private var liveResult: CaptureResult?
@@ -129,6 +129,11 @@ struct ARCameraView: UIViewRepresentable {
             aimerUpdateTimer = nil
             clearMeasurementContent()
             clearCaptureContent()
+
+            for marker in selectionPool {
+                marker.removeFromParent()
+            }
+            selectionPool.removeAll()
 
             if let contentAnchor, let arView {
                 arView.scene.removeAnchor(contentAnchor)
@@ -264,7 +269,7 @@ struct ARCameraView: UIViewRepresentable {
             let points = DepthPointCloud.worldPoints(
                 from: frame,
                 near: seed,
-                maxRadius: ObjectCapturePipeline.accumulationRadius
+                radius: ObjectCapturePipeline.accumulationRadius
             )
 
             guard !points.isEmpty else {
@@ -790,42 +795,53 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             captureEntities.removeAll()
-            clearSelectionEntities()
+            hideAllSelectionMarkers()
             lastSelectionPoints = []
         }
 
-        /// Redraws (or hides) the cyan markers showing which voxel cluster the last capture selected.
+        /// Updates the cyan markers showing which voxel cluster the last capture selected. Reuses a
+        /// persistent pool of entities (repositioning and enabling/disabling them) instead of
+        /// recreating entities every live tick, which would churn hundreds of allocations per second.
         private func updateSelectionVisualization() {
-            clearSelectionEntities()
-
             guard captureEngine.showsSelectedPoints, !lastSelectionPoints.isEmpty,
                   let contentAnchor else {
+                hideAllSelectionMarkers()
                 return
             }
 
-            // Keep the marker count bounded so a dense cluster never floods the scene (it is
-            // rebuilt on every live tick); stride through the voxel centers when over the cap.
-            let maxMarkers = 500
+            // Keep the visible marker count bounded; stride through the voxel centers when over the cap.
+            let maxMarkers = 250
             let step = max(1, lastSelectionPoints.count / maxMarkers)
+
+            var shown = 0
             var index = 0
             while index < lastSelectionPoints.count {
-                let marker = ModelEntity(
-                    mesh: Coordinator.selectionMarkerMesh,
-                    materials: [Coordinator.selectionMaterial]
-                )
+                let marker: ModelEntity
+                if shown < selectionPool.count {
+                    marker = selectionPool[shown]
+                } else {
+                    marker = ModelEntity(
+                        mesh: Coordinator.selectionMarkerMesh,
+                        materials: [Coordinator.selectionMaterial]
+                    )
+                    contentAnchor.addChild(marker)
+                    selectionPool.append(marker)
+                }
                 marker.position = lastSelectionPoints[index]
-                contentAnchor.addChild(marker)
-                selectionEntities.append(marker)
+                marker.isEnabled = true
+                shown += 1
                 index += step
+            }
+
+            for poolIndex in shown..<selectionPool.count {
+                selectionPool[poolIndex].isEnabled = false
             }
         }
 
-        private func clearSelectionEntities() {
-            for entity in selectionEntities {
-                entity.removeFromParent()
+        private func hideAllSelectionMarkers() {
+            for marker in selectionPool {
+                marker.isEnabled = false
             }
-
-            selectionEntities.removeAll()
         }
 
         private func stopTrackedRaycasts() {

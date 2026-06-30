@@ -1186,3 +1186,20 @@ so it no longer crashes between objects. Capture still freezes the current resul
 On the physical iPhone: scan one object (box appears), pan to a different object across the table
 (box re-anchors to the new one), repeat many times — confirm no crash and that each object is
 captured on its own. Leave it scanning a while to confirm memory stays flat.
+
+### Follow-up - the real cause was the gather volume
+
+The cap/re-anchor above were not enough on device. The deeper problem: each frame gathered depth
+within a horizontal radius but **unbounded vertically and out to 2.5 m**, i.e. a tall column of the
+whole room (floor, walls, background). Orbiting kept revealing new background, so the buffer filled
+with non-object data and the per-tick clustering grew until iOS killed the app — "too much
+information." Additional fixes:
+
+- **Gather a tight 3D sphere** around the reticle (`accumulationRadius` 0.4 m, distance now measured
+  in 3D, not just horizontally), so accumulation only covers the object and its immediate
+  surroundings. This is the main fix.
+- **Non-finite guard**: skip any depth pixel whose world coordinate is NaN/Inf — otherwise the
+  `Int(floor(...))` voxel conversion would hard-trap.
+- Lowered the accumulator cap to 12000 voxels.
+- **Pooled the selection markers**: the cyan markers are now a reused, enable/disable pool instead of
+  hundreds of entities created and destroyed every tick.
