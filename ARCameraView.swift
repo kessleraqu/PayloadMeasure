@@ -6,6 +6,7 @@
 //
 
 import ARKit
+import ImageIO
 import RealityKit
 import SwiftUI
 import UIKit
@@ -76,16 +77,20 @@ struct ARCameraView: UIViewRepresentable {
         private var selectionPool: [ModelEntity] = []
         private var lastSelectionPoints: [SIMD3<Float>] = []
         private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+        private let objectMaskProcessor = ObjectMaskProcessor()
         private var liveResult: CaptureResult?
         private var accumulationAnchor: SIMD3<Float>?
         private var isScanFrozen = false
         private var scanTickCounter = 0
+        private var maskTickCounter = 0
+        private var consecutiveMaskMisses = 0
+        private var objectMaskTask: Task<Void, Never>?
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
-        private var observedMode: MeasurementMode = .line
+        private var observedMode: MeasurementMode = .scan
         private var observedCaptureRequestRevision = 0
         private var observedCaptureResetRevision = 0
         private var observedMeshVisible = true
@@ -117,6 +122,7 @@ struct ARCameraView: UIViewRepresentable {
                 Task { @MainActor in
                     self.updateAimerSurface(in: arView)
                     self.updatePlacedPointBillboards(in: arView)
+                    self.updateObjectMaskPreview(in: arView)
                     self.updateScanLive(in: arView)
                 }
             }
@@ -127,6 +133,9 @@ struct ARCameraView: UIViewRepresentable {
         func detach() {
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
+            objectMaskTask?.cancel()
+            objectMaskTask = nil
+            captureEngine.clearObjectMaskPreview()
             clearMeasurementContent()
             clearCaptureContent()
 
@@ -222,7 +231,9 @@ struct ARCameraView: UIViewRepresentable {
 
             // The reconstructed mesh overlay is only useful while scanning. RealityKit renders it
             // natively from the LiDAR scene-reconstruction data already enabled on the session.
-            let shouldShow = measurementEngine.mode == .scan && captureEngine.isMeshVisible
+            let shouldShow = measurementEngine.mode == .scan
+                && sessionManager.isSceneReconstructionEnabled
+                && captureEngine.isMeshVisible
             if shouldShow {
                 arView.debugOptions.insert(.showSceneUnderstanding)
             } else {
@@ -230,10 +241,72 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
+        /// Runs RGB foreground-instance segmentation at roughly 3 Hz. Only one Vision request may
+        /// be in flight, so slower devices drop intermediate frames instead of building a backlog.
+        private func updateObjectMaskPreview(in arView: ARView) {
+            guard measurementEngine.mode == .scan, !isScanFrozen else {
+                return
+            }
+
+            maskTickCounter &+= 1
+            guard maskTickCounter % 5 == 0,
+                  objectMaskTask == nil,
+                  let frame = arView.session.currentFrame else {
+                return
+            }
+
+            let input = ObjectMaskFrame(
+                pixelBuffer: frame.capturedImage,
+                orientation: cameraImageOrientation(in: arView)
+            )
+            let processor = objectMaskProcessor
+
+            objectMaskTask = Task { [weak self] in
+                let preview = await processor.makePreview(from: input)
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+
+                self.objectMaskTask = nil
+                guard self.measurementEngine.mode == .scan, !self.isScanFrozen else {
+                    return
+                }
+
+                if let preview {
+                    self.consecutiveMaskMisses = 0
+                    self.captureEngine.showObjectMaskPreview(preview)
+                } else {
+                    self.consecutiveMaskMisses += 1
+                    if self.consecutiveMaskMisses >= 3 {
+                        self.captureEngine.clearObjectMaskPreview()
+                    }
+                }
+            }
+        }
+
+        /// ARKit supplies the rear-camera buffer in its native landscape orientation. Vision needs
+        /// the current interface orientation so its selected mask is upright for display.
+        private func cameraImageOrientation(in arView: ARView) -> CGImagePropertyOrientation {
+            switch arView.window?.windowScene?.effectiveGeometry.interfaceOrientation {
+            case .portraitUpsideDown:
+                .left
+            case .landscapeLeft:
+                .up
+            case .landscapeRight:
+                .down
+            case .portrait, .unknown, .none:
+                .right
+            @unknown default:
+                .right
+            }
+        }
+
         /// Throttled live scanning: accumulate depth around the reticle across frames and keep a
         /// running cluster + box so the operator sees what will be captured before pressing Capture.
         private func updateScanLive(in arView: ARView) {
-            guard measurementEngine.mode == .scan, !isScanFrozen else {
+            guard measurementEngine.mode == .scan,
+                  sessionManager.isAutomaticObjectCaptureSupported,
+                  !isScanFrozen else {
                 return
             }
 
@@ -325,6 +398,8 @@ struct ARCameraView: UIViewRepresentable {
             liveResult = nil
             accumulationAnchor = nil
             isScanFrozen = false
+            consecutiveMaskMisses = 0
+            captureEngine.clearObjectMaskPreview()
             captureEngine.clearPreview()
         }
 

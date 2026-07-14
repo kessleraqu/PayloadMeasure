@@ -18,8 +18,13 @@ struct MeasurementOverlayView: View {
         measurementEngine.mode == .scan
     }
 
+    private var isAutomaticCaptureSupported: Bool {
+        sessionManager.isAutomaticObjectCaptureSupported
+    }
+
     var body: some View {
         ZStack {
+            objectMaskPreview
             aimer
 
             VStack {
@@ -60,14 +65,16 @@ struct MeasurementOverlayView: View {
                 Spacer()
 
                 HStack(alignment: .bottom) {
-                    if isScanning {
+                    if isScanning, isAutomaticCaptureSupported {
                         HStack(spacing: 8) {
-                            meshToggleButton
+                            if sessionManager.isSceneReconstructionSupported {
+                                meshToggleButton
+                            }
                             selectionToggleButton
                         }
                     }
                     Spacer()
-                    modeToggle
+                    modeMenu
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 32)
@@ -87,6 +94,22 @@ struct MeasurementOverlayView: View {
         .animation(.snappy(duration: 0.22), value: showsPanel)
         .animation(.snappy(duration: 0.18), value: measurementEngine.mode)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
+    }
+
+    @ViewBuilder
+    private var objectMaskPreview: some View {
+        if isScanning, let preview = captureEngine.objectMaskPreview {
+            GeometryReader { proxy in
+                Image(decorative: preview.image, scale: 1, orientation: .up)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .clipped()
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
     }
 
     private var infoPanel: some View {
@@ -168,24 +191,26 @@ struct MeasurementOverlayView: View {
     private var captureReadout: some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(captureEngine.statusHeadline)
+                Text(scanStatusHeadline)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                Text(captureEngine.primaryText)
+                Text(scanPrimaryText)
                     .font(.system(.caption, design: .rounded).weight(.semibold))
                     .monospacedDigit()
                     .lineLimit(2)
                     .minimumScaleFactor(0.72)
 
-                if let secondaryText = captureEngine.secondaryText {
+                if isAutomaticCaptureSupported, let secondaryText = captureEngine.secondaryText {
                     Text(secondaryText)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
 
-                Text(captureEngine.statusText)
+                Text(
+                    scanStatusText
+                )
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -210,6 +235,34 @@ struct MeasurementOverlayView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: 240, alignment: .leading)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var scanStatusHeadline: String {
+        if isAutomaticCaptureSupported {
+            return captureEngine.statusHeadline
+        }
+
+        return captureEngine.hasObjectMaskPreview ? "Object detected" : "Finding object"
+    }
+
+    private var scanPrimaryText: String {
+        if isAutomaticCaptureSupported {
+            return captureEngine.primaryText
+        }
+
+        return captureEngine.hasObjectMaskPreview ? "RGB mask selected" : "--"
+    }
+
+    private var scanStatusText: String {
+        if isAutomaticCaptureSupported {
+            return captureEngine.statusText
+        }
+
+        if captureEngine.hasObjectMaskPreview {
+            return sessionManager.automaticObjectCaptureAvailabilityText
+        }
+
+        return "Aim the center marker at a distinct object to preview its RGB boundary."
     }
 
     private var meshToggleButton: some View {
@@ -246,43 +299,78 @@ struct MeasurementOverlayView: View {
         Button {
             captureEngine.requestCapture()
         } label: {
-            Label(captureEngine.isCapturing ? "Capturing…" : "Capture", systemImage: "cube.transparent")
+            Label(
+                isAutomaticCaptureSupported
+                    ? (captureEngine.isCapturing ? "Capturing…" : "Capture")
+                    : "LiDAR Required",
+                systemImage: "cube.transparent"
+            )
                 .font(.headline.weight(.semibold))
-                .foregroundStyle(sessionManager.isTrackingReady ? .primary : .secondary)
+                .foregroundStyle(
+                    sessionManager.isTrackingReady && isAutomaticCaptureSupported
+                        ? .primary
+                        : .secondary
+                )
                 .padding(.horizontal, 22)
                 .frame(height: 52)
         }
         .buttonStyle(.plain)
         .glassEffect(.regular.interactive(), in: Capsule())
         .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 6)
-        .disabled(!sessionManager.isTrackingReady || captureEngine.isCapturing)
-        .accessibilityLabel("Capture object dimensions")
+        .disabled(
+            !isAutomaticCaptureSupported
+                || !sessionManager.isTrackingReady
+                || captureEngine.isCapturing
+        )
+        .accessibilityLabel(
+            isAutomaticCaptureSupported
+                ? "Capture object dimensions"
+                : "Automatic object capture requires LiDAR"
+        )
     }
 
-    private var modeToggle: some View {
-        HStack(spacing: 4) {
+    private var modeMenu: some View {
+        Menu {
             ForEach(MeasurementMode.allCases) { mode in
                 Button {
                     measurementEngine.mode = mode
                 } label: {
-                    Image(systemName: mode.systemImageName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .frame(width: 38, height: 34)
-                        .contentShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(measurementEngine.mode == mode ? .yellow : .primary)
-                .background {
-                    if measurementEngine.mode == mode {
-                        RoundedRectangle(cornerRadius: 17, style: .continuous)
-                            .fill(.white.opacity(0.18))
+                    HStack {
+                        Label(mode.title, systemImage: mode.systemImageName)
+                        Spacer()
+
+                        if measurementEngine.mode == mode {
+                            Image(systemName: "checkmark")
+                        }
                     }
                 }
-                .accessibilityLabel(mode.title)
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: measurementEngine.mode.systemImageName)
+                    .font(.system(size: 14, weight: .semibold))
+
+                Text("Mode")
+                    .font(.caption.weight(.semibold))
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 42)
+            .contentShape(Capsule())
+            .background {
+                if measurementEngine.mode == .scan {
+                    Capsule()
+                        .fill(.white.opacity(0.08))
+                }
             }
         }
-        .padding(4)
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
         .glassEffect(.regular.interactive(), in: Capsule())
+        .accessibilityLabel("Measurement mode, \(measurementEngine.mode.title)")
     }
 
     private var aimer: some View {

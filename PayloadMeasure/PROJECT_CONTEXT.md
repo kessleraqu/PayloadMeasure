@@ -35,10 +35,13 @@ The app should therefore act as an intelligent measurement and decision-support 
 ## Development machine
 - MacBook Air M2
 
-## Test device
-- iPhone 13 Pro
-- LiDAR Scanner
-- ARKit compatible
+## Target and test devices
+
+- Original target: iPhone 13 Pro with LiDAR Scanner.
+- Currently available development device: iPhone 15 Plus without LiDAR.
+- The app must detect LiDAR capabilities at runtime and keep unsupported workflows explicit.
+- RGB camera, world tracking, plane detection, and non-depth UI work can be tested on the iPhone 15 Plus.
+- Scene depth, reconstructed mesh, and metric automatic object capture still require a LiDAR-capable device.
 
 The simulator should **never** be considered a substitute for testing AR functionality.
 
@@ -50,7 +53,7 @@ The simulator should **never** be considered a substitute for testing AR functio
 - SwiftUI
 - ARKit
 - RealityKit
-- Vision (later)
+- Vision
 - CoreML (optional later)
 
 Avoid Unity unless explicitly requested.
@@ -70,6 +73,14 @@ Current milestone:
 ✅ Initial ARView embedded inside SwiftUI
 
 ✅ Camera permission (`NSCameraUsageDescription`) configured via build settings (`INFOPLIST_KEY_NSCameraUsageDescription`).
+
+✅ Manual Line and Box measurement workflows implemented.
+
+✅ LiDAR depth-based automatic Scan workflow implemented with live multi-frame accumulation.
+
+✅ Scan is the default workflow and reports unsupported hardware explicitly on non-LiDAR devices.
+
+✅ Live RGB foreground-instance mask preview runs in Scan mode on both LiDAR and non-LiDAR devices.
 
 ---
 
@@ -135,8 +146,12 @@ PayloadMeasure/
 - ARCameraView.swift
 - ARSessionManager.swift
 - MeasurementEngine.swift
+- MeasurementMode.swift
 - MeasurementOverlayView.swift
 - MeasurementPoint.swift
+- ObjectCapture.swift
+- ObjectCaptureEngine.swift
+- ObjectMaskProcessor.swift
 - PayloadMeasurement.swift
 - CompatibilityChecker.swift
 - ExportManager.swift

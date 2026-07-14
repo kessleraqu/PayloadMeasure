@@ -1218,3 +1218,97 @@ trended toward the cap. Made the capture confidence-based so it refines and conv
 
 Result: for a static object the box settles after ~1 s and stays put; moving around the object only
 extends it to genuinely-new, repeatedly-observed surface (true refinement) rather than ballooning.
+
+---
+
+## 2026-07-14 - Capability-Aware Scan and Compact Mode Menu
+
+### Goal
+
+Make automatic object capture the primary workflow while ensuring the app behaves clearly on the
+currently available iPhone 15 Plus, which does not provide LiDAR scene depth.
+
+### What changed
+
+- Scan is now the default mode at app launch.
+- Replaced the always-visible three-icon mode toggle with one compact `Mode` menu. The menu still
+  exposes Scan, Line, and Box without changing the existing manual measurement implementations.
+- Added an explicit automatic-capture capability derived from ARKit's scene-depth support check.
+- On a non-LiDAR device, Scan now:
+  - shows `Scan unavailable` and explains that automatic capture requires LiDAR;
+  - replaces Capture with a disabled `LiDAR Required` control;
+  - hides mesh and selected-depth-point controls;
+  - skips the background live-depth update loop entirely.
+- The RealityKit scene-understanding overlay is now shown only when scene reconstruction is actually
+  enabled, as well as when Scan mode and mesh visibility are selected.
+
+### Why this design
+
+Automatic capture is the project's main workflow, so it remains the default instead of falling back
+silently to a manual tool. Capability-aware presentation makes the hardware boundary visible and
+prevents an unsupported device from misleadingly reporting that it merely needs more mesh data.
+
+### Scope
+
+The Line and Box measurement, raycasting, refinement, anchoring, rendering, and calculations were
+not changed.
+
+### Validation
+
+- Generic iOS Debug build succeeded with Xcode 26.6.
+- On an iPhone 15 Plus, confirm Scan opens by default, displays the LiDAR requirement, and exposes
+  all three workflows through the Mode menu.
+- On a LiDAR device, confirm Scan controls and the live depth workflow remain available.
+
+---
+
+## 2026-07-14 - RGB Object Mask Preview for Non-LiDAR Devices
+
+### Goal
+
+Detect and display the aimed object's RGB boundary in Scan mode on the available iPhone 15 Plus,
+without requiring scene depth or changing the manual Line and Box tools.
+
+### What changed
+
+- Added `ObjectMaskProcessor.swift`.
+- The processor runs Vision's foreground-instance mask request on the AR camera image.
+- The instance beneath the center aimer is selected. If the exact center is background in Vision's
+  lower-resolution result, the processor searches a small ring around it rather than selecting an
+  unrelated object elsewhere in the image.
+- The selected mask is converted with Core Image into a translucent cyan fill and a brighter
+  morphology-derived boundary.
+- `ARCameraView.Coordinator` requests an RGB mask at about 3 Hz while Scan mode is active.
+- Vision processing is isolated in an actor, and only one request may be in flight. Intermediate
+  frames are dropped when processing is busy, preventing a growing queue from slowing the AR feed.
+- Three consecutive misses are required before removing the last mask, reducing preview flicker.
+- `ObjectCaptureEngine` now exposes the latest display-ready mask to SwiftUI.
+- `MeasurementOverlayView` scales the upright mask over the camera feed and reports either
+  `Finding object` or `Object detected` on a non-LiDAR device.
+- On the iPhone 15 Plus, metric Capture remains disabled and the UI explains that RGB detection is
+  available while LiDAR is still required for 3D dimensions.
+
+### Why a mask instead of raw edge detection
+
+Raw image contours include table edges, shadows, labels, and surface texture. A foreground-instance
+mask first determines which pixels belong to the object under the aimer. Its boundary can then be
+used as the meaningful object edge, and the filled mask can later reject table pixels before depth
+points enter the 3D accumulator.
+
+### Current limitations
+
+- This milestone is preview-only. The RGB mask is not yet applied to LiDAR depth samples.
+- Vision's generic foreground segmentation can still merge an object with its support when their
+  appearance is very similar, or miss transparent, reflective, very small, or low-contrast objects.
+- The preview is intentionally throttled and can lag briefly during fast camera movement.
+- Camera-to-overlay alignment and mask quality still require physical-device validation in portrait
+  and both supported landscape orientations.
+
+### Validation
+
+- Generic iOS Debug build succeeded with Xcode 26.6 without source warnings.
+- On the iPhone 15 Plus, open Scan, aim the center marker at a distinct object, and confirm a cyan
+  fill and edge appear over only that object.
+- Move the aimer onto the table or another object and confirm the selected mask changes after a
+  short delay.
+- Switch to Line or Box and confirm the RGB mask disappears and both manual tools behave unchanged.

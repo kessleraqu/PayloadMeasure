@@ -19,6 +19,7 @@ import simd
 final class ObjectCaptureEngine {
     private(set) var capturedObject: CapturedObject?
     private(set) var previewObject: CapturedObject?
+    private(set) var objectMaskPreview: ObjectMaskPreview?
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = true
     private(set) var showsSelectedPoints = true
@@ -36,6 +37,10 @@ final class ObjectCaptureEngine {
 
     var hasCapture: Bool {
         capturedObject != nil
+    }
+
+    var hasObjectMaskPreview: Bool {
+        objectMaskPreview != nil
     }
 
     var canReset: Bool {
@@ -78,6 +83,14 @@ final class ObjectCaptureEngine {
 
     func toggleSelectedPoints() {
         showsSelectedPoints.toggle()
+    }
+
+    func showObjectMaskPreview(_ preview: ObjectMaskPreview) {
+        objectMaskPreview = preview
+    }
+
+    func clearObjectMaskPreview() {
+        objectMaskPreview = nil
     }
 
     /// Called continuously by the AR layer while live-scanning to show the box being built.
@@ -133,6 +146,7 @@ final class ObjectCaptureEngine {
     func reset() {
         capturedObject = nil
         previewObject = nil
+        objectMaskPreview = nil
         isCapturing = false
         statusText = Self.defaultPrompt
         resetRevision += 1

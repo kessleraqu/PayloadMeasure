@@ -12,7 +12,7 @@ import simd
 @MainActor
 @Observable
 final class MeasurementEngine {
-    var mode: MeasurementMode = .line {
+    var mode: MeasurementMode = .scan {
         didSet {
             if mode != oldValue {
                 reset()
@@ -21,7 +21,7 @@ final class MeasurementEngine {
     }
 
     private(set) var points: [MeasurementPoint] = []
-    private(set) var lastMessage = "Aim at a point, then press Add Point."
+    private(set) var lastMessage = "Aim at an object on a flat surface, then Capture."
     private(set) var resetRevision = 0
     private(set) var placementRequestRevision = 0
     private(set) var aimerSurfaceScaleY: Double = 1

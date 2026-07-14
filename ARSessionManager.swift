@@ -66,6 +66,17 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         trackingStatus == .normal
     }
 
+    /// Automatic object capture currently depends on the per-frame LiDAR depth map.
+    var isAutomaticObjectCaptureSupported: Bool {
+        isSceneDepthSupported
+    }
+
+    var automaticObjectCaptureAvailabilityText: String {
+        isAutomaticObjectCaptureSupported
+            ? "Automatic object capture available"
+            : "RGB object detection is available. LiDAR is required for 3D dimensions."
+    }
+
     var depthStatusText: String {
         if isSceneDepthEnabled {
             "Scene depth enabled"
