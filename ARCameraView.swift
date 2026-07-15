@@ -53,6 +53,11 @@ struct ARCameraView: UIViewRepresentable {
             var trackedRaycast: ARTrackedRaycast?
         }
 
+        private struct ObjectMaskMarkerState {
+            let color: ObjectMaskDisplayColor
+            let isMaskVisible: Bool
+        }
+
         // Bright UI-white for measurement visuals. `applyPostProcessToneMap: false` keeps the color
         // from being darkened by RealityKit's tone mapper, matching the on-screen SwiftUI aimer.
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
@@ -77,22 +82,30 @@ struct ARCameraView: UIViewRepresentable {
         private var selectionPool: [ModelEntity] = []
         private var lastSelectionPoints: [SIMD3<Float>] = []
         private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+        private var maskedAccumulators: [UUID: PointAccumulator] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
         private var liveResult: CaptureResult?
         private var accumulationAnchor: SIMD3<Float>?
+        private var selectedCaptureMaskID: UUID?
         private var isScanFrozen = false
         private var scanTickCounter = 0
-        private var maskTickCounter = 0
         private var consecutiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
+        private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
+        private var objectMaskToggleAttemptsRemaining = 0
+        private var objectMaskAnchors: [UUID: ARAnchor] = [:]
+        private var objectMaskMarkerStates: [UUID: ObjectMaskMarkerState] = [:]
+        private var objectMaskTrackingGeneration = 0
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
+        private var maskUpdateTimer: Timer?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
         private var observedMode: MeasurementMode = .scan
         private var observedCaptureRequestRevision = 0
         private var observedCaptureResetRevision = 0
+        private var observedObjectMaskToggleRequestRevision = 0
         private var observedMeshVisible = true
         private var observedShowsSelectedPoints = true
 
@@ -122,10 +135,25 @@ struct ARCameraView: UIViewRepresentable {
                 Task { @MainActor in
                     self.updateAimerSurface(in: arView)
                     self.updatePlacedPointBillboards(in: arView)
-                    self.updateObjectMaskPreview(in: arView)
                     self.updateScanLive(in: arView)
                 }
             }
+
+            // World-anchor projection is cheap enough to update at display cadence. Vision remains
+            // single-flight below, so segmentation runs only as fast as the device can sustain.
+            let maskTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self, weak arView] _ in
+                guard let self, let arView else {
+                    return
+                }
+
+                Task { @MainActor in
+                    self.updateFastObjectMaskMarkers(in: arView)
+                    self.updateObjectMaskPreview(in: arView)
+                }
+            }
+            maskTimer.tolerance = 1.0 / 240.0
+            RunLoop.main.add(maskTimer, forMode: .common)
+            maskUpdateTimer = maskTimer
 
             observeEngineRevisions()
         }
@@ -133,8 +161,14 @@ struct ARCameraView: UIViewRepresentable {
         func detach() {
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
+            maskUpdateTimer?.invalidate()
+            maskUpdateTimer = nil
             objectMaskTask?.cancel()
             objectMaskTask = nil
+            pendingObjectMaskToggleRequest = nil
+            removeAllObjectMaskAnchors()
+            captureEngine.updateLockedObjectMaskCount(0)
+            captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
             captureEngine.clearObjectMaskPreview()
             clearMeasurementContent()
             clearCaptureContent()
@@ -164,6 +198,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = measurementEngine.mode
                 _ = captureEngine.captureRequestRevision
                 _ = captureEngine.resetRevision
+                _ = captureEngine.objectMaskToggleRequestRevision
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
             } onChange: { [weak self] in
@@ -213,6 +248,12 @@ struct ARCameraView: UIViewRepresentable {
                 commitScanCapture()
             }
 
+            if captureEngine.objectMaskToggleRequestRevision != observedObjectMaskToggleRequestRevision {
+                observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
+                pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
+                objectMaskToggleAttemptsRemaining = 4
+            }
+
             if captureEngine.isMeshVisible != observedMeshVisible {
                 observedMeshVisible = captureEngine.isMeshVisible
                 updateMeshVisibility()
@@ -241,64 +282,317 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Runs RGB foreground-instance segmentation at roughly 3 Hz. Only one Vision request may
-        /// be in flight, so slower devices drop intermediate frames instead of building a backlog.
+        /// Offers frames to Vision at display cadence. Only one segmentation may be in flight, so
+        /// actual mask throughput is device-dependent and stale frames never queue.
         private func updateObjectMaskPreview(in arView: ARView) {
-            guard measurementEngine.mode == .scan, !isScanFrozen else {
+            guard measurementEngine.mode == .scan else {
                 return
             }
 
-            maskTickCounter &+= 1
-            guard maskTickCounter % 5 == 0,
-                  objectMaskTask == nil,
+            guard objectMaskTask == nil,
                   let frame = arView.session.currentFrame else {
                 return
             }
 
+            let submittedToggleRequest = pendingObjectMaskToggleRequest
+            let toggleRequest = preparedObjectMaskToggleRequest(
+                submittedToggleRequest,
+                frame: frame,
+                in: arView
+            )
             let input = ObjectMaskFrame(
                 pixelBuffer: frame.capturedImage,
-                orientation: cameraImageOrientation(in: arView)
+                orientation: cameraImageOrientation(in: arView),
+                viewportSize: arView.bounds.size,
+                toggleRequest: toggleRequest,
+                anchorHints: objectMaskAnchorHints(frame: frame, in: arView),
+                timestamp: frame.timestamp,
+                trackingGeneration: objectMaskTrackingGeneration,
+                depthSnapshot: objectMaskDepthSnapshot(from: frame, in: arView)
             )
+            if submittedToggleRequest != nil {
+                pendingObjectMaskToggleRequest = nil
+                objectMaskToggleAttemptsRemaining = max(objectMaskToggleAttemptsRemaining - 1, 0)
+            }
             let processor = objectMaskProcessor
 
             objectMaskTask = Task { [weak self] in
-                let preview = await processor.makePreview(from: input)
+                let result = await processor.makePreview(from: input)
                 guard let self, !Task.isCancelled else {
                     return
                 }
 
                 self.objectMaskTask = nil
-                guard self.measurementEngine.mode == .scan, !self.isScanFrozen else {
+                guard self.measurementEngine.mode == .scan else {
                     return
                 }
 
-                if let preview {
+                let previousLockedObjectCount = self.captureEngine.lockedObjectMaskCount
+                self.applyObjectMaskLockChange(result.lockChange, in: arView)
+                for cloud in result.maskedPointClouds {
+                    var accumulator = self.maskedAccumulators[cloud.id]
+                        ?? PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+                    accumulator.add(cloud.points)
+                    self.maskedAccumulators[cloud.id] = accumulator
+                }
+                for marker in result.markers {
+                    self.objectMaskMarkerStates[marker.id] = ObjectMaskMarkerState(
+                        color: marker.color,
+                        isMaskVisible: marker.isMaskVisible
+                    )
+                }
+                self.objectMaskMarkerStates = self.objectMaskMarkerStates.filter {
+                    self.objectMaskAnchors[$0.key] != nil
+                }
+                self.captureEngine.updateLockedObjectMaskCount(result.lockedObjectCount)
+                self.captureEngine.updateObjectMaskTracking(
+                    visibleCount: result.visibleObjectCount,
+                    markers: result.markers
+                )
+                if submittedToggleRequest != nil,
+                   !result.didToggleLock,
+                   self.pendingObjectMaskToggleRequest == nil,
+                   self.objectMaskToggleAttemptsRemaining > 0 {
+                    // Foreground-instance segmentation can miss an object for a single camera
+                    // frame. Retry the same tap on a few fresh frames instead of silently losing it.
+                    self.pendingObjectMaskToggleRequest = submittedToggleRequest
+                } else if submittedToggleRequest != nil,
+                          !result.didToggleLock,
+                          self.pendingObjectMaskToggleRequest == nil {
+                    self.captureEngine.reportObjectLockNotFound()
+                } else if result.needsWorldSurface {
+                    self.captureEngine.reportObjectLockNeedsSurface()
+                }
+
+                // Presentation-safe path: display only a mask generated from this segmented camera
+                // frame. Dense optical flow could leave a newer stale overlay on screen and hide
+                // the correction, which made masks appear fixed to the viewport rather than objects.
+                if let preview = result.preview {
                     self.consecutiveMaskMisses = 0
                     self.captureEngine.showObjectMaskPreview(preview)
                 } else {
                     self.consecutiveMaskMisses += 1
-                    if self.consecutiveMaskMisses >= 3 {
+                    if result.didToggleLock
+                        || result.lockedObjectCount < previousLockedObjectCount
+                        || self.consecutiveMaskMisses >= 3 {
                         self.captureEngine.clearObjectMaskPreview()
                     }
                 }
             }
         }
 
+        private func updateFastObjectMaskMarkers(in arView: ARView) {
+            guard measurementEngine.mode == .scan,
+                  let frame = arView.session.currentFrame else {
+                captureEngine.updateObjectMaskMarkers([])
+                return
+            }
+
+            let markers: [ObjectMaskMarker] = objectMaskAnchorHints(
+                frame: frame,
+                in: arView
+            ).compactMap { hint -> ObjectMaskMarker? in
+                guard let point = hint.normalizedViewportPoint,
+                      let state = objectMaskMarkerStates[hint.id] else {
+                    return nil
+                }
+                return ObjectMaskMarker(
+                    id: hint.id,
+                    normalizedViewportPoint: point,
+                    color: state.color,
+                    isMaskVisible: state.isMaskVisible
+                )
+            }
+            captureEngine.updateObjectMaskMarkers(markers)
+        }
+
+        private func preparedObjectMaskToggleRequest(
+            _ request: ObjectMaskToggleRequest?,
+            frame: ARFrame,
+            in arView: ARView
+        ) -> ObjectMaskToggleRequest? {
+            guard let request else {
+                return nil
+            }
+
+            let viewportPoint = CGPoint(
+                x: request.normalizedViewportPoint.x * arView.bounds.width,
+                y: request.normalizedViewportPoint.y * arView.bounds.height
+            )
+            let worldTransform: simd_float4x4
+            if let depthPoint = DepthPointCloud.worldPoint(
+                from: frame,
+                normalizedViewportPoint: request.normalizedViewportPoint,
+                interfaceOrientation: interfaceOrientation(in: arView),
+                viewportSize: arView.bounds.size
+            ) {
+                var depthTransform = matrix_identity_float4x4
+                depthTransform.columns.3 = SIMD4<Float>(depthPoint, 1)
+                worldTransform = depthTransform
+            } else if let raycast = bestRaycastResult(from: viewportPoint, in: arView) {
+                worldTransform = raycast.worldTransform
+            } else if let ray = arView.ray(through: viewportPoint) {
+                // RGB locking must not depend on LiDAR or on ARKit having detected a plane. A
+                // provisional point along the camera ray gives the visual tracker a world-relative
+                // reacquisition hint immediately; non-LiDAR devices can refine their map later.
+                let direction = simd_normalize(ray.direction)
+                let estimatedDistance = provisionalObjectDistance(
+                    rayOrigin: ray.origin,
+                    rayDirection: direction,
+                    frame: frame
+                )
+                var provisionalTransform = matrix_identity_float4x4
+                provisionalTransform.columns.3 = SIMD4<Float>(
+                    ray.origin + direction * estimatedDistance,
+                    1
+                )
+                worldTransform = provisionalTransform
+            } else {
+                // This should be rare (usually an invalid/zero-sized viewport). Existing locks can
+                // still be removed from the raw Vision tap.
+                return request
+            }
+
+            let distance = simd_distance(
+                frame.camera.transform.translation,
+                worldTransform.translation
+            )
+            return ObjectMaskToggleRequest(
+                normalizedViewportPoint: request.normalizedViewportPoint,
+                proposedLockID: UUID(),
+                worldTransform: worldTransform,
+                cameraDistance: distance
+            )
+        }
+
+        /// Estimates distance for an RGB-only provisional anchor from sparse AR feature points
+        /// close to the tap ray. A conservative one-metre fallback keeps locking available even in
+        /// a texture-poor scene; this estimate is never used as metric object depth.
+        private func provisionalObjectDistance(
+            rayOrigin: SIMD3<Float>,
+            rayDirection: SIMD3<Float>,
+            frame: ARFrame
+        ) -> Float {
+            guard let featurePoints = frame.rawFeaturePoints?.points else {
+                return 1.0
+            }
+
+            var candidates: [Float] = []
+            for point in featurePoints {
+                let displacement = point - rayOrigin
+                let distanceAlongRay = simd_dot(displacement, rayDirection)
+                guard (0.2 ... 4.0).contains(distanceAlongRay) else {
+                    continue
+                }
+                let perpendicular = displacement - rayDirection * distanceAlongRay
+                let tolerance = max(0.035, distanceAlongRay * 0.035)
+                if simd_length_squared(perpendicular) <= tolerance * tolerance {
+                    candidates.append(distanceAlongRay)
+                }
+            }
+
+            guard !candidates.isEmpty else {
+                return 1.0
+            }
+            candidates.sort()
+            // Prefer the nearest coherent surface rather than a wall or table behind the object.
+            return candidates[min(candidates.count / 4, candidates.count - 1)]
+        }
+
+        private func objectMaskAnchorHints(frame: ARFrame, in arView: ARView) -> [ObjectMaskAnchorHint] {
+            let orientation = interfaceOrientation(in: arView)
+            let viewportSize = arView.bounds.size
+            guard viewportSize.width > 0, viewportSize.height > 0 else {
+                return []
+            }
+
+            return objectMaskAnchors.map { lockID, anchor in
+                let worldPosition = anchor.transform.translation
+                let pointInCamera = frame.camera.transform.inverse * SIMD4<Float>(worldPosition, 1)
+                let isInFrontOfCamera = pointInCamera.z < -0.02
+                let projectedPoint = frame.camera.projectPoint(
+                    worldPosition,
+                    orientation: orientation,
+                    viewportSize: viewportSize
+                )
+                let normalizedPoint = CGPoint(
+                    x: projectedPoint.x / viewportSize.width,
+                    y: projectedPoint.y / viewportSize.height
+                )
+                let isInsideViewport = isInFrontOfCamera
+                    && (-0.05 ... 1.05).contains(normalizedPoint.x)
+                    && (-0.05 ... 1.05).contains(normalizedPoint.y)
+                return ObjectMaskAnchorHint(
+                    id: lockID,
+                    normalizedViewportPoint: isInsideViewport ? normalizedPoint : nil,
+                    cameraDistance: simd_distance(frame.camera.transform.translation, worldPosition),
+                    worldPosition: worldPosition
+                )
+            }
+        }
+
+        private func objectMaskDepthSnapshot(
+            from frame: ARFrame,
+            in arView: ARView
+        ) -> ObjectMaskDepthSnapshot? {
+            // Raw scene depth is preferred here because it belongs to this exact RGB timestamp.
+            // Temporal averaging happens later in the per-object voxel accumulator.
+            guard let sceneDepth = frame.sceneDepth ?? frame.smoothedSceneDepth else {
+                return nil
+            }
+            return ObjectMaskDepthSnapshot(
+                depthMap: sceneDepth.depthMap,
+                confidenceMap: sceneDepth.confidenceMap,
+                cameraTransform: frame.camera.transform,
+                cameraIntrinsics: frame.camera.intrinsics,
+                cameraImageResolution: frame.camera.imageResolution,
+                imageToViewportTransform: frame.displayTransform(
+                    for: interfaceOrientation(in: arView),
+                    viewportSize: arView.bounds.size
+                )
+            )
+        }
+
+        private func applyObjectMaskLockChange(_ change: ObjectMaskLockChange?, in arView: ARView) {
+            guard let change else {
+                return
+            }
+
+            switch change.kind {
+            case .added:
+                guard let transform = change.worldTransform else {
+                    return
+                }
+                let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
+                arView.session.add(anchor: anchor)
+                objectMaskAnchors[change.id] = anchor
+            case .removed:
+                if let anchor = objectMaskAnchors.removeValue(forKey: change.id) {
+                    arView.session.remove(anchor: anchor)
+                }
+                maskedAccumulators.removeValue(forKey: change.id)
+            }
+        }
+
         /// ARKit supplies the rear-camera buffer in its native landscape orientation. Vision needs
         /// the current interface orientation so its selected mask is upright for display.
         private func cameraImageOrientation(in arView: ARView) -> CGImagePropertyOrientation {
-            switch arView.window?.windowScene?.effectiveGeometry.interfaceOrientation {
+            switch interfaceOrientation(in: arView) {
             case .portraitUpsideDown:
                 .left
             case .landscapeLeft:
                 .up
             case .landscapeRight:
                 .down
-            case .portrait, .unknown, .none:
+            case .portrait, .unknown:
                 .right
             @unknown default:
                 .right
             }
+        }
+
+        private func interfaceOrientation(in arView: ARView) -> UIInterfaceOrientation {
+            arView.window?.windowScene?.effectiveGeometry.interfaceOrientation ?? .portrait
         }
 
         /// Throttled live scanning: accumulate depth around the reticle across frames and keep a
@@ -323,25 +617,48 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             let seed = aimerTransform.translation
+            let selectedLockedObject: (id: UUID, anchor: ARAnchor)?
+            if objectMaskAnchors.isEmpty {
+                selectedLockedObject = nil
+            } else {
+                let centeredHint = objectMaskAnchorHints(frame: frame, in: arView)
+                    .compactMap { hint -> (hint: ObjectMaskAnchorHint, distance: CGFloat)? in
+                        guard let point = hint.normalizedViewportPoint else {
+                            return nil
+                        }
+                        return (hint, hypot(point.x - 0.5, point.y - 0.5))
+                    }
+                    .min { $0.distance < $1.distance }?.hint
+                guard let centeredHint,
+                      let anchor = objectMaskAnchors[centeredHint.id] else {
+                    // Locked masks exist, but none is currently visible. Never substitute an
+                    // unrelated raw cloud while the selected object is outside the camera.
+                    return
+                }
+                selectedLockedObject = (centeredHint.id, anchor)
+            }
+            let gatherSeed = selectedLockedObject?.anchor.transform.translation ?? seed
 
             // If the operator has aimed at a clearly different place (farther than the gather
             // radius), start a fresh accumulation. This keeps the buffer bounded and makes the tool
             // track the object currently being aimed at instead of piling up the whole scene.
             if let anchor = accumulationAnchor {
-                let deltaX = seed.x - anchor.x
-                let deltaZ = seed.z - anchor.z
+                let deltaX = gatherSeed.x - anchor.x
+                let deltaZ = gatherSeed.z - anchor.z
                 let jump = ObjectCapturePipeline.accumulationRadius
                 if deltaX * deltaX + deltaZ * deltaZ > jump * jump {
-                    resetScanState()
+                    // Re-aiming the LiDAR capture box must not erase independently locked object
+                    // masks. Only reset the depth accumulator here.
+                    resetCaptureAccumulation()
                 }
             }
             if accumulationAnchor == nil {
-                accumulationAnchor = seed
+                accumulationAnchor = gatherSeed
             }
 
             let points = DepthPointCloud.worldPoints(
                 from: frame,
-                near: seed,
+                near: gatherSeed,
                 radius: ObjectCapturePipeline.accumulationRadius
             )
 
@@ -357,13 +674,42 @@ struct ARCameraView: UIViewRepresentable {
                 accumulator.pruneTransient(below: 2)
             }
 
+            let supportPoints = accumulator.points(
+                minObservations: ObjectCapturePipeline.minObservations
+            )
+            let captureOutcome: CaptureOutcome
+            if let lockedObject = selectedLockedObject {
+                let lockID = lockedObject.id
+                let objectSeed = lockedObject.anchor.transform.translation
+                if selectedCaptureMaskID != lockID {
+                    selectedCaptureMaskID = lockID
+                    clearCaptureContent()
+                    liveResult = nil
+                    captureEngine.clearPreview()
+                }
+                // Once a mask is locked there is intentionally no raw-depth fallback: falling back
+                // would silently reintroduce the table/bigger-object failure this path prevents.
+                guard let objectPoints = maskedAccumulators[lockID]?.points(minObservations: 2),
+                      !objectPoints.isEmpty else {
+                    return
+                }
+                captureOutcome = ObjectCapturePipeline.capture(
+                    objectPoints: objectPoints,
+                    supportPoints: supportPoints,
+                    seed: objectSeed,
+                    up: SIMD3<Float>(0, 1, 0)
+                )
+            } else {
+                selectedCaptureMaskID = nil
+                captureOutcome = ObjectCapturePipeline.capture(
+                    points: supportPoints,
+                    seed: seed,
+                    up: SIMD3<Float>(0, 1, 0)
+                )
+            }
+
             // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
-            // Only well-observed voxels count toward the fit, so the box converges instead of growing.
-            guard case .success(let result) = ObjectCapturePipeline.capture(
-                points: accumulator.points(minObservations: ObjectCapturePipeline.minObservations),
-                seed: seed,
-                up: SIMD3<Float>(0, 1, 0)
-            ) else {
+            guard case .success(let result) = captureOutcome else {
                 return
             }
 
@@ -393,14 +739,44 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func resetScanState() {
+            resetCaptureAccumulation()
+            resetObjectMaskTracking()
+        }
+
+        private func resetCaptureAccumulation() {
             clearCaptureContent()
             accumulator.reset()
             liveResult = nil
             accumulationAnchor = nil
+            selectedCaptureMaskID = nil
             isScanFrozen = false
-            consecutiveMaskMisses = 0
-            captureEngine.clearObjectMaskPreview()
+            scanTickCounter = 0
             captureEngine.clearPreview()
+        }
+
+        private func resetObjectMaskTracking() {
+            objectMaskTrackingGeneration &+= 1
+            pendingObjectMaskToggleRequest = nil
+            consecutiveMaskMisses = 0
+            maskedAccumulators.removeAll()
+            removeAllObjectMaskAnchors()
+            objectMaskMarkerStates.removeAll()
+            captureEngine.updateLockedObjectMaskCount(0)
+            captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
+            captureEngine.clearObjectMaskPreview()
+        }
+
+        private func removeAllObjectMaskAnchors() {
+            guard let arView else {
+                objectMaskAnchors.removeAll()
+                return
+            }
+            for anchor in objectMaskAnchors.values {
+                arView.session.remove(anchor: anchor)
+            }
+            objectMaskAnchors.removeAll()
+            objectMaskMarkerStates.removeAll()
+            maskedAccumulators.removeAll()
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -508,11 +884,15 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func bestRaycastResult(from point: CGPoint, in arView: ARView) -> ARRaycastResult? {
-            if let meshOrEstimatedSurface = arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any).first {
-                return meshOrEstimatedSurface
+            if let detectedSurface = arView.raycast(
+                from: point,
+                allowing: .existingPlaneGeometry,
+                alignment: .any
+            ).first {
+                return detectedSurface
             }
 
-            return arView.raycast(from: point, allowing: .existingPlaneGeometry, alignment: .any).first
+            return arView.raycast(from: point, allowing: .estimatedPlane, alignment: .any).first
         }
 
         private func startRefining(pointID: UUID, targetLocation: CGPoint, in arView: ARView) {

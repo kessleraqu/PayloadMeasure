@@ -82,6 +82,18 @@ Current milestone:
 
 ✅ Live RGB foreground-instance mask preview runs in Scan mode on both LiDAR and non-LiDAR devices.
 
+✅ RGB masks use persistent AR world anchors, appearance/geometry reacquisition, tap-again removal,
+and per-object colors on both LiDAR and non-LiDAR devices.
+
+✅ Locked masks are propagated between segmentation keyframes with dense RGB optical flow; global
+one-to-one instance assignment prevents order-dependent multi-object overlap.
+
+✅ On LiDAR hardware, automatic box geometry is fitted only from depth pixels admitted by the
+time-synchronized object mask. Unmasked depth is restricted to support-plane height estimation.
+
+✅ Environment readiness is reported at runtime: LiDAR devices wait for depth/mesh data, while
+non-LiDAR devices guide the operator until camera-based plane mapping is stable.
+
 ---
 
 # Long-Term Roadmap
@@ -124,6 +136,15 @@ Evaluate:
 - Platform compatibility
 - Arrangement possibilities
 - Payload constraints
+
+## Deferred Tracking Upgrade
+
+After the presentation-safe native Vision version is validated, evaluate replacing foreground-mask
+selection with pretrained promptable video segmentation. The leading option is EdgeTAM exported to
+Core ML: tap prompts select arbitrary objects, one image encoding is shared across locks, and AR
+anchor reprojection plus temporal mask state supports reacquisition. Keep synchronized mask-gated
+LiDAR points for metric capture. EfficientTAM is a secondary candidate if its iOS deployment path
+matures; fixed-class YOLO segmentation is appropriate only with a payload-specific training set.
 
 ---
 

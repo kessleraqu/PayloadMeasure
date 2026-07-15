@@ -11,6 +11,34 @@ import Observation
 @MainActor
 @Observable
 final class ARSessionManager: NSObject, ARSessionDelegate {
+    enum EnvironmentReadiness: Equatable {
+        case preparing(String)
+        case ready(String)
+
+        var title: String {
+            switch self {
+            case .preparing:
+                "Understanding environment"
+            case .ready:
+                "Environment ready"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .preparing(let message), .ready(let message):
+                message
+            }
+        }
+
+        var isReady: Bool {
+            if case .ready = self {
+                return true
+            }
+            return false
+        }
+    }
+
     enum TrackingStatus: Equatable {
         case starting
         case normal
@@ -61,9 +89,29 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var isSceneReconstructionEnabled = false
     private(set) var hasDetectedHorizontalPlane = false
     private(set) var hasDetectedVerticalPlane = false
+    private(set) var hasReceivedSceneDepth = false
+    private(set) var hasReconstructedMesh = false
+    private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
+    private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
+        "Move the iPhone slowly across the object and its supporting surface."
+    )
 
     var isTrackingReady: Bool {
         trackingStatus == .normal
+    }
+
+    var isLiDARAvailable: Bool {
+        isSceneDepthSupported && isSceneReconstructionSupported
+    }
+
+    var isObjectTrackingEnvironmentReady: Bool {
+        environmentReadiness.isReady
+    }
+
+    var trackingHardwareText: String {
+        isLiDARAvailable
+            ? "LiDAR-assisted world tracking"
+            : "Camera-based world tracking"
     }
 
     /// Automatic object capture currently depends on the per-frame LiDAR depth map.
@@ -115,6 +163,14 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
+        hasReceivedSceneDepth = false
+        hasReconstructedMesh = false
+        worldMappingStatus = .notAvailable
+        environmentReadiness = .preparing(
+            isLiDARAvailable
+                ? "LiDAR is starting. Move slowly across the object and table."
+                : "Move slowly across the object and table until a surface is detected."
+        )
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.horizontal, .vertical]
@@ -152,25 +208,49 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         Task { @MainActor in
-            updateDetectedPlanes(from: anchors)
+            updateEnvironmentAnchors(from: anchors)
+            refreshEnvironmentReadiness()
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        Task { @MainActor in
+            updateEnvironmentAnchors(from: anchors)
+            refreshEnvironmentReadiness()
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let mappingStatus = frame.worldMappingStatus
+        let receivedDepth = frame.smoothedSceneDepth != nil || frame.sceneDepth != nil
+        Task { @MainActor in
+            guard worldMappingStatus != mappingStatus || (receivedDepth && !hasReceivedSceneDepth) else {
+                return
+            }
+            worldMappingStatus = mappingStatus
+            hasReceivedSceneDepth = hasReceivedSceneDepth || receivedDepth
+            refreshEnvironmentReadiness()
         }
     }
 
     nonisolated func sessionWasInterrupted(_ session: ARSession) {
         Task { @MainActor in
             trackingStatus = .interrupted
+            refreshEnvironmentReadiness()
         }
     }
 
     nonisolated func sessionInterruptionEnded(_ session: ARSession) {
         Task { @MainActor in
             trackingStatus = .starting
+            refreshEnvironmentReadiness()
         }
     }
 
     nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
         Task { @MainActor in
             trackingStatus = .failed(error.localizedDescription)
+            refreshEnvironmentReadiness()
         }
     }
 
@@ -183,6 +263,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         case .limited(let reason):
             trackingStatus = .limited(limitedTrackingMessage(for: reason))
         }
+        refreshEnvironmentReadiness()
     }
 
     private func limitedTrackingMessage(for reason: ARCamera.TrackingState.Reason) -> String {
@@ -200,20 +281,77 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
     }
 
-    private func updateDetectedPlanes(from anchors: [ARAnchor]) {
+    private func updateEnvironmentAnchors(from anchors: [ARAnchor]) {
         for anchor in anchors {
-            guard let planeAnchor = anchor as? ARPlaneAnchor else {
-                continue
+            if anchor is ARMeshAnchor {
+                hasReconstructedMesh = true
             }
 
-            switch planeAnchor.alignment {
-            case .horizontal:
-                hasDetectedHorizontalPlane = true
-            case .vertical:
-                hasDetectedVerticalPlane = true
-            @unknown default:
-                continue
+            if let planeAnchor = anchor as? ARPlaneAnchor {
+                switch planeAnchor.alignment {
+                case .horizontal:
+                    hasDetectedHorizontalPlane = true
+                case .vertical:
+                    hasDetectedVerticalPlane = true
+                @unknown default:
+                    continue
+                }
             }
+        }
+    }
+
+    private func refreshEnvironmentReadiness() {
+        guard trackingStatus == .normal else {
+            setEnvironmentReadiness(.preparing(trackingStatus.detail))
+            return
+        }
+
+        if isLiDARAvailable {
+            guard hasReceivedSceneDepth else {
+                setEnvironmentReadiness(.preparing(
+                    "LiDAR depth is starting. Keep the camera pointed at the payload area."
+                ))
+                return
+            }
+
+            guard hasReconstructedMesh || hasDetectedHorizontalPlane || hasDetectedVerticalPlane else {
+                setEnvironmentReadiness(.preparing(
+                    "Move slowly across the object and table while LiDAR builds the surface map."
+                ))
+                return
+            }
+        } else if !hasDetectedHorizontalPlane && !hasDetectedVerticalPlane {
+            setEnvironmentReadiness(.preparing(
+                "This iPhone has no LiDAR. Move slowly across the table until a stable surface is detected."
+            ))
+            return
+        }
+
+        switch worldMappingStatus {
+        case .notAvailable, .limited:
+            setEnvironmentReadiness(.preparing(
+                "Continue moving slowly from side to side so returning to locked objects is reliable."
+            ))
+        case .extending:
+            setEnvironmentReadiness(.ready(
+                isLiDARAvailable
+                    ? "LiDAR and world tracking are ready. You can lock objects now."
+                    : "A stable surface is available. You can lock objects while the visual map improves."
+            ))
+        case .mapped:
+            setEnvironmentReadiness(.ready(
+                "The environment map is stable. Locked objects can be recovered after leaving the view."
+            ))
+        @unknown default:
+            setEnvironmentReadiness(.preparing(
+                "Continue moving slowly while ARKit finishes understanding the environment."
+            ))
+        }
+    }
+
+    private func setEnvironmentReadiness(_ readiness: EnvironmentReadiness) {
+        if environmentReadiness != readiness {
+            environmentReadiness = readiness
         }
     }
 }

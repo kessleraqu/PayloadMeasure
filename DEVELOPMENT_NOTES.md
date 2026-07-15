@@ -1312,3 +1312,286 @@ points enter the 3D accumulator.
 - Move the aimer onto the table or another object and confirm the selected mask changes after a
   short delay.
 - Switch to Line or Box and confirm the RGB mask disappears and both manual tools behave unchanged.
+
+---
+
+## 2026-07-15 - RGB Mask Alignment and Refresh Fix
+
+### Observed issue
+
+Physical-device testing showed that the RGB object mask was rotated, did not align with the object
+in the AR camera feed, and updated too slowly to remain useful during quicker camera movement.
+
+### Cause
+
+Vision received the raw landscape camera buffer together with orientation metadata. The generated
+full-resolution mask was then explicitly rotated again in Core Image. That left the output-space
+contract ambiguous and produced a rotated mask on the tested device. Mask requests were also
+throttled to every fifth 15 Hz update tick, limiting the preview to about 3 Hz.
+
+### What changed
+
+- The camera buffer is now converted to a lazily oriented `CIImage` before it enters Vision.
+- Vision processes that upright image without separate orientation metadata, so its scaled mask is
+  already in the same upright coordinate space used by the SwiftUI camera overlay.
+- The redundant post-segmentation mask rotation was removed.
+- The foreground-mask request is reused between frames instead of recreated for every update.
+- The request cadence increased from every fifth timer tick to every second tick: approximately
+  7.5 Hz instead of 3 Hz when the device can complete requests at that rate.
+- The existing single-in-flight rule remains, so slow devices still drop stale intermediate frames
+  rather than accumulating latency.
+
+### Validation
+
+- Build the generic iOS target in Debug configuration.
+- On the physical iPhone, verify portrait and both landscape orientations.
+- Confirm the cyan fill and edge cover the selected object without a 90-degree rotation or offset.
+- Pan the camera briskly and confirm the preview updates at least twice as often as before without
+  visibly reducing AR camera responsiveness.
+
+---
+
+## 2026-07-15 - Faster Multi-Object Mask Tracking
+
+### Goal
+
+Make the RGB mask follow quicker phone movement and allow the operator to retain several visually
+distinct object selections.
+
+### What changed
+
+- The mask pipeline now accepts every 15 Hz coordinator tick instead of every second tick. The
+  existing single-in-flight rule still drops intermediate frames when Vision is busy, so requests
+  never form a stale backlog.
+- A transparent Scan-mode interaction layer captures spatial taps without blocking the existing
+  controls.
+- Tap coordinates are mapped through the same centered aspect-fill crop as the camera preview and
+  converted into Vision's normalized lower-left coordinate system.
+- Tapping a segmented object creates a Vision `TrackObjectRequest` initialized from that instance's
+  mask bounds. Tapping the same tracked object again removes its lock.
+- On each new segmentation, the stateful tracker predicts the object's current region. The processor
+  samples that region to associate it with the newest frame-local instance number, preventing color
+  identity from depending on instance numbers remaining stable between frames.
+- A lock survives up to 20 missed processing frames so short blur, rapid motion, or a temporary
+  segmentation miss does not immediately delete it.
+- Up to eight objects can be locked. Each uses a distinct high-contrast color; cyan remains reserved
+  for the unlocked object currently beneath the center aimer.
+- Reset, mode changes, and AR view teardown clear the tracked masks and their UI count.
+
+### Current limitations
+
+- Foreground segmentation still determines the visible object boundary. Tracking can preserve the
+  search region through motion, but it cannot create a good mask when Vision cannot segment the
+  object in the new frame.
+- Tracking is image-based rather than a persistent semantic identity. Long occlusion or two very
+  similar objects crossing inside the same region can still cause the association to be lost.
+- More simultaneous colored masks require additional high-resolution compositing work, so physical
+  device testing should include one, several, and the maximum eight locks.
+
+### Validation
+
+- Generic iOS Debug build succeeds with Xcode 26.6.
+- On a physical iPhone, tap one object and confirm its cyan preview changes to a locked palette color.
+- Move the phone quickly and confirm the colored mask follows the object and survives brief blur.
+- Tap a second and third object and confirm each retains a different color.
+- Tap a locked object again and confirm only that object's colored mask is removed.
+- Press Reset or switch modes and confirm all locked masks and their count are cleared.
+
+---
+
+## 2026-07-15 - Locked Mask Drift and Background-Switch Fix
+
+### Observed issue
+
+After locking an object, moving the phone could make its colored mask jump to the table or appear
+like a large inverse mask. Adding another lock could also produce confusing overlapping overlays.
+
+### Root cause
+
+The tracker used its predicted rectangle only as a sampling region and then selected whichever
+foreground instance occupied most of that rectangle. There were no area or size checks. When the
+rectangle drifted down or expanded, the support surface could become the most frequent instance and
+replace the payload in one update.
+
+The unlocked cyan center preview also remained active while objects were locked. Panning the aimer
+off the payload frequently selected the table in cyan and composited it with the colored locks,
+which looked like an inverted or overlapping tracked mask.
+
+Finally, the tap-to-remove fallback treated any tap inside a tracked bounding rectangle as removal,
+even when Vision positively identified a different object under that tap.
+
+### What changed
+
+- Every candidate mask is now measured for normalized pixel area, bounding width and height, center,
+  and overlap with the tracker prediction.
+- A candidate is accepted only if its area changes by at most 35% and each bounding dimension changes
+  by at most 25% from the previous accepted frame. Moving closer or farther still changes the mask,
+  but the change must happen progressively instead of jumping from an object to the whole table.
+- Implausibly large, small, or displaced tracker predictions are discarded before they can search
+  unrelated parts of the scene.
+- After a candidate passes validation, the stateful tracker is reinitialized from the accepted mask
+  bounds. This corrects accumulated rectangle growth and drift on every successful frame.
+- If no candidate passes validation, the lock records a temporary miss and renders no replacement
+  mask. Losing the overlay briefly is safer than displaying a confidently wrong surface.
+- The cyan center preview is now shown only when there are no locks. New objects can still be tapped
+  directly while existing colored locks remain visible.
+- Rectangle-based tap removal is used only when segmentation found nothing at the tap. A positively
+  identified different instance can now be added instead of accidentally deleting an overlapping
+  tracked rectangle.
+- RGB mask scheduling moved to a dedicated 30 Hz timer, double the previous 15 Hz offer rate. The
+  single-in-flight guard remains, so actual throughput is limited by the device's Vision processing
+  speed and never builds a stale frame queue.
+
+### Validation
+
+- Generic iOS Debug build succeeds with Xcode 26.6.
+- On a physical device, lock a payload on a table and pan so the aimer crosses the table. Confirm no
+  cyan table mask appears while a lock exists.
+- Move closer and farther gradually and confirm the locked mask changes size progressively.
+- Move abruptly or briefly blur the frame and confirm the lock disappears temporarily instead of
+  switching to the table or background.
+- Lock two nearby objects and confirm each retains its own non-overlapping frame-local instance and
+  color; tap each again to remove it independently.
+
+---
+
+## 2026-07-15 - Persistent World-Anchored Object Locks
+
+### Architecture
+
+- Each new RGB mask lock now requires a world-space surface result and creates a dedicated
+  `ARAnchor`. LiDAR devices use the depth/mesh-assisted AR session; non-LiDAR devices use detected
+  or estimated planes through the same code path.
+- On LiDAR hardware, the tap samples the aligned depth map first so the anchor lands on the object's
+  physical surface. If depth is unavailable, the implementation falls back to the plane raycast.
+- Lock records no longer expire after a fixed number of missed Vision frames. They remain until the
+  operator taps the colored object/marker again, presses Reset, or leaves Scan mode.
+- The anchor is projected into every camera frame and becomes the authoritative reacquisition search
+  area. Vision's rectangle tracker remains a short-term hint rather than the lock's identity.
+- Expected mask scale is derived from camera-to-anchor distance. This allows genuine close/far
+  motion while rejecting unexplained jumps from a payload to a whole table.
+- A small normalized color/luminance signature is stored when locking and used with anchor position,
+  mask size, and geometry when choosing a segmentation candidate after a miss.
+- Colored anchor markers update at 60 Hz independently of the single-flight segmentation request.
+  A dashed location marker represents a temporarily lost mask; the lock itself is still retained.
+- Moving the LiDAR capture aimer to a new accumulation region now resets only the depth accumulator,
+  not the independently locked RGB objects.
+
+### Device adaptation and readiness
+
+- `ARSessionManager` detects scene depth and scene-reconstruction support at runtime.
+- LiDAR readiness waits for a depth frame plus a mesh or detected plane.
+- Non-LiDAR readiness waits for camera-based plane detection and explains that more movement may be
+  needed to build a reliable visual map.
+- Both paths include ARKit world-mapping status. The Scan UI shows an "Understanding environment"
+  banner until the map is usable, and the information panel identifies the active tracking mode.
+
+### Validation
+
+- Generic iOS Debug build succeeds with the iOS 26.5 SDK.
+- Physical-device tests should cover an iPhone 15/15 Plus without LiDAR and an iPhone 13 Pro with
+  LiDAR: lock several static objects, leave the view, return at a different distance, and confirm
+  the same colored anchors guide reacquisition without attaching to the support surface.
+
+---
+
+## 2026-07-15 - Optical-Flow Masks and Mask-Gated LiDAR Capture
+
+### Root cause addressed
+
+The previous overlay displayed the result of the last completed segmentation request until another
+segmentation completed. During fast camera movement that bitmap belonged to an older camera pose,
+which created severe ghosting even though its world-anchor marker was current. The LiDAR capture
+also still accumulated an unmasked sphere around the reticle, so the table could enter the fitted
+geometry independently of what the RGB overlay showed.
+
+### Tracking architecture
+
+- Foreground instance segmentation is now a correction keyframe rather than the only source of
+  visible updates.
+- A separate `ObjectMaskMotionProcessor` runs one stateful dense Vision optical-flow request over a
+  compact upright RGB stream. It propagates every locked binary mask independently between slower
+  segmentation corrections.
+- The optical-flow worker is single-flight and always consumes the newest available AR frame. At a
+  60 Hz offer cadence it updates as quickly as the device can sustain without queuing stale frames.
+- Per-pixel motion is constrained around each mask's median flow. A single update may change mask
+  area by at most 28%; an outlier falls back to a rigid translation instead of expanding onto the
+  table or collapsing.
+- Small one-pixel holes are closed after warping. Each object retains its own binary state and
+  color; partial segmentation corrections cannot erase another on-screen mask still carried by
+  optical flow.
+- Segmentation candidates for all locked objects are now assigned globally with a one-to-one
+  maximum-score search. This replaces order-dependent greedy matching, where an early lock could
+  take the instance belonging to a later lock.
+- New locks reject masks occupying nearly the entire image. This makes selecting the table as an
+  apparent inverse/background mask less likely.
+
+### Measurement architecture
+
+- The RGB image, raw scene-depth map, confidence map, camera pose, intrinsics, viewport transform,
+  and timestamp are retained as one processing input.
+- For every accepted locked instance, only depth pixels inside that exact frame's mask are
+  back-projected into its own world-space point accumulator.
+- Samples must also pass LiDAR confidence, camera-depth proximity to the object's anchor, and a
+  bounded world-space distance from that anchor.
+- `ObjectCapturePipeline` now accepts separate `objectPoints` and `supportPoints`. Width, depth,
+  height, clustering, and box fitting use only mask-approved object points. Unmasked surrounding
+  depth can estimate the table/support height but can never enlarge the object's fitted bounds.
+- Once any mask is locked, capture deliberately has no unmasked fallback. If the mask is outside
+  the view or lacks enough confirmed depth, the app waits instead of measuring a different surface.
+- With multiple visible locks, the one closest to the screen center drives the live 3D box.
+
+### Literature alignment
+
+The supplied literature-review summaries support mask-gated geometry as a sound design:
+
+- `Weng.2019` explicitly uses instance masks instead of 2D boxes to produce cleaner object-specific
+  point-cloud frustums.
+- `Zheng.2026` combines instance segmentation, RGB-D registration/fusion, and later geometric
+  measurement; it is the closest end-to-end analogue in the chapter.
+- `Feng.2024` combines RGB segmentation with coarse mobile AR depth and boundary fitting.
+- `Foroutannia.2026` projects camera detections into a LiDAR frustum before 3D segmentation.
+- `CamachoMunoz.2026` is the closest cited work on maintaining multiple geometric object tracks
+  through occlusion and changing views.
+
+None of the supplied summaries directly studies dense optical-flow propagation of instance masks
+for mobile AR measurement. That is a literature gap to cover with video-object-segmentation or
+mask-propagation papers in the final review.
+
+### Validation
+
+- Generic iOS Debug build succeeds with the iOS 26.5 SDK.
+- Validate the optical-flow direction and upright coordinate convention on both physical devices;
+  these cannot be established by the simulator.
+- On iPhone 15/15 Plus, test RGB propagation, multi-lock identity, off-screen persistence, and
+  reacquisition. Metric automatic capture remains unavailable without scene depth.
+- On iPhone 13 Pro, additionally display selected points and confirm every fitted point lies inside
+  the current object silhouette; scan the same object on a bare table from several distances.
+- Record sustained optical-flow rate and thermal state. If the A15 cannot sustain `.high` accuracy
+  at the desired cadence, reduce the 320-pixel working long edge before lowering flow accuracy.
+
+---
+
+## 2026-07-15 - Non-LiDAR Lock Regression Fix
+
+- Object locking no longer waits for scene depth, a detected plane, or full environment readiness.
+- When neither depth nor a raycast surface is available, the tap ray gets a provisional visual-only
+  world anchor. Nearby AR feature points estimate its distance, with a conservative fallback; this
+  estimate is never used as metric depth.
+- The initial-mask guard now rejects only near-full-frame/background masks instead of also rejecting
+  legitimate close-up objects that occupy a large part of the camera image.
+- RGB mask tracking and lock markers continue while ARKit world tracking is temporarily limited;
+  environment readiness still gates metric capture where appropriate, not visual selection.
+- A tap missed by one segmentation frame is retried on fresh frames. Selection prefers the exact
+  instance but can accept a nearby plausible mask, and the UI reports when no mask can be separated.
+- Generic iOS Debug build succeeds with the iOS 26.5 SDK.
+
+### Temporary presentation mode
+
+- The cyan center preview is hidden: an overlay appears only after a tap creates a real colored lock.
+- Dense optical-flow display propagation is temporarily disabled. Colored masks come only from fresh
+  segmentation frames, preventing a newer stale flow overlay from hiding object-position corrections.
+- Consecutive-frame 2D Vision tracking is authoritative on RGB-only hardware; provisional AR depth is
+  only a secondary reacquisition hint.
+- Non-LiDAR banners, the unavailable Capture button, and explicit depth/mesh-unavailable rows are
+  hidden for the presentation. Restore capability messaging when measurement development resumes.

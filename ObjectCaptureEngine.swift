@@ -20,12 +20,19 @@ final class ObjectCaptureEngine {
     private(set) var capturedObject: CapturedObject?
     private(set) var previewObject: CapturedObject?
     private(set) var objectMaskPreview: ObjectMaskPreview?
+    private(set) var lockedObjectMaskCount = 0
+    private(set) var visibleObjectMaskCount = 0
+    private(set) var objectMaskMarkers: [ObjectMaskMarker] = []
+    private(set) var objectMaskFeedbackText: String?
+    private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = true
     private(set) var showsSelectedPoints = true
     private(set) var isCapturing = false
     private(set) var captureRequestRevision = 0
     private(set) var resetRevision = 0
+    private(set) var objectMaskToggleRequestRevision = 0
+    private var latestObjectMaskPreviewTimestamp: TimeInterval = -.greatestFiniteMagnitude
 
     private static let defaultPrompt = "Aim at an object on a flat surface, then Capture."
     private static let scanningPrompt = "Scanning — move slowly around the object, then Capture."
@@ -43,8 +50,12 @@ final class ObjectCaptureEngine {
         objectMaskPreview != nil
     }
 
+    var lostObjectMaskCount: Int {
+        max(lockedObjectMaskCount - visibleObjectMaskCount, 0)
+    }
+
     var canReset: Bool {
-        capturedObject != nil || previewObject != nil
+        capturedObject != nil || previewObject != nil || lockedObjectMaskCount > 0
     }
 
     var statusHeadline: String {
@@ -86,11 +97,64 @@ final class ObjectCaptureEngine {
     }
 
     func showObjectMaskPreview(_ preview: ObjectMaskPreview) {
+        guard preview.timestamp >= latestObjectMaskPreviewTimestamp else {
+            return
+        }
+        latestObjectMaskPreviewTimestamp = preview.timestamp
         objectMaskPreview = preview
+    }
+
+    func updateLockedObjectMaskCount(_ count: Int) {
+        lockedObjectMaskCount = count
+        visibleObjectMaskCount = min(visibleObjectMaskCount, count)
+        if count == 0 {
+            objectMaskMarkers = []
+            objectMaskFeedbackText = nil
+        }
+    }
+
+    func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
+        visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
+        objectMaskMarkers = markers
+        let lostCount = lostObjectMaskCount
+        if lostCount > 0 {
+            objectMaskFeedbackText = lostCount == 1
+                ? "1 locked object is outside the view or temporarily lost. Its world anchor is retained."
+                : "\(lostCount) locked objects are outside the view or temporarily lost. Their world anchors are retained."
+        } else if lockedObjectMaskCount > 0 {
+            objectMaskFeedbackText = "Locked objects are visible and tied to their world positions."
+        } else {
+            objectMaskFeedbackText = nil
+        }
+    }
+
+    /// Called from the inexpensive AR-anchor projection loop so lost/lock markers keep up with
+    /// fast phone motion even while a slower Vision segmentation request is still running.
+    func updateObjectMaskMarkers(_ markers: [ObjectMaskMarker]) {
+        if objectMaskMarkers != markers {
+            objectMaskMarkers = markers
+        }
+    }
+
+    func reportObjectLockNeedsSurface() {
+        objectMaskFeedbackText = "No stable surface was found at that point. Move slowly around it, then tap again."
+    }
+
+    func reportObjectLockNotFound() {
+        objectMaskFeedbackText = "No separate object mask was found there. Keep the object fully visible and tap near its center."
+    }
+
+    func requestObjectMaskToggle(at normalizedViewportPoint: CGPoint) {
+        objectMaskToggleRequest = ObjectMaskToggleRequest(
+            normalizedViewportPoint: normalizedViewportPoint
+        )
+        objectMaskFeedbackText = "Selecting object…"
+        objectMaskToggleRequestRevision += 1
     }
 
     func clearObjectMaskPreview() {
         objectMaskPreview = nil
+        latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
 
     /// Called continuously by the AR layer while live-scanning to show the box being built.
@@ -147,6 +211,12 @@ final class ObjectCaptureEngine {
         capturedObject = nil
         previewObject = nil
         objectMaskPreview = nil
+        latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
+        lockedObjectMaskCount = 0
+        visibleObjectMaskCount = 0
+        objectMaskMarkers = []
+        objectMaskFeedbackText = nil
+        objectMaskToggleRequest = nil
         isCapturing = false
         statusText = Self.defaultPrompt
         resetRevision += 1

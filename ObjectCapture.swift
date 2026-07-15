@@ -8,6 +8,7 @@
 import ARKit
 import CoreVideo
 import simd
+import UIKit
 
 /// An object captured from the LiDAR depth map.
 ///
@@ -78,15 +79,32 @@ enum ObjectCapturePipeline {
         seed: SIMD3<Float>,
         up: SIMD3<Float>
     ) -> CaptureOutcome {
-        guard points.count >= minimumClusterPoints else {
+        capture(
+            objectPoints: points,
+            supportPoints: points,
+            seed: seed,
+            up: up
+        )
+    }
+
+    /// Fits geometry from mask-approved object points while estimating only the base height from
+    /// the surrounding unmasked depth. The table can therefore support the object without ever
+    /// becoming part of its width/depth/height bounds.
+    static func capture(
+        objectPoints: [SIMD3<Float>],
+        supportPoints: [SIMD3<Float>],
+        seed: SIMD3<Float>,
+        up: SIMD3<Float>
+    ) -> CaptureOutcome {
+        guard objectPoints.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
-        guard let supportHeight = estimateSupportHeight(points: points, seed: seed) else {
+        guard let supportHeight = estimateSupportHeight(points: supportPoints, seed: seed) else {
             return .noSupport
         }
 
-        let candidates = points.filter { point in
+        let candidates = objectPoints.filter { point in
             let heightAboveSupport = point.y - supportHeight
             return heightAboveSupport > floorClearance && heightAboveSupport < maxHeight
         }
@@ -142,6 +160,99 @@ enum ObjectCapturePipeline {
 
 /// Back-projects the dense LiDAR depth map into world-space points near the reticle.
 enum DepthPointCloud {
+    /// Samples LiDAR at a viewport tap and returns the corresponding physical surface point. This
+    /// gives mask locks on LiDAR devices an anchor on the object itself instead of the table plane
+    /// that may lie behind it. Non-LiDAR devices simply return nil and use an ARKit plane raycast.
+    static func worldPoint(
+        from frame: ARFrame,
+        normalizedViewportPoint: CGPoint,
+        interfaceOrientation: UIInterfaceOrientation,
+        viewportSize: CGSize
+    ) -> SIMD3<Float>? {
+        guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth,
+              viewportSize.width > 0,
+              viewportSize.height > 0 else {
+            return nil
+        }
+
+        let viewportToImage = frame.displayTransform(
+            for: interfaceOrientation,
+            viewportSize: viewportSize
+        ).inverted()
+        let imagePoint = normalizedViewportPoint.applying(viewportToImage)
+        guard (0 ... 1).contains(imagePoint.x), (0 ... 1).contains(imagePoint.y) else {
+            return nil
+        }
+
+        let depthMap = sceneDepth.depthMap
+        let confidenceMap = sceneDepth.confidenceMap
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let centerX = min(max(Int(imagePoint.x * CGFloat(width)), 0), width - 1)
+        let centerY = min(max(Int(imagePoint.y * CGFloat(height)), 0), height - 1)
+
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        if let confidenceMap {
+            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+        }
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            if let confidenceMap {
+                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+            }
+        }
+
+        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
+            return nil
+        }
+        let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+        let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0) }
+        let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+        var validSamples: [(depth: Float, x: Int, y: Int)] = []
+
+        for y in max(centerY - 2, 0) ... min(centerY + 2, height - 1) {
+            let depthRow = depthBase
+                .advanced(by: y * depthRowBytes)
+                .assumingMemoryBound(to: Float32.self)
+            let confidenceRow = confidenceBase?
+                .advanced(by: y * confidenceRowBytes)
+                .assumingMemoryBound(to: UInt8.self)
+            for x in max(centerX - 2, 0) ... min(centerX + 2, width - 1) {
+                let depth = depthRow[x]
+                if depth > 0.12, depth < 3.5, (confidenceRow?[x] ?? 2) >= 1 {
+                    validSamples.append((depth, x, y))
+                }
+            }
+        }
+
+        guard !validSamples.isEmpty else {
+            return nil
+        }
+        validSamples.sort { $0.depth < $1.depth }
+        let sample = validSamples[validSamples.count / 2]
+
+        let imageResolution = frame.camera.imageResolution
+        let intrinsics = frame.camera.intrinsics
+        let scaleX = Float(width) / Float(imageResolution.width)
+        let scaleY = Float(height) / Float(imageResolution.height)
+        let fx = intrinsics.columns.0.x * scaleX
+        let fy = intrinsics.columns.1.y * scaleY
+        let cx = intrinsics.columns.2.x * scaleX
+        let cy = intrinsics.columns.2.y * scaleY
+        guard fx > 0, fy > 0 else {
+            return nil
+        }
+
+        let x = (Float(sample.x) - cx) * sample.depth / fx
+        let y = (Float(sample.y) - cy) * sample.depth / fy
+        let cameraPoint = SIMD4<Float>(x, -y, -sample.depth, 1)
+        let worldPoint = frame.camera.transform * cameraPoint
+        guard worldPoint.x.isFinite, worldPoint.y.isFinite, worldPoint.z.isFinite else {
+            return nil
+        }
+        return SIMD3<Float>(worldPoint.x, worldPoint.y, worldPoint.z)
+    }
+
     /// - Parameters:
     ///   - frame: the current AR frame (must carry scene depth).
     ///   - seed: world-space reticle position; only points within `radius` (a 3D sphere) are kept.

@@ -25,6 +25,8 @@ struct MeasurementOverlayView: View {
     var body: some View {
         ZStack {
             objectMaskPreview
+            objectMaskMarkers
+            objectMaskInteractionLayer
             aimer
 
             VStack {
@@ -82,7 +84,7 @@ struct MeasurementOverlayView: View {
 
             VStack {
                 Spacer()
-                if isScanning {
+                if isScanning, isAutomaticCaptureSupported {
                     captureButton
                         .padding(.bottom, 28)
                 } else {
@@ -90,10 +92,106 @@ struct MeasurementOverlayView: View {
                         .padding(.bottom, 28)
                 }
             }
+
+            VStack {
+                if isScanning,
+                   sessionManager.isLiDARAvailable,
+                   !sessionManager.isObjectTrackingEnvironmentReady {
+                    environmentReadinessBanner
+                        .padding(.top, 86)
+                }
+                Spacer()
+            }
         }
         .animation(.snappy(duration: 0.22), value: showsPanel)
         .animation(.snappy(duration: 0.18), value: measurementEngine.mode)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
+    }
+
+    @ViewBuilder
+    private var objectMaskMarkers: some View {
+        if isScanning, !captureEngine.objectMaskMarkers.isEmpty {
+            GeometryReader { proxy in
+                ForEach(captureEngine.objectMaskMarkers) { marker in
+                    let color = Color(
+                        red: marker.color.red,
+                        green: marker.color.green,
+                        blue: marker.color.blue
+                    )
+                    ZStack {
+                        Circle()
+                            .fill(color.opacity(marker.isMaskVisible ? 0.92 : 0.28))
+                        Circle()
+                            .stroke(color, style: StrokeStyle(
+                                lineWidth: marker.isMaskVisible ? 2 : 3,
+                                dash: marker.isMaskVisible ? [] : [4, 3]
+                            ))
+                        Image(systemName: marker.isMaskVisible ? "lock.fill" : "location.fill")
+                            .font(.system(size: marker.isMaskVisible ? 8 : 11, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(
+                        width: marker.isMaskVisible ? 18 : 28,
+                        height: marker.isMaskVisible ? 18 : 28
+                    )
+                    .position(
+                        x: marker.normalizedViewportPoint.x * proxy.size.width,
+                        y: marker.normalizedViewportPoint.y * proxy.size.height
+                    )
+                    .shadow(color: color.opacity(0.65), radius: 5)
+                }
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private var environmentReadinessBanner: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sessionManager.environmentReadiness.title)
+                    .font(.caption.weight(.semibold))
+                Text(sessionManager.environmentReadiness.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 310, alignment: .leading)
+        .glassEffect(.regular, in: Capsule())
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private var objectMaskInteractionLayer: some View {
+        if isScanning {
+            GeometryReader { proxy in
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                guard proxy.size.width > 0, proxy.size.height > 0 else {
+                                    return
+                                }
+                                captureEngine.requestObjectMaskToggle(
+                                    at: CGPoint(
+                                        x: value.location.x / proxy.size.width,
+                                        y: value.location.y / proxy.size.height
+                                    )
+                                )
+                            }
+                    )
+                    .accessibilityLabel("Tap an object to lock or remove its mask")
+            }
+            .ignoresSafeArea()
+        }
     }
 
     @ViewBuilder
@@ -134,9 +232,13 @@ struct MeasurementOverlayView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                statusLine("Depth", sessionManager.depthStatusText)
-                statusLine("Mesh", sessionManager.sceneReconstructionStatusText)
+                if isAutomaticCaptureSupported {
+                    statusLine("Depth", sessionManager.depthStatusText)
+                    statusLine("Mesh", sessionManager.sceneReconstructionStatusText)
+                }
                 statusLine("Planes", sessionManager.planeStatusText)
+                statusLine("Tracking", sessionManager.trackingHardwareText)
+                statusLine("Map", sessionManager.environmentReadiness.title)
             }
             .font(.caption)
 
@@ -238,6 +340,14 @@ struct MeasurementOverlayView: View {
     }
 
     private var scanStatusHeadline: String {
+        if captureEngine.lockedObjectMaskCount > 0 {
+            let visible = captureEngine.visibleObjectMaskCount
+            let total = captureEngine.lockedObjectMaskCount
+            return visible == total
+                ? "\(total) object\(total == 1 ? "" : "s") locked"
+                : "\(visible) of \(total) locks visible"
+        }
+
         if isAutomaticCaptureSupported {
             return captureEngine.statusHeadline
         }
@@ -250,19 +360,32 @@ struct MeasurementOverlayView: View {
             return captureEngine.primaryText
         }
 
+        if captureEngine.lockedObjectMaskCount > 0 {
+            return captureEngine.lockedObjectMaskCount == 1
+                ? "1 colored mask"
+                : "\(captureEngine.lockedObjectMaskCount) colored masks"
+        }
+
         return captureEngine.hasObjectMaskPreview ? "RGB mask selected" : "--"
     }
 
     private var scanStatusText: String {
+        if let feedback = captureEngine.objectMaskFeedbackText {
+            return "\(feedback) Tap a new object to add it, or tap its colored marker to remove it."
+        }
+
         if isAutomaticCaptureSupported {
-            return captureEngine.statusText
+            if captureEngine.lockedObjectMaskCount > 0 {
+                return "\(captureEngine.statusText) Tap another object to add it, or a colored object again to remove it."
+            }
+            return "\(captureEngine.statusText) Tap a highlighted object to lock and track it."
         }
 
-        if captureEngine.hasObjectMaskPreview {
-            return sessionManager.automaticObjectCaptureAvailabilityText
+        if captureEngine.lockedObjectMaskCount > 0 {
+            return "Tap another object to add it, or tap a colored object again to remove it."
         }
 
-        return "Aim the center marker at a distinct object to preview its RGB boundary."
+        return "Tap a distinct object to add a colored mask. Tap it again to remove it."
     }
 
     private var meshToggleButton: some View {
@@ -300,14 +423,12 @@ struct MeasurementOverlayView: View {
             captureEngine.requestCapture()
         } label: {
             Label(
-                isAutomaticCaptureSupported
-                    ? (captureEngine.isCapturing ? "Capturing…" : "Capture")
-                    : "LiDAR Required",
+                captureEngine.isCapturing ? "Capturing…" : "Capture",
                 systemImage: "cube.transparent"
             )
                 .font(.headline.weight(.semibold))
                 .foregroundStyle(
-                    sessionManager.isTrackingReady && isAutomaticCaptureSupported
+                    sessionManager.isTrackingReady
                         ? .primary
                         : .secondary
                 )
@@ -318,15 +439,10 @@ struct MeasurementOverlayView: View {
         .glassEffect(.regular.interactive(), in: Capsule())
         .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 6)
         .disabled(
-            !isAutomaticCaptureSupported
-                || !sessionManager.isTrackingReady
+            !sessionManager.isTrackingReady
                 || captureEngine.isCapturing
         )
-        .accessibilityLabel(
-            isAutomaticCaptureSupported
-                ? "Capture object dimensions"
-                : "Automatic object capture requires LiDAR"
-        )
+        .accessibilityLabel("Capture object dimensions")
     }
 
     private var modeMenu: some View {
@@ -395,6 +511,7 @@ struct MeasurementOverlayView: View {
         .scaleEffect(CGFloat(measurementEngine.aimerDistanceScale), anchor: .center)
         .rotationEffect(.degrees(measurementEngine.aimerSurfaceRotationDegrees))
         .shadow(color: .white.opacity(0.55), radius: 5)
+        .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 
