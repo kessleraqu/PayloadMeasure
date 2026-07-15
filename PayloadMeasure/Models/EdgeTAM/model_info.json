@@ -1,0 +1,9 @@
+{
+  "model_name": "EdgeTAM",
+  "version": "1.0",
+  "components": {
+    "image_encoder": "edgetam_image_encoder.mlpackage",
+    "prompt_encoder": "edgetam_prompt_encoder.mlpackage",
+    "mask_decoder": "edgetam_mask_decoder.mlpackage"
+  }
+}

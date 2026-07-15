@@ -123,6 +123,14 @@ nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {
     let layers: [ObjectMaskMotionLayer]
 }
 
+/// The newest camera frame available when a slower segmentation keyframe finishes. Optical flow
+/// advances that correction to this time before it is displayed, eliminating a backwards snap.
+nonisolated struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let orientation: CGImagePropertyOrientation
+    let timestamp: TimeInterval
+}
+
 /// Carries both the rendered overlay and tracker state back to the main actor. A nil preview is a
 /// valid result when locked objects are temporarily outside the camera frame.
 nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {
@@ -150,6 +158,24 @@ actor ObjectMaskProcessor {
         var appearance: AppearanceSignature?
         var lastGeometry: MaskGeometry
         var currentInstance: Int?
+        var missedFrames: Int
+        var lastAcceptedTimestamp: TimeInterval
+    }
+
+    /// EdgeTAM owns a separate lock state so the previous Vision implementation remains an intact
+    /// fallback. The visual tracker predicts where to prompt the segmentation model; the model's
+    /// fresh pixel mask then corrects the tracker on every accepted frame.
+    private struct EdgeTAMTrackedObject {
+        let id: UUID
+        let colorIndex: Int
+        var request: TrackObjectRequest
+        let referenceGeometry: MaskGeometry
+        let anchorOffset: CGPoint
+        let referenceCameraDistance: Float
+        var appearance: AppearanceSignature?
+        var lastGeometry: MaskGeometry
+        var currentMask: CVPixelBuffer?
+        var lastPrompt: NormalizedPoint
         var missedFrames: Int
         var lastAcceptedTimestamp: TimeInterval
     }
@@ -206,15 +232,42 @@ actor ObjectMaskProcessor {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let segmentationRequest = GenerateForegroundInstanceMaskRequest()
+    private var edgeTAMSegmenter: EdgeTAMSegmenter?
+    private var didAttemptEdgeTAMLoad = false
     private static let motionLongEdge = 320
     private var trackedObjects: [TrackedObject] = []
+    private var edgeTAMTrackedObjects: [EdgeTAMTrackedObject] = []
     private var trackingGeneration: Int?
 
     func makePreview(from frame: ObjectMaskFrame) async -> ObjectMaskProcessingResult {
         if trackingGeneration != frame.trackingGeneration {
             trackedObjects.removeAll()
+            edgeTAMTrackedObjects.removeAll()
             trackingGeneration = frame.trackingGeneration
         }
+
+        if !didAttemptEdgeTAMLoad {
+            didAttemptEdgeTAMLoad = true
+            edgeTAMSegmenter = EdgeTAMSegmenter.loadIfAvailable()
+        }
+
+        if let edgeTAMSegmenter,
+           let edgeTAMResult = await makeEdgeTAMPreview(
+               from: frame,
+               segmenter: edgeTAMSegmenter
+           ) {
+            return edgeTAMResult
+        }
+
+        return await makeNativeVisionPreview(from: frame)
+    }
+
+    /// The presentation implementation is intentionally retained unchanged behind EdgeTAM. If
+    /// the model cannot load or execute on a device, object selection still works with Apple's
+    /// foreground-instance segmentation rather than failing completely.
+    private func makeNativeVisionPreview(
+        from frame: ObjectMaskFrame
+    ) async -> ObjectMaskProcessingResult {
 
         // Materialize the camera orientation in the CIImage coordinate space before handing it to
         // Vision. The request input and generated mask then share one upright coordinate system.
@@ -294,6 +347,581 @@ actor ObjectMaskProcessor {
         } catch {
             ageUnmatchedTrackers()
             return result(preview: nil, frame: frame)
+        }
+    }
+
+    /// Runs EdgeTAM's image encoder once, then applies a separate prompt and decoder pass for each
+    /// lock. Returning nil is reserved for a model-level failure before any EdgeTAM locks exist;
+    /// that lets the caller fall back to the preserved native Vision implementation.
+    private func makeEdgeTAMPreview(
+        from frame: ObjectMaskFrame,
+        segmenter: EdgeTAMSegmenter
+    ) async -> ObjectMaskProcessingResult? {
+        let cameraImage = CIImage(cvPixelBuffer: frame.pixelBuffer).oriented(frame.orientation)
+
+        // Do not spend an encoder pass until there is either a lock to update or a tap to resolve.
+        guard !edgeTAMTrackedObjects.isEmpty || frame.toggleRequest != nil else {
+            return edgeTAMResult(preview: nil, frame: frame)
+        }
+
+        let features: EdgeTAMFrameFeatures
+        do {
+            features = try segmenter.encode(
+                pixelBuffer: frame.pixelBuffer,
+                orientation: frame.orientation
+            )
+        } catch {
+            ageUnmatchedEdgeTAMTrackers()
+            if edgeTAMTrackedObjects.isEmpty {
+                edgeTAMSegmenter = nil
+                return nil
+            }
+            return edgeTAMResult(preview: nil, frame: frame)
+        }
+
+        let handler = ImageRequestHandler(cameraImage)
+        await updateEdgeTAMTrackedObjects(
+            features: features,
+            segmenter: segmenter,
+            handler: handler,
+            cameraImage: cameraImage,
+            frame: frame
+        )
+
+        let toggleOutcome: ToggleOutcome
+        if let toggleRequest = frame.toggleRequest,
+           let point = imagePoint(
+               for: toggleRequest.normalizedViewportPoint,
+               imageSize: cameraImage.extent.size,
+               viewportSize: frame.viewportSize
+           ) {
+            toggleOutcome = (try? toggleEdgeTAMLock(
+                at: point,
+                request: toggleRequest,
+                features: features,
+                segmenter: segmenter,
+                cameraImage: cameraImage,
+                frame: frame
+            )) ?? .unchanged
+        } else {
+            toggleOutcome = .unchanged
+        }
+
+        let renderedMasks = edgeTAMTrackedObjects.compactMap { trackedObject in
+            trackedObject.currentMask.map {
+                RenderedMask(
+                    lockID: trackedObject.id,
+                    color: Self.lockedColors[trackedObject.colorIndex],
+                    fillAlpha: 0.24,
+                    pixelBuffer: $0
+                )
+            }
+        }
+        let preview = try? makeDisplayImage(
+            from: renderedMasks,
+            outputSize: cameraImage.extent.size
+        ).map { ObjectMaskPreview(image: $0, timestamp: frame.timestamp) }
+        let maskedPointClouds = makeMaskedPointClouds(
+            from: renderedMasks,
+            cameraImageSize: cameraImage.extent.size,
+            frame: frame
+        )
+        let motionKeyframe = makeMotionKeyframe(
+            from: renderedMasks,
+            cameraImageSize: cameraImage.extent.size,
+            frame: frame,
+            activeLockIDs: Set(edgeTAMTrackedObjects.map(\.id))
+        )
+
+        switch toggleOutcome {
+        case .changed(let change):
+            return edgeTAMResult(
+                preview: preview ?? nil,
+                frame: frame,
+                lockChange: change,
+                motionKeyframe: motionKeyframe,
+                maskedPointClouds: maskedPointClouds
+            )
+        case .needsWorldSurface:
+            return edgeTAMResult(
+                preview: preview ?? nil,
+                frame: frame,
+                needsWorldSurface: true,
+                motionKeyframe: motionKeyframe,
+                maskedPointClouds: maskedPointClouds
+            )
+        case .unchanged:
+            return edgeTAMResult(
+                preview: preview ?? nil,
+                frame: frame,
+                motionKeyframe: motionKeyframe,
+                maskedPointClouds: maskedPointClouds
+            )
+        }
+    }
+
+    private func updateEdgeTAMTrackedObjects(
+        features: EdgeTAMFrameFeatures,
+        segmenter: EdgeTAMSegmenter,
+        handler: ImageRequestHandler,
+        cameraImage: CIImage,
+        frame: ObjectMaskFrame
+    ) async {
+        let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
+        var claimedMasks: [CVPixelBuffer] = []
+
+        for index in edgeTAMTrackedObjects.indices {
+            edgeTAMTrackedObjects[index].currentMask = nil
+            let trackedObservation = try? await handler.perform(
+                edgeTAMTrackedObjects[index].request
+            )
+            let visualBox = validTrackingPrediction(
+                trackedObservation?.boundingBox,
+                relativeTo: edgeTAMTrackedObjects[index].lastGeometry.boundingBox
+            )
+            let hint = hintsByID[edgeTAMTrackedObjects[index].id]
+            let anchorPoint = hint?.normalizedViewportPoint.flatMap {
+                imagePoint(
+                    for: $0,
+                    imageSize: cameraImage.extent.size,
+                    viewportSize: frame.viewportSize
+                )
+            }
+
+            let expectedBox: NormalizedRect
+            let prompt: NormalizedPoint
+            if edgeTAMTrackedObjects[index].missedFrames >= 2,
+               let anchorPoint,
+               let hint {
+                expectedBox = projectedObjectBox(
+                    for: edgeTAMTrackedObjects[index],
+                    anchorPoint: anchorPoint,
+                    cameraDistance: hint.cameraDistance
+                )
+                prompt = anchorPoint
+            } else if let visualBox {
+                expectedBox = visualBox
+                prompt = promptPoint(
+                    in: visualBox,
+                    offset: edgeTAMTrackedObjects[index].anchorOffset
+                )
+            } else if let anchorPoint, let hint {
+                expectedBox = projectedObjectBox(
+                    for: edgeTAMTrackedObjects[index],
+                    anchorPoint: anchorPoint,
+                    cameraDistance: hint.cameraDistance
+                )
+                prompt = anchorPoint
+            } else {
+                edgeTAMTrackedObjects[index].missedFrames += 1
+                continue
+            }
+
+            let expectedArea = expectedEdgeTAMArea(
+                for: edgeTAMTrackedObjects[index],
+                cameraDistance: hint?.cameraDistance
+            )
+            guard let mask = try? segmenter.segment(
+                features: features,
+                at: prompt,
+                negativePoints: negativePromptPoints(around: expectedBox),
+                expectedArea: expectedArea
+            ), let geometry = maskGeometry(of: mask.pixelBuffer),
+                  acceptsEdgeTAMGeometry(
+                      geometry,
+                      mask: mask.pixelBuffer,
+                      prompt: prompt,
+                      expectedBox: expectedBox,
+                      expectedArea: expectedArea,
+                      trackedObject: edgeTAMTrackedObjects[index],
+                      cameraImage: cameraImage,
+                      timestamp: frame.timestamp
+                  ), !claimedMasks.contains(where: {
+                      maskIntersectionOverUnion(mask.pixelBuffer, $0) > 0.92
+                  }) else {
+                edgeTAMTrackedObjects[index].missedFrames += 1
+                continue
+            }
+
+            let correctedObservation = DetectedObjectObservation(
+                boundingBox: geometry.boundingBox
+            )
+            edgeTAMTrackedObjects[index].request = TrackObjectRequest(
+                detectedObject: correctedObservation
+            )
+            edgeTAMTrackedObjects[index].lastGeometry = geometry
+            edgeTAMTrackedObjects[index].currentMask = mask.pixelBuffer
+            edgeTAMTrackedObjects[index].lastPrompt = prompt
+            edgeTAMTrackedObjects[index].missedFrames = 0
+            edgeTAMTrackedObjects[index].lastAcceptedTimestamp = frame.timestamp
+            if let appearance = appearanceSignature(
+                of: cameraImage,
+                inside: geometry.boundingBox
+            ) {
+                edgeTAMTrackedObjects[index].appearance = blendedAppearance(
+                    previous: edgeTAMTrackedObjects[index].appearance,
+                    current: appearance
+                )
+            }
+            claimedMasks.append(mask.pixelBuffer)
+        }
+    }
+
+    private func toggleEdgeTAMLock(
+        at point: NormalizedPoint,
+        request: ObjectMaskToggleRequest,
+        features: EdgeTAMFrameFeatures,
+        segmenter: EdgeTAMSegmenter,
+        cameraImage: CIImage,
+        frame: ObjectMaskFrame
+    ) throws -> ToggleOutcome {
+        let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
+        let maskMatches = edgeTAMTrackedObjects.indices.filter {
+            guard let mask = edgeTAMTrackedObjects[$0].currentMask else { return false }
+            return maskContains(mask, point: point, radius: 2)
+        }
+        let removalIndex = maskMatches.min {
+            distance(edgeTAMTrackedObjects[$0].lastGeometry.centroid, to: point.cgPoint)
+                < distance(edgeTAMTrackedObjects[$1].lastGeometry.centroid, to: point.cgPoint)
+        } ?? edgeTAMTrackedObjects.firstIndex(where: { trackedObject in
+            guard trackedObject.currentMask == nil else {
+                return false
+            }
+            if trackedObject.lastGeometry.boundingBox.cgRect.contains(point.cgPoint) {
+                return true
+            }
+            guard let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint,
+                  let projectedPoint = imagePoint(
+                      for: viewportPoint,
+                      imageSize: cameraImage.extent.size,
+                      viewportSize: frame.viewportSize
+                  ) else {
+                return false
+            }
+            return hypot(projectedPoint.x - point.x, projectedPoint.y - point.y) <= 0.05
+        })
+
+        if let removalIndex {
+            let removed = edgeTAMTrackedObjects.remove(at: removalIndex)
+            return .changed(
+                ObjectMaskLockChange(id: removed.id, kind: .removed, worldTransform: nil)
+            )
+        }
+
+        guard edgeTAMTrackedObjects.count < Self.lockedColors.count else {
+            return .unchanged
+        }
+        guard let proposedLockID = request.proposedLockID,
+              let worldTransform = request.worldTransform,
+              let cameraDistance = request.cameraDistance else {
+            return .needsWorldSurface
+        }
+
+        let initialMask = try segmenter.segment(features: features, at: point)
+        guard let geometry = maskGeometry(of: initialMask.pixelBuffer),
+              geometry.area > 0.00015,
+              geometry.area < 0.82,
+              maskContains(initialMask.pixelBuffer, point: point, radius: 3) else {
+            return .unchanged
+        }
+
+        // If EdgeTAM resolves the tap to an already locked mask even though the exact low-resolution
+        // pixel missed it, interpret the action as the expected tap-again deletion.
+        if let duplicateIndex = edgeTAMTrackedObjects.firstIndex(where: { trackedObject in
+            if let currentMask = trackedObject.currentMask {
+                return maskIntersectionOverUnion(initialMask.pixelBuffer, currentMask) > 0.92
+            }
+            return normalizedIntersectionOverUnion(
+                geometry.boundingBox,
+                trackedObject.lastGeometry.boundingBox
+            ) > 0.94
+        }) {
+            let removed = edgeTAMTrackedObjects.remove(at: duplicateIndex)
+            return .changed(
+                ObjectMaskLockChange(id: removed.id, kind: .removed, worldTransform: nil)
+            )
+        }
+
+        let initialObservation = DetectedObjectObservation(boundingBox: geometry.boundingBox)
+        let rect = geometry.boundingBox.cgRect
+        let anchorOffset = CGPoint(
+            x: min(max((point.x - rect.minX) / max(rect.width, 0.001), 0), 1),
+            y: min(max((point.y - rect.minY) / max(rect.height, 0.001), 0), 1)
+        )
+        edgeTAMTrackedObjects.append(
+            EdgeTAMTrackedObject(
+                id: proposedLockID,
+                colorIndex: firstAvailableEdgeTAMColorIndex(),
+                request: TrackObjectRequest(detectedObject: initialObservation),
+                referenceGeometry: geometry,
+                anchorOffset: anchorOffset,
+                referenceCameraDistance: max(cameraDistance, 0.05),
+                appearance: appearanceSignature(of: cameraImage, inside: geometry.boundingBox),
+                lastGeometry: geometry,
+                currentMask: initialMask.pixelBuffer,
+                lastPrompt: point,
+                missedFrames: 0,
+                lastAcceptedTimestamp: frame.timestamp
+            )
+        )
+        return .changed(
+            ObjectMaskLockChange(
+                id: proposedLockID,
+                kind: .added,
+                worldTransform: worldTransform
+            )
+        )
+    }
+
+    private func edgeTAMResult(
+        preview: ObjectMaskPreview?,
+        frame: ObjectMaskFrame,
+        lockChange: ObjectMaskLockChange? = nil,
+        needsWorldSurface: Bool = false,
+        motionKeyframe: ObjectMaskMotionKeyframe? = nil,
+        maskedPointClouds: [ObjectMaskDepthPointCloud] = []
+    ) -> ObjectMaskProcessingResult {
+        let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
+        let markers = edgeTAMTrackedObjects.compactMap { trackedObject -> ObjectMaskMarker? in
+            guard let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint else {
+                return nil
+            }
+            return ObjectMaskMarker(
+                id: trackedObject.id,
+                normalizedViewportPoint: viewportPoint,
+                color: Self.lockedColors[trackedObject.colorIndex],
+                isMaskVisible: trackedObject.currentMask != nil
+            )
+        }
+        return ObjectMaskProcessingResult(
+            preview: preview,
+            lockedObjectCount: edgeTAMTrackedObjects.count,
+            visibleObjectCount: edgeTAMTrackedObjects.count(where: { $0.currentMask != nil }),
+            markers: markers,
+            didToggleLock: lockChange != nil,
+            lockChange: lockChange,
+            needsWorldSurface: needsWorldSurface,
+            motionKeyframe: motionKeyframe,
+            maskedPointClouds: maskedPointClouds
+        )
+    }
+
+    private func projectedObjectBox(
+        for trackedObject: EdgeTAMTrackedObject,
+        anchorPoint: NormalizedPoint,
+        cameraDistance: Float
+    ) -> NormalizedRect {
+        let scale = min(max(
+            CGFloat(trackedObject.referenceCameraDistance / max(cameraDistance, 0.05)),
+            0.20
+        ), 5.0)
+        let reference = trackedObject.referenceGeometry.boundingBox
+        let width = min(max(reference.width * scale, 0.01), 0.98)
+        let height = min(max(reference.height * scale, 0.01), 0.98)
+        let x = min(max(anchorPoint.x - trackedObject.anchorOffset.x * width, 0), 1 - width)
+        let y = min(max(anchorPoint.y - trackedObject.anchorOffset.y * height, 0), 1 - height)
+        return NormalizedRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func expectedEdgeTAMArea(
+        for trackedObject: EdgeTAMTrackedObject,
+        cameraDistance: Float?
+    ) -> CGFloat {
+        if trackedObject.missedFrames < 2 {
+            return trackedObject.lastGeometry.area
+        }
+        guard let cameraDistance else {
+            return trackedObject.lastGeometry.area
+        }
+        let scale = min(max(
+            CGFloat(trackedObject.referenceCameraDistance / max(cameraDistance, 0.05)),
+            0.20
+        ), 5.0)
+        return min(max(trackedObject.referenceGeometry.area * scale * scale, 0.0001), 0.80)
+    }
+
+    private func promptPoint(
+        in boundingBox: NormalizedRect,
+        offset: CGPoint
+    ) -> NormalizedPoint {
+        let rect = boundingBox.cgRect
+        return NormalizedPoint(
+            x: min(max(rect.minX + rect.width * offset.x, 0), 1),
+            y: min(max(rect.minY + rect.height * offset.y, 0), 1)
+        )
+    }
+
+    /// Three negative prompts just outside the previous/predicted object boundary strongly reduce
+    /// the chance that EdgeTAM expands from a payload onto the table supporting it.
+    private func negativePromptPoints(around boundingBox: NormalizedRect) -> [NormalizedPoint] {
+        let rect = boundingBox.cgRect
+        let margin = max(max(rect.width, rect.height) * 0.12, 0.018)
+        let candidates = [
+            CGPoint(x: rect.minX - margin, y: rect.midY),
+            CGPoint(x: rect.maxX + margin, y: rect.midY),
+            CGPoint(x: rect.midX, y: rect.minY - margin),
+            CGPoint(x: rect.midX, y: rect.maxY + margin)
+        ]
+        return candidates.compactMap { candidate in
+            guard (0 ... 1).contains(candidate.x), (0 ... 1).contains(candidate.y) else {
+                return nil
+            }
+            return NormalizedPoint(x: candidate.x, y: candidate.y)
+        }.prefix(3).map { $0 }
+    }
+
+    private func acceptsEdgeTAMGeometry(
+        _ geometry: MaskGeometry,
+        mask: CVPixelBuffer,
+        prompt: NormalizedPoint,
+        expectedBox: NormalizedRect,
+        expectedArea: CGFloat,
+        trackedObject: EdgeTAMTrackedObject,
+        cameraImage: CIImage,
+        timestamp: TimeInterval
+    ) -> Bool {
+        guard geometry.area > 0.00015,
+              geometry.area < 0.82,
+              geometry.boundingBox.width < 0.985,
+              geometry.boundingBox.height < 0.985,
+              maskContains(mask, point: prompt, radius: 3),
+              expectedArea > 0.00001 else {
+            return false
+        }
+
+        let elapsed = CGFloat(min(max(timestamp - trackedObject.lastAcceptedTimestamp, 0), 0.5))
+        let widthRatio = geometry.boundingBox.width
+            / max(trackedObject.lastGeometry.boundingBox.width, 0.005)
+        let heightRatio = geometry.boundingBox.height
+            / max(trackedObject.lastGeometry.boundingBox.height, 0.005)
+        let areaRatio = geometry.area / max(trackedObject.lastGeometry.area, 0.00001)
+        if trackedObject.missedFrames == 0 {
+            let linearLimit = min(1.72, 1.48 + elapsed * 0.48)
+            guard widthRatio >= 1 / linearLimit,
+                  widthRatio <= linearLimit,
+                  heightRatio >= 1 / linearLimit,
+                  heightRatio <= linearLimit,
+                  areaRatio >= 1 / (linearLimit * linearLimit),
+                  areaRatio <= linearLimit * linearLimit else {
+                return false
+            }
+        } else {
+            let reacquisitionRatio = geometry.area / expectedArea
+            guard (0.28 ... 3.4).contains(reacquisitionRatio) else {
+                return false
+            }
+        }
+
+        let overlap = normalizedIntersectionOverUnion(
+            geometry.boundingBox,
+            expectedBox
+        )
+        let centerDistance = distance(
+            geometry.centroid,
+            to: CGPoint(x: expectedBox.cgRect.midX, y: expectedBox.cgRect.midY)
+        )
+        let allowedDistance = max(expectedBox.width, expectedBox.height) * 0.9 + 0.045
+        guard overlap >= 0.025 || centerDistance <= allowedDistance else {
+            return false
+        }
+
+        if let currentAppearance = appearanceSignature(of: cameraImage, inside: geometry.boundingBox),
+           let difference = appearanceDistance(currentAppearance, trackedObject.appearance),
+           difference > 0.85 {
+            return false
+        }
+        return true
+    }
+
+    private func maskContains(
+        _ pixelBuffer: CVPixelBuffer,
+        point: NormalizedPoint,
+        radius: Int
+    ) -> Bool {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_OneComponent32Float,
+              let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return false
+        }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer) / MemoryLayout<Float>.stride
+        let pixels = baseAddress.assumingMemoryBound(to: Float.self)
+        let centerX = min(max(Int(point.x * CGFloat(width)), 0), width - 1)
+        let centerY = min(max(Int((1 - point.y) * CGFloat(height)), 0), height - 1)
+        for y in max(centerY - radius, 0) ... min(centerY + radius, height - 1) {
+            let row = pixels.advanced(by: y * stride)
+            for x in max(centerX - radius, 0) ... min(centerX + radius, width - 1)
+            where row[x] > 0.5 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func normalizedIntersectionOverUnion(
+        _ left: NormalizedRect,
+        _ right: NormalizedRect
+    ) -> CGFloat {
+        let intersection = left.cgRect.intersection(right.cgRect)
+        let intersectionArea = intersection.isNull ? 0 : intersection.width * intersection.height
+        let unionArea = left.width * left.height + right.width * right.height - intersectionArea
+        return unionArea > 0 ? intersectionArea / unionArea : 0
+    }
+
+    private func maskIntersectionOverUnion(
+        _ left: CVPixelBuffer,
+        _ right: CVPixelBuffer
+    ) -> CGFloat {
+        guard CVPixelBufferGetPixelFormatType(left) == kCVPixelFormatType_OneComponent32Float,
+              CVPixelBufferGetPixelFormatType(right) == kCVPixelFormatType_OneComponent32Float,
+              CVPixelBufferGetWidth(left) == CVPixelBufferGetWidth(right),
+              CVPixelBufferGetHeight(left) == CVPixelBufferGetHeight(right) else {
+            return 0
+        }
+        CVPixelBufferLockBaseAddress(left, .readOnly)
+        CVPixelBufferLockBaseAddress(right, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(left, .readOnly)
+            CVPixelBufferUnlockBaseAddress(right, .readOnly)
+        }
+        guard let leftBase = CVPixelBufferGetBaseAddress(left)?.assumingMemoryBound(to: Float.self),
+              let rightBase = CVPixelBufferGetBaseAddress(right)?.assumingMemoryBound(to: Float.self) else {
+            return 0
+        }
+        let width = CVPixelBufferGetWidth(left)
+        let height = CVPixelBufferGetHeight(left)
+        let leftStride = CVPixelBufferGetBytesPerRow(left) / MemoryLayout<Float>.stride
+        let rightStride = CVPixelBufferGetBytesPerRow(right) / MemoryLayout<Float>.stride
+        var intersection = 0
+        var union = 0
+        for rowIndex in 0 ..< height {
+            let leftRow = leftBase.advanced(by: rowIndex * leftStride)
+            let rightRow = rightBase.advanced(by: rowIndex * rightStride)
+            for column in 0 ..< width {
+                let leftSelected = leftRow[column] > 0.5
+                let rightSelected = rightRow[column] > 0.5
+                if leftSelected || rightSelected { union += 1 }
+                if leftSelected && rightSelected { intersection += 1 }
+            }
+        }
+        return union > 0 ? CGFloat(intersection) / CGFloat(union) : 0
+    }
+
+    private func distance(_ left: CGPoint, to right: CGPoint) -> CGFloat {
+        hypot(left.x - right.x, left.y - right.y)
+    }
+
+    private func firstAvailableEdgeTAMColorIndex() -> Int {
+        let usedColors = Set(edgeTAMTrackedObjects.map(\.colorIndex))
+        return Self.lockedColors.indices.first(where: { !usedColors.contains($0) }) ?? 0
+    }
+
+    private func ageUnmatchedEdgeTAMTrackers() {
+        for index in edgeTAMTrackedObjects.indices {
+            edgeTAMTrackedObjects[index].currentMask = nil
+            edgeTAMTrackedObjects[index].missedFrames += 1
         }
     }
 
@@ -559,10 +1187,17 @@ actor ObjectMaskProcessor {
         _ prediction: NormalizedRect?,
         relativeTo previous: NormalizedRect
     ) -> NormalizedRect {
+        validTrackingPrediction(prediction, relativeTo: previous) ?? previous
+    }
+
+    private func validTrackingPrediction(
+        _ prediction: NormalizedRect?,
+        relativeTo previous: NormalizedRect
+    ) -> NormalizedRect? {
         guard let prediction,
               previous.width > 0,
               previous.height > 0 else {
-            return previous
+            return nil
         }
 
         let widthScale = prediction.width / previous.width
@@ -584,7 +1219,7 @@ actor ObjectMaskProcessor {
         guard (0.5 ... 2.0).contains(widthScale),
               (0.5 ... 2.0).contains(heightScale),
               centerDistance <= maximumCenterDistance else {
-            return previous
+            return nil
         }
 
         return prediction
@@ -1121,21 +1756,44 @@ actor ObjectMaskProcessor {
         }
     }
 
-    private func makeDisplayImage(from renderedMasks: [RenderedMask]) throws -> CGImage? {
+    private func makeDisplayImage(
+        from renderedMasks: [RenderedMask],
+        outputSize: CGSize? = nil
+    ) throws -> CGImage? {
         var composite: CIImage?
         var imageExtent: CGRect?
 
         for renderedMask in renderedMasks {
-            let mask = CIImage(cvPixelBuffer: renderedMask.pixelBuffer)
+            let sourceMask = CIImage(cvPixelBuffer: renderedMask.pixelBuffer)
+            let targetSize = outputSize ?? sourceMask.extent.size
+            guard sourceMask.extent.width > 0,
+                  sourceMask.extent.height > 0,
+                  targetSize.width > 0,
+                  targetSize.height > 0 else {
+                continue
+            }
+            let normalizedMask = sourceMask.transformed(
+                by: CGAffineTransform(
+                    translationX: -sourceMask.extent.minX,
+                    y: -sourceMask.extent.minY
+                )
+            )
+            let mask = normalizedMask.transformed(
+                by: CGAffineTransform(
+                    scaleX: targetSize.width / sourceMask.extent.width,
+                    y: targetSize.height / sourceMask.extent.height
+                )
+            )
+            let targetExtent = CGRect(origin: .zero, size: targetSize)
             let fill = tint(mask, color: renderedMask.color, alpha: renderedMask.fillAlpha)
             let edgeMask = mask.applyingFilter(
                 "CIMorphologyGradient",
                 parameters: [kCIInputRadiusKey: 4.0]
             )
             let edge = tint(edgeMask, color: renderedMask.color, alpha: 0.95)
-            let layer = edge.composited(over: fill).cropped(to: mask.extent)
+            let layer = edge.composited(over: fill).cropped(to: targetExtent)
             composite = composite.map { layer.composited(over: $0) } ?? layer
-            imageExtent = mask.extent
+            imageExtent = targetExtent
         }
 
         guard let composite, let imageExtent else {
@@ -1147,7 +1805,8 @@ actor ObjectMaskProcessor {
     private func makeMotionKeyframe(
         from renderedMasks: [RenderedMask],
         cameraImageSize: CGSize,
-        frame: ObjectMaskFrame
+        frame: ObjectMaskFrame,
+        activeLockIDs: Set<UUID>? = nil
     ) -> ObjectMaskMotionKeyframe? {
         guard cameraImageSize.width > 0, cameraImageSize.height > 0 else {
             return nil
@@ -1175,7 +1834,7 @@ actor ObjectMaskProcessor {
             timestamp: frame.timestamp,
             width: width,
             height: height,
-            activeLockIDs: Set(trackedObjects.map(\.id)),
+            activeLockIDs: activeLockIDs ?? Set(trackedObjects.map(\.id)),
             onScreenLockIDs: Set(
                 frame.anchorHints.compactMap { $0.normalizedViewportPoint == nil ? nil : $0.id }
             ),
@@ -1396,13 +2055,17 @@ actor ObjectMaskMotionProcessor {
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private var opticalFlowRequest: VNTrackOpticalFlowRequest?
     private var layers: [UUID: LayerState] = [:]
+    private var missedCorrections: [UUID: Int] = [:]
     private var activeLockIDs = Set<UUID>()
     private var width = 0
     private var height = 0
     private var lastTimestamp: TimeInterval = -.greatestFiniteMagnitude
 
-    func install(_ keyframe: ObjectMaskMotionKeyframe) -> ObjectMaskPreview? {
-        let correctedLayers = Dictionary(
+    func install(
+        _ keyframe: ObjectMaskMotionKeyframe,
+        catchUp: ObjectMaskMotionCatchUpFrame? = nil
+    ) -> ObjectMaskPreview? {
+        var correctedLayers = Dictionary(
             uniqueKeysWithValues: keyframe.layers.map {
                 ($0.id, LayerState(id: $0.id, color: $0.color, mask: $0.mask))
             }
@@ -1413,17 +2076,20 @@ actor ObjectMaskMotionProcessor {
             return nil
         }
 
-        // A partial segmentation correction must not erase masks that optical flow is still
-        // tracking. This is especially important when several objects are selected and Vision
-        // temporarily omits one at a different viewing distance.
-        let retainedIDs = Set(layers.keys).intersection(keyframe.activeLockIDs)
-        let missingOnScreenIDs = retainedIDs
-            .intersection(keyframe.onScreenLockIDs)
-            .subtracting(correctedLayers.keys)
-        if keyframe.activeLockIDs == activeLockIDs,
-           !missingOnScreenIDs.isEmpty {
-            return makePreview(timestamp: lastTimestamp)
+        missedCorrections = missedCorrections.filter {
+            keyframe.activeLockIDs.contains($0.key)
         }
+        for id in keyframe.activeLockIDs {
+            if correctedLayers[id] != nil {
+                missedCorrections[id] = 0
+            } else {
+                missedCorrections[id, default: 0] += 1
+            }
+        }
+
+        let previousLayers = layers
+        let previousTimestamp = lastTimestamp
+        let dimensionsMatch = width == keyframe.width && height == keyframe.height
 
         guard let camera = makeWorkingCamera(
             keyframe.pixelBuffer,
@@ -1444,13 +2110,52 @@ actor ObjectMaskMotionProcessor {
             return makePreview(timestamp: lastTimestamp)
         }
 
-        opticalFlowRequest = request
-        layers = correctedLayers
-        activeLockIDs = keyframe.activeLockIDs
         width = keyframe.width
         height = keyframe.height
-        lastTimestamp = keyframe.timestamp
-        return makePreview(timestamp: keyframe.timestamp)
+
+        var installedTimestamp = keyframe.timestamp
+        if let catchUp,
+           catchUp.timestamp > keyframe.timestamp,
+           let currentCamera = makeWorkingCamera(
+               catchUp.pixelBuffer,
+               orientation: catchUp.orientation,
+               width: keyframe.width,
+               height: keyframe.height
+           ) {
+            let currentHandler = VNImageRequestHandler(
+                cvPixelBuffer: currentCamera,
+                orientation: .up,
+                options: [:]
+            )
+            if (try? currentHandler.perform([request])) != nil,
+               let flow = request.results?.first?.pixelBuffer {
+                for id in Array(correctedLayers.keys) {
+                    guard var layer = correctedLayers[id] else { continue }
+                    layer.mask = warp(layer.mask, with: flow)
+                    correctedLayers[id] = layer
+                }
+                installedTimestamp = catchUp.timestamp
+            }
+        }
+
+        // A missing object can retain its independently propagated layer briefly, but only when it
+        // is already at essentially the same time as this newly installed request.
+        var mergedLayers = correctedLayers
+        if dimensionsMatch, abs(previousTimestamp - installedTimestamp) <= 0.10 {
+            let retainedIDs = Set(previousLayers.keys)
+                .intersection(keyframe.activeLockIDs)
+                .intersection(keyframe.onScreenLockIDs)
+                .subtracting(correctedLayers.keys)
+            for id in retainedIDs where missedCorrections[id, default: 0] <= 2 {
+                mergedLayers[id] = previousLayers[id]
+            }
+        }
+
+        opticalFlowRequest = request
+        layers = mergedLayers
+        activeLockIDs = keyframe.activeLockIDs
+        lastTimestamp = installedTimestamp
+        return makePreview(timestamp: installedTimestamp)
     }
 
     func propagate(
@@ -1496,6 +2201,7 @@ actor ObjectMaskMotionProcessor {
     func reset() {
         opticalFlowRequest = nil
         layers.removeAll()
+        missedCorrections.removeAll()
         activeLockIDs.removeAll()
         width = 0
         height = 0

@@ -84,6 +84,7 @@ struct ARCameraView: UIViewRepresentable {
         private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
         private var maskedAccumulators: [UUID: PointAccumulator] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
+        private let objectMaskMotionProcessor = ObjectMaskMotionProcessor()
         private var liveResult: CaptureResult?
         private var accumulationAnchor: SIMD3<Float>?
         private var selectedCaptureMaskID: UUID?
@@ -91,6 +92,7 @@ struct ARCameraView: UIViewRepresentable {
         private var scanTickCounter = 0
         private var consecutiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
+        private var objectMaskMotionTask: Task<Void, Never>?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
@@ -165,6 +167,10 @@ struct ARCameraView: UIViewRepresentable {
             maskUpdateTimer = nil
             objectMaskTask?.cancel()
             objectMaskTask = nil
+            objectMaskMotionTask?.cancel()
+            objectMaskMotionTask = nil
+            let motionProcessor = objectMaskMotionProcessor
+            Task { await motionProcessor.reset() }
             pendingObjectMaskToggleRequest = nil
             removeAllObjectMaskAnchors()
             captureEngine.updateLockedObjectMaskCount(0)
@@ -285,12 +291,18 @@ struct ARCameraView: UIViewRepresentable {
         /// Offers frames to Vision at display cadence. Only one segmentation may be in flight, so
         /// actual mask throughput is device-dependent and stale frames never queue.
         private func updateObjectMaskPreview(in arView: ARView) {
-            guard measurementEngine.mode == .scan else {
+            guard measurementEngine.mode == .scan,
+                  let frame = arView.session.currentFrame else {
                 return
             }
 
-            guard objectMaskTask == nil,
-                  let frame = arView.session.currentFrame else {
+            updateObjectMaskMotion(
+                pixelBuffer: frame.capturedImage,
+                orientation: cameraImageOrientation(in: arView),
+                timestamp: frame.timestamp
+            )
+
+            guard objectMaskTask == nil else {
                 return
             }
 
@@ -315,10 +327,31 @@ struct ARCameraView: UIViewRepresentable {
                 objectMaskToggleAttemptsRemaining = max(objectMaskToggleAttemptsRemaining - 1, 0)
             }
             let processor = objectMaskProcessor
+            let motionProcessor = objectMaskMotionProcessor
 
             objectMaskTask = Task { [weak self] in
                 let result = await processor.makePreview(from: input)
                 guard let self, !Task.isCancelled else {
+                    return
+                }
+
+                var motionCorrectionPreview: ObjectMaskPreview?
+                if let keyframe = result.motionKeyframe {
+                    let catchUp = arView.session.currentFrame.map {
+                        ObjectMaskMotionCatchUpFrame(
+                            pixelBuffer: $0.capturedImage,
+                            orientation: self.cameraImageOrientation(in: arView),
+                            timestamp: $0.timestamp
+                        )
+                    }
+                    motionCorrectionPreview = await motionProcessor.install(
+                        keyframe,
+                        catchUp: catchUp
+                    )
+                } else if result.lockedObjectCount == 0 {
+                    await motionProcessor.reset()
+                }
+                guard !Task.isCancelled else {
                     return
                 }
 
@@ -364,10 +397,9 @@ struct ARCameraView: UIViewRepresentable {
                     self.captureEngine.reportObjectLockNeedsSurface()
                 }
 
-                // Presentation-safe path: display only a mask generated from this segmented camera
-                // frame. Dense optical flow could leave a newer stale overlay on screen and hide
-                // the correction, which made masks appear fixed to the viewport rather than objects.
-                if let preview = result.preview {
+                // EdgeTAM is the authoritative correction. Between these keyframes, the separate
+                // high-rate worker moves each accepted mask with dense optical flow.
+                if let preview = motionCorrectionPreview ?? result.preview {
                     self.consecutiveMaskMisses = 0
                     self.captureEngine.showObjectMaskPreview(preview)
                 } else {
@@ -378,6 +410,36 @@ struct ARCameraView: UIViewRepresentable {
                         self.captureEngine.clearObjectMaskPreview()
                     }
                 }
+            }
+        }
+
+        private func updateObjectMaskMotion(
+            pixelBuffer: CVPixelBuffer,
+            orientation: CGImagePropertyOrientation,
+            timestamp: TimeInterval
+        ) {
+            guard captureEngine.lockedObjectMaskCount > 0,
+                  objectMaskMotionTask == nil else {
+                return
+            }
+
+            let processor = objectMaskMotionProcessor
+            objectMaskMotionTask = Task { [weak self] in
+                let preview = await processor.propagate(
+                    pixelBuffer: pixelBuffer,
+                    orientation: orientation,
+                    timestamp: timestamp
+                )
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                self.objectMaskMotionTask = nil
+                guard self.measurementEngine.mode == .scan,
+                      self.captureEngine.lockedObjectMaskCount > 0,
+                      let preview else {
+                    return
+                }
+                self.captureEngine.showObjectMaskPreview(preview)
             }
         }
 
@@ -756,6 +818,10 @@ struct ARCameraView: UIViewRepresentable {
 
         private func resetObjectMaskTracking() {
             objectMaskTrackingGeneration &+= 1
+            objectMaskMotionTask?.cancel()
+            objectMaskMotionTask = nil
+            let motionProcessor = objectMaskMotionProcessor
+            Task { await motionProcessor.reset() }
             pendingObjectMaskToggleRequest = nil
             consecutiveMaskMisses = 0
             maskedAccumulators.removeAll()
