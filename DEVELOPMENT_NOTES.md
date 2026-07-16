@@ -1,4 +1,4 @@
-`# DEVELOPMENT_NOTES.md
+# DEVELOPMENT_NOTES.md
 
 # PayloadMeasure Development Notes
 
@@ -1605,8 +1605,8 @@ mask-propagation papers in the final review.
 The measurement goal is to acquire 3–15 object boxes quickly, not to maintain many persistent video
 object identities. The production workflow therefore keeps one active object, saves its masked LiDAR
 box, clears only that active target, and immediately accepts the next object. The pre-change native
-Vision presentation version remains available on branch
-`backup/presentation-native-vision-2026-07-15` at commit `642c46d`.
+Vision presentation version remains available in `main` history at commit `642c46d`. The former
+backup branch was removed after its commit became part of `main` history.
 
 ### What changed
 
@@ -1732,3 +1732,51 @@ was smaller, that buffer does not guarantee the source-image geometry required f
 scene depth, so mask-approved LiDAR samples could fall to zero and no cyan cloud or box would appear.
 Sequential source-aligned mask processing above fixes that regression without restoring the original
 multi-mask memory peak.
+
+---
+
+## 2026-07-17 - iOS 18 Deployment and Liquid Glass Removal
+
+### Goal
+
+Allow the same measurement and segmentation implementation to build with an iOS 18 deployment
+target, including on an older development Mac that can run Xcode 16.3 or 16.4.
+
+### What changed
+
+- Lowered the Debug and Release deployment targets from iOS 26.5 to iOS 18.0.
+- Replaced every iOS 26-only SwiftUI `glassEffect` with `ultraThinMaterial` backgrounds. The HUD
+  retains readable translucent controls but no longer requires Liquid Glass.
+- Removed the Xcode 26-only approachable-concurrency, default-MainActor and member-import project
+  settings after confirming the source builds with their older defaults.
+- Kept all functional Scan visuals unchanged: live and locked masks, LiDAR points, reconstructed
+  mesh, lock markers and fitted boxes are still calculated and remain independently switchable.
+- Consolidated the current two feature commits into the local `main` branch and removed the fully
+  merged local feature and presentation-backup branches. No commit or remote operation was made.
+
+### Backup and restoration
+
+The exact pre-change Liquid Glass source is commit `00ed3f0` in `main` history and is also marked by
+the local tag `backup/ios26-liquid-glass-2026-07-17`. To inspect or restore only that view later:
+
+```sh
+git show 00ed3f0:MeasurementOverlayView.swift
+git restore --source 00ed3f0 -- MeasurementOverlayView.swift
+```
+
+The restore command modifies the working tree only; review it before committing.
+
+### Compatibility boundary
+
+- The core path uses iOS 18 Vision APIs (`GenerateForegroundInstanceMaskRequest`,
+  `TrackObjectRequest` and `ImageRequestHandler`) and therefore remains iOS 18 or newer.
+- ARKit world tracking, LiDAR scene depth and scene reconstruction do not raise that minimum.
+- iOS 26.5 devices can run the iOS 18-targeted binary and use their installed ARKit, Vision and
+  Core ML runtimes. Lowering the deployment target does not reduce behavior on newer devices.
+- Two generic-device builds succeed with the installed Xcode 26.6 toolchain: the normal project
+  configuration and a compatibility build with approachable concurrency, default MainActor
+  isolation and member-import visibility disabled to approximate the older compiler defaults.
+- Opening and building with Xcode 16.3/16.4 must still be verified on the older Mac because this
+  machine cannot reproduce that compiler and project-editor version exactly.
+- App Store uploads after April 28, 2026 still require a final archive produced with Xcode 26 and
+  the iOS 26 SDK, even though the app's minimum deployment target is iOS 18.

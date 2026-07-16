@@ -55,7 +55,7 @@ struct MeasurementOverlayView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.primary)
-                    .glassEffect(.regular.interactive(), in: Circle())
+                    .background(.ultraThinMaterial, in: Circle())
                     .accessibilityLabel(showsPanel ? "Hide controls" : "Show controls")
                 }
                 .padding(.top, 16)
@@ -164,7 +164,7 @@ struct MeasurementOverlayView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .frame(maxWidth: 310, alignment: .leading)
-        .glassEffect(.regular, in: Capsule())
+        .background(.ultraThinMaterial, in: Capsule())
         .accessibilityElement(children: .combine)
     }
 
@@ -292,7 +292,10 @@ struct MeasurementOverlayView: View {
         }
         .padding(14)
         .frame(maxWidth: 275, alignment: .leading)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+        )
     }
 
     private var measurementReadout: some View {
@@ -327,14 +330,17 @@ struct MeasurementOverlayView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.primary)
-                .glassEffect(.regular.interactive(), in: Circle())
+                .background(.ultraThinMaterial, in: Circle())
                 .accessibilityLabel("Reset measurement")
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: 220, alignment: .leading)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
     }
 
     private var captureReadout: some View {
@@ -393,14 +399,17 @@ struct MeasurementOverlayView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.primary)
-                .glassEffect(.regular.interactive(), in: Circle())
+                .background(.ultraThinMaterial, in: Circle())
                 .accessibilityLabel("Clear all locked objects and boxes")
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: 270, alignment: .leading)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+        )
     }
 
     private var scanStatusHeadline: String {
@@ -551,7 +560,7 @@ struct MeasurementOverlayView: View {
         }
         .padding(.horizontal, 4)
         .frame(height: 48)
-        .glassEffect(.regular, in: Capsule())
+        .background(.ultraThinMaterial, in: Capsule())
         .accessibilityElement(children: .contain)
     }
 
@@ -699,7 +708,7 @@ struct MeasurementOverlayView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .background(.ultraThinMaterial, in: Capsule())
         .accessibilityLabel("Measurement mode, \(measurementEngine.mode.title)")
     }
 
@@ -740,7 +749,7 @@ struct MeasurementOverlayView: View {
                 .frame(height: 52)
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .background(.ultraThinMaterial, in: Capsule())
         .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 6)
         .disabled(!sessionManager.isTrackingReady)
         .accessibilityLabel("Add measurement point")

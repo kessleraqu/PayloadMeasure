@@ -32,13 +32,17 @@ The app should therefore act as an intelligent measurement and decision-support 
 
 # Hardware
 
-## Development machine
-- MacBook Air M2
+## Development machines
+
+- Primary development machine: MacBook Air M2 with Xcode 26.
+- A second, older-macOS laptop is intended for local development with Xcode 16.3/16.4.
 
 ## Target and test devices
 
 - Original target: iPhone 13 Pro with LiDAR Scanner.
-- Currently available development device: iPhone 15 Plus without LiDAR.
+- Physical testing includes a LiDAR-capable iPhone; the iPhone 13 Pro remains the compatibility
+  target for LiDAR scanning.
+- An iPhone 15 Plus without LiDAR remains useful for validating the RGB-only fallback.
 - The app must detect LiDAR capabilities at runtime and keep unsupported workflows explicit.
 - RGB camera, world tracking, plane detection, and non-depth UI work can be tested on the iPhone 15 Plus.
 - Scene depth, reconstructed mesh, and metric automatic object capture still require a LiDAR-capable device.
@@ -57,6 +61,18 @@ The simulator should **never** be considered a substitute for testing AR functio
 - CoreML (optional later)
 
 Avoid Unity unless explicitly requested.
+
+## OS and toolchain compatibility
+
+- The application deployment target is iOS 18.0.
+- The core Vision foreground segmentation and object-tracking APIs establish that minimum.
+- LiDAR scene depth and scene reconstruction are runtime capability checked and do not require a
+  deployment target newer than iOS 18.
+- The HUD uses standard SwiftUI material backgrounds; iOS 26-only Liquid Glass is not required.
+- The exact pre-removal Liquid Glass implementation remains in `main` history at commit `00ed3f0`
+  and is named locally by tag `backup/ios26-liquid-glass-2026-07-17`.
+- Use Xcode 16.3/16.4 for compatible local development where necessary. Produce App Store archives
+  with Xcode 26 or newer to satisfy Apple's current upload requirement.
 
 ---
 
@@ -120,6 +136,9 @@ available, while the sheet explains the absence of metric depth, automatic boxes
 
 ✅ Environment readiness is reported at runtime: LiDAR devices wait for depth/mesh data, while
 non-LiDAR devices guide the operator until camera-based plane mapping is stable.
+
+✅ The functional app targets iOS 18.0. iOS 26-only Liquid Glass styling has been removed without
+changing the segmentation, tracking, LiDAR capture or visualization controls.
 
 ---
 
