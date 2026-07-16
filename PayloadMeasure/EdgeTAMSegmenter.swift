@@ -282,7 +282,10 @@ nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {
         }
 
         let pixelCount = Self.maskSize * Self.maskSize
-        let maximumArea = Int(Double(pixelCount) * 0.82)
+        // A first-click mask covering most of the image is almost always the inverse/background
+        // candidate. Subsequent masks are additionally constrained to modest per-keyframe growth.
+        let maximumAreaFraction = expectedArea == nil ? 0.60 : 0.82
+        let maximumArea = Int(Double(pixelCount) * maximumAreaFraction)
         let plausible = candidates.filter {
             guard $0.containsPrompt,
                   $0.score.isFinite,
@@ -295,12 +298,21 @@ nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {
             }
             let area = CGFloat($0.area) / CGFloat(pixelCount)
             let ratio = area / expectedArea
-            return (0.30 ... 3.25).contains(ratio)
+            return (0.45 ... 2.20).contains(ratio)
         }
-        guard let selected = plausible.max(by: { left, right in
-            adjustedScore(left, pixelCount: pixelCount, expectedArea: expectedArea)
-                < adjustedScore(right, pixelCount: pixelCount, expectedArea: expectedArea)
-        }) else {
+        let selected: (index: Int, score: Float, containsPrompt: Bool, area: Int)?
+        if expectedArea == nil, let primaryMask = plausible.first(where: { $0.index == 0 }) {
+            // The exported decoder is traced in multimask mode. Its official Core ML example uses
+            // token zero for the primary object; picking the highest IoU token instead frequently
+            // selected a tiny sub-part (window/label) rather than the complete tapped object.
+            selected = primaryMask
+        } else {
+            selected = plausible.max(by: { left, right in
+                adjustedScore(left, pixelCount: pixelCount, expectedArea: expectedArea)
+                    < adjustedScore(right, pixelCount: pixelCount, expectedArea: expectedArea)
+            })
+        }
+        guard let selected else {
             throw EdgeTAMSegmenterError.noPlausibleMask
         }
 

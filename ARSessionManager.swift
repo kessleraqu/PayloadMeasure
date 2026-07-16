@@ -90,6 +90,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var hasDetectedHorizontalPlane = false
     private(set) var hasDetectedVerticalPlane = false
     private(set) var hasReceivedSceneDepth = false
+    private(set) var sceneDepthResolutionText = "Waiting for depth"
     private(set) var hasReconstructedMesh = false
     private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
     private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
@@ -164,6 +165,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
         hasReceivedSceneDepth = false
+        sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
         hasReconstructedMesh = false
         worldMappingStatus = .notAvailable
         environmentReadiness = .preparing(
@@ -222,13 +224,23 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let mappingStatus = frame.worldMappingStatus
-        let receivedDepth = frame.smoothedSceneDepth != nil || frame.sceneDepth != nil
+        let depthData = frame.sceneDepth ?? frame.smoothedSceneDepth
+        let receivedDepth = depthData != nil
+        let depthResolutionText = depthData.map {
+            "\(CVPixelBufferGetWidth($0.depthMap)) × \(CVPixelBufferGetHeight($0.depthMap)) px"
+        }
         Task { @MainActor in
-            guard worldMappingStatus != mappingStatus || (receivedDepth && !hasReceivedSceneDepth) else {
+            guard worldMappingStatus != mappingStatus
+                    || (receivedDepth && !hasReceivedSceneDepth)
+                    || (depthResolutionText != nil
+                        && depthResolutionText != sceneDepthResolutionText) else {
                 return
             }
             worldMappingStatus = mappingStatus
             hasReceivedSceneDepth = hasReceivedSceneDepth || receivedDepth
+            if let depthResolutionText {
+                sceneDepthResolutionText = depthResolutionText
+            }
             refreshEnvironmentReadiness()
         }
     }

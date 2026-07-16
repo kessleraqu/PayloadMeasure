@@ -82,14 +82,41 @@ Current milestone:
 
 ✅ Live RGB foreground-instance mask preview runs in Scan mode on both LiDAR and non-LiDAR devices.
 
-✅ RGB masks use persistent AR world anchors, appearance/geometry reacquisition, tap-again removal,
-and per-object colors on both LiDAR and non-LiDAR devices.
+✅ RGB masks use independent AR world anchors plus global appearance/geometry reassignment on
+both LiDAR and non-LiDAR devices. Up to 15 targets retain distinct colors and identities.
 
-✅ Locked masks are propagated between segmentation keyframes with dense RGB optical flow; global
-one-to-one instance assignment prevents order-dependent multi-object overlap.
+✅ The active production path uses Apple's native foreground-instance mask from the exact camera
+frame. Between results, its display overlay follows the current projected AR anchor and camera
+distance; the experimental EdgeTAM and dense optical-flow paths remain bypassed.
 
 ✅ On LiDAR hardware, automatic box geometry is fitted only from depth pixels admitted by the
 time-synchronized object mask. Unmasked depth is restricted to support-plane height estimation.
+
+✅ The center aimer previews the next object in its future lock color. Tapping adds that object;
+locked masks, anchors and same-colored 3D boxes remain while additional objects are selected.
+
+✅ The live aimer preview can be hidden without stopping segmentation. Locked mask layers are cached
+per object and composited together whenever their retained AR anchors project into the camera view.
+
+✅ A display-only Visuals menu independently controls the live/locked masks, lock markers, LiDAR
+object points, reconstructed mesh and 3D boxes. Diagnostic points and mesh default to hidden.
+
+✅ Mask-gated LiDAR uses direct registered-image coordinates, a conservative two-depth-pixel mask
+interior and depth-edge rejection. One-centimetre object voxels, temporal voxel expiry, dominant
+support-plane estimation and bounded box refinements reduce table leakage and box growth.
+
+✅ Cyan points are final-box inliers only. Direct bottom controls toggle masks, points and boxes,
+and the diagnostics panel reports the device's actual ARKit depth-map resolution at runtime.
+
+✅ Multi-object memory is bounded: source-aligned Vision masks are consumed sequentially, while
+one-table voxel accumulators, per-object caps and a bounded debug-entity pool replace simultaneous
+full-resolution masks and unbounded scene data.
+
+✅ LiDAR frames are back-projected once and partitioned around every visible locked anchor. Each
+object owns independent synchronized mask points, support/table samples and an oriented 3D box.
+
+✅ Non-LiDAR Scan mode is explicitly marked with a tappable limitations badge. RGB masking remains
+available, while the sheet explains the absence of metric depth, automatic boxes and 3D table removal.
 
 ✅ Environment readiness is reported at runtime: LiDAR devices wait for depth/mesh data, while
 non-LiDAR devices guide the operator until camera-based plane mapping is stable.

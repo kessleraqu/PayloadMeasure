@@ -1595,3 +1595,140 @@ mask-propagation papers in the final review.
   only a secondary reacquisition hint.
 - Non-LiDAR banners, the unavailable Capture button, and explicit depth/mesh-unavailable rows are
   hidden for the presentation. Restore capability messaging when measurement development resumes.
+
+---
+
+## 2026-07-16 - Fast Sequential Mask-Gated Object Scanning
+
+### Initial decision (superseded by the multi-object batch scanner below)
+
+The measurement goal is to acquire 3–15 object boxes quickly, not to maintain many persistent video
+object identities. The production workflow therefore keeps one active object, saves its masked LiDAR
+box, clears only that active target, and immediately accepts the next object. The pre-change native
+Vision presentation version remains available on branch
+`backup/presentation-native-vision-2026-07-15` at commit `642c46d`.
+
+### What changed
+
+- One press on Capture selects the foreground instance under the center point and waits for stable,
+  mask-approved LiDAR samples; a second press can cancel only that acquisition.
+- Saved objects and their RealityKit boxes remain while the next object is scanned. Boxes cycle
+  through eight high-contrast colors and the engine retains every `CapturedObject` result.
+- Apple's native foreground-instance request is the active A15/A16-compatible segmentation path.
+  The incomplete image-only EdgeTAM export and speculative optical-flow overlay are bypassed.
+- Segmentation is single-flight and always accepts the newest camera frame; stale frames never queue.
+  The visual overlay raster is smaller, while metric gating still samples the full-resolution mask.
+- Masked depth accumulation and live 3D box fitting now run at the full 15 Hz acquisition cadence,
+  five times the previous three-Hz cadence.
+- Metric samples use the RGB mask and scene depth captured at the same AR frame. Approximately one
+  LiDAR pixel is eroded from the mask boundary to reject RGB/depth calibration leakage from tables.
+- There is no unmasked box-fitting fallback. A missing or lost mask waits/cancels instead of silently
+  measuring the table or another object.
+
+### Intended physical-device test
+
+On an iPhone 13 Pro, center an isolated object on a flat surface and press Capture once. Move the
+phone slightly to reveal its sides until the colored box is saved, then repeat for several objects.
+Use Cancel if a difficult object does not converge; prior boxes must remain. An iPhone 15 without
+LiDAR can exercise RGB selection, but cannot produce metric automatic boxes.
+
+### 2026-07-16 follow-up: low-latency anchored display
+
+- Scan mode no longer shows the manual Add Point control. Manual point placement is available only
+  in the manual measurement modes.
+- Every exact segmentation preview now records the selected object's world-anchor projection and
+  camera distance from its source frame.
+- At display cadence, ARKit reprojects that anchor. SwiftUI translates and distance-scales the last
+  exact mask immediately, so it follows a static object as the phone moves instead of remaining at
+  the old screen position.
+- This prediction is display-only. Mask-gated LiDAR points still come exclusively from RGB and
+  depth captured in the same AR frame, preventing visual reprojection error from enlarging a box.
+
+---
+
+## 2026-07-16 - Multi-Object LiDAR Batch Scanner
+
+- Restored independent multi-object locks while retaining the corrected viewport/depth transforms
+  and global one-to-one Vision instance assignment.
+- Scan mode previews the unclaimed foreground instance under the center aimer before selection.
+  Its color is the next free lock color; tapping preserves that color and advances the preview palette.
+- Expanded the mask palette to 15 objects. Each locked instance retains its own AR anchor,
+  synchronized masked-depth accumulator, local support accumulator, capture result and box entities.
+- A LiDAR depth frame is back-projected once, then its points are partitioned around all visible
+  object anchors. This avoids repeating the expensive depth-map conversion for every lock.
+- Table/support points estimate only the local support height. Box dimensions and clustering still
+  use mask-approved points exclusively, with the conservative boundary erosion retained.
+- Boxes are inserted/refined by object ID and use the mask's color. Removing a mask removes only its
+  accumulators, stored result and RealityKit box; other objects continue scanning.
+- Locked objects are not deleted when off-screen. Their anchors and appearance state remain for
+  reacquisition, and their world-space boxes remain attached to the stable content anchor.
+- Non-LiDAR devices show a tappable `No LiDAR` badge. Its information sheet documents what remains
+  available in RGB-only mode and why metric boxes/table separation require scene depth.
+- Manual Add Point is still hidden in Scan mode. `Lock Center` is an optional one-handed equivalent
+  to tapping the highlighted object; direct taps can add/remove locks anywhere in the view.
+- A Live Mask eye control hides only the unselected mask under the aimer. Foreground segmentation
+  continues at the same rate while hidden, so tapping can still lock the object immediately.
+- Fresh segmentation corrections are merged into a retained per-lock display cache instead of
+  replacing the complete layer set. All locked objects that project into the current frame can now
+  show their masks together; removing one lock clears only its cached mask.
+- Scan display layers are independently switchable from a single Visuals menu: live preview,
+  locked masks, anchor markers, admitted LiDAR object points, scene mesh and fitted 3D boxes.
+  `Results only` and `Hide all overlays` presets provide clean presentation views. These controls
+  never pause segmentation, depth accumulation, object association or measurement.
+- Diagnostic LiDAR points and the reconstructed mesh now default to hidden. When enabled, admitted
+  points use small 7 mm spherical dots instead of the previous 2 cm cyan cubes, reducing occlusion.
+
+### 2026-07-16 follow-up: mask/depth registration and stable boxes
+
+- Depth pixels now map directly from ARKit's native registered camera coordinates into the upright
+  Vision mask. This removes an unnecessary raw-image → cropped-viewport → raw-image round trip.
+- Metric admission erodes approximately two oriented LiDAR pixels from every mask edge and rejects
+  samples across a local depth discontinuity. These checks target foreground/background mixing at
+  the silhouette without changing the visible 2D mask.
+- Object accumulation and connected-component fitting now use 1 cm voxels instead of 2 cm voxels.
+  Up to 900 small cyan points can be shown, producing a denser and more legible object surface.
+- Accumulated voxels record when they were last observed. Unconfirmed and stale geometry expires
+  instead of remaining forever and causing slow outward box creep.
+- Support height now comes from the dominant local horizontal height layer rather than a low
+  percentile. A lower shelf or floor can therefore no longer pull the base down and turn the real
+  tabletop into part of the object cluster.
+- A fitted object rejects any single update that grows a sorted dimension by more than 18% or
+  2.5 cm, or moves the box center implausibly far. Shrinking corrections remain permitted.
+- The center `Lock` button was removed. In Scan mode, tapping a highlighted object is the only
+  visible add/remove interaction, leaving a simpler camera UI.
+
+### 2026-07-16 follow-up: point/box consistency and quick display controls
+
+- The robust box intentionally trims extreme samples. Cyan visualization now filters those same
+  samples through the final oriented box, so a displayed cyan point cannot contradict the box.
+- Confirmed masked voxels remain in the rolling cloud for 180 mask updates, preserving side and
+  vertical surfaces during a normal walk-around while still allowing old geometry to expire.
+- The bottom Scan UI exposes direct `Mask`, `Points`, and `Box` switches. A compact `More` menu keeps
+  separate live/locked mask controls, lock markers, scene mesh and presentation presets.
+- The information panel reports the depth-map pixel dimensions supplied by the current device at
+  runtime and distinguishes that native map from the filtered 1 cm object voxel model.
+
+### 2026-07-16 follow-up: bounded scan memory
+
+- Native Vision rendering generates a source-image-aligned mask for one selection at a time,
+  immediately derives its small display layer and masked depth points, then drains an autorelease
+  pool before processing the next selection. This retains exact RGB/depth registration without
+  holding full-camera-resolution Float32 masks for every visible lock simultaneously.
+- `PointAccumulator` stores sum, count and age in one compact hash-table value with 32-bit voxel
+  keys. The former three dictionaries multiplied both key and allocator overhead.
+- Masked clouds are capped at 10,000 voxels per object and support clouds at 4,000. These limits
+  still exceed normal object-surface requirements while keeping 15-object memory deterministic.
+- The reusable RealityKit cyan-marker pool is capped at 360 entities instead of 900. The underlying
+  1 cm measurement cloud is unchanged; only the debug display is subsampled.
+- Local support-plane sampling uses every third depth pixel because it only estimates a dominant
+  height. Mask-gated object sampling continues to inspect every native depth pixel.
+- On an iOS memory warning, the app releases only rebuildable masks, depth accumulators and debug
+  entities. Locks and already fitted boxes remain, and fresh synchronized frames rebuild the caches.
+
+#### Registration correction
+
+An initial memory optimization used Vision's compact observation-space mask directly. Although it
+was smaller, that buffer does not guarantee the source-image geometry required for registered ARKit
+scene depth, so mask-approved LiDAR samples could fall to zero and no cyan cloud or box would appear.
+Sequential source-aligned mask processing above fixes that regression without restoring the original
+multi-mask memory peak.

@@ -12,11 +12,40 @@ import ImageIO
 import simd
 import Vision
 
-/// A display-ready RGB segmentation preview. The image is already oriented upright for the
-/// interface orientation used when Vision processed the camera frame.
-nonisolated struct ObjectMaskPreview: @unchecked Sendable {
+/// One independently positioned colored mask. Locked layers carry a world-anchor reference;
+/// the unlocked center preview intentionally has no object ID and is replaced on every inference.
+nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let image: CGImage
+    let trackedObjectID: UUID?
+    let referenceAnchorPoint: CGPoint?
+    let referenceCameraDistance: Float?
+}
+
+/// Display-ready RGB segmentation layers, already upright for the current interface orientation.
+nonisolated struct ObjectMaskPreview: @unchecked Sendable {
+    let layers: [ObjectMaskPreviewLayer]
     let timestamp: TimeInterval
+
+    init(
+        image: CGImage,
+        timestamp: TimeInterval,
+        trackedObjectID: UUID? = nil,
+        referenceAnchorPoint: CGPoint? = nil,
+        referenceCameraDistance: Float? = nil
+    ) {
+        layers = [ObjectMaskPreviewLayer(
+            image: image,
+            trackedObjectID: trackedObjectID,
+            referenceAnchorPoint: referenceAnchorPoint,
+            referenceCameraDistance: referenceCameraDistance
+        )]
+        self.timestamp = timestamp
+    }
+
+    init(layers: [ObjectMaskPreviewLayer], timestamp: TimeInterval) {
+        self.layers = layers
+        self.timestamp = timestamp
+    }
 }
 
 /// A tap in normalized viewport coordinates, with an upper-left origin like SwiftUI.
@@ -58,6 +87,7 @@ nonisolated struct ObjectMaskDisplayColor: Sendable, Hashable {
 nonisolated struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint
+    let cameraDistance: Float
     let color: ObjectMaskDisplayColor
     let isMaskVisible: Bool
 }
@@ -79,6 +109,9 @@ nonisolated struct ObjectMaskFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let viewportSize: CGSize
+    /// ARKit's normalized raw-camera (top-left) to normalized viewport (top-left) transform.
+    /// Every tap, mask, depth sample, and motion frame must use this same transform.
+    let imageToViewportTransform: CGAffineTransform
     let toggleRequest: ObjectMaskToggleRequest?
     let anchorHints: [ObjectMaskAnchorHint]
     let timestamp: TimeInterval
@@ -115,6 +148,7 @@ nonisolated struct ObjectMaskMotionLayer: @unchecked Sendable {
 nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
+    let imageToViewportTransform: CGAffineTransform
     let timestamp: TimeInterval
     let width: Int
     let height: Int
@@ -128,6 +162,7 @@ nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {
 nonisolated struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
+    let imageToViewportTransform: CGAffineTransform
     let timestamp: TimeInterval
 }
 
@@ -217,7 +252,6 @@ actor ObjectMaskProcessor {
         case unchanged
     }
 
-    private static let previewColor = ObjectMaskDisplayColor(red: 0.08, green: 0.82, blue: 1.0)
     private static let lockedColors = [
         ObjectMaskDisplayColor(red: 1.00, green: 0.78, blue: 0.12),
         ObjectMaskDisplayColor(red: 1.00, green: 0.22, blue: 0.62),
@@ -226,7 +260,14 @@ actor ObjectMaskProcessor {
         ObjectMaskDisplayColor(red: 0.64, green: 0.38, blue: 1.00),
         ObjectMaskDisplayColor(red: 0.20, green: 0.55, blue: 1.00),
         ObjectMaskDisplayColor(red: 1.00, green: 0.30, blue: 0.28),
-        ObjectMaskDisplayColor(red: 0.16, green: 0.92, blue: 0.78)
+        ObjectMaskDisplayColor(red: 0.16, green: 0.92, blue: 0.78),
+        ObjectMaskDisplayColor(red: 0.72, green: 1.00, blue: 0.16),
+        ObjectMaskDisplayColor(red: 0.78, green: 0.55, blue: 1.00),
+        ObjectMaskDisplayColor(red: 0.10, green: 0.82, blue: 1.00),
+        ObjectMaskDisplayColor(red: 1.00, green: 0.55, blue: 0.45),
+        ObjectMaskDisplayColor(red: 0.95, green: 0.62, blue: 0.05),
+        ObjectMaskDisplayColor(red: 0.45, green: 1.00, blue: 0.72),
+        ObjectMaskDisplayColor(red: 0.95, green: 0.20, blue: 0.35)
     ]
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
@@ -246,25 +287,24 @@ actor ObjectMaskProcessor {
             trackingGeneration = frame.trackingGeneration
         }
 
+        // Apple's native request is the lowest-latency common path on both A15 and A16, returns all
+        // noticeable foreground instances in one pass, and pairs every correction with the exact
+        // LiDAR frame below. Do not fall through to the image-only EdgeTAM export: its extra encoder
+        // pass made selection slower and still did not include EdgeTAM's temporal memory bank.
+        edgeTAMTrackedObjects.removeAll(keepingCapacity: true)
+        return await makeNativeVisionPreview(from: frame)
+    }
+
+    private func loadedEdgeTAMSegmenter() -> EdgeTAMSegmenter? {
         if !didAttemptEdgeTAMLoad {
             didAttemptEdgeTAMLoad = true
             edgeTAMSegmenter = EdgeTAMSegmenter.loadIfAvailable()
         }
-
-        if let edgeTAMSegmenter,
-           let edgeTAMResult = await makeEdgeTAMPreview(
-               from: frame,
-               segmenter: edgeTAMSegmenter
-           ) {
-            return edgeTAMResult
-        }
-
-        return await makeNativeVisionPreview(from: frame)
+        return edgeTAMSegmenter
     }
 
-    /// The presentation implementation is intentionally retained unchanged behind EdgeTAM. If
-    /// the model cannot load or execute on a device, object selection still works with Apple's
-    /// foreground-instance segmentation rather than failing completely.
+    /// Native foreground instances provide the production multi-object keyframes. The masks are
+    /// reprojected with ARKit and then propagated at camera cadence by the motion worker.
     private func makeNativeVisionPreview(
         from frame: ObjectMaskFrame
     ) async -> ObjectMaskProcessingResult {
@@ -293,8 +333,7 @@ actor ObjectMaskProcessor {
             if let toggleRequest = frame.toggleRequest,
                let imagePoint = imagePoint(
                    for: toggleRequest.normalizedViewportPoint,
-                   imageSize: cameraImage.extent.size,
-                   viewportSize: frame.viewportSize
+                   frame: frame
                ) {
                 toggleOutcome = try toggleLock(
                     at: imagePoint,
@@ -307,20 +346,59 @@ actor ObjectMaskProcessor {
                 toggleOutcome = .unchanged
             }
 
-            let selections = renderSelections(in: observation)
-            let renderedMasks = try makeRenderedMasks(
-                selections: selections,
-                observation: observation,
-                handler: handler
-            )
-            let preview = try makeDisplayImage(from: renderedMasks).map {
-                ObjectMaskPreview(image: $0, timestamp: frame.timestamp)
+            let selections = try renderSelections(in: observation, frame: frame)
+            var previewLayers: [ObjectMaskPreviewLayer] = []
+            var maskedPointClouds: [ObjectMaskDepthPointCloud] = []
+            previewLayers.reserveCapacity(selections.count)
+            maskedPointClouds.reserveCapacity(selections.count)
+
+            // Vision's compact observation mask does not preserve the source-image registration
+            // required by ARKit scene depth. Generate the correctly aligned source-size mask one
+            // selection at a time, consume it immediately, then drain its autorelease pool. This
+            // keeps metric alignment without retaining N full-resolution Float masks at once.
+            for selection in selections {
+                let processed = try autoreleasepool {
+                    let pixelBuffer = try observation.generateScaledMask(
+                        for: selection.instances,
+                        scaledToImageFrom: handler
+                    )
+                    let renderedMask = RenderedMask(
+                        lockID: selection.lockID,
+                        color: selection.color,
+                        fillAlpha: selection.fillAlpha,
+                        pixelBuffer: pixelBuffer
+                    )
+                    let layer = makeDisplayImage(from: [renderedMask], frame: frame).map { image in
+                        let trackingReference = renderedMask.lockID.flatMap {
+                            displayTrackingReference(
+                                for: $0,
+                                toggleOutcome: toggleOutcome,
+                                frame: frame
+                            )
+                        }
+                        return ObjectMaskPreviewLayer(
+                            image: image,
+                            trackedObjectID: renderedMask.lockID,
+                            referenceAnchorPoint: trackingReference?.point,
+                            referenceCameraDistance: trackingReference?.cameraDistance
+                        )
+                    }
+                    let cloud = makeMaskedPointClouds(
+                        from: [renderedMask],
+                        frame: frame
+                    ).first
+                    return (layer, cloud)
+                }
+                if let layer = processed.0 {
+                    previewLayers.append(layer)
+                }
+                if let cloud = processed.1 {
+                    maskedPointClouds.append(cloud)
+                }
             }
-            let maskedPointClouds = makeMaskedPointClouds(
-                from: renderedMasks,
-                cameraImageSize: cameraImage.extent.size,
-                frame: frame
-            )
+            let preview = previewLayers.isEmpty
+                ? nil
+                : ObjectMaskPreview(layers: previewLayers, timestamp: frame.timestamp)
 
             switch toggleOutcome {
             case .changed(let change):
@@ -392,8 +470,7 @@ actor ObjectMaskProcessor {
         if let toggleRequest = frame.toggleRequest,
            let point = imagePoint(
                for: toggleRequest.normalizedViewportPoint,
-               imageSize: cameraImage.extent.size,
-               viewportSize: frame.viewportSize
+               frame: frame
            ) {
             toggleOutcome = (try? toggleEdgeTAMLock(
                 at: point,
@@ -417,18 +494,15 @@ actor ObjectMaskProcessor {
                 )
             }
         }
-        let preview = try? makeDisplayImage(
-            from: renderedMasks,
-            outputSize: cameraImage.extent.size
-        ).map { ObjectMaskPreview(image: $0, timestamp: frame.timestamp) }
+        let preview = makeDisplayImage(from: renderedMasks, frame: frame).map {
+            ObjectMaskPreview(image: $0, timestamp: frame.timestamp)
+        }
         let maskedPointClouds = makeMaskedPointClouds(
             from: renderedMasks,
-            cameraImageSize: cameraImage.extent.size,
             frame: frame
         )
         let motionKeyframe = makeMotionKeyframe(
             from: renderedMasks,
-            cameraImageSize: cameraImage.extent.size,
             frame: frame,
             activeLockIDs: Set(edgeTAMTrackedObjects.map(\.id))
         )
@@ -481,11 +555,7 @@ actor ObjectMaskProcessor {
             )
             let hint = hintsByID[edgeTAMTrackedObjects[index].id]
             let anchorPoint = hint?.normalizedViewportPoint.flatMap {
-                imagePoint(
-                    for: $0,
-                    imageSize: cameraImage.extent.size,
-                    viewportSize: frame.viewportSize
-                )
+                imagePoint(for: $0, frame: frame)
             }
 
             let expectedBox: NormalizedRect
@@ -591,11 +661,7 @@ actor ObjectMaskProcessor {
                 return true
             }
             guard let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint,
-                  let projectedPoint = imagePoint(
-                      for: viewportPoint,
-                      imageSize: cameraImage.extent.size,
-                      viewportSize: frame.viewportSize
-                  ) else {
+                  let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
                 return false
             }
             return hypot(projectedPoint.x - point.x, projectedPoint.y - point.y) <= 0.05
@@ -689,6 +755,8 @@ actor ObjectMaskProcessor {
             return ObjectMaskMarker(
                 id: trackedObject.id,
                 normalizedViewportPoint: viewportPoint,
+                cameraDistance: hintsByID[trackedObject.id]?.cameraDistance
+                    ?? trackedObject.referenceCameraDistance,
                 color: Self.lockedColors[trackedObject.colorIndex],
                 isMaskVisible: trackedObject.currentMask != nil
             )
@@ -933,7 +1001,26 @@ actor ObjectMaskProcessor {
         motionKeyframe: ObjectMaskMotionKeyframe? = nil,
         maskedPointClouds: [ObjectMaskDepthPointCloud] = []
     ) -> ObjectMaskProcessingResult {
-        let markers = makeMarkers(from: frame.anchorHints)
+        var markers = makeMarkers(from: frame.anchorHints)
+        if let lockChange,
+           case .added = lockChange.kind,
+           !markers.contains(where: { $0.id == lockChange.id }),
+           let request = frame.toggleRequest,
+           let cameraDistance = request.cameraDistance,
+           let trackedObject = trackedObjects.first(where: { $0.id == lockChange.id }) {
+            // The AR anchor is applied on the main actor after this result returns, so its first
+            // frame has no anchor hint yet. Emit the tap/depth projection immediately to avoid a
+            // one-frame disappearance just after the user locks the colored preview.
+            markers.append(
+                ObjectMaskMarker(
+                    id: lockChange.id,
+                    normalizedViewportPoint: request.normalizedViewportPoint,
+                    cameraDistance: cameraDistance,
+                    color: Self.lockedColors[trackedObject.colorIndex],
+                    isMaskVisible: trackedObject.currentInstance != nil
+                )
+            )
+        }
         return ObjectMaskProcessingResult(
             preview: preview,
             lockedObjectCount: trackedObjects.count,
@@ -956,10 +1043,35 @@ actor ObjectMaskProcessor {
             return ObjectMaskMarker(
                 id: trackedObject.id,
                 normalizedViewportPoint: point,
+                cameraDistance: hintsByID[trackedObject.id]?.cameraDistance
+                    ?? trackedObject.referenceCameraDistance,
                 color: Self.lockedColors[trackedObject.colorIndex],
                 isMaskVisible: trackedObject.currentInstance != nil
             )
         }
+    }
+
+    /// Associates the exact mask with the world anchor projection from the same source frame. If
+    /// this frame created the target, its tap/depth anchor is newer than `anchorHints`,
+    /// which still describes the previous target until the main actor applies the lock change.
+    private func displayTrackingReference(
+        for lockID: UUID,
+        toggleOutcome: ToggleOutcome,
+        frame: ObjectMaskFrame
+    ) -> (point: CGPoint, cameraDistance: Float)? {
+        if case .changed(let change) = toggleOutcome,
+           case .added = change.kind,
+           change.id == lockID,
+           let toggleRequest = frame.toggleRequest,
+           let cameraDistance = toggleRequest.cameraDistance {
+            return (toggleRequest.normalizedViewportPoint, cameraDistance)
+        }
+
+        guard let hint = frame.anchorHints.first(where: { $0.id == lockID }),
+              let point = hint.normalizedViewportPoint else {
+            return nil
+        }
+        return (point, hint.cameraDistance)
     }
 
     /// Uses Vision's lightweight stateful tracker to predict each locked object's new rectangle,
@@ -980,11 +1092,7 @@ actor ObjectMaskProcessor {
             let cameraDistance: Float
             if let hint = hintsByID[trackedObjects[index].id] {
                 guard let viewportPoint = hint.normalizedViewportPoint,
-                      let projectedPoint = imagePoint(
-                          for: viewportPoint,
-                          imageSize: cameraImage.extent.size,
-                          viewportSize: frame.viewportSize
-                      ) else {
+                      let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
                     trackedObjects[index].currentInstance = nil
                     trackedObjects[index].missedFrames += 1
                     continue
@@ -1076,8 +1184,8 @@ actor ObjectMaskProcessor {
                 )
             }
 
-            // Four alternatives per lock are enough for a robust global decision while keeping the
-            // tiny exhaustive assignment bounded even at the eight-lock UI limit.
+            // Four alternatives per lock keep the association matrix sparse while still allowing
+            // the polynomial assignment below to resolve competition among up to fifteen locks.
             candidateLists[index] = Array(
                 candidateLists[index].sorted { $0.score > $1.score }.prefix(4)
             )
@@ -1119,37 +1227,96 @@ actor ObjectMaskProcessor {
             return []
         }
 
-        var current = [CandidateMatch?](repeating: nil, count: candidates.count)
-        var best = current
-        var usedInstances = Set<Int>()
-        var bestScore: CGFloat = -.greatestFiniteMagnitude
-
-        func search(index: Int, score: CGFloat) {
-            guard index < candidates.count else {
-                if score > bestScore {
-                    bestScore = score
-                    best = current
+        let instances = Array(Set(candidates.flatMap { $0.map(\.instance) })).sorted()
+        guard !instances.isEmpty else {
+            return [CandidateMatch?](repeating: nil, count: candidates.count)
+        }
+        let instanceColumn = Dictionary(
+            uniqueKeysWithValues: instances.enumerated().map { ($0.element, $0.offset) }
+        )
+        let rowCount = candidates.count
+        // One dummy column per row allows any tracker to stay unmatched at zero score instead of
+        // accepting a weak/invalid instance. Columns therefore always outnumber rows.
+        let columnCount = instances.count + rowCount
+        let invalidWeight: CGFloat = -1_000_000
+        var weights = Array(
+            repeating: Array(repeating: invalidWeight, count: columnCount),
+            count: rowCount
+        )
+        var candidateByColumn = Array(
+            repeating: [Int: CandidateMatch](),
+            count: rowCount
+        )
+        for row in 0 ..< rowCount {
+            for candidate in candidates[row] {
+                guard let column = instanceColumn[candidate.instance] else { continue }
+                if candidate.score > weights[row][column] {
+                    weights[row][column] = candidate.score
+                    candidateByColumn[row][column] = candidate
                 }
-                return
             }
-
-            // Missing a correction is safer than borrowing a different object's mask. Optical
-            // flow and the world anchor keep the previous identity alive until segmentation
-            // produces an unambiguous candidate again.
-            current[index] = nil
-            search(index: index + 1, score: score)
-
-            for candidate in candidates[index] where !usedInstances.contains(candidate.instance) {
-                usedInstances.insert(candidate.instance)
-                current[index] = candidate
-                search(index: index + 1, score: score + candidate.score)
-                current[index] = nil
-                usedInstances.remove(candidate.instance)
+            for dummyColumn in instances.count ..< columnCount {
+                weights[row][dummyColumn] = 0
             }
         }
 
-        search(index: 0, score: 0)
-        return best
+        // Hungarian assignment, expressed as minimum cost (`-score`). This replaces the previous
+        // exponential exhaustive search, which was reasonable for a few locks but not for fifteen.
+        var rowPotential = [CGFloat](repeating: 0, count: rowCount + 1)
+        var columnPotential = [CGFloat](repeating: 0, count: columnCount + 1)
+        var matchedRow = [Int](repeating: 0, count: columnCount + 1)
+        var predecessor = [Int](repeating: 0, count: columnCount + 1)
+
+        for row in 1 ... rowCount {
+            matchedRow[0] = row
+            var currentColumn = 0
+            var minimum = [CGFloat](repeating: .greatestFiniteMagnitude, count: columnCount + 1)
+            var used = [Bool](repeating: false, count: columnCount + 1)
+
+            repeat {
+                used[currentColumn] = true
+                let currentRow = matchedRow[currentColumn]
+                var delta = CGFloat.greatestFiniteMagnitude
+                var nextColumn = 0
+                for column in 1 ... columnCount where !used[column] {
+                    let cost = -weights[currentRow - 1][column - 1]
+                    let reducedCost = cost
+                        - rowPotential[currentRow]
+                        - columnPotential[column]
+                    if reducedCost < minimum[column] {
+                        minimum[column] = reducedCost
+                        predecessor[column] = currentColumn
+                    }
+                    if minimum[column] < delta {
+                        delta = minimum[column]
+                        nextColumn = column
+                    }
+                }
+                for column in 0 ... columnCount {
+                    if used[column] {
+                        rowPotential[matchedRow[column]] += delta
+                        columnPotential[column] -= delta
+                    } else {
+                        minimum[column] -= delta
+                    }
+                }
+                currentColumn = nextColumn
+            } while matchedRow[currentColumn] != 0
+
+            repeat {
+                let previousColumn = predecessor[currentColumn]
+                matchedRow[currentColumn] = matchedRow[previousColumn]
+                currentColumn = previousColumn
+            } while currentColumn != 0
+        }
+
+        var result = [CandidateMatch?](repeating: nil, count: rowCount)
+        for column in 1 ... columnCount {
+            let row = matchedRow[column]
+            guard row > 0 else { continue }
+            result[row - 1] = candidateByColumn[row - 1][column - 1]
+        }
+        return result
     }
 
     private func mergeCandidateCounts(_ source: [Int: Int], into destination: inout [Int: Int]) {
@@ -1256,11 +1423,7 @@ actor ObjectMaskProcessor {
                 return true
             }
             guard let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint,
-                  let projectedPoint = imagePoint(
-                      for: viewportPoint,
-                      imageSize: cameraImage.extent.size,
-                      viewportSize: frame.viewportSize
-                  ) else {
+                  let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
                 return false
             }
             return hypot(projectedPoint.x - point.x, projectedPoint.y - point.y) <= 0.065
@@ -1302,7 +1465,6 @@ actor ObjectMaskProcessor {
 
         let initialObservation = DetectedObjectObservation(boundingBox: geometry.boundingBox)
         let tracker = TrackObjectRequest(detectedObject: initialObservation)
-        let colorIndex = firstAvailableColorIndex()
         let rect = geometry.boundingBox.cgRect
         let anchorOffset = CGPoint(
             x: min(max((point.x - rect.minX) / max(rect.width, 0.001), 0), 1),
@@ -1311,7 +1473,7 @@ actor ObjectMaskProcessor {
         trackedObjects.append(
             TrackedObject(
                 id: proposedLockID,
-                colorIndex: colorIndex,
+                colorIndex: firstAvailableColorIndex(),
                 request: tracker,
                 referenceGeometry: geometry,
                 anchorOffset: anchorOffset,
@@ -1376,42 +1538,48 @@ actor ObjectMaskProcessor {
         return Self.lockedColors.indices.first(where: { !usedColors.contains($0) }) ?? 0
     }
 
-    /// Maps a SwiftUI tap through the centered aspect-fill crop used by the camera overlay and
-    /// flips it into Vision's lower-left normalized coordinate system.
+    /// Maps the actual RealityKit viewport point back through ARKit's display transform, rotates
+    /// the raw sensor coordinate into Vision's upright image, then changes to Vision's lower-left
+    /// origin. Using ARKit's transform is critical: a generic aspect-fill crop is not equivalent in
+    /// portrait and was the cause of the visibly lowered/rotated masks.
     private func imagePoint(
         for viewportPoint: CGPoint,
-        imageSize: CGSize,
-        viewportSize: CGSize
+        frame: ObjectMaskFrame
     ) -> NormalizedPoint? {
-        guard imageSize.width > 0,
-              imageSize.height > 0,
-              viewportSize.width > 0,
-              viewportSize.height > 0 else {
+        guard frame.viewportSize.width > 0,
+              frame.viewportSize.height > 0,
+              abs(
+                  frame.imageToViewportTransform.a * frame.imageToViewportTransform.d
+                      - frame.imageToViewportTransform.b * frame.imageToViewportTransform.c
+              ) > 0.000001 else {
             return nil
         }
-
-        let scale = max(
-            viewportSize.width / imageSize.width,
-            viewportSize.height / imageSize.height
-        )
-        let displayedSize = CGSize(
-            width: imageSize.width * scale,
-            height: imageSize.height * scale
-        )
-        let cropX = (displayedSize.width - viewportSize.width) / 2
-        let cropY = (displayedSize.height - viewportSize.height) / 2
-        let viewportLocation = CGPoint(
-            x: viewportPoint.x * viewportSize.width,
-            y: viewportPoint.y * viewportSize.height
-        )
-        let imageX = (viewportLocation.x + cropX) / displayedSize.width
-        let imageYFromTop = (viewportLocation.y + cropY) / displayedSize.height
-
-        guard (0 ... 1).contains(imageX), (0 ... 1).contains(imageYFromTop) else {
+        let rawPoint = viewportPoint.applying(frame.imageToViewportTransform.inverted())
+        guard (-0.001 ... 1.001).contains(rawPoint.x),
+              (-0.001 ... 1.001).contains(rawPoint.y) else {
             return nil
         }
+        let upright = uprightTopLeftPoint(fromRawTopLeft: rawPoint, orientation: frame.orientation)
+        return NormalizedPoint(
+            x: min(max(upright.x, 0), 1),
+            y: min(max(1 - upright.y, 0), 1)
+        )
+    }
 
-        return NormalizedPoint(x: imageX, y: 1 - imageYFromTop)
+    private func uprightTopLeftPoint(
+        fromRawTopLeft point: CGPoint,
+        orientation: CGImagePropertyOrientation
+    ) -> CGPoint {
+        switch orientation {
+        case .up: point
+        case .upMirrored: CGPoint(x: 1 - point.x, y: point.y)
+        case .down: CGPoint(x: 1 - point.x, y: 1 - point.y)
+        case .downMirrored: CGPoint(x: point.x, y: 1 - point.y)
+        case .left: CGPoint(x: point.y, y: 1 - point.x)
+        case .leftMirrored: CGPoint(x: point.y, y: point.x)
+        case .right: CGPoint(x: 1 - point.y, y: point.x)
+        case .rightMirrored: CGPoint(x: 1 - point.y, y: 1 - point.x)
+        }
     }
 
     /// Prefer the exact point, then search a small ring. This tolerates low-resolution instance
@@ -1716,7 +1884,10 @@ actor ObjectMaskProcessor {
         return MaskGeometry(boundingBox: boundingBox, area: area, centroid: centroid)
     }
 
-    private func renderSelections(in observation: InstanceMaskObservation) -> [RenderSelection] {
+    private func renderSelections(
+        in observation: InstanceMaskObservation,
+        frame: ObjectMaskFrame
+    ) throws -> [RenderSelection] {
         var selections: [RenderSelection] = []
 
         for trackedObject in trackedObjects {
@@ -1733,95 +1904,151 @@ actor ObjectMaskProcessor {
             )
         }
 
-        return selections
-    }
+        // Preview the unclaimed foreground instance under the center aimer before it is tapped.
+        // Only inspect instances at/very near the center instead of generating geometry for every
+        // object in the frame; this keeps the preview cheap even when 10–15 locks are visible.
+        if trackedObjects.count < Self.lockedColors.count,
+           !frame.anchorHints.contains(where: { hint in
+               guard let point = hint.normalizedViewportPoint else { return false }
+               return hypot(point.x - 0.5, point.y - 0.5) < 0.075
+           }),
+           let centerPoint = imagePoint(for: CGPoint(x: 0.5, y: 0.5), frame: frame) {
+            let claimedInstances = Set(trackedObjects.compactMap(\.currentInstance))
+            let nearbyInstances = instances(near: centerPoint, in: observation)
+                .filter { !claimedInstances.contains($0) }
+            var bestPreview: (instance: Int, score: CGFloat)?
 
-    /// Converts the selected instance masks into colored translucent fills with stronger edges.
-    private func makeRenderedMasks(
-        selections: [RenderSelection],
-        observation: InstanceMaskObservation,
-        handler: ImageRequestHandler
-    ) throws -> [RenderedMask] {
-        try selections.map { selection in
-            let pixelBuffer = try observation.generateScaledMask(
-                for: selection.instances,
-                scaledToImageFrom: handler
-            )
-            return RenderedMask(
-                lockID: selection.lockID,
-                color: selection.color,
-                fillAlpha: selection.fillAlpha,
-                pixelBuffer: pixelBuffer
-            )
+            for instance in nearbyInstances {
+                let mask = try observation.generateMask(for: IndexSet(integer: instance))
+                guard let geometry = maskGeometry(of: mask),
+                      geometry.area < 0.90,
+                      !(geometry.boundingBox.width > 0.985
+                          && geometry.boundingBox.height > 0.985) else {
+                    continue
+                }
+                let score = hypot(
+                    geometry.centroid.x - centerPoint.x,
+                    geometry.centroid.y - centerPoint.y
+                ) + geometry.area * 0.02
+                if bestPreview == nil || score < bestPreview!.score {
+                    bestPreview = (instance, score)
+                }
+            }
+
+            if let bestPreview {
+                selections.append(
+                    RenderSelection(
+                        lockID: nil,
+                        instances: IndexSet(integer: bestPreview.instance),
+                        color: Self.lockedColors[firstAvailableColorIndex()],
+                        fillAlpha: 0.16
+                    )
+                )
+            }
         }
+
+        return selections
     }
 
     private func makeDisplayImage(
         from renderedMasks: [RenderedMask],
-        outputSize: CGSize? = nil
-    ) throws -> CGImage? {
-        var composite: CIImage?
-        var imageExtent: CGRect?
-
-        for renderedMask in renderedMasks {
-            let sourceMask = CIImage(cvPixelBuffer: renderedMask.pixelBuffer)
-            let targetSize = outputSize ?? sourceMask.extent.size
-            guard sourceMask.extent.width > 0,
-                  sourceMask.extent.height > 0,
-                  targetSize.width > 0,
-                  targetSize.height > 0 else {
-                continue
-            }
-            let normalizedMask = sourceMask.transformed(
-                by: CGAffineTransform(
-                    translationX: -sourceMask.extent.minX,
-                    y: -sourceMask.extent.minY
-                )
-            )
-            let mask = normalizedMask.transformed(
-                by: CGAffineTransform(
-                    scaleX: targetSize.width / sourceMask.extent.width,
-                    y: targetSize.height / sourceMask.extent.height
-                )
-            )
-            let targetExtent = CGRect(origin: .zero, size: targetSize)
-            let fill = tint(mask, color: renderedMask.color, alpha: renderedMask.fillAlpha)
-            let edgeMask = mask.applyingFilter(
-                "CIMorphologyGradient",
-                parameters: [kCIInputRadiusKey: 4.0]
-            )
-            let edge = tint(edgeMask, color: renderedMask.color, alpha: 0.95)
-            let layer = edge.composited(over: fill).cropped(to: targetExtent)
-            composite = composite.map { layer.composited(over: $0) } ?? layer
-            imageExtent = targetExtent
-        }
-
-        guard let composite, let imageExtent else {
+        frame: ObjectMaskFrame
+    ) -> CGImage? {
+        // The overlay is only visual feedback. A smaller raster removes a large Swift per-pixel
+        // compositing cost from every correction.
+        let dimensions = viewportDimensions(for: frame.viewportSize, longEdge: 320)
+        guard dimensions.width > 0, dimensions.height > 0 else {
             return nil
         }
-        return ciContext.createCGImage(composite.cropped(to: imageExtent), from: imageExtent)
+
+        var rgba = [UInt8](repeating: 0, count: dimensions.width * dimensions.height * 4)
+        var renderedLayer = false
+        for renderedMask in renderedMasks {
+            guard let mask = viewportMask(
+                renderedMask.pixelBuffer,
+                width: dimensions.width,
+                height: dimensions.height,
+                frame: frame
+            ) else {
+                continue
+            }
+            renderedLayer = true
+            let red = CGFloat(renderedMask.color.red)
+            let green = CGFloat(renderedMask.color.green)
+            let blue = CGFloat(renderedMask.color.blue)
+            for y in 0 ..< dimensions.height {
+                for x in 0 ..< dimensions.width where mask[y * dimensions.width + x] != 0 {
+                    let edgeRadius = 2
+                    let isEdge = x < edgeRadius
+                        || x >= dimensions.width - edgeRadius
+                        || y < edgeRadius
+                        || y >= dimensions.height - edgeRadius
+                        || mask[y * dimensions.width + max(x - edgeRadius, 0)] == 0
+                        || mask[y * dimensions.width + min(x + edgeRadius, dimensions.width - 1)] == 0
+                        || mask[max(y - edgeRadius, 0) * dimensions.width + x] == 0
+                        || mask[min(y + edgeRadius, dimensions.height - 1) * dimensions.width + x] == 0
+                    let sourceAlpha = isEdge ? CGFloat(0.95) : renderedMask.fillAlpha
+                    let offset = (y * dimensions.width + x) * 4
+                    let retained = 1 - sourceAlpha
+                    rgba[offset] = UInt8(min(
+                        red * sourceAlpha * 255 + CGFloat(rgba[offset]) * retained,
+                        255
+                    ).rounded())
+                    rgba[offset + 1] = UInt8(min(
+                        green * sourceAlpha * 255 + CGFloat(rgba[offset + 1]) * retained,
+                        255
+                    ).rounded())
+                    rgba[offset + 2] = UInt8(min(
+                        blue * sourceAlpha * 255 + CGFloat(rgba[offset + 2]) * retained,
+                        255
+                    ).rounded())
+                    rgba[offset + 3] = UInt8(min(
+                        sourceAlpha * 255 + CGFloat(rgba[offset + 3]) * retained,
+                        255
+                    ).rounded())
+                }
+            }
+        }
+
+        guard renderedLayer,
+              let provider = CGDataProvider(data: Data(rgba) as CFData) else {
+            return nil
+        }
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        return CGImage(
+            width: dimensions.width,
+            height: dimensions.height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: dimensions.width * 4,
+            space: rgbColorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        )
     }
 
     private func makeMotionKeyframe(
         from renderedMasks: [RenderedMask],
-        cameraImageSize: CGSize,
         frame: ObjectMaskFrame,
         activeLockIDs: Set<UUID>? = nil
     ) -> ObjectMaskMotionKeyframe? {
-        guard cameraImageSize.width > 0, cameraImageSize.height > 0 else {
-            return nil
-        }
-
-        let longEdge = CGFloat(Self.motionLongEdge)
-        let scale = longEdge / max(cameraImageSize.width, cameraImageSize.height)
-        let width = max(Int((cameraImageSize.width * scale).rounded()), 1)
-        let height = max(Int((cameraImageSize.height * scale).rounded()), 1)
+        let dimensions = viewportDimensions(
+            for: frame.viewportSize,
+            longEdge: Self.motionLongEdge
+        )
+        let width = dimensions.width
+        let height = dimensions.height
+        guard width > 0, height > 0 else { return nil }
         let layers = renderedMasks.compactMap { renderedMask -> ObjectMaskMotionLayer? in
             guard let lockID = renderedMask.lockID,
-                  let mask = downsampleMask(
+                  let mask = viewportMask(
                       renderedMask.pixelBuffer,
                       width: width,
-                      height: height
+                      height: height,
+                      frame: frame
                   ) else {
                 return nil
             }
@@ -1831,6 +2058,7 @@ actor ObjectMaskProcessor {
         return ObjectMaskMotionKeyframe(
             pixelBuffer: frame.pixelBuffer,
             orientation: frame.orientation,
+            imageToViewportTransform: frame.imageToViewportTransform,
             timestamp: frame.timestamp,
             width: width,
             height: height,
@@ -1842,10 +2070,24 @@ actor ObjectMaskProcessor {
         )
     }
 
-    private func downsampleMask(
+    private func viewportDimensions(for viewportSize: CGSize, longEdge: Int) -> (width: Int, height: Int) {
+        guard viewportSize.width > 0, viewportSize.height > 0, longEdge > 0 else {
+            return (0, 0)
+        }
+        let scale = CGFloat(longEdge) / max(viewportSize.width, viewportSize.height)
+        return (
+            max(Int((viewportSize.width * scale).rounded()), 1),
+            max(Int((viewportSize.height * scale).rounded()), 1)
+        )
+    }
+
+    /// Produces a canonical top-left viewport mask. The inverse ARKit transform handles both the
+    /// camera crop and rotation; all downstream rendering and optical flow operate on this raster.
+    private func viewportMask(
         _ pixelBuffer: CVPixelBuffer,
         width targetWidth: Int,
-        height targetHeight: Int
+        height targetHeight: Int,
+        frame: ObjectMaskFrame
     ) -> [UInt8]? {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -1853,7 +2095,11 @@ actor ObjectMaskProcessor {
         guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_OneComponent32Float,
               let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
               targetWidth > 0,
-              targetHeight > 0 else {
+              targetHeight > 0,
+              abs(
+                  frame.imageToViewportTransform.a * frame.imageToViewportTransform.d
+                      - frame.imageToViewportTransform.b * frame.imageToViewportTransform.c
+              ) > 0.000001 else {
             return nil
         }
 
@@ -1861,13 +2107,35 @@ actor ObjectMaskProcessor {
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
         let sourceStride = CVPixelBufferGetBytesPerRow(pixelBuffer) / MemoryLayout<Float>.stride
         let source = baseAddress.assumingMemoryBound(to: Float.self)
+        let viewportToRaw = frame.imageToViewportTransform.inverted()
         var result = [UInt8](repeating: 0, count: targetWidth * targetHeight)
 
         for y in 0 ..< targetHeight {
-            let sourceY = min(Int((CGFloat(y) + 0.5) * CGFloat(sourceHeight) / CGFloat(targetHeight)), sourceHeight - 1)
-            let row = source.advanced(by: sourceY * sourceStride)
             for x in 0 ..< targetWidth {
-                let sourceX = min(Int((CGFloat(x) + 0.5) * CGFloat(sourceWidth) / CGFloat(targetWidth)), sourceWidth - 1)
+                let viewportPoint = CGPoint(
+                    x: (CGFloat(x) + 0.5) / CGFloat(targetWidth),
+                    y: (CGFloat(y) + 0.5) / CGFloat(targetHeight)
+                )
+                let rawPoint = viewportPoint.applying(viewportToRaw)
+                guard (0 ... 1).contains(rawPoint.x), (0 ... 1).contains(rawPoint.y) else {
+                    continue
+                }
+                let uprightPoint = uprightTopLeftPoint(
+                    fromRawTopLeft: rawPoint,
+                    orientation: frame.orientation
+                )
+                guard (0 ... 1).contains(uprightPoint.x), (0 ... 1).contains(uprightPoint.y) else {
+                    continue
+                }
+                let sourceX = min(
+                    Int(uprightPoint.x * CGFloat(sourceWidth)),
+                    sourceWidth - 1
+                )
+                let sourceY = min(
+                    Int(uprightPoint.y * CGFloat(sourceHeight)),
+                    sourceHeight - 1
+                )
+                let row = source.advanced(by: sourceY * sourceStride)
                 if row[sourceX] > 0.5 {
                     result[y * targetWidth + x] = 255
                 }
@@ -1881,12 +2149,9 @@ actor ObjectMaskProcessor {
     /// turn a fast camera movement into a table-sized point cloud.
     private func makeMaskedPointClouds(
         from renderedMasks: [RenderedMask],
-        cameraImageSize: CGSize,
         frame: ObjectMaskFrame
     ) -> [ObjectMaskDepthPointCloud] {
-        guard let depth = frame.depthSnapshot,
-              cameraImageSize.width > 0,
-              cameraImageSize.height > 0 else {
+        guard let depth = frame.depthSnapshot else {
             return []
         }
 
@@ -1899,8 +2164,7 @@ actor ObjectMaskProcessor {
             let points = maskedWorldPoints(
                 mask: renderedMask.pixelBuffer,
                 anchor: hint,
-                cameraImageSize: cameraImageSize,
-                viewportSize: frame.viewportSize,
+                frame: frame,
                 depth: depth
             )
             guard !points.isEmpty else {
@@ -1913,13 +2177,10 @@ actor ObjectMaskProcessor {
     private func maskedWorldPoints(
         mask: CVPixelBuffer,
         anchor: ObjectMaskAnchorHint,
-        cameraImageSize: CGSize,
-        viewportSize: CGSize,
+        frame: ObjectMaskFrame,
         depth: ObjectMaskDepthSnapshot
     ) -> [SIMD3<Float>] {
-        guard CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float,
-              viewportSize.width > 0,
-              viewportSize.height > 0 else {
+        guard CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float else {
             return []
         }
 
@@ -1961,12 +2222,32 @@ actor ObjectMaskProcessor {
         let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
         let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0) }
         let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+        // Require approximately two LiDAR pixels of mask interior on every side. RGB and LiDAR are
+        // registered by ARKit, but foreground/background depth mixing is still strongest at object
+        // silhouettes. This erosion affects measurement only; the displayed mask stays unchanged.
+        let swapsDepthAxes: Bool
+        switch frame.orientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            swapsDepthAxes = true
+        default:
+            swapsDepthAxes = false
+        }
+        let uprightDepthWidth = swapsDepthAxes ? depthHeight : depthWidth
+        let uprightDepthHeight = swapsDepthAxes ? depthWidth : depthHeight
+        let maskInsetX = max(
+            Int((CGFloat(maskWidth) / CGFloat(max(uprightDepthWidth, 1)) * 2).rounded()),
+            2
+        )
+        let maskInsetY = max(
+            Int((CGFloat(maskHeight) / CGFloat(max(uprightDepthHeight, 1)) * 2).rounded()),
+            2
+        )
         let cameraToWorld = depth.cameraTransform
         let worldToCamera = cameraToWorld.inverse
         let anchorInCamera = worldToCamera * SIMD4<Float>(anchor.worldPosition, 1)
         let anchorDepth = max(-anchorInCamera.z, 0.05)
-        let maximumDepthDifference = max(min(anchorDepth * 0.30, 0.45), 0.12)
-        let maximumWorldDistanceSquared: Float = 0.55 * 0.55
+        let maximumDepthDifference = max(min(anchorDepth * 0.22, 0.32), 0.10)
+        let maximumWorldDistanceSquared: Float = 0.42 * 0.42
         var points: [SIMD3<Float>] = []
         points.reserveCapacity(depthWidth * depthHeight / 5)
 
@@ -1987,21 +2268,60 @@ actor ObjectMaskProcessor {
                     continue
                 }
 
+                // Reject mixed-depth edge pixels before mask lookup. A LiDAR sample whose direct
+                // neighbours jump to a different surface is exactly where table/background depth
+                // can leak through an otherwise correct RGB silhouette.
+                guard row > 0, row < depthHeight - 1,
+                      column > 0, column < depthWidth - 1 else {
+                    continue
+                }
+                let discontinuityLimit = max(measuredDepth * 0.035, 0.025)
+                var isDepthContinuous = true
+                for (dx, dy) in [(0, -1), (-1, 0), (1, 0), (0, 1)] {
+                    let neighbourRow = depthBase
+                        .advanced(by: (row + dy) * depthRowBytes)
+                        .assumingMemoryBound(to: Float32.self)
+                    let neighbourDepth = neighbourRow[column + dx]
+                    if neighbourDepth <= 0.15
+                        || abs(neighbourDepth - measuredDepth) > discontinuityLimit {
+                        isDepthContinuous = false
+                        break
+                    }
+                }
+                guard isDepthContinuous else {
+                    continue
+                }
+
+                // Scene depth uses the captured image's native normalized coordinates. Rotate that
+                // raw point directly into the upright Vision mask instead of round-tripping through
+                // the cropped viewport, which can introduce boundary disagreement in portrait.
                 let nativeImagePoint = CGPoint(
                     x: (CGFloat(column) + 0.5) / CGFloat(depthWidth),
                     y: (CGFloat(row) + 0.5) / CGFloat(depthHeight)
                 )
-                let viewportPoint = nativeImagePoint.applying(depth.imageToViewportTransform)
-                guard let visionPoint = imagePoint(
-                    for: viewportPoint,
-                    imageSize: cameraImageSize,
-                    viewportSize: viewportSize
-                ) else {
-                    continue
-                }
-                let maskX = min(max(Int(visionPoint.x * CGFloat(maskWidth)), 0), maskWidth - 1)
-                let maskY = min(max(Int((1 - visionPoint.y) * CGFloat(maskHeight)), 0), maskHeight - 1)
-                guard maskBase[maskY * maskStride + maskX] > 0.5 else {
+                let uprightPoint = uprightTopLeftPoint(
+                    fromRawTopLeft: nativeImagePoint,
+                    orientation: frame.orientation
+                )
+                let maskX = min(max(Int(uprightPoint.x * CGFloat(maskWidth)), 0), maskWidth - 1)
+                let maskY = min(max(Int(uprightPoint.y * CGFloat(maskHeight)), 0), maskHeight - 1)
+                let leftX = maskX - maskInsetX
+                let rightX = maskX + maskInsetX
+                let topY = maskY - maskInsetY
+                let bottomY = maskY + maskInsetY
+                guard leftX >= 0,
+                      rightX < maskWidth,
+                      topY >= 0,
+                      bottomY < maskHeight,
+                      maskBase[maskY * maskStride + maskX] > 0.5,
+                      maskBase[maskY * maskStride + leftX] > 0.5,
+                      maskBase[maskY * maskStride + rightX] > 0.5,
+                      maskBase[topY * maskStride + maskX] > 0.5,
+                      maskBase[bottomY * maskStride + maskX] > 0.5,
+                      maskBase[topY * maskStride + leftX] > 0.5,
+                      maskBase[topY * maskStride + rightX] > 0.5,
+                      maskBase[bottomY * maskStride + leftX] > 0.5,
+                      maskBase[bottomY * maskStride + rightX] > 0.5 else {
                     continue
                 }
 
@@ -2022,23 +2342,6 @@ actor ObjectMaskProcessor {
         return points
     }
 
-    private func tint(_ image: CIImage, color: ObjectMaskDisplayColor, alpha: CGFloat) -> CIImage {
-        image.applyingFilter(
-            "CIColorMatrix",
-            parameters: [
-                "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                "inputAVector": CIVector(x: alpha, y: 0, z: 0, w: 0),
-                "inputBiasVector": CIVector(
-                    x: CGFloat(color.red),
-                    y: CGFloat(color.green),
-                    z: CGFloat(color.blue),
-                    w: 0
-                )
-            ]
-        )
-    }
 }
 
 /// Propagates every locked binary mask through the RGB video between segmentation corrections.
@@ -2094,6 +2397,7 @@ actor ObjectMaskMotionProcessor {
         guard let camera = makeWorkingCamera(
             keyframe.pixelBuffer,
             orientation: keyframe.orientation,
+            imageToViewportTransform: keyframe.imageToViewportTransform,
             width: keyframe.width,
             height: keyframe.height
         ) else {
@@ -2119,6 +2423,7 @@ actor ObjectMaskMotionProcessor {
            let currentCamera = makeWorkingCamera(
                catchUp.pixelBuffer,
                orientation: catchUp.orientation,
+               imageToViewportTransform: catchUp.imageToViewportTransform,
                width: keyframe.width,
                height: keyframe.height
            ) {
@@ -2161,6 +2466,7 @@ actor ObjectMaskMotionProcessor {
     func propagate(
         pixelBuffer: CVPixelBuffer,
         orientation: CGImagePropertyOrientation,
+        imageToViewportTransform: CGAffineTransform,
         timestamp: TimeInterval
     ) -> ObjectMaskPreview? {
         guard timestamp > lastTimestamp,
@@ -2171,6 +2477,7 @@ actor ObjectMaskMotionProcessor {
               let camera = makeWorkingCamera(
                   pixelBuffer,
                   orientation: orientation,
+                  imageToViewportTransform: imageToViewportTransform,
                   width: width,
                   height: height
               ) else {
@@ -2210,7 +2517,8 @@ actor ObjectMaskMotionProcessor {
 
     private func makeWorkingCamera(
         _ pixelBuffer: CVPixelBuffer,
-        orientation: CGImagePropertyOrientation,
+        orientation _: CGImagePropertyOrientation,
+        imageToViewportTransform: CGAffineTransform,
         width: Int,
         height: Int
     ) -> CVPixelBuffer? {
@@ -2230,24 +2538,42 @@ actor ObjectMaskMotionProcessor {
             return nil
         }
 
-        let oriented = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
-        let extent = oriented.extent
+        let source = CIImage(cvPixelBuffer: pixelBuffer)
+        let extent = source.extent
         guard extent.width > 0, extent.height > 0 else {
             return nil
         }
-        let normalized = oriented.transformed(
+        let normalized = source.transformed(
             by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
         )
-        let scaled = normalized.transformed(
-            by: CGAffineTransform(
-                scaleX: CGFloat(width) / extent.width,
-                y: CGFloat(height) / extent.height
+        func mapToOutput(_ sourcePoint: CGPoint) -> CGPoint {
+            let rawTopLeft = CGPoint(
+                x: sourcePoint.x / extent.width,
+                y: 1 - sourcePoint.y / extent.height
             )
+            let viewportTopLeft = rawTopLeft.applying(imageToViewportTransform)
+            return CGPoint(
+                x: viewportTopLeft.x * CGFloat(width),
+                y: (1 - viewportTopLeft.y) * CGFloat(height)
+            )
+        }
+        let origin = mapToOutput(.zero)
+        let unitX = mapToOutput(CGPoint(x: 1, y: 0))
+        let unitY = mapToOutput(CGPoint(x: 0, y: 1))
+        let rawToViewport = CGAffineTransform(
+            a: unitX.x - origin.x,
+            b: unitX.y - origin.y,
+            c: unitY.x - origin.x,
+            d: unitY.y - origin.y,
+            tx: origin.x,
+            ty: origin.y
         )
+        let viewportImage = normalized.transformed(by: rawToViewport)
+        let outputBounds = CGRect(x: 0, y: 0, width: width, height: height)
         ciContext.render(
-            scaled,
+            viewportImage.cropped(to: outputBounds),
             to: output,
-            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            bounds: outputBounds,
             colorSpace: colorSpace
         )
         return output

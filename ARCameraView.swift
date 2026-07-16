@@ -61,12 +61,11 @@ struct ARCameraView: UIViewRepresentable {
         // Bright UI-white for measurement visuals. `applyPostProcessToneMap: false` keeps the color
         // from being darkened by RealityKit's tone mapper, matching the on-screen SwiftUI aimer.
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
-        // A distinct green for a captured object's box so it never reads as a manual measurement.
-        fileprivate static let captureMaterial = UnlitMaterial(color: .systemGreen, applyPostProcessToneMap: false)
         // Cyan for the selected-cluster debug markers, so it is clearly separate from the box.
         fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
-        // One shared marker mesh reused by every selection point to avoid regenerating geometry.
-        fileprivate static let selectionMarkerMesh = MeshResource.generateBox(size: 0.02)
+        // Small dots expose the admitted LiDAR samples without covering the object. The previous
+        // 2 cm cubes obscured both the mask and the fitted box at typical payload distances.
+        fileprivate static let selectionMarkerMesh = MeshResource.generateSphere(radius: 0.0035)
         // A unit cube reused for every box edge (scaled per edge), since the box is rebuilt live.
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
 
@@ -78,21 +77,18 @@ struct ARCameraView: UIViewRepresentable {
         private var placedPoints: [PlacedPoint] = []
         private var measurementEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
-        private var captureEntities: [ModelEntity] = []
+        private var captureEntitiesByObject: [UUID: [ModelEntity]] = [:]
         private var selectionPool: [ModelEntity] = []
         private var lastSelectionPoints: [SIMD3<Float>] = []
-        private var accumulator = PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+        private var supportAccumulators: [UUID: PointAccumulator] = [:]
         private var maskedAccumulators: [UUID: PointAccumulator] = [:]
+        private var newestMaskedPointTimestamp: [UUID: TimeInterval] = [:]
+        private var fittedMaskedPointTimestamp: [UUID: TimeInterval] = [:]
+        private var liveResultsByObject: [UUID: CaptureResult] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
-        private let objectMaskMotionProcessor = ObjectMaskMotionProcessor()
-        private var liveResult: CaptureResult?
-        private var accumulationAnchor: SIMD3<Float>?
-        private var selectedCaptureMaskID: UUID?
-        private var isScanFrozen = false
         private var scanTickCounter = 0
         private var consecutiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
-        private var objectMaskMotionTask: Task<Void, Never>?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
@@ -102,14 +98,16 @@ struct ARCameraView: UIViewRepresentable {
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
         private var maskUpdateTimer: Timer?
+        private var memoryWarningObserver: NSObjectProtocol?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
         private var observedMode: MeasurementMode = .scan
         private var observedCaptureRequestRevision = 0
         private var observedCaptureResetRevision = 0
         private var observedObjectMaskToggleRequestRevision = 0
-        private var observedMeshVisible = true
-        private var observedShowsSelectedPoints = true
+        private var observedMeshVisible = false
+        private var observedShowsSelectedPoints = false
+        private var observedShowsBoundingBoxes = true
 
         init(
             sessionManager: ARSessionManager,
@@ -126,6 +124,7 @@ struct ARCameraView: UIViewRepresentable {
             observedMode = measurementEngine.mode
             observedMeshVisible = captureEngine.isMeshVisible
             observedShowsSelectedPoints = captureEngine.showsSelectedPoints
+            observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
             createContentAnchorIfNeeded(in: arView)
             updateMeshVisibility()
 
@@ -157,6 +156,16 @@ struct ARCameraView: UIViewRepresentable {
             RunLoop.main.add(maskTimer, forMode: .common)
             maskUpdateTimer = maskTimer
 
+            memoryWarningObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.releaseRebuildableScanCaches()
+                }
+            }
+
             observeEngineRevisions()
         }
 
@@ -165,19 +174,19 @@ struct ARCameraView: UIViewRepresentable {
             aimerUpdateTimer = nil
             maskUpdateTimer?.invalidate()
             maskUpdateTimer = nil
+            if let memoryWarningObserver {
+                NotificationCenter.default.removeObserver(memoryWarningObserver)
+                self.memoryWarningObserver = nil
+            }
             objectMaskTask?.cancel()
             objectMaskTask = nil
-            objectMaskMotionTask?.cancel()
-            objectMaskMotionTask = nil
-            let motionProcessor = objectMaskMotionProcessor
-            Task { await motionProcessor.reset() }
             pendingObjectMaskToggleRequest = nil
             removeAllObjectMaskAnchors()
             captureEngine.updateLockedObjectMaskCount(0)
             captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
             captureEngine.clearObjectMaskPreview()
             clearMeasurementContent()
-            clearCaptureContent()
+            clearAllCaptureContent()
 
             for marker in selectionPool {
                 marker.removeFromParent()
@@ -190,6 +199,24 @@ struct ARCameraView: UIViewRepresentable {
 
             arView = nil
             contentAnchor = nil
+        }
+
+        /// Keeps lock identities and already rendered boxes, but drops data that fresh synchronized
+        /// frames can reconstruct. This is preferable to iOS terminating the process under stress.
+        private func releaseRebuildableScanCaches() {
+            objectMaskTask?.cancel()
+            objectMaskTask = nil
+            supportAccumulators.removeAll(keepingCapacity: false)
+            maskedAccumulators.removeAll(keepingCapacity: false)
+            newestMaskedPointTimestamp.removeAll(keepingCapacity: false)
+            fittedMaskedPointTimestamp.removeAll(keepingCapacity: false)
+            liveResultsByObject.removeAll(keepingCapacity: false)
+            captureEngine.clearObjectMaskPreview()
+            lastSelectionPoints.removeAll(keepingCapacity: false)
+            for marker in selectionPool {
+                marker.removeFromParent()
+            }
+            selectionPool.removeAll(keepingCapacity: false)
         }
 
         // Direct observation of MeasurementEngine revision counters. Using
@@ -207,6 +234,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = captureEngine.objectMaskToggleRequestRevision
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
+                _ = captureEngine.showsBoundingBoxes
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else {
@@ -269,6 +297,11 @@ struct ARCameraView: UIViewRepresentable {
                 observedShowsSelectedPoints = captureEngine.showsSelectedPoints
                 updateSelectionVisualization()
             }
+
+            if captureEngine.showsBoundingBoxes != observedShowsBoundingBoxes {
+                observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
+                updateCaptureBoxVisibility()
+            }
         }
 
         private func updateMeshVisibility() {
@@ -296,10 +329,11 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            updateObjectMaskMotion(
-                pixelBuffer: frame.capturedImage,
-                orientation: cameraImageOrientation(in: arView),
-                timestamp: frame.timestamp
+            let orientation = cameraImageOrientation(in: arView)
+            let viewportSize = arView.bounds.size
+            let imageToViewportTransform = frame.displayTransform(
+                for: interfaceOrientation(in: arView),
+                viewportSize: viewportSize
             )
 
             guard objectMaskTask == nil else {
@@ -314,8 +348,9 @@ struct ARCameraView: UIViewRepresentable {
             )
             let input = ObjectMaskFrame(
                 pixelBuffer: frame.capturedImage,
-                orientation: cameraImageOrientation(in: arView),
-                viewportSize: arView.bounds.size,
+                orientation: orientation,
+                viewportSize: viewportSize,
+                imageToViewportTransform: imageToViewportTransform,
                 toggleRequest: toggleRequest,
                 anchorHints: objectMaskAnchorHints(frame: frame, in: arView),
                 timestamp: frame.timestamp,
@@ -327,31 +362,10 @@ struct ARCameraView: UIViewRepresentable {
                 objectMaskToggleAttemptsRemaining = max(objectMaskToggleAttemptsRemaining - 1, 0)
             }
             let processor = objectMaskProcessor
-            let motionProcessor = objectMaskMotionProcessor
 
             objectMaskTask = Task { [weak self] in
                 let result = await processor.makePreview(from: input)
                 guard let self, !Task.isCancelled else {
-                    return
-                }
-
-                var motionCorrectionPreview: ObjectMaskPreview?
-                if let keyframe = result.motionKeyframe {
-                    let catchUp = arView.session.currentFrame.map {
-                        ObjectMaskMotionCatchUpFrame(
-                            pixelBuffer: $0.capturedImage,
-                            orientation: self.cameraImageOrientation(in: arView),
-                            timestamp: $0.timestamp
-                        )
-                    }
-                    motionCorrectionPreview = await motionProcessor.install(
-                        keyframe,
-                        catchUp: catchUp
-                    )
-                } else if result.lockedObjectCount == 0 {
-                    await motionProcessor.reset()
-                }
-                guard !Task.isCancelled else {
                     return
                 }
 
@@ -364,14 +378,30 @@ struct ARCameraView: UIViewRepresentable {
                 self.applyObjectMaskLockChange(result.lockChange, in: arView)
                 for cloud in result.maskedPointClouds {
                     var accumulator = self.maskedAccumulators[cloud.id]
-                        ?? PointAccumulator(voxelSize: ObjectCapturePipeline.voxelSize)
+                        ?? PointAccumulator(
+                            voxelSize: ObjectCapturePipeline.voxelSize,
+                            maxVoxels: 10_000
+                        )
                     accumulator.add(cloud.points)
                     self.maskedAccumulators[cloud.id] = accumulator
+                    self.newestMaskedPointTimestamp[cloud.id] = max(
+                        self.newestMaskedPointTimestamp[cloud.id] ?? -.greatestFiniteMagnitude,
+                        cloud.timestamp
+                    )
                 }
                 for marker in result.markers {
                     self.objectMaskMarkerStates[marker.id] = ObjectMaskMarkerState(
                         color: marker.color,
                         isMaskVisible: marker.isMaskVisible
+                    )
+                }
+                let correctedMarkerIDs = Set(result.markers.map(\.id))
+                for id in Array(self.objectMaskMarkerStates.keys)
+                where !correctedMarkerIDs.contains(id) {
+                    guard let state = self.objectMaskMarkerStates[id] else { continue }
+                    self.objectMaskMarkerStates[id] = ObjectMaskMarkerState(
+                        color: state.color,
+                        isMaskVisible: false
                     )
                 }
                 self.objectMaskMarkerStates = self.objectMaskMarkerStates.filter {
@@ -380,7 +410,7 @@ struct ARCameraView: UIViewRepresentable {
                 self.captureEngine.updateLockedObjectMaskCount(result.lockedObjectCount)
                 self.captureEngine.updateObjectMaskTracking(
                     visibleCount: result.visibleObjectCount,
-                    markers: result.markers
+                    markers: self.currentObjectMaskMarkers(in: arView)
                 )
                 if submittedToggleRequest != nil,
                    !result.didToggleLock,
@@ -392,19 +422,35 @@ struct ARCameraView: UIViewRepresentable {
                 } else if submittedToggleRequest != nil,
                           !result.didToggleLock,
                           self.pendingObjectMaskToggleRequest == nil {
-                    self.captureEngine.reportObjectLockNotFound()
+                    if result.lockedObjectCount >= 15 {
+                        self.captureEngine.reportObjectLimitReached()
+                    } else {
+                        self.captureEngine.reportObjectLockNotFound()
+                    }
                 } else if result.needsWorldSurface {
                     self.captureEngine.reportObjectLockNeedsSurface()
                 }
 
-                // EdgeTAM is the authoritative correction. Between these keyframes, the separate
-                // high-rate worker moves each accepted mask with dense optical flow.
-                if let preview = motionCorrectionPreview ?? result.preview {
+                if submittedToggleRequest != nil, let lockChange = result.lockChange {
+                    switch lockChange.kind {
+                    case .added:
+                        self.captureEngine.finishObjectSelection(didAdd: true)
+                    case .removed:
+                        self.captureEngine.finishObjectSelection(didAdd: false)
+                    }
+                }
+
+                // Pixel shapes come only from exact segmentation frames. Between corrections,
+                // SwiftUI reprojects each locked layer from its own AR anchor; no optical-flow warp
+                // can merge identities or feed an invented boundary into LiDAR measurement.
+                if let preview = result.preview {
                     self.consecutiveMaskMisses = 0
                     self.captureEngine.showObjectMaskPreview(preview)
                 } else {
                     self.consecutiveMaskMisses += 1
-                    if result.didToggleLock
+                    self.captureEngine.clearLiveObjectMaskPreview()
+                    if result.lockedObjectCount == 0,
+                       result.didToggleLock
                         || result.lockedObjectCount < previousLockedObjectCount
                         || self.consecutiveMaskMisses >= 3 {
                         self.captureEngine.clearObjectMaskPreview()
@@ -413,44 +459,19 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        private func updateObjectMaskMotion(
-            pixelBuffer: CVPixelBuffer,
-            orientation: CGImagePropertyOrientation,
-            timestamp: TimeInterval
-        ) {
-            guard captureEngine.lockedObjectMaskCount > 0,
-                  objectMaskMotionTask == nil else {
-                return
-            }
-
-            let processor = objectMaskMotionProcessor
-            objectMaskMotionTask = Task { [weak self] in
-                let preview = await processor.propagate(
-                    pixelBuffer: pixelBuffer,
-                    orientation: orientation,
-                    timestamp: timestamp
-                )
-                guard let self, !Task.isCancelled else {
-                    return
-                }
-                self.objectMaskMotionTask = nil
-                guard self.measurementEngine.mode == .scan,
-                      self.captureEngine.lockedObjectMaskCount > 0,
-                      let preview else {
-                    return
-                }
-                self.captureEngine.showObjectMaskPreview(preview)
-            }
-        }
-
         private func updateFastObjectMaskMarkers(in arView: ARView) {
-            guard measurementEngine.mode == .scan,
-                  let frame = arView.session.currentFrame else {
+            guard measurementEngine.mode == .scan else {
                 captureEngine.updateObjectMaskMarkers([])
                 return
             }
+            captureEngine.updateObjectMaskMarkers(currentObjectMaskMarkers(in: arView))
+        }
 
-            let markers: [ObjectMaskMarker] = objectMaskAnchorHints(
+        private func currentObjectMaskMarkers(in arView: ARView) -> [ObjectMaskMarker] {
+            guard let frame = arView.session.currentFrame else {
+                return []
+            }
+            return objectMaskAnchorHints(
                 frame: frame,
                 in: arView
             ).compactMap { hint -> ObjectMaskMarker? in
@@ -461,11 +482,11 @@ struct ARCameraView: UIViewRepresentable {
                 return ObjectMaskMarker(
                     id: hint.id,
                     normalizedViewportPoint: point,
+                    cameraDistance: hint.cameraDistance,
                     color: state.color,
                     isMaskVisible: state.isMaskVisible
                 )
             }
-            captureEngine.updateObjectMaskMarkers(markers)
         }
 
         private func preparedObjectMaskToggleRequest(
@@ -625,6 +646,17 @@ struct ARCameraView: UIViewRepresentable {
                 guard let transform = change.worldTransform else {
                     return
                 }
+                if let previousAnchor = objectMaskAnchors.removeValue(forKey: change.id) {
+                    arView.session.remove(anchor: previousAnchor)
+                }
+                maskedAccumulators.removeValue(forKey: change.id)
+                supportAccumulators[change.id] = PointAccumulator(
+                    voxelSize: ObjectCapturePipeline.supportVoxelSize,
+                    maxVoxels: 4_000
+                )
+                newestMaskedPointTimestamp.removeValue(forKey: change.id)
+                fittedMaskedPointTimestamp.removeValue(forKey: change.id)
+                liveResultsByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
                 arView.session.add(anchor: anchor)
                 objectMaskAnchors[change.id] = anchor
@@ -633,6 +665,13 @@ struct ARCameraView: UIViewRepresentable {
                     arView.session.remove(anchor: anchor)
                 }
                 maskedAccumulators.removeValue(forKey: change.id)
+                supportAccumulators.removeValue(forKey: change.id)
+                newestMaskedPointTimestamp.removeValue(forKey: change.id)
+                fittedMaskedPointTimestamp.removeValue(forKey: change.id)
+                liveResultsByObject.removeValue(forKey: change.id)
+                clearCaptureContent(for: change.id)
+                captureEngine.removeObjectMaskLayer(id: change.id)
+                captureEngine.removeCapture(id: change.id)
             }
         }
 
@@ -657,174 +696,189 @@ struct ARCameraView: UIViewRepresentable {
             arView.window?.windowScene?.effectiveGeometry.interfaceOrientation ?? .portrait
         }
 
-        /// Throttled live scanning: accumulate depth around the reticle across frames and keep a
-        /// running cluster + box so the operator sees what will be captured before pressing Capture.
+        /// Updates every visible locked object from one LiDAR frame. Scene depth is back-projected
+        /// once and partitioned around the world anchors; each target then owns independent support
+        /// and mask-approved accumulators, so neighbouring objects cannot overwrite one another.
         private func updateScanLive(in arView: ARView) {
             guard measurementEngine.mode == .scan,
-                  sessionManager.isAutomaticObjectCaptureSupported,
-                  !isScanFrozen else {
+                  sessionManager.isAutomaticObjectCaptureSupported else {
                 return
             }
 
-            // The aimer timer fires at 15 Hz; segment roughly every 5th tick (~3 Hz) to keep cost low.
             scanTickCounter &+= 1
-            guard scanTickCounter % 5 == 0 else {
-                return
-            }
 
             guard sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
-                  let aimerTransform = lastAimerRaycastTransform else {
+                  !objectMaskAnchors.isEmpty else {
                 return
             }
 
-            let seed = aimerTransform.translation
-            let selectedLockedObject: (id: UUID, anchor: ARAnchor)?
-            if objectMaskAnchors.isEmpty {
-                selectedLockedObject = nil
-            } else {
-                let centeredHint = objectMaskAnchorHints(frame: frame, in: arView)
-                    .compactMap { hint -> (hint: ObjectMaskAnchorHint, distance: CGFloat)? in
-                        guard let point = hint.normalizedViewportPoint else {
-                            return nil
-                        }
-                        return (hint, hypot(point.x - 0.5, point.y - 0.5))
-                    }
-                    .min { $0.distance < $1.distance }?.hint
-                guard let centeredHint,
-                      let anchor = objectMaskAnchors[centeredHint.id] else {
-                    // Locked masks exist, but none is currently visible. Never substitute an
-                    // unrelated raw cloud while the selected object is outside the camera.
-                    return
-                }
-                selectedLockedObject = (centeredHint.id, anchor)
+            let visibleHints = objectMaskAnchorHints(frame: frame, in: arView).filter {
+                $0.normalizedViewportPoint != nil
             }
-            let gatherSeed = selectedLockedObject?.anchor.transform.translation ?? seed
-
-            // If the operator has aimed at a clearly different place (farther than the gather
-            // radius), start a fresh accumulation. This keeps the buffer bounded and makes the tool
-            // track the object currently being aimed at instead of piling up the whole scene.
-            if let anchor = accumulationAnchor {
-                let deltaX = gatherSeed.x - anchor.x
-                let deltaZ = gatherSeed.z - anchor.z
-                let jump = ObjectCapturePipeline.accumulationRadius
-                if deltaX * deltaX + deltaZ * deltaZ > jump * jump {
-                    // Re-aiming the LiDAR capture box must not erase independently locked object
-                    // masks. Only reset the depth accumulator here.
-                    resetCaptureAccumulation()
-                }
-            }
-            if accumulationAnchor == nil {
-                accumulationAnchor = gatherSeed
+            let seeds = Dictionary(uniqueKeysWithValues: visibleHints.compactMap { hint in
+                objectMaskAnchors[hint.id].map { (hint.id, $0.transform.translation) }
+            })
+            guard !seeds.isEmpty else {
+                return
             }
 
-            let points = DepthPointCloud.worldPoints(
+            let supportPointsByObject = DepthPointCloud.worldPoints(
                 from: frame,
-                near: gatherSeed,
-                radius: ObjectCapturePipeline.accumulationRadius
+                near: seeds,
+                radius: ObjectCapturePipeline.accumulationRadius,
+                pixelStride: 3
             )
 
-            guard !points.isEmpty else {
-                return
+            for (id, points) in supportPointsByObject where !points.isEmpty {
+                var support = supportAccumulators[id]
+                    ?? PointAccumulator(
+                        voxelSize: ObjectCapturePipeline.supportVoxelSize,
+                        maxVoxels: 4_000
+                    )
+                support.add(points)
+                if scanTickCounter % 45 == 0 {
+                    support.pruneTransient(below: 2, olderThan: 8)
+                    support.pruneStale(olderThan: 90)
+                }
+                supportAccumulators[id] = support
             }
 
-            accumulator.add(points)
-
-            // Every ~3 s (at this ~3 Hz cadence), drop voxels seen only once: transient noise that
-            // was never reconfirmed. This bounds the buffer and keeps the box from creeping outward.
             if scanTickCounter % 45 == 0 {
-                accumulator.pruneTransient(below: 2)
+                for id in Array(maskedAccumulators.keys) {
+                    guard var masked = maskedAccumulators[id] else { continue }
+                    masked.pruneTransient(below: 2, olderThan: 8)
+                    // Keep roughly a full walk-around rather than only the most recent face. This
+                    // remains finite, but preserves side and vertical samples while the operator
+                    // moves to a second viewpoint.
+                    masked.pruneStale(olderThan: 180)
+                    maskedAccumulators[id] = masked
+                }
             }
 
-            let supportPoints = accumulator.points(
-                minObservations: ObjectCapturePipeline.minObservations
-            )
-            let captureOutcome: CaptureOutcome
-            if let lockedObject = selectedLockedObject {
-                let lockID = lockedObject.id
-                let objectSeed = lockedObject.anchor.transform.translation
-                if selectedCaptureMaskID != lockID {
-                    selectedCaptureMaskID = lockID
-                    clearCaptureContent()
-                    liveResult = nil
-                    captureEngine.clearPreview()
+            createContentAnchorIfNeeded(in: arView)
+            for hint in visibleHints {
+                let id = hint.id
+                guard let maskTimestamp = newestMaskedPointTimestamp[id],
+                      maskTimestamp > fittedMaskedPointTimestamp[id, default: -.greatestFiniteMagnitude],
+                      let objectPoints = maskedAccumulators[id]?.points(minObservations: 2),
+                      let supportPoints = supportAccumulators[id]?.points(
+                          minObservations: ObjectCapturePipeline.minObservations
+                      ),
+                      !objectPoints.isEmpty,
+                      !supportPoints.isEmpty,
+                      let anchor = objectMaskAnchors[id] else {
+                    continue
                 }
-                // Once a mask is locked there is intentionally no raw-depth fallback: falling back
-                // would silently reintroduce the table/bigger-object failure this path prevents.
-                guard let objectPoints = maskedAccumulators[lockID]?.points(minObservations: 2),
-                      !objectPoints.isEmpty else {
-                    return
-                }
-                captureOutcome = ObjectCapturePipeline.capture(
+
+                let outcome = ObjectCapturePipeline.capture(
                     objectPoints: objectPoints,
                     supportPoints: supportPoints,
-                    seed: objectSeed,
+                    seed: anchor.transform.translation,
                     up: SIMD3<Float>(0, 1, 0)
                 )
-            } else {
-                selectedCaptureMaskID = nil
-                captureOutcome = ObjectCapturePipeline.capture(
-                    points: supportPoints,
-                    seed: seed,
-                    up: SIMD3<Float>(0, 1, 0)
-                )
+                guard case .success(let result) = outcome else {
+                    continue
+                }
+
+                fittedMaskedPointTimestamp[id] = maskTimestamp
+                if let previous = liveResultsByObject[id],
+                   !isPlausibleBoxRefinement(result.object, from: previous.object) {
+                    // Keep the last stable box. Fresh mask/depth frames can still shrink it or
+                    // propose a bounded refinement on the next update.
+                    continue
+                }
+                liveResultsByObject[id] = result
+                addCapturedBox(result.object, for: id)
+                captureEngine.updateCapture(id: id, object: result.object)
             }
 
-            // ARKit world Y is gravity-aligned (`.gravity` world alignment), so up is (0, 1, 0).
-            guard case .success(let result) = captureOutcome else {
+            // The debug point cloud and dimension readout follow the object nearest the aimer;
+            // every other fitted box remains rendered and stored independently.
+            if let centeredID = visibleHints.compactMap({ hint -> (UUID, CGFloat)? in
+                guard let point = hint.normalizedViewportPoint else { return nil }
+                return (hint.id, hypot(point.x - 0.5, point.y - 0.5))
+            }).min(by: { $0.1 < $1.1 })?.0,
+               let centeredResult = liveResultsByObject[centeredID] {
+                lastSelectionPoints = centeredResult.selectionPoints
+                updateSelectionVisualization()
+                captureEngine.focusCapture(id: centeredID)
+            }
+        }
+
+        /// Prevents a single leaked support/background component from turning a stable object box
+        /// into a table-sized result. Axis order can swap as PCA settles, so dimensions are compared
+        /// sorted; contractions remain unrestricted because they often correct earlier leakage.
+        private func isPlausibleBoxRefinement(
+            _ candidate: CapturedObject,
+            from previous: CapturedObject
+        ) -> Bool {
+            let previousDimensions = [
+                previous.dimensions.x,
+                previous.dimensions.y,
+                previous.dimensions.z
+            ].sorted()
+            let candidateDimensions = [
+                candidate.dimensions.x,
+                candidate.dimensions.y,
+                candidate.dimensions.z
+            ].sorted()
+
+            for (old, new) in zip(previousDimensions, candidateDimensions) {
+                let maximumGrowth = max(old * 1.18, old + 0.025)
+                if new > maximumGrowth {
+                    return false
+                }
+            }
+
+            let previousLargestDimension = previousDimensions.last ?? 0.1
+            let maximumCenterShift = max(0.05, previousLargestDimension * 0.30)
+            return simd_distance(candidate.center, previous.center) <= maximumCenterShift
+        }
+
+        /// Retained as a programmatic center-selection entry point. Scan mode no longer exposes a
+        /// visible center-lock button; normal selection is performed by tapping the object itself.
+        private func commitScanCapture() {
+            guard captureEngine.isCapturing else {
+                pendingObjectMaskToggleRequest = nil
+                objectMaskToggleAttemptsRemaining = 0
                 return
             }
 
-            liveResult = result
-            createContentAnchorIfNeeded(in: arView)
-            addCapturedBox(result.object)
-            lastSelectionPoints = result.selectionPoints
-            updateSelectionVisualization()
-            captureEngine.showPreview(result.object)
-        }
-
-        /// Locks in the latest live result as the committed capture and stops live updating.
-        private func commitScanCapture() {
             guard sessionManager.isTrackingReady else {
                 captureEngine.reportTrackingNotReady()
                 return
             }
 
-            guard let liveResult else {
-                captureEngine.reportNotEnoughMesh()
-                return
-            }
-
-            isScanFrozen = true
-            captureEngine.applyCapture(liveResult.object)
-            // The box and selection markers are already rendered from the last live tick.
+            pendingObjectMaskToggleRequest = ObjectMaskToggleRequest(
+                normalizedViewportPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+            objectMaskToggleAttemptsRemaining = 4
         }
 
         private func resetScanState() {
-            resetCaptureAccumulation()
-            resetObjectMaskTracking()
-        }
-
-        private func resetCaptureAccumulation() {
-            clearCaptureContent()
-            accumulator.reset()
-            liveResult = nil
-            accumulationAnchor = nil
-            selectedCaptureMaskID = nil
-            isScanFrozen = false
+            clearAllCaptureContent()
+            supportAccumulators.removeAll()
+            maskedAccumulators.removeAll()
+            newestMaskedPointTimestamp.removeAll()
+            fittedMaskedPointTimestamp.removeAll()
+            liveResultsByObject.removeAll()
             scanTickCounter = 0
             captureEngine.clearPreview()
+            resetObjectMaskTracking()
         }
 
         private func resetObjectMaskTracking() {
             objectMaskTrackingGeneration &+= 1
-            objectMaskMotionTask?.cancel()
-            objectMaskMotionTask = nil
-            let motionProcessor = objectMaskMotionProcessor
-            Task { await motionProcessor.reset() }
+            objectMaskTask?.cancel()
+            objectMaskTask = nil
             pendingObjectMaskToggleRequest = nil
             consecutiveMaskMisses = 0
             maskedAccumulators.removeAll()
+            supportAccumulators.removeAll()
+            newestMaskedPointTimestamp.removeAll()
+            fittedMaskedPointTimestamp.removeAll()
+            liveResultsByObject.removeAll()
             removeAllObjectMaskAnchors()
             objectMaskMarkerStates.removeAll()
             captureEngine.updateLockedObjectMaskCount(0)
@@ -843,6 +897,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskAnchors.removeAll()
             objectMaskMarkerStates.removeAll()
             maskedAccumulators.removeAll()
+            supportAccumulators.removeAll()
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -1260,12 +1315,24 @@ struct ARCameraView: UIViewRepresentable {
             previewMeasurementEntities.removeAll()
         }
 
-        private func addCapturedBox(_ object: CapturedObject) {
-            clearCaptureContent()
+        private func addCapturedBox(_ object: CapturedObject, for id: UUID) {
+            clearCaptureContent(for: id)
 
             guard object.corners.count == 8 else {
                 return
             }
+
+            let displayColor = objectMaskMarkerStates[id]?.color
+                ?? ObjectMaskDisplayColor(red: 0.20, green: 0.95, blue: 0.42)
+            let material = UnlitMaterial(
+                color: UIColor(
+                    red: CGFloat(displayColor.red),
+                    green: CGFloat(displayColor.green),
+                    blue: CGFloat(displayColor.blue),
+                    alpha: 1
+                ),
+                applyPostProcessToneMap: false
+            )
 
             // Edges for the `i + 2*j + 4*k` corner layout: base face, top face, vertical edges.
             let edges = [
@@ -1275,11 +1342,21 @@ struct ARCameraView: UIViewRepresentable {
             ]
 
             for edge in edges {
-                addCapturedBoxEdge(from: object.corners[edge.0], to: object.corners[edge.1])
+                addCapturedBoxEdge(
+                    from: object.corners[edge.0],
+                    to: object.corners[edge.1],
+                    material: material,
+                    objectID: id
+                )
             }
         }
 
-        private func addCapturedBoxEdge(from start: SIMD3<Float>, to end: SIMD3<Float>) {
+        private func addCapturedBoxEdge(
+            from start: SIMD3<Float>,
+            to end: SIMD3<Float>,
+            material: UnlitMaterial,
+            objectID: UUID
+        ) {
             let delta = end - start
             let length = simd_length(delta)
 
@@ -1293,14 +1370,23 @@ struct ARCameraView: UIViewRepresentable {
             let thickness: Float = 0.006
             let bar = ModelEntity(
                 mesh: Coordinator.unitCubeMesh,
-                materials: [Coordinator.captureMaterial]
+                materials: [material]
             )
             bar.scale = SIMD3<Float>(length, thickness, thickness)
             bar.position = start + delta / 2
             bar.orientation = orientation(alongX: delta)
 
             contentAnchor?.addChild(bar)
-            captureEntities.append(bar)
+            bar.isEnabled = captureEngine.showsBoundingBoxes
+            captureEntitiesByObject[objectID, default: []].append(bar)
+        }
+
+        private func updateCaptureBoxVisibility() {
+            for entities in captureEntitiesByObject.values {
+                for entity in entities {
+                    entity.isEnabled = captureEngine.showsBoundingBoxes
+                }
+            }
         }
 
         /// A rotation that maps a box's local +X axis onto `direction`, built from a stable
@@ -1317,12 +1403,19 @@ struct ARCameraView: UIViewRepresentable {
             return simd_quatf(simd_float3x3(columns: (xAxis, yAxis, zAxis)))
         }
 
-        private func clearCaptureContent() {
-            for entity in captureEntities {
+        private func clearCaptureContent(for id: UUID) {
+            for entity in captureEntitiesByObject.removeValue(forKey: id) ?? [] {
                 entity.removeFromParent()
             }
+        }
 
-            captureEntities.removeAll()
+        private func clearAllCaptureContent() {
+            for entities in captureEntitiesByObject.values {
+                for entity in entities {
+                    entity.removeFromParent()
+                }
+            }
+            captureEntitiesByObject.removeAll()
             hideAllSelectionMarkers()
             lastSelectionPoints = []
         }
@@ -1338,7 +1431,9 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             // Keep the visible marker count bounded; stride through the voxel centers when over the cap.
-            let maxMarkers = 250
+            // RealityKit entities are much heavier than point values. A bounded reusable pool
+            // keeps the debug view informative without allocating hundreds of extra scene nodes.
+            let maxMarkers = 360
             let step = max(1, lastSelectionPoints.count / maxMarkers)
 
             var shown = 0
