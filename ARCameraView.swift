@@ -1108,7 +1108,7 @@ struct ARCameraView: UIViewRepresentable {
                 name: "MeasurementPoint-\(pointID.uuidString)",
                 transform: latestTransform
             )
-            let anchorEntity = AnchorEntity(anchor: arAnchor)
+            let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))
 
             arView.session.add(anchor: arAnchor)
             arView.scene.addAnchor(anchorEntity)

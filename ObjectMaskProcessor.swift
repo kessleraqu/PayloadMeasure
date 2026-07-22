@@ -14,7 +14,7 @@ import Vision
 
 /// One independently positioned colored mask. Locked layers carry a world-anchor reference;
 /// the unlocked center preview intentionally has no object ID and is replaced on every inference.
-nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
+struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let image: CGImage
     let trackedObjectID: UUID?
     let referenceAnchorPoint: CGPoint?
@@ -22,7 +22,7 @@ nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
 }
 
 /// Display-ready RGB segmentation layers, already upright for the current interface orientation.
-nonisolated struct ObjectMaskPreview: @unchecked Sendable {
+struct ObjectMaskPreview: @unchecked Sendable {
     let layers: [ObjectMaskPreviewLayer]
     let timestamp: TimeInterval
 
@@ -49,7 +49,7 @@ nonisolated struct ObjectMaskPreview: @unchecked Sendable {
 }
 
 /// A tap in normalized viewport coordinates, with an upper-left origin like SwiftUI.
-nonisolated struct ObjectMaskToggleRequest: @unchecked Sendable {
+struct ObjectMaskToggleRequest: @unchecked Sendable {
     let normalizedViewportPoint: CGPoint
     let proposedLockID: UUID?
     let worldTransform: simd_float4x4?
@@ -70,21 +70,21 @@ nonisolated struct ObjectMaskToggleRequest: @unchecked Sendable {
 
 /// The current screen projection of a persistent AR anchor. Vision uses this as the authoritative
 /// search location after a lock leaves the camera and later becomes visible again.
-nonisolated struct ObjectMaskAnchorHint: @unchecked Sendable {
+struct ObjectMaskAnchorHint: @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint?
     let cameraDistance: Float
     let worldPosition: SIMD3<Float>
 }
 
-nonisolated struct ObjectMaskDisplayColor: Sendable, Hashable {
+struct ObjectMaskDisplayColor: Sendable, Hashable {
     let red: Double
     let green: Double
     let blue: Double
 }
 
 /// A lightweight world-anchored marker shown whenever an exact pixel mask is unavailable.
-nonisolated struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
+struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint
     let cameraDistance: Float
@@ -92,12 +92,12 @@ nonisolated struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendabl
     let isMaskVisible: Bool
 }
 
-nonisolated enum ObjectMaskLockChangeKind: Sendable {
+enum ObjectMaskLockChangeKind: Sendable {
     case added
     case removed
 }
 
-nonisolated struct ObjectMaskLockChange: @unchecked Sendable {
+struct ObjectMaskLockChange: @unchecked Sendable {
     let id: UUID
     let kind: ObjectMaskLockChangeKind
     let worldTransform: simd_float4x4?
@@ -105,7 +105,7 @@ nonisolated struct ObjectMaskLockChange: @unchecked Sendable {
 
 /// Retains an AR camera pixel buffer while it crosses from the main actor to the Vision worker.
 /// ARKit camera frames are immutable for the duration of this processing request.
-nonisolated struct ObjectMaskFrame: @unchecked Sendable {
+struct ObjectMaskFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let viewportSize: CGSize
@@ -122,7 +122,7 @@ nonisolated struct ObjectMaskFrame: @unchecked Sendable {
 /// The calibration and depth buffers captured with the RGB image passed to Vision. Keeping these
 /// together is essential: sampling a newer depth frame with an older mask is a direct source of
 /// table leakage when the phone moves.
-nonisolated struct ObjectMaskDepthSnapshot: @unchecked Sendable {
+struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let depthMap: CVPixelBuffer
     let confidenceMap: CVPixelBuffer?
     let cameraTransform: simd_float4x4
@@ -131,7 +131,7 @@ nonisolated struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let imageToViewportTransform: CGAffineTransform
 }
 
-nonisolated struct ObjectMaskDepthPointCloud: @unchecked Sendable {
+struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let id: UUID
     let points: [SIMD3<Float>]
     let timestamp: TimeInterval
@@ -139,13 +139,13 @@ nonisolated struct ObjectMaskDepthPointCloud: @unchecked Sendable {
 
 /// A compact segmentation correction consumed by the high-rate optical-flow worker. Each locked
 /// object retains its own binary mask, so one object's update can never erase another's overlay.
-nonisolated struct ObjectMaskMotionLayer: @unchecked Sendable {
+struct ObjectMaskMotionLayer: @unchecked Sendable {
     let id: UUID
     let color: ObjectMaskDisplayColor
     let mask: [UInt8]
 }
 
-nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {
+struct ObjectMaskMotionKeyframe: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let imageToViewportTransform: CGAffineTransform
@@ -159,7 +159,7 @@ nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {
 
 /// The newest camera frame available when a slower segmentation keyframe finishes. Optical flow
 /// advances that correction to this time before it is displayed, eliminating a backwards snap.
-nonisolated struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
+struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let imageToViewportTransform: CGAffineTransform
@@ -168,7 +168,7 @@ nonisolated struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
 
 /// Carries both the rendered overlay and tracker state back to the main actor. A nil preview is a
 /// valid result when locked objects are temporarily outside the camera frame.
-nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {
+struct ObjectMaskProcessingResult: @unchecked Sendable {
     let preview: ObjectMaskPreview?
     let lockedObjectCount: Int
     let visibleObjectCount: Int

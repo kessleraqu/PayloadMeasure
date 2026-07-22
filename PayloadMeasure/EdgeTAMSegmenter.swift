@@ -13,18 +13,18 @@ import Foundation
 import ImageIO
 import Vision
 
-nonisolated struct EdgeTAMFrameFeatures: @unchecked Sendable {
+struct EdgeTAMFrameFeatures: @unchecked Sendable {
     let visionFeatures: MLMultiArray
     let highResolutionFeature0: MLMultiArray
     let highResolutionFeature1: MLMultiArray
 }
 
-nonisolated struct EdgeTAMMask: @unchecked Sendable {
+struct EdgeTAMMask: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let predictedIoU: Float
 }
 
-nonisolated enum EdgeTAMSegmenterError: LocalizedError {
+enum EdgeTAMSegmenterError: LocalizedError {
     case modelsMissing
     case inputBufferCreationFailed
     case missingOutput(String)
@@ -47,7 +47,7 @@ nonisolated enum EdgeTAMSegmenterError: LocalizedError {
 /// A small dynamic Core ML wrapper avoids coupling the app to Xcode-generated model class names.
 /// It is owned and called serially by `ObjectMaskProcessor`, so synchronous prediction never blocks
 /// the main actor and one image encoding can be shared by every object prompt in a camera frame.
-nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {
+final class EdgeTAMSegmenter: @unchecked Sendable {
     static let inputSize = 1024
     static let maskSize = 256
 
