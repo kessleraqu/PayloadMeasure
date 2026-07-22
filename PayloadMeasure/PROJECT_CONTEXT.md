@@ -208,17 +208,17 @@ matures; fixed-class YOLO segmentation is appropriate only with a payload-specif
 # Expected Project Structure
 
 PayloadMeasure/
-- PayloadMeasureApp.swift
-- ContentView.swift
-- ARCameraView.swift
-- ARSessionManager.swift
-- MeasurementEngine.swift
-- MeasurementMode.swift
-- MeasurementOverlayView.swift
-- MeasurementPoint.swift
-- ObjectCapture.swift
-- ObjectCaptureEngine.swift
-- ObjectMaskProcessor.swift
+- payloadmeasureapp.swift
+- contentview.swift
+- arcameraview.swift
+- arsessionmanager.swift
+- mesengine.swift
+- mesmode.swift
+- mesoverlayview.swift
+- mespoint.swift
+- objectcapture.swift
+- objectcaptureengine.swift
+- objectmaskprocessor.swift
 - PayloadMeasurement.swift
 - CompatibilityChecker.swift
 - ExportManager.swift

@@ -1780,3 +1780,136 @@ The restore command modifies the working tree only; review it before committing.
   machine cannot reproduce that compiler and project-editor version exactly.
 - App Store uploads after April 28, 2026 still require a final archive produced with Xcode 26 and
   the iOS 26 SDK, even though the app's minimum deployment target is iOS 18.
+
+---
+
+## 2026-07-22 - Additive and Stable Object Surface Points
+
+### Observed problem
+
+While walking around a locked object, the cyan points appeared to move continuously rather than
+settle onto the measured surface. Previously visible sides could also disappear after the camera
+stopped seeing them, and adding new coverage could reshuffle most of the displayed markers.
+
+### Causes
+
+- Observation counts were incremented once per raw depth pixel. Several pixels from a single AR
+  frame could therefore make a voxel look temporally confirmed without any later-frame evidence.
+- Confirmed masked voxels expired after a rolling scan window, so an old face was eventually removed
+  while the operator viewed another face.
+- The cyan debug markers used geometric voxel centers rather than the measured depth positions.
+- The final robust bounding box also filtered the debug cloud. A legitimate boundary point could
+  disappear when the robust box refined even though the accumulated measurement still existed.
+- Connected-component output and marker subsampling depended on unordered collection traversal, so
+  adding a point could assign many reusable marker entities to different positions.
+- One-centimetre mask-edge erosion could leave a one-cell gap between surfaces acquired from
+  different viewpoints, keeping a valid new face outside the seed component.
+
+The reconstructed ARKit scene mesh and the cached 2D display mask were not responsible for deleting
+points. The mesh is a visual overlay, and the 2D mask only gates synchronized incoming depth.
+
+### What changed
+
+- Raw pixels are coalesced to one centroid per voxel per synchronized AR frame. A voxel must now be
+  seen in three distinct frames before it is admitted as stable geometry. Duplicate or out-of-order
+  deliveries of the same source timestamp cannot increase that count.
+- The measured centroid is frozen when a masked voxel becomes stable. Later observations can update
+  internal evidence but cannot make an admitted cyan point wander.
+- Stable masked voxels remain until that object is unlocked or its rebuildable cache is explicitly
+  cleared. Periodic cleanup removes only candidates that never reached three-frame confirmation.
+- When a capped accumulator needs space, old unconfirmed candidates are removed before newly seen
+  geometry is rejected; confirmed geometry is never evicted by that replacement path.
+- A box/cloud refit is requested only when at least one new voxel becomes stable. Repeated views of
+  already confirmed geometry no longer rebuild the same result every segmentation update.
+- Cyan markers now use measured surface representatives for every voxel in the selected connected
+  component. Robust trimming still protects dimension fitting, but no longer hides valid surface
+  coverage merely because it lies outside the current trimmed box.
+- Connectivity uses a conservative two-voxel Euclidean neighbourhood. This bridges a single empty
+  one-centimetre seam while avoiding the broad diagonal reach of a complete 5-by-5-by-5 stencil.
+- Component traversal is deterministic. If more than 360 debug points exist, a stable voxel-key hash
+  chooses the displayed subset, so adding coverage changes at most the necessary subset rather than
+  arbitrarily reshuffling the cloud.
+- If the existing plausibility guard rejects a sudden box expansion, the last accepted dimensions
+  remain locked while newly confirmed surface coverage is still retained and displayed.
+
+No segmentation model, mask/depth registration rule, depth-discontinuity rejection, erosion amount,
+one-centimetre measurement voxel size, 10,000-voxel per-object cap, 360-marker display cap, oriented
+box fitting rule, dimension threshold, or scene-mesh behavior was changed.
+
+### Build validation
+
+- Xcode 16.2 (`16C5032a`) generic iOS device Debug build: succeeded with code signing disabled.
+- Xcode 16.2 (`16C5032a`) generic iOS Simulator Debug build: succeeded with code signing disabled.
+- LiDAR acquisition behavior still requires a physical device; a simulator build cannot validate
+  scene depth, mask/depth registration, or a real walk-around scan.
+
+### Physical-device validation
+
+On the LiDAR device, enable `Points`, lock one isolated object on a bare support surface, and hold
+each newly revealed face in view for at least three synchronized segmentation/depth frames. Walk a
+full circle around it and confirm:
+
+1. Points already acquired on the first face remain fixed and visible when that face leaves view.
+2. Newly revealed sides add points without moving or removing the established surface cloud.
+3. Cyan marker centers lie on the measured object surface rather than on an artificial grid center.
+4. Repeatedly viewing an already-covered face does not continuously rebuild its points or dimensions.
+5. A suspicious abrupt box expansion remains rejected while legitimate new cyan coverage remains.
+6. Unlocking one object clears only that object's accumulated surface; other locked objects remain.
+7. A long multi-object scan remains within the existing 10,000 stable-voxel limit per object and
+   acceptable device memory/thermal behavior.
+
+### 2026-07-22 follow-up: continued coverage and quarantined outliers
+
+Physical testing exposed two different forms of apparent point-cloud saturation. The renderer could
+show only 360 globally hash-ranked markers, so acquisition often continued without placing a marker
+on a small newly revealed face. Separately, a masked accumulator whose 10,000 slots had all become
+stable could no longer admit a new voxel. Stable disconnected points and old mask/depth leaks also
+occupied those slots indefinitely.
+
+The exterior cyan points had a separate, intentional cause in the preceding implementation. The
+oriented box robustly trims the outer four percent of projections, but the debug cloud displayed
+every point in the connected component. If a proposed box failed the growth plausibility guard, the
+old box was retained while all points from the rejected proposal were still displayed. A point could
+therefore appear outside the box precisely because that box did not accept it. Every point had been
+inside a synchronized mask when sampled, but a leak lasting three processed frames could remain
+after a later mask correction because historical surfaces are deliberately not tested against the
+current 2D mask.
+
+The follow-up changes are:
+
+- A capture result exposes only measured representatives contained by its robust box, with a
+  half-centimetre tolerance to avoid boundary flicker. Rejected tail samples remain quarantined in
+  the accumulator for possible later reevaluation rather than being rendered as accepted geometry.
+- When a proposed box fails the existing plausibility guard, the old box and its prior points remain.
+  Newly confirmed points are added to that display only when the retained box also supports them.
+- The accumulator permanently marks voxels once an accepted result has used them. A later box
+  contraction therefore cannot make previously accepted historical evidence replaceable. Under
+  capacity pressure it first reclaims unconfirmed noise, then the oldest stable voxels that have
+  never been accepted because they remain disconnected or robustly rejected. It never chooses a
+  protected historical surface for this replacement path, and replaces at most 256 stable
+  candidates per processed mask frame so one noisy frame cannot discard a whole pending face.
+- The bounded masked-cloud allowance is now 16,000 one-centimetre voxels per object instead of
+  10,000. This provides room for larger multi-face payloads while remaining well below the former
+  unsafe 30,000-voxel design.
+- The optional cyan debug pool is now capped at 600 markers instead of 360. Its sampler first places
+  one deterministic representative in each occupied coarse spatial cell, then spends remaining
+  markers on detail. New faces therefore receive visible coverage after the pool is full instead of
+  competing only by a global random-looking hash rank.
+
+The three-distinct-frame confirmation requirement was not lowered, connectivity was not widened,
+and no segmentation, mask erosion, depth registration, depth-discontinuity threshold, box trim,
+box-growth guard, or one-centimetre measurement resolution was changed. Historical points are also
+not removed merely because they are absent from the current 2D mask: from another viewpoint they may
+be off-screen or occluded, so such a test would again erase valid previously scanned faces.
+
+#### Follow-up physical-device validation
+
+1. Scan one face until it has stable cyan coverage, then reveal several previously empty faces.
+   Confirm each new spatial region gains markers even after the displayed pool is full.
+2. Continue a long scan and verify the reported fitted-point count can grow beyond 10,000 without
+   stopping at that former boundary.
+3. Deliberately include a small mask-edge leak or background sliver. Confirm points rejected by the
+   accepted box do not remain visible outside it.
+4. Turn the first face away from the camera and confirm its accepted points remain protected.
+5. Repeat with several simultaneous locks and watch memory pressure and thermal state because the
+   per-object measurement allowance and optional RealityKit marker pool are both larger.

@@ -1,10 +1,3 @@
-//
-//  EdgeTAMSegmenter.swift
-//  PayloadMeasure
-//
-//  Runs Meta's pretrained EdgeTAM point-prompt segmentation through the three official
-//  Core ML exports. The models are Apache-2.0 licensed and execute entirely on device.
-//
 
 import CoreImage
 import CoreML
@@ -44,9 +37,6 @@ enum EdgeTAMSegmenterError: LocalizedError {
     }
 }
 
-/// A small dynamic Core ML wrapper avoids coupling the app to Xcode-generated model class names.
-/// It is owned and called serially by `ObjectMaskProcessor`, so synchronous prediction never blocks
-/// the main actor and one image encoding can be shared by every object prompt in a camera frame.
 final class EdgeTAMSegmenter: @unchecked Sendable {
     static let inputSize = 1024
     static let maskSize = 256
@@ -119,7 +109,6 @@ final class EdgeTAMSegmenter: @unchecked Sendable {
         )
     }
 
-    /// `point` uses Vision's lower-left normalized coordinates in the upright camera image.
     func segment(
         features: EdgeTAMFrameFeatures,
         at point: NormalizedPoint,
@@ -282,8 +271,6 @@ final class EdgeTAMSegmenter: @unchecked Sendable {
         }
 
         let pixelCount = Self.maskSize * Self.maskSize
-        // A first-click mask covering most of the image is almost always the inverse/background
-        // candidate. Subsequent masks are additionally constrained to modest per-keyframe growth.
         let maximumAreaFraction = expectedArea == nil ? 0.60 : 0.82
         let maximumArea = Int(Double(pixelCount) * maximumAreaFraction)
         let plausible = candidates.filter {
@@ -302,9 +289,6 @@ final class EdgeTAMSegmenter: @unchecked Sendable {
         }
         let selected: (index: Int, score: Float, containsPrompt: Bool, area: Int)?
         if expectedArea == nil, let primaryMask = plausible.first(where: { $0.index == 0 }) {
-            // The exported decoder is traced in multimask mode. Its official Core ML example uses
-            // token zero for the primary object; picking the highest IoU token instead frequently
-            // selected a tiny sub-part (window/label) rather than the complete tapped object.
             selected = primaryMask
         } else {
             selected = plausible.max(by: { left, right in
@@ -348,9 +332,6 @@ final class EdgeTAMSegmenter: @unchecked Sendable {
         return EdgeTAMMask(pixelBuffer: output, predictedIoU: selected.score)
     }
 
-    /// EdgeTAM normally ranks its three granularities by predicted IoU. A small temporal-area
-    /// penalty prevents a support surface (or inverse mask) from winning solely because it is a
-    /// larger, easier region, while still allowing genuine close/far camera movement.
     private func adjustedScore(
         _ candidate: (index: Int, score: Float, containsPrompt: Bool, area: Int),
         pixelCount: Int,

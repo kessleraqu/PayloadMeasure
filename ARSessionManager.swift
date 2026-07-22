@@ -1,9 +1,3 @@
-//
-//  ARSessionManager.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
 
 import ARKit
 import Observation
@@ -115,7 +109,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             : "Camera-based world tracking"
     }
 
-    /// Automatic object capture currently depends on the per-frame LiDAR depth map.
     var isAutomaticObjectCaptureSupported: Bool {
         isSceneDepthSupported
     }
@@ -180,8 +173,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
         if isSceneDepthSupported {
             configuration.frameSemantics.insert(.sceneDepth)
-            // Smoothed depth is temporally filtered and noticeably less noisy; the capture pipeline
-            // prefers it when available.
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
                 configuration.frameSemantics.insert(.smoothedSceneDepth)
             }
@@ -191,8 +182,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
 
         if isSceneReconstructionSupported {
-            // The mesh drives the optional on-screen wireframe overlay. Object capture itself uses
-            // the dense depth map, not the mesh, so a plain mesh is sufficient here.
             configuration.sceneReconstruction = .mesh
             isSceneReconstructionEnabled = true
         } else {

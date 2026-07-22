@@ -1,22 +1,15 @@
-//
-//  MeasurementOverlayView.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
-
 import SwiftUI
 
-struct MeasurementOverlayView: View {
+struct MesOverlayView: View {
     let sessionManager: ARSessionManager
-    let measurementEngine: MeasurementEngine
+    let mesEngine: MesEngine
     let captureEngine: ObjectCaptureEngine
 
     @State private var showsPanel = false
     @State private var showsLiDARLimitations = false
 
     private var isScanning: Bool {
-        measurementEngine.mode == .scan
+        mesEngine.mode == .scan
     }
 
     private var isAutomaticCaptureSupported: Bool {
@@ -35,7 +28,7 @@ struct MeasurementOverlayView: View {
                     if isScanning {
                         captureReadout
                     } else {
-                        measurementReadout
+                        mesReadout
                     }
 
                     Spacer(minLength: 12)
@@ -97,7 +90,7 @@ struct MeasurementOverlayView: View {
             }
         }
         .animation(.snappy(duration: 0.22), value: showsPanel)
-        .animation(.snappy(duration: 0.18), value: measurementEngine.mode)
+        .animation(.snappy(duration: 0.18), value: mesEngine.mode)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
@@ -214,9 +207,6 @@ struct MeasurementOverlayView: View {
         }
     }
 
-    /// A fresh segmentation image may finish after the phone has already moved. Reprojecting its
-    /// world anchor translates and scales the visual mask to the current camera pose immediately.
-    /// Metric depth never uses this visual prediction; it stays tied to the exact source frame.
     private func trackedObjectMaskPreview(
         _ layer: ObjectMaskPreviewLayer,
         marker: ObjectMaskMarker?
@@ -298,20 +288,20 @@ struct MeasurementOverlayView: View {
         )
     }
 
-    private var measurementReadout: some View {
+    private var mesReadout: some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(measurementEngine.measurementStatusText)
+                Text(mesEngine.mesStatusText)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                Text(measurementEngine.primaryMeasurementText)
+                Text(mesEngine.primaryMeasurementText)
                     .font(primaryValueFont)
                     .monospacedDigit()
                     .lineLimit(2)
                     .minimumScaleFactor(0.72)
 
-                if let secondaryMeasurementText = measurementEngine.secondaryMeasurementText {
+                if let secondaryMeasurementText = mesEngine.secondaryMeasurementText {
                     Text(secondaryMeasurementText)
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.secondary)
@@ -319,9 +309,9 @@ struct MeasurementOverlayView: View {
                 }
             }
 
-            if measurementEngine.canReset {
+            if mesEngine.canReset {
                 Button {
-                    measurementEngine.reset()
+                    mesEngine.reset()
                 } label: {
                     Image(systemName: "arrow.counterclockwise")
                         .font(.system(size: 14, weight: .semibold))
@@ -670,15 +660,15 @@ struct MeasurementOverlayView: View {
 
     private var modeMenu: some View {
         Menu {
-            ForEach(MeasurementMode.allCases) { mode in
+            ForEach(MesMode.allCases) { mode in
                 Button {
-                    measurementEngine.mode = mode
+                    mesEngine.mode = mode
                 } label: {
                     HStack {
                         Label(mode.title, systemImage: mode.systemImageName)
                         Spacer()
 
-                        if measurementEngine.mode == mode {
+                        if mesEngine.mode == mode {
                             Image(systemName: "checkmark")
                         }
                     }
@@ -686,7 +676,7 @@ struct MeasurementOverlayView: View {
             }
         } label: {
             HStack(spacing: 7) {
-                Image(systemName: measurementEngine.mode.systemImageName)
+                Image(systemName: mesEngine.mode.systemImageName)
                     .font(.system(size: 14, weight: .semibold))
 
                 Text("Mode")
@@ -700,7 +690,7 @@ struct MeasurementOverlayView: View {
             .frame(height: 42)
             .contentShape(Capsule())
             .background {
-                if measurementEngine.mode == .scan {
+                if mesEngine.mode == .scan {
                     Capsule()
                         .fill(.white.opacity(0.08))
                 }
@@ -709,17 +699,17 @@ struct MeasurementOverlayView: View {
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
         .background(.ultraThinMaterial, in: Capsule())
-        .accessibilityLabel("Measurement mode, \(measurementEngine.mode.title)")
+        .accessibilityLabel("Measurement mode, \(mesEngine.mode.title)")
     }
 
     private var aimer: some View {
         ZStack {
             Ellipse()
-                .fill(.white.opacity(measurementEngine.isAimerOnSurface ? 0.24 : 0.12))
+                .fill(.white.opacity(mesEngine.isAimerOnSurface ? 0.24 : 0.12))
                 .frame(width: 22, height: 22)
 
             Ellipse()
-                .stroke(.white.opacity(measurementEngine.isAimerOnSurface ? 1 : 0.62), lineWidth: 1.5)
+                .stroke(.white.opacity(mesEngine.isAimerOnSurface ? 1 : 0.62), lineWidth: 1.5)
                 .frame(width: 15, height: 15)
 
             Ellipse()
@@ -728,11 +718,11 @@ struct MeasurementOverlayView: View {
         }
         .scaleEffect(
             x: 1,
-            y: CGFloat(measurementEngine.aimerSurfaceScaleY),
+            y: CGFloat(mesEngine.aimerSurfaceScaleY),
             anchor: .center
         )
-        .scaleEffect(CGFloat(measurementEngine.aimerDistanceScale), anchor: .center)
-        .rotationEffect(.degrees(measurementEngine.aimerSurfaceRotationDegrees))
+        .scaleEffect(CGFloat(mesEngine.aimerDistanceScale), anchor: .center)
+        .rotationEffect(.degrees(mesEngine.aimerSurfaceRotationDegrees))
         .shadow(color: .white.opacity(0.55), radius: 5)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -740,7 +730,7 @@ struct MeasurementOverlayView: View {
 
     private var addPointButton: some View {
         Button {
-            measurementEngine.requestPointPlacement()
+            mesEngine.requestPointPlacement()
         } label: {
             Label("Add Point", systemImage: "plus")
                 .font(.headline.weight(.semibold))
@@ -756,7 +746,7 @@ struct MeasurementOverlayView: View {
     }
 
     private var primaryValueFont: Font {
-        switch measurementEngine.mode {
+        switch mesEngine.mode {
         case .line:
             .system(.callout, design: .rounded).weight(.semibold)
         case .boundingBox, .scan:
@@ -786,9 +776,9 @@ struct MeasurementOverlayView: View {
 }
 
 #Preview {
-    MeasurementOverlayView(
+    MesOverlayView(
         sessionManager: ARSessionManager(),
-        measurementEngine: MeasurementEngine(),
+        mesEngine: MesEngine(),
         captureEngine: ObjectCaptureEngine()
     )
 }

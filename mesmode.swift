@@ -1,13 +1,6 @@
-//
-//  MeasurementMode.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
-
 import Foundation
 
-enum MeasurementMode: String, CaseIterable, Identifiable {
+enum MesMode: String, CaseIterable, Identifiable {
     case line
     case boundingBox
     case scan

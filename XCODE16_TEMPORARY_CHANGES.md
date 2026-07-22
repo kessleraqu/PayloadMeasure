@@ -6,9 +6,9 @@ Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), th
 
 ## Files changed
 
-- `ObjectMaskProcessor.swift`
-- `PayloadMeasure/EdgeTAMSegmenter.swift`
-- `ARCameraView.swift`
+- `objectmaskprocessor.swift`
+- `PayloadMeasure/edgetamsegmenter.swift`
+- `arcameraview.swift`
 - `XCODE16_TEMPORARY_CHANGES.md` (this record; newly created)
 
 `PayloadMeasure.xcodeproj/project.pbxproj` was not changed.
@@ -17,7 +17,7 @@ Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), th
 
 Only 19 type declaration headers and one RealityKit initializer expression were changed. No segmentation, tracking, ARKit session flow, Vision, Core ML, depth processing, concurrency implementation, rendering behavior, constants, or thresholds were changed.
 
-### ObjectMaskProcessor.swift
+### objectmaskprocessor.swift
 
 Xcode 16.2's Swift 6.0.3 compiler rejects the Xcode 26 declaration-level `nonisolated` syntax. Each temporary replacement removes only the unsupported modifier and retains the original protocol conformances, including `Sendable` and `@unchecked Sendable`.
 
@@ -52,7 +52,7 @@ Xcode 16.2's Swift 6.0.3 compiler rejects the Xcode 26 declaration-level `noniso
 - Original: `nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {`
   Temporary: `struct ObjectMaskProcessingResult: @unchecked Sendable {`
 
-### PayloadMeasure/EdgeTAMSegmenter.swift
+### PayloadMeasure/edgetamsegmenter.swift
 
 - Original: `nonisolated struct EdgeTAMFrameFeatures: @unchecked Sendable {`
   Temporary: `struct EdgeTAMFrameFeatures: @unchecked Sendable {`
@@ -63,14 +63,14 @@ Xcode 16.2's Swift 6.0.3 compiler rejects the Xcode 26 declaration-level `noniso
 - Original: `nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {`
   Temporary: `final class EdgeTAMSegmenter: @unchecked Sendable {`
 
-### ARCameraView.swift
+### arcameraview.swift
 
 Xcode 16.2's iPhoneOS RealityKit interface contains `AnchorEntity(anchor: ARAnchor)`, but its iPhoneSimulator RealityKit interface omits that convenience initializer. Both SDK interfaces support an anchor target identified by the same `ARAnchor` UUID. The following one-line spelling compiles for device and simulator and continues to bind the RealityKit entity to the exact `ARAnchor` added to the `ARSession` immediately afterward.
 
 - Original: `let anchorEntity = AnchorEntity(anchor: arAnchor)`
   Temporary: `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))`
 
-The supported method-level `nonisolated` modifiers on the seven `ARSessionDelegate` methods in `ARSessionManager.swift` were intentionally retained. They are accepted by Swift 6.0 and are part of the existing concurrency architecture.
+The supported method-level `nonisolated` modifiers on the seven `ARSessionDelegate` methods in `arsessionmanager.swift` were intentionally retained. They are accepted by Swift 6.0 and are part of the existing concurrency architecture.
 
 ## Project settings
 
@@ -92,7 +92,7 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 
 ## Source and model membership verification
 
-- `ObjectMaskProcessor.swift` exists once, has one `PBXFileReference`, one `PBXBuildFile`, and one entry in the sole target's `PBXSourcesBuildPhase`. It is outside the synchronized `PayloadMeasure/` group, so it is compiled exactly once.
+- `objectmaskprocessor.swift` exists once, has one `PBXFileReference`, one `PBXBuildFile`, and one entry in the sole target's `PBXSourcesBuildPhase`. It is outside the synchronized `PayloadMeasure/` group, so it is compiled exactly once.
 - These Core ML packages remain under the target's synchronized `PayloadMeasure/` root group with no membership exception and were all compiled into the app during verification:
   - `PayloadMeasure/Models/EdgeTAM/edgetam_image_encoder.mlpackage`
   - `PayloadMeasure/Models/EdgeTAM/edgetam_prompt_encoder.mlpackage`
@@ -106,11 +106,11 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 
 ## Restoring the Xcode 26 syntax next week
 
-1. In `ObjectMaskProcessor.swift`, restore `nonisolated ` immediately before each of the 15 type declarations listed above.
-2. In `PayloadMeasure/EdgeTAMSegmenter.swift`, restore `nonisolated ` immediately before each of the four type declarations listed above.
-3. In `ARCameraView.swift`, replace `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))` with `let anchorEntity = AnchorEntity(anchor: arAnchor)`.
-4. Do not change the retained method-level `nonisolated` modifiers in `ARSessionManager.swift`.
+1. In `objectmaskprocessor.swift`, restore `nonisolated ` immediately before each of the 15 type declarations listed above.
+2. In `PayloadMeasure/edgetamsegmenter.swift`, restore `nonisolated ` immediately before each of the four type declarations listed above.
+3. In `arcameraview.swift`, replace `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))` with `let anchorEntity = AnchorEntity(anchor: arAnchor)`.
+4. Do not change the retained method-level `nonisolated` modifiers in `arsessionmanager.swift`.
 5. No project setting needs to be restored because none was changed.
-6. Rebuild with Xcode 26 and confirm all three Core ML models still compile and `ObjectMaskProcessor.swift` remains present once in Compile Sources.
+6. Rebuild with Xcode 26 and confirm all three Core ML models still compile and `objectmaskprocessor.swift` remains present once in Compile Sources.
 
 No Git command was used while making or verifying these temporary changes.

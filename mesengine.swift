@@ -1,18 +1,11 @@
-//
-//  MeasurementEngine.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
-
 import Foundation
 import Observation
 import simd
 
 @MainActor
 @Observable
-final class MeasurementEngine {
-    var mode: MeasurementMode = .scan {
+final class MesEngine {
+    var mode: MesMode = .scan {
         didSet {
             if mode != oldValue {
                 reset()
@@ -20,7 +13,7 @@ final class MeasurementEngine {
         }
     }
 
-    private(set) var points: [MeasurementPoint] = []
+    private(set) var points: [MesPoint] = []
     private(set) var lastMessage = "Aim at an object on a flat surface, then Capture."
     private(set) var resetRevision = 0
     private(set) var placementRequestRevision = 0
@@ -53,7 +46,7 @@ final class MeasurementEngine {
         return dimensions.x * dimensions.y * dimensions.z
     }
 
-    var measurementStatusText: String {
+    var mesStatusText: String {
         if points.contains(where: \.isRefining) {
             return "Refining point placement"
         }
@@ -83,7 +76,6 @@ final class MeasurementEngine {
         case .boundingBox:
             formattedBoundingBoxDimensions
         case .scan:
-            // Scan mode is presented by ObjectCaptureEngine; MeasurementEngine stays idle here.
             "--"
         }
     }
@@ -157,7 +149,7 @@ final class MeasurementEngine {
             reset()
         }
 
-        let point = MeasurementPoint(index: points.count + 1, position: position)
+        let point = MesPoint(index: points.count + 1, position: position)
         points.append(point)
         updateMessage()
         return point.id

@@ -1,9 +1,3 @@
-//
-//  ObjectMaskProcessor.swift
-//  PayloadMeasure
-//
-//  Created by Codex on 14/07/2026.
-//
 
 import CoreImage
 import CoreVideo
@@ -12,8 +6,6 @@ import ImageIO
 import simd
 import Vision
 
-/// One independently positioned colored mask. Locked layers carry a world-anchor reference;
-/// the unlocked center preview intentionally has no object ID and is replaced on every inference.
 struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let image: CGImage
     let trackedObjectID: UUID?
@@ -21,7 +13,6 @@ struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let referenceCameraDistance: Float?
 }
 
-/// Display-ready RGB segmentation layers, already upright for the current interface orientation.
 struct ObjectMaskPreview: @unchecked Sendable {
     let layers: [ObjectMaskPreviewLayer]
     let timestamp: TimeInterval
@@ -48,7 +39,6 @@ struct ObjectMaskPreview: @unchecked Sendable {
     }
 }
 
-/// A tap in normalized viewport coordinates, with an upper-left origin like SwiftUI.
 struct ObjectMaskToggleRequest: @unchecked Sendable {
     let normalizedViewportPoint: CGPoint
     let proposedLockID: UUID?
@@ -68,8 +58,6 @@ struct ObjectMaskToggleRequest: @unchecked Sendable {
     }
 }
 
-/// The current screen projection of a persistent AR anchor. Vision uses this as the authoritative
-/// search location after a lock leaves the camera and later becomes visible again.
 struct ObjectMaskAnchorHint: @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint?
@@ -83,7 +71,6 @@ struct ObjectMaskDisplayColor: Sendable, Hashable {
     let blue: Double
 }
 
-/// A lightweight world-anchored marker shown whenever an exact pixel mask is unavailable.
 struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint
@@ -103,14 +90,10 @@ struct ObjectMaskLockChange: @unchecked Sendable {
     let worldTransform: simd_float4x4?
 }
 
-/// Retains an AR camera pixel buffer while it crosses from the main actor to the Vision worker.
-/// ARKit camera frames are immutable for the duration of this processing request.
 struct ObjectMaskFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let viewportSize: CGSize
-    /// ARKit's normalized raw-camera (top-left) to normalized viewport (top-left) transform.
-    /// Every tap, mask, depth sample, and motion frame must use this same transform.
     let imageToViewportTransform: CGAffineTransform
     let toggleRequest: ObjectMaskToggleRequest?
     let anchorHints: [ObjectMaskAnchorHint]
@@ -119,9 +102,6 @@ struct ObjectMaskFrame: @unchecked Sendable {
     let depthSnapshot: ObjectMaskDepthSnapshot?
 }
 
-/// The calibration and depth buffers captured with the RGB image passed to Vision. Keeping these
-/// together is essential: sampling a newer depth frame with an older mask is a direct source of
-/// table leakage when the phone moves.
 struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let depthMap: CVPixelBuffer
     let confidenceMap: CVPixelBuffer?
@@ -137,8 +117,6 @@ struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let timestamp: TimeInterval
 }
 
-/// A compact segmentation correction consumed by the high-rate optical-flow worker. Each locked
-/// object retains its own binary mask, so one object's update can never erase another's overlay.
 struct ObjectMaskMotionLayer: @unchecked Sendable {
     let id: UUID
     let color: ObjectMaskDisplayColor
@@ -157,8 +135,6 @@ struct ObjectMaskMotionKeyframe: @unchecked Sendable {
     let layers: [ObjectMaskMotionLayer]
 }
 
-/// The newest camera frame available when a slower segmentation keyframe finishes. Optical flow
-/// advances that correction to this time before it is displayed, eliminating a backwards snap.
 struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
@@ -166,8 +142,6 @@ struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {
     let timestamp: TimeInterval
 }
 
-/// Carries both the rendered overlay and tracker state back to the main actor. A nil preview is a
-/// valid result when locked objects are temporarily outside the camera frame.
 struct ObjectMaskProcessingResult: @unchecked Sendable {
     let preview: ObjectMaskPreview?
     let lockedObjectCount: Int
@@ -180,8 +154,6 @@ struct ObjectMaskProcessingResult: @unchecked Sendable {
     let maskedPointClouds: [ObjectMaskDepthPointCloud]
 }
 
-/// Performs foreground-instance segmentation and stateful object tracking away from the main
-/// actor. The center aimer previews an object; tapping any visible object toggles its lock.
 actor ObjectMaskProcessor {
     private struct TrackedObject {
         let id: UUID
@@ -197,9 +169,6 @@ actor ObjectMaskProcessor {
         var lastAcceptedTimestamp: TimeInterval
     }
 
-    /// EdgeTAM owns a separate lock state so the previous Vision implementation remains an intact
-    /// fallback. The visual tracker predicts where to prompt the segmentation model; the model's
-    /// fresh pixel mask then corrects the tracker on every accepted frame.
     private struct EdgeTAMTrackedObject {
         let id: UUID
         let colorIndex: Int
@@ -287,10 +256,6 @@ actor ObjectMaskProcessor {
             trackingGeneration = frame.trackingGeneration
         }
 
-        // Apple's native request is the lowest-latency common path on both A15 and A16, returns all
-        // noticeable foreground instances in one pass, and pairs every correction with the exact
-        // LiDAR frame below. Do not fall through to the image-only EdgeTAM export: its extra encoder
-        // pass made selection slower and still did not include EdgeTAM's temporal memory bank.
         edgeTAMTrackedObjects.removeAll(keepingCapacity: true)
         return await makeNativeVisionPreview(from: frame)
     }
@@ -303,14 +268,10 @@ actor ObjectMaskProcessor {
         return edgeTAMSegmenter
     }
 
-    /// Native foreground instances provide the production multi-object keyframes. The masks are
-    /// reprojected with ARKit and then propagated at camera cadence by the motion worker.
     private func makeNativeVisionPreview(
         from frame: ObjectMaskFrame
     ) async -> ObjectMaskProcessingResult {
 
-        // Materialize the camera orientation in the CIImage coordinate space before handing it to
-        // Vision. The request input and generated mask then share one upright coordinate system.
         let cameraImage = CIImage(cvPixelBuffer: frame.pixelBuffer).oriented(frame.orientation)
         let handler = ImageRequestHandler(cameraImage)
 
@@ -320,8 +281,6 @@ actor ObjectMaskProcessor {
                 return result(preview: nil, frame: frame)
             }
 
-            // Vision tracking is independent of ARKit's mapping-readiness label. In particular,
-            // RGB-only devices must be able to retain a mask while world tracking is still limited.
             await updateTrackedObjects(
                 using: observation,
                 handler: handler,
@@ -352,10 +311,6 @@ actor ObjectMaskProcessor {
             previewLayers.reserveCapacity(selections.count)
             maskedPointClouds.reserveCapacity(selections.count)
 
-            // Vision's compact observation mask does not preserve the source-image registration
-            // required by ARKit scene depth. Generate the correctly aligned source-size mask one
-            // selection at a time, consume it immediately, then drain its autorelease pool. This
-            // keeps metric alignment without retaining N full-resolution Float masks at once.
             for selection in selections {
                 let processed = try autoreleasepool {
                     let pixelBuffer = try observation.generateScaledMask(
@@ -428,16 +383,12 @@ actor ObjectMaskProcessor {
         }
     }
 
-    /// Runs EdgeTAM's image encoder once, then applies a separate prompt and decoder pass for each
-    /// lock. Returning nil is reserved for a model-level failure before any EdgeTAM locks exist;
-    /// that lets the caller fall back to the preserved native Vision implementation.
     private func makeEdgeTAMPreview(
         from frame: ObjectMaskFrame,
         segmenter: EdgeTAMSegmenter
     ) async -> ObjectMaskProcessingResult? {
         let cameraImage = CIImage(cvPixelBuffer: frame.pixelBuffer).oriented(frame.orientation)
 
-        // Do not spend an encoder pass until there is either a lock to update or a tap to resolve.
         guard !edgeTAMTrackedObjects.isEmpty || frame.toggleRequest != nil else {
             return edgeTAMResult(preview: nil, frame: frame)
         }
@@ -691,8 +642,6 @@ actor ObjectMaskProcessor {
             return .unchanged
         }
 
-        // If EdgeTAM resolves the tap to an already locked mask even though the exact low-resolution
-        // pixel missed it, interpret the action as the expected tap-again deletion.
         if let duplicateIndex = edgeTAMTrackedObjects.firstIndex(where: { trackedObject in
             if let currentMask = trackedObject.currentMask {
                 return maskIntersectionOverUnion(initialMask.pixelBuffer, currentMask) > 0.92
@@ -819,8 +768,6 @@ actor ObjectMaskProcessor {
         )
     }
 
-    /// Three negative prompts just outside the previous/predicted object boundary strongly reduce
-    /// the chance that EdgeTAM expands from a payload onto the table supporting it.
     private func negativePromptPoints(around boundingBox: NormalizedRect) -> [NormalizedPoint] {
         let rect = boundingBox.cgRect
         let margin = max(max(rect.width, rect.height) * 0.12, 0.018)
@@ -1008,9 +955,6 @@ actor ObjectMaskProcessor {
            let request = frame.toggleRequest,
            let cameraDistance = request.cameraDistance,
            let trackedObject = trackedObjects.first(where: { $0.id == lockChange.id }) {
-            // The AR anchor is applied on the main actor after this result returns, so its first
-            // frame has no anchor hint yet. Emit the tap/depth projection immediately to avoid a
-            // one-frame disappearance just after the user locks the colored preview.
             markers.append(
                 ObjectMaskMarker(
                     id: lockChange.id,
@@ -1051,9 +995,6 @@ actor ObjectMaskProcessor {
         }
     }
 
-    /// Associates the exact mask with the world anchor projection from the same source frame. If
-    /// this frame created the target, its tap/depth anchor is newer than `anchorHints`,
-    /// which still describes the previous target until the main actor applies the lock change.
     private func displayTrackingReference(
         for lockID: UUID,
         toggleOutcome: ToggleOutcome,
@@ -1074,8 +1015,6 @@ actor ObjectMaskProcessor {
         return (point, hint.cameraDistance)
     }
 
-    /// Uses Vision's lightweight stateful tracker to predict each locked object's new rectangle,
-    /// then associates that rectangle with the corresponding instance in the fresh segmentation.
     private func updateTrackedObjects(
         using observation: InstanceMaskObservation,
         handler: ImageRequestHandler,
@@ -1100,8 +1039,6 @@ actor ObjectMaskProcessor {
                 anchorPoint = projectedPoint
                 cameraDistance = hint.cameraDistance
             } else {
-                // The AR anchor is installed on the main actor after this worker returns. Until its
-                // first projection arrives, continue from the last visual location.
                 anchorPoint = NormalizedPoint(
                     x: trackedObjects[index].lastGeometry.centroid.x,
                     y: trackedObjects[index].lastGeometry.centroid.y
@@ -1184,21 +1121,15 @@ actor ObjectMaskProcessor {
                 )
             }
 
-            // Four alternatives per lock keep the association matrix sparse while still allowing
-            // the polynomial assignment below to resolve competition among up to fifteen locks.
             candidateLists[index] = Array(
                 candidateLists[index].sorted { $0.score > $1.score }.prefix(4)
             )
         }
 
-        // Solve all locks together. The previous greedy loop let the first tracker claim an
-        // ambiguous instance and made a later, correct mask disappear.
         let assignments = globallyOptimalAssignments(candidateLists)
         for index in trackedObjects.indices {
             let bestMatch = assignments[index]
             if let bestMatch {
-                // Correct the tracker back to the accepted segmentation bounds every frame. Without
-                // this correction its rectangle can expand or drift onto the support surface.
                 let correctedObservation = DetectedObjectObservation(
                     boundingBox: bestMatch.geometry.boundingBox
                 )
@@ -1235,8 +1166,6 @@ actor ObjectMaskProcessor {
             uniqueKeysWithValues: instances.enumerated().map { ($0.element, $0.offset) }
         )
         let rowCount = candidates.count
-        // One dummy column per row allows any tracker to stay unmatched at zero score instead of
-        // accepting a weak/invalid instance. Columns therefore always outnumber rows.
         let columnCount = instances.count + rowCount
         let invalidWeight: CGFloat = -1_000_000
         var weights = Array(
@@ -1260,8 +1189,6 @@ actor ObjectMaskProcessor {
             }
         }
 
-        // Hungarian assignment, expressed as minimum cost (`-score`). This replaces the previous
-        // exponential exhaustive search, which was reasonable for a few locks but not for fifteen.
         var rowPotential = [CGFloat](repeating: 0, count: rowCount + 1)
         var columnPotential = [CGFloat](repeating: 0, count: columnCount + 1)
         var matchedRow = [Int](repeating: 0, count: columnCount + 1)
@@ -1325,8 +1252,6 @@ actor ObjectMaskProcessor {
         }
     }
 
-    /// Predicts mask scale from camera-to-anchor distance. This permits legitimate close/far moves
-    /// while preventing a small payload mask from suddenly expanding onto its supporting table.
     private func projectedSearchBox(
         for trackedObject: TrackedObject,
         anchorPoint: NormalizedPoint,
@@ -1348,8 +1273,6 @@ actor ObjectMaskProcessor {
         return NormalizedRect(x: x, y: y, width: width, height: height)
     }
 
-    /// Vision tracking is only a search hint. A full-frame or abruptly displaced rectangle must not
-    /// be allowed to search unrelated objects, even if one happens to have a similar mask area.
     private func validatedPrediction(
         _ prediction: NormalizedRect?,
         relativeTo previous: NormalizedRect
@@ -1399,8 +1322,6 @@ actor ObjectMaskProcessor {
         }
     }
 
-    /// Tapping a currently tracked instance removes it. The AR layer supplies either a measured
-    /// surface anchor or an RGB-only provisional ray anchor, so locking never depends on LiDAR.
     private func toggleLock(
         at point: NormalizedPoint,
         request: ObjectMaskToggleRequest,
@@ -1416,8 +1337,6 @@ actor ObjectMaskProcessor {
                tappedInstances.contains(currentInstance) {
                 return true
             }
-            // Only use the rectangle fallback when segmentation missed the tap completely. If the
-            // tap selected a different instance inside an overlapping rectangle, it is a new object.
             if tappedInstances.isEmpty,
                trackedObject.lastGeometry.boundingBox.cgRect.contains(point.cgPoint) {
                 return true
@@ -1443,8 +1362,6 @@ actor ObjectMaskProcessor {
             return .unchanged
         }
 
-        // The nearest-mask fallback is also used for removal. This keeps tap-again deletion working
-        // when the low-resolution instance map misses the exact touch pixel.
         if let existingIndex = trackedObjects.firstIndex(where: {
             $0.currentInstance == candidate.instance
         }) {
@@ -1494,9 +1411,6 @@ actor ObjectMaskProcessor {
         )
     }
 
-    /// Chooses the closest plausible foreground instance. Exact taps remain preferred, but a
-    /// nearest-mask fallback makes selection tolerant of the low-resolution Vision mask boundary
-    /// and small camera movement between the UI tap and the processed frame.
     private func lockCandidate(
         near point: NormalizedPoint,
         preferredInstances: IndexSet,
@@ -1538,10 +1452,6 @@ actor ObjectMaskProcessor {
         return Self.lockedColors.indices.first(where: { !usedColors.contains($0) }) ?? 0
     }
 
-    /// Maps the actual RealityKit viewport point back through ARKit's display transform, rotates
-    /// the raw sensor coordinate into Vision's upright image, then changes to Vision's lower-left
-    /// origin. Using ARKit's transform is critical: a generic aspect-fill crop is not equivalent in
-    /// portrait and was the cause of the visibly lowered/rotated masks.
     private func imagePoint(
         for viewportPoint: CGPoint,
         frame: ObjectMaskFrame
@@ -1582,8 +1492,6 @@ actor ObjectMaskProcessor {
         }
     }
 
-    /// Prefer the exact point, then search a small ring. This tolerates low-resolution instance
-    /// masks missing the user's tap or the center aimer by a few pixels.
     private func instances(
         near point: NormalizedPoint,
         in observation: InstanceMaskObservation
@@ -1617,8 +1525,6 @@ actor ObjectMaskProcessor {
         return []
     }
 
-    /// Collects every instance found inside the predicted rectangle. The caller validates their
-    /// full mask geometry instead of blindly choosing the most common one (which may be the table).
     private func candidateInstanceCounts(
         in observation: InstanceMaskObservation,
         inside boundingBox: NormalizedRect
@@ -1662,9 +1568,6 @@ actor ObjectMaskProcessor {
             return nil
         }
 
-        // Consecutive-frame scale is more trustworthy than an RGB-only provisional anchor depth.
-        // It naturally permits gradual close/far movement while rejecting a one-frame jump from an
-        // object to the whole table. The 3D anchor remains a secondary reacquisition hint below.
         let previous = trackedObject.lastGeometry
         let expectedWidth = max(previous.boundingBox.width, 0.005)
         let expectedHeight = max(previous.boundingBox.height, 0.005)
@@ -1764,9 +1667,6 @@ actor ObjectMaskProcessor {
         return AppearanceSignature(values: values)
     }
 
-    /// A small chromaticity/luminance grid is inexpensive to compute and gives reacquisition an
-    /// identity signal beyond rectangle size. Normalizing each sample makes it less sensitive to
-    /// the exposure changes that occur while walking around an object.
     private func appearanceSignature(
         of image: CIImage,
         inside boundingBox: NormalizedRect
@@ -1871,7 +1771,6 @@ actor ObjectMaskProcessor {
 
         let padding: CGFloat = 0.015
         let x = max(CGFloat(minX) / CGFloat(width) - padding, 0)
-        // Pixel-buffer rows have a top-left origin; Vision rectangles use a lower-left origin.
         let y = max(1 - CGFloat(maxY + 1) / CGFloat(height) - padding, 0)
         let rectWidth = min(CGFloat(maxX - minX + 1) / CGFloat(width) + padding * 2, 1 - x)
         let rectHeight = min(CGFloat(maxY - minY + 1) / CGFloat(height) + padding * 2, 1 - y)
@@ -1904,9 +1803,6 @@ actor ObjectMaskProcessor {
             )
         }
 
-        // Preview the unclaimed foreground instance under the center aimer before it is tapped.
-        // Only inspect instances at/very near the center instead of generating geometry for every
-        // object in the frame; this keeps the preview cheap even when 10–15 locks are visible.
         if trackedObjects.count < Self.lockedColors.count,
            !frame.anchorHints.contains(where: { hint in
                guard let point = hint.normalizedViewportPoint else { return false }
@@ -1954,8 +1850,6 @@ actor ObjectMaskProcessor {
         from renderedMasks: [RenderedMask],
         frame: ObjectMaskFrame
     ) -> CGImage? {
-        // The overlay is only visual feedback. A smaller raster removes a large Swift per-pixel
-        // compositing cost from every correction.
         let dimensions = viewportDimensions(for: frame.viewportSize, longEdge: 320)
         guard dimensions.width > 0, dimensions.height > 0 else {
             return nil
@@ -2081,8 +1975,6 @@ actor ObjectMaskProcessor {
         )
     }
 
-    /// Produces a canonical top-left viewport mask. The inverse ARKit transform handles both the
-    /// camera crop and rotation; all downstream rendering and optical flow operate on this raster.
     private func viewportMask(
         _ pixelBuffer: CVPixelBuffer,
         width targetWidth: Int,
@@ -2144,9 +2036,6 @@ actor ObjectMaskProcessor {
         return result
     }
 
-    /// Back-projects only depth pixels accepted by a locked object's mask. The mask and depth map
-    /// are retained from the same ARFrame, avoiding the stale-mask/new-depth mismatch that used to
-    /// turn a fast camera movement into a table-sized point cloud.
     private func makeMaskedPointClouds(
         from renderedMasks: [RenderedMask],
         frame: ObjectMaskFrame
@@ -2222,9 +2111,6 @@ actor ObjectMaskProcessor {
         let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
         let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0) }
         let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
-        // Require approximately two LiDAR pixels of mask interior on every side. RGB and LiDAR are
-        // registered by ARKit, but foreground/background depth mixing is still strongest at object
-        // silhouettes. This erosion affects measurement only; the displayed mask stays unchanged.
         let swapsDepthAxes: Bool
         switch frame.orientation {
         case .left, .leftMirrored, .right, .rightMirrored:
@@ -2268,9 +2154,6 @@ actor ObjectMaskProcessor {
                     continue
                 }
 
-                // Reject mixed-depth edge pixels before mask lookup. A LiDAR sample whose direct
-                // neighbours jump to a different surface is exactly where table/background depth
-                // can leak through an otherwise correct RGB silhouette.
                 guard row > 0, row < depthHeight - 1,
                       column > 0, column < depthWidth - 1 else {
                     continue
@@ -2292,9 +2175,6 @@ actor ObjectMaskProcessor {
                     continue
                 }
 
-                // Scene depth uses the captured image's native normalized coordinates. Rotate that
-                // raw point directly into the upright Vision mask instead of round-tripping through
-                // the cropped viewport, which can introduce boundary disagreement in portrait.
                 let nativeImagePoint = CGPoint(
                     x: (CGFloat(column) + 0.5) / CGFloat(depthWidth),
                     y: (CGFloat(row) + 0.5) / CGFloat(depthHeight)
@@ -2344,9 +2224,6 @@ actor ObjectMaskProcessor {
 
 }
 
-/// Propagates every locked binary mask through the RGB video between segmentation corrections.
-/// This worker is deliberately separate from `ObjectMaskProcessor`: the expensive foreground
-/// segmentation request can be busy without blocking the much faster temporal update stream.
 actor ObjectMaskMotionProcessor {
     private struct LayerState {
         let id: UUID
@@ -2443,8 +2320,6 @@ actor ObjectMaskMotionProcessor {
             }
         }
 
-        // A missing object can retain its independently propagated layer briefly, but only when it
-        // is already at essentially the same time as this newly installed request.
         var mergedLayers = correctedLayers
         if dimensionsMatch, abs(previousTimestamp - installedTimestamp) <= 0.10 {
             let retainedIDs = Set(previousLayers.keys)
@@ -2500,7 +2375,6 @@ actor ObjectMaskMotionProcessor {
             lastTimestamp = timestamp
             return makePreview(timestamp: timestamp)
         } catch {
-            // Retain the last good mask rather than flashing it off for one failed flow request.
             return makePreview(timestamp: lastTimestamp)
         }
     }

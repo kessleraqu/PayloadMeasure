@@ -1,19 +1,8 @@
-//
-//  ObjectCaptureEngine.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
 
 import Foundation
 import Observation
 import simd
 
-/// Owns the LiDAR object-scan workflow: mesh/point display state, saved captures, and the
-/// request/reset counters the AR layer observes to do its work.
-///
-/// This deliberately mirrors the revision-counter pattern in `MeasurementEngine`: SwiftUI controls
-/// bump a counter, and `ARCameraView.Coordinator` reacts via `withObservationTracking`.
 @MainActor
 @Observable
 final class ObjectCaptureEngine {
@@ -46,7 +35,6 @@ final class ObjectCaptureEngine {
     private static let defaultPrompt = "Center or tap a highlighted object to lock it."
     private static let scanningPrompt = "Scanning masked depth — move slightly to reveal its sides."
 
-    /// The live box being refined, otherwise the most recently saved box.
     private var displayObject: CapturedObject? {
         if let previewObject {
             return previewObject
@@ -112,7 +100,6 @@ final class ObjectCaptureEngine {
         guard let object = displayObject else {
             return nil
         }
-        // Liters read more naturally than cubic meters at payload scale (1 m³ = 1000 L).
         let saved = capturedObjectsByID.isEmpty ? "" : "Ready \(capturedObjectsByID.count) · "
         return saved + String(
             format: "Volume %.1f L · %d pts",
@@ -151,8 +138,6 @@ final class ObjectCaptureEngine {
         showsObjectMaskMarkers.toggle()
     }
 
-    /// Hides only visualization layers. Tracking, segmentation, LiDAR accumulation, and saved
-    /// measurements continue unchanged so the operator can return to any display combination.
     func hideAllScanVisuals() {
         showsLiveMaskPreview = false
         showsLockedMaskPreviews = false
@@ -162,8 +147,6 @@ final class ObjectCaptureEngine {
         showsObjectMaskMarkers = false
     }
 
-    /// A presentation-friendly view: retain the selected masks and measured boxes without the
-    /// diagnostic mesh, raw LiDAR points, transient preview, or anchor markers.
     func showResultsOnly() {
         showsLiveMaskPreview = false
         showsLockedMaskPreviews = true
@@ -216,8 +199,6 @@ final class ObjectCaptureEngine {
         }
     }
 
-    /// Called from the inexpensive AR-anchor projection loop so lost/lock markers keep up with
-    /// fast phone motion even while a slower Vision segmentation request is still running.
     func updateObjectMaskMarkers(_ markers: [ObjectMaskMarker]) {
         if objectMaskMarkers != markers {
             objectMaskMarkers = markers
@@ -262,8 +243,6 @@ final class ObjectCaptureEngine {
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
 
-    /// Clears only the transient aimer preview. Cached locked layers remain available for
-    /// simultaneous display and immediate world-anchor reprojection after returning to an object.
     func clearLiveObjectMaskPreview() {
         liveMaskLayer = nil
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
@@ -285,7 +264,6 @@ final class ObjectCaptureEngine {
             : ObjectMaskPreview(layers: layers, timestamp: timestamp)
     }
 
-    /// Called continuously by the AR layer while live-scanning to show the box being built.
     func showPreview(_ object: CapturedObject) {
         previewObject = object
         if statusText != Self.scanningPrompt {
@@ -293,7 +271,6 @@ final class ObjectCaptureEngine {
         }
     }
 
-    /// Clears the live preview without a full reset (used when the scan re-anchors to a new object).
     func clearPreview() {
         previewObject = nil
         let prompt = capturedObjectsByID.isEmpty
@@ -311,7 +288,6 @@ final class ObjectCaptureEngine {
         captureRequestRevision += 1
     }
 
-    /// Cancels only the active acquisition. Previously saved objects and their boxes remain.
     func cancelCapture() {
         guard isCapturing else {
             return
@@ -327,7 +303,6 @@ final class ObjectCaptureEngine {
         updateCapture(id: UUID(), object: object)
     }
 
-    /// Inserts or refines one mask-owned 3D box without disturbing any other object.
     func updateCapture(id: UUID, object: CapturedObject) {
         if capturedObjectsByID[id] == nil {
             captureOrder.append(id)

@@ -7,29 +7,29 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AC99C67C2FF2B088006EBB3A /* ARSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */; };
-		AC99C67E2FF2B088006EBB3A /* ARCameraView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */; };
-		AC99C6802FF2B08A006EBB3A /* MeasurementOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */; };
+		AC99C67C2FF2B088006EBB3A /* arsessionmanager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */; };
+		AC99C67E2FF2B088006EBB3A /* arcameraview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67D2FF2B088006EBB3A /* arcameraview.swift */; };
+		AC99C6802FF2B08A006EBB3A /* mesoverlayview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */; };
 		AC99C6822FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md in Resources */ = {isa = PBXBuildFile; fileRef = AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */; };
-		AC99C6842FF2B226006EBB3A /* MeasurementPoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */; };
-		AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */; };
-		AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */; };
-		AC99C6912FF2C100006EBB3A /* ObjectCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */; };
-		AC99C6932FF2C100006EBB3A /* ObjectCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */; };
-		AC99C6952FF2C101006EBB3A /* ObjectMaskProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6942FF2C101006EBB3A /* ObjectMaskProcessor.swift */; };
+		AC99C6842FF2B226006EBB3A /* mespoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* mespoint.swift */; };
+		AC99C6862FF2B227006EBB3A /* mesengine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* mesengine.swift */; };
+		AC99C6882FF2BA02006EBB3A /* mesmode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* mesmode.swift */; };
+		AC99C6912FF2C100006EBB3A /* objectcapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6902FF2C100006EBB3A /* objectcapture.swift */; };
+		AC99C6932FF2C100006EBB3A /* objectcaptureengine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */; };
+		AC99C6952FF2C101006EBB3A /* objectmaskprocessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARSessionManager.swift; sourceTree = "<group>"; };
-		AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARCameraView.swift; sourceTree = "<group>"; };
-		AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementOverlayView.swift; sourceTree = "<group>"; };
+		AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arsessionmanager.swift; sourceTree = "<group>"; };
+		AC99C67D2FF2B088006EBB3A /* arcameraview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arcameraview.swift; sourceTree = "<group>"; };
+		AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesoverlayview.swift; sourceTree = "<group>"; };
 		AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = DEVELOPMENT_NOTES.md; sourceTree = "<group>"; };
-		AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementPoint.swift; sourceTree = "<group>"; };
-		AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementEngine.swift; sourceTree = "<group>"; };
-		AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeasurementMode.swift; sourceTree = "<group>"; };
-		AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectCapture.swift; sourceTree = "<group>"; };
-		AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectCaptureEngine.swift; sourceTree = "<group>"; };
-		AC99C6942FF2C101006EBB3A /* ObjectMaskProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectMaskProcessor.swift; sourceTree = "<group>"; };
+		AC99C6832FF2B226006EBB3A /* mespoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mespoint.swift; sourceTree = "<group>"; };
+		AC99C6852FF2B227006EBB3A /* mesengine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesengine.swift; sourceTree = "<group>"; };
+		AC99C6872FF2BA02006EBB3A /* mesmode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesmode.swift; sourceTree = "<group>"; };
+		AC99C6902FF2C100006EBB3A /* objectcapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectcapture.swift; sourceTree = "<group>"; };
+		AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectcaptureengine.swift; sourceTree = "<group>"; };
+		AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectmaskprocessor.swift; sourceTree = "<group>"; };
 		ACDB56EE2FF2805400508C46 /* PayloadMeasure.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayloadMeasure.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -57,16 +57,16 @@
 			children = (
 				ACDB56F02FF2805400508C46 /* PayloadMeasure */,
 				ACDB56EF2FF2805400508C46 /* Products */,
-				AC99C67B2FF2B088006EBB3A /* ARSessionManager.swift */,
-				AC99C67D2FF2B088006EBB3A /* ARCameraView.swift */,
-				AC99C67F2FF2B08A006EBB3A /* MeasurementOverlayView.swift */,
+				AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */,
+				AC99C67D2FF2B088006EBB3A /* arcameraview.swift */,
+				AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */,
 				AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */,
-				AC99C6832FF2B226006EBB3A /* MeasurementPoint.swift */,
-				AC99C6852FF2B227006EBB3A /* MeasurementEngine.swift */,
-				AC99C6872FF2BA02006EBB3A /* MeasurementMode.swift */,
-				AC99C6902FF2C100006EBB3A /* ObjectCapture.swift */,
-				AC99C6922FF2C100006EBB3A /* ObjectCaptureEngine.swift */,
-				AC99C6942FF2C101006EBB3A /* ObjectMaskProcessor.swift */,
+				AC99C6832FF2B226006EBB3A /* mespoint.swift */,
+				AC99C6852FF2B227006EBB3A /* mesengine.swift */,
+				AC99C6872FF2BA02006EBB3A /* mesmode.swift */,
+				AC99C6902FF2C100006EBB3A /* objectcapture.swift */,
+				AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */,
+				AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -153,15 +153,15 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AC99C67E2FF2B088006EBB3A /* ARCameraView.swift in Sources */,
-				AC99C6842FF2B226006EBB3A /* MeasurementPoint.swift in Sources */,
-				AC99C6802FF2B08A006EBB3A /* MeasurementOverlayView.swift in Sources */,
-				AC99C6882FF2BA02006EBB3A /* MeasurementMode.swift in Sources */,
-				AC99C6862FF2B227006EBB3A /* MeasurementEngine.swift in Sources */,
-				AC99C67C2FF2B088006EBB3A /* ARSessionManager.swift in Sources */,
-				AC99C6912FF2C100006EBB3A /* ObjectCapture.swift in Sources */,
-				AC99C6932FF2C100006EBB3A /* ObjectCaptureEngine.swift in Sources */,
-				AC99C6952FF2C101006EBB3A /* ObjectMaskProcessor.swift in Sources */,
+				AC99C67E2FF2B088006EBB3A /* arcameraview.swift in Sources */,
+				AC99C6842FF2B226006EBB3A /* mespoint.swift in Sources */,
+				AC99C6802FF2B08A006EBB3A /* mesoverlayview.swift in Sources */,
+				AC99C6882FF2BA02006EBB3A /* mesmode.swift in Sources */,
+				AC99C6862FF2B227006EBB3A /* mesengine.swift in Sources */,
+				AC99C67C2FF2B088006EBB3A /* arsessionmanager.swift in Sources */,
+				AC99C6912FF2C100006EBB3A /* objectcapture.swift in Sources */,
+				AC99C6932FF2C100006EBB3A /* objectcaptureengine.swift in Sources */,
+				AC99C6952FF2C101006EBB3A /* objectmaskprocessor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

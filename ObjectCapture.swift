@@ -1,32 +1,15 @@
-//
-//  ObjectCapture.swift
-//  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
-//
 
 import ARKit
 import CoreVideo
 import simd
 import UIKit
 
-/// An object captured from the LiDAR depth map.
-///
-/// The box is aligned to gravity on the vertical axis (ARKit's world Y, since the session uses
-/// `.gravity` world alignment) and to the object's dominant horizontal footprint direction on the
-/// two base axes. This gives an oriented box that follows the object instead of the world axes.
 struct CapturedObject {
-    /// Edge lengths in meters: `x` and `y` are the two horizontal extents, `z` is the vertical height.
     let dimensions: SIMD3<Float>
-    /// World-space center of the box.
     let center: SIMD3<Float>
-    /// The three orthonormal box axes in world space: (width, depth, height).
     let axes: (width: SIMD3<Float>, depth: SIMD3<Float>, height: SIMD3<Float>)
-    /// Eight world-space corners, indexed `i + 2*j + 4*k` along (width, depth, height).
     let corners: [SIMD3<Float>]
-    /// Volume in cubic meters.
     let volume: Float
-    /// Number of depth points that contributed to the capture — a rough confidence signal.
     let sampleCount: Int
 
     var widthInMeters: Float { dimensions.x }
@@ -41,45 +24,27 @@ struct CapturedObject {
     }
 }
 
-/// The result of a successful capture: the fitted box plus the cluster's voxel centers so the AR
-/// layer can show the operator exactly which points were selected.
 struct CaptureResult {
     let object: CapturedObject
     let selectionPoints: [SIMD3<Float>]
 }
 
-/// Outcome of a capture attempt, so the UI can explain failures precisely.
 enum CaptureOutcome {
     case success(CaptureResult)
     case noSupport
     case notEnoughMesh
 }
 
-/// Orchestrates a single object capture from a set of world-space depth points:
-/// support-height estimation → support/height gating → connected-component clustering seeded at the
-/// reticle → oriented-box fit. The clustering isolates a single object: once points near the
-/// support surface are dropped, an object resting on it becomes a spatially disconnected blob, so
-/// growing the connected component from the aimed point keeps the object and drops everything else.
 enum ObjectCapturePipeline {
-    /// One-centimetre object voxels preserve substantially more of the LiDAR silhouette than the
-    /// previous 2 cm grid. Support points stay coarser because they only estimate a plane height.
     static let voxelSize: Float = 0.01
     static let supportVoxelSize: Float = 0.02
-    /// 3D radius (a sphere) gathered around the reticle each frame. Kept tight so accumulation only
-    /// covers the aimed object and its immediate surroundings — not a tall column of the whole room,
-    /// which is what previously let the buffer explode.
     static let accumulationRadius: Float = 0.4
-    /// Tallest object we consider, above the support surface.
     static let maxHeight: Float = 1.5
-    /// Points within this height of the support surface are treated as the surface and dropped.
     static let floorClearance: Float = 0.025
-    /// Minimum cluster size before we trust a fit.
     static let minimumClusterPoints = 30
-    /// How many times a voxel must be observed before it counts toward the box. This is what makes
-    /// the box converge and refine instead of growing: transient depth noise (seen once or twice)
-    /// is ignored, while real surfaces — re-observed as the operator moves around — solidify.
+    private static let connectivityRadiusInVoxels = 2
     static let minObservations = 3
-    /// Radius around the reticle used to estimate the local support height.
+    static let selectionTolerance: Float = voxelSize * 0.5
     private static let supportRadius: Float = 0.24
 
     static func capture(
@@ -95,9 +60,6 @@ enum ObjectCapturePipeline {
         )
     }
 
-    /// Fits geometry from mask-approved object points while estimating only the base height from
-    /// the surrounding unmasked depth. The table can therefore support the object without ever
-    /// becoming part of its width/depth/height bounds.
     static func capture(
         objectPoints: [SIMD3<Float>],
         supportPoints: [SIMD3<Float>],
@@ -124,13 +86,12 @@ enum ObjectCapturePipeline {
         guard let cluster = VoxelCluster.connectedComponent(
             points: candidates,
             seed: seed,
-            voxelSize: voxelSize
+            voxelSize: voxelSize,
+            neighborRadius: connectivityRadiusInVoxels
         ), cluster.points.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
-        // The object rests on the support, so anchor the box's base to the support height rather
-        // than to the lowest clustered point (we dropped the bottom `floorClearance` for isolation).
         guard let object = ObjectBoundingBox.make(
             from: cluster.points,
             up: up,
@@ -139,15 +100,14 @@ enum ObjectCapturePipeline {
             return .notEnoughMesh
         }
 
-        // The robust box trims extreme projections. Showing those trimmed samples as cyan points
-        // made the visualization contradict the fitted result, so expose only actual box inliers.
-        let boxInliers = cluster.voxelCenters.filter { object.contains($0, tolerance: 0.001) }
-        return .success(CaptureResult(object: object, selectionPoints: boxInliers))
+        return .success(CaptureResult(
+            object: object,
+            selectionPoints: cluster.representativePoints.filter {
+                object.contains($0, tolerance: selectionTolerance)
+            }
+        ))
     }
 
-    /// Estimates the support as the dominant horizontal height layer near the object. A low
-    /// percentile is unsafe here: after enough camera motion, a few samples from a lower shelf or
-    /// the floor can drag the fitted base downward and make the real tabletop join the object.
     private static func estimateSupportHeight(points: [SIMD3<Float>], seed: SIMD3<Float>) -> Float? {
         let radiusSquared = supportRadius * supportRadius
         var nearbyHeights: [Float] = []
@@ -171,8 +131,6 @@ enum ObjectCapturePipeline {
         }
         guard let strongestBin = histogram.max(by: { lhs, rhs in
             if lhs.value == rhs.value {
-                // Prefer the upper layer on a tie: it is more likely to be the tabletop than a
-                // partially observed shelf or floor below it.
                 return lhs.key < rhs.key
             }
             return lhs.value < rhs.value
@@ -190,11 +148,7 @@ enum ObjectCapturePipeline {
     }
 }
 
-/// Back-projects the dense LiDAR depth map into world-space points near the reticle.
 enum DepthPointCloud {
-    /// Samples LiDAR at a viewport tap and returns the corresponding physical surface point. This
-    /// gives mask locks on LiDAR devices an anchor on the object itself instead of the table plane
-    /// that may lie behind it. Non-LiDAR devices simply return nil and use an ARKit plane raycast.
     static func worldPoint(
         from frame: ARFrame,
         normalizedViewportPoint: CGPoint,
@@ -285,19 +239,12 @@ enum DepthPointCloud {
         return SIMD3<Float>(worldPoint.x, worldPoint.y, worldPoint.z)
     }
 
-    /// - Parameters:
-    ///   - frame: the current AR frame (must carry scene depth).
-    ///   - seed: world-space reticle position; only points within `radius` (a 3D sphere) are kept.
-    ///   - radius: 3D gather radius in meters.
-    ///   - pixelStride: sample every Nth depth pixel to bound the point count.
     static func worldPoints(
         from frame: ARFrame,
         near seed: SIMD3<Float>,
         radius: Float,
         pixelStride: Int = 2
     ) -> [SIMD3<Float>] {
-        // Prefer the temporally smoothed depth: it is markedly less noisy frame to frame, which
-        // keeps the fitted box from jittering and over-sizing on stray pixels.
         guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return []
         }
@@ -307,7 +254,6 @@ enum DepthPointCloud {
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
 
-        // Intrinsics are given at the captured-image resolution; scale them to the depth resolution.
         let imageResolution = frame.camera.imageResolution
         let intrinsics = frame.camera.intrinsics
         let scaleX = Float(width) / Float(imageResolution.width)
@@ -357,9 +303,7 @@ enum DepthPointCloud {
             while column < width {
                 let depth = depthRow[column]
 
-                // Keep only valid, in-range, confident depth samples.
                 if depth > 0.15, depth < 2.5, (confidenceRow?[column] ?? 2) >= 1 {
-                    // Camera space: +x right, +y up, -z forward. Image v grows downward, so y is negated.
                     let x = (Float(column) - cx) * depth / fx
                     let y = (Float(row) - cy) * depth / fy
                     let cameraPoint = SIMD4<Float>(x, -y, -depth, 1)
@@ -369,8 +313,6 @@ enum DepthPointCloud {
                     let deltaY = world.y - seed.y
                     let deltaZ = world.z - seed.z
                     let distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ
-                    // Gather a 3D sphere around the reticle, and guard against any non-finite value
-                    // (a NaN/Inf world coordinate would hard-trap the voxel Int() conversion later).
                     if distanceSquared < radiusSquared,
                        world.x.isFinite, world.y.isFinite, world.z.isFinite {
                         points.append(SIMD3<Float>(world.x, world.y, world.z))
@@ -386,9 +328,6 @@ enum DepthPointCloud {
         return points
     }
 
-    /// Back-projects one depth frame once, then partitions samples around every visible object
-    /// anchor. This is substantially cheaper than re-reading and re-projecting the depth map once
-    /// per object when a frame contains many payloads.
     static func worldPoints(
         from frame: ARFrame,
         near seeds: [UUID: SIMD3<Float>],
@@ -474,9 +413,6 @@ enum DepthPointCloud {
     }
 }
 
-/// Accumulates depth points across frames into a voxel grid, averaging the points that fall in
-/// each voxel. This gives multi-viewpoint coverage as the operator walks around the object (so the
-/// box is not biased toward the side facing the camera) and averages out per-frame depth noise.
 struct PointAccumulator {
     private struct Key: Hashable {
         let x: Int32
@@ -484,22 +420,41 @@ struct PointAccumulator {
         let z: Int32
     }
 
-    private struct Sample {
+    private struct FrameSample {
         var sum: SIMD3<Float>
         var count: Int32
-        var lastSeenGeneration: Int32
     }
 
-    /// One hash table instead of separate sum/count/age dictionaries. At the former 30,000-voxel
-    /// per-object limit, three Swift dictionaries multiplied allocator and key overhead enough to
-    /// become unsafe with many simultaneous locks.
+    private struct Sample {
+        var sum: SIMD3<Float>
+        var observationCount: Int32
+        var lastSeenGeneration: Int32
+        var stablePoint: SIMD3<Float>?
+        var isProtected: Bool
+    }
+
     private var samples: [Key: Sample] = [:]
     private var generation: Int32 = 0
+    private var lastAddedTimestamp: TimeInterval?
     private let voxelSize: Float
-    /// Hard cap on distinct voxels so the buffer can never grow without bound (which would
-    /// eventually exhaust memory and crash). Once reached, existing voxels keep averaging but no
-    /// new ones are added.
     private let maxVoxels: Int
+
+    private func key(for point: SIMD3<Float>) -> Key {
+        Key(
+            x: Int32(floor(point.x / voxelSize)),
+            y: Int32(floor(point.y / voxelSize)),
+            z: Int32(floor(point.z / voxelSize))
+        )
+    }
+
+    private static func stablePriority(for key: Key) -> UInt64 {
+        let prime: UInt64 = 1_099_511_628_211
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        hash = (hash ^ UInt64(UInt32(bitPattern: key.x))) &* prime
+        hash = (hash ^ UInt64(UInt32(bitPattern: key.y))) &* prime
+        hash = (hash ^ UInt64(UInt32(bitPattern: key.z))) &* prime
+        return hash
+    }
 
     init(voxelSize: Float, maxVoxels: Int = 8_000) {
         self.voxelSize = voxelSize
@@ -510,48 +465,171 @@ struct PointAccumulator {
         samples.isEmpty
     }
 
-    mutating func add(_ points: [SIMD3<Float>]) {
+    @discardableResult
+    mutating func add(
+        _ points: [SIMD3<Float>],
+        timestamp: TimeInterval? = nil,
+        stabilizationObservations: Int? = nil
+    ) -> Int {
+        if let timestamp {
+            guard timestamp > (lastAddedTimestamp ?? -.greatestFiniteMagnitude) else {
+                return 0
+            }
+            lastAddedTimestamp = timestamp
+        }
         generation &+= 1
+
+        var frameSamples: [Key: FrameSample] = [:]
+        var frameKeyOrder: [Key] = []
+        frameSamples.reserveCapacity(min(points.count, maxVoxels))
+        frameKeyOrder.reserveCapacity(min(points.count, maxVoxels))
+
         for point in points {
-            let key = Key(
-                x: Int32(floor(point.x / voxelSize)),
-                y: Int32(floor(point.y / voxelSize)),
-                z: Int32(floor(point.z / voxelSize))
-            )
-            if var sample = samples[key] {
-                sample.sum += point
-                sample.count &+= 1
-                sample.lastSeenGeneration = generation
-                samples[key] = sample
-            } else if samples.count < maxVoxels {
-                samples[key] = Sample(
-                    sum: point,
-                    count: 1,
-                    lastSeenGeneration: generation
-                )
+            let key = key(for: point)
+            if var frameSample = frameSamples[key] {
+                frameSample.sum += point
+                frameSample.count &+= 1
+                frameSamples[key] = frameSample
+            } else {
+                frameSamples[key] = FrameSample(sum: point, count: 1)
+                frameKeyOrder.append(key)
             }
         }
+
+        let stabilizationThreshold = stabilizationObservations.map {
+            Int32(max($0, 1))
+        }
+
+        var newlyStabilizedCount = 0
+        for key in frameKeyOrder {
+            guard var sample = samples[key],
+                  let frameSample = frameSamples[key] else {
+                continue
+            }
+            let framePoint = frameSample.sum / Float(frameSample.count)
+            sample.sum += framePoint
+            sample.observationCount &+= 1
+            sample.lastSeenGeneration = generation
+            if sample.stablePoint == nil,
+               let stabilizationThreshold,
+               sample.observationCount >= stabilizationThreshold {
+                sample.stablePoint = sample.sum / Float(sample.observationCount)
+                newlyStabilizedCount += 1
+            }
+            samples[key] = sample
+        }
+
+        let newKeys = frameKeyOrder.filter { samples[$0] == nil }.sorted { left, right in
+            let leftPriority = Self.stablePriority(for: left)
+            let rightPriority = Self.stablePriority(for: right)
+            if leftPriority != rightPriority { return leftPriority < rightPriority }
+            if left.x != right.x { return left.x < right.x }
+            if left.y != right.y { return left.y < right.y }
+            return left.z < right.z
+        }
+        if stabilizationThreshold != nil {
+            var requiredSlots = max(samples.count + newKeys.count - maxVoxels, 0)
+            if requiredSlots > 0 {
+                let removableUnconfirmed = samples.compactMap { entry in
+                    entry.value.stablePoint == nil
+                        && entry.value.lastSeenGeneration < generation
+                        ? (key: entry.key, sample: entry.value)
+                        : nil
+                }.sorted { left, right in
+                    if left.sample.observationCount != right.sample.observationCount {
+                        return left.sample.observationCount < right.sample.observationCount
+                    }
+                    if left.sample.lastSeenGeneration != right.sample.lastSeenGeneration {
+                        return left.sample.lastSeenGeneration < right.sample.lastSeenGeneration
+                    }
+                    if left.key.x != right.key.x { return left.key.x < right.key.x }
+                    if left.key.y != right.key.y { return left.key.y < right.key.y }
+                    return left.key.z < right.key.z
+                }
+                let unconfirmedKeys = removableUnconfirmed.prefix(requiredSlots).map(\.key)
+                remove(unconfirmedKeys)
+                requiredSlots -= unconfirmedKeys.count
+
+                if requiredSlots > 0 {
+                    let removableUnprotected = samples.compactMap { entry in
+                        entry.value.stablePoint != nil
+                            && !entry.value.isProtected
+                            && entry.value.lastSeenGeneration < generation
+                            ? (key: entry.key, sample: entry.value)
+                            : nil
+                    }.sorted { left, right in
+                        if left.sample.lastSeenGeneration != right.sample.lastSeenGeneration {
+                            return left.sample.lastSeenGeneration < right.sample.lastSeenGeneration
+                        }
+                        if left.sample.observationCount != right.sample.observationCount {
+                            return left.sample.observationCount < right.sample.observationCount
+                        }
+                        if left.key.x != right.key.x { return left.key.x < right.key.x }
+                        if left.key.y != right.key.y { return left.key.y < right.key.y }
+                        return left.key.z < right.key.z
+                    }
+                    let maximumStableReplacementsPerFrame = 256
+                    remove(
+                        removableUnprotected
+                            .prefix(min(requiredSlots, maximumStableReplacementsPerFrame))
+                            .map(\.key)
+                    )
+                }
+            }
+        }
+
+        for key in newKeys where samples.count < maxVoxels {
+            guard let frameSample = frameSamples[key] else {
+                continue
+            }
+            let framePoint = frameSample.sum / Float(frameSample.count)
+            let stablePoint = stabilizationThreshold == 1 ? framePoint : nil
+            samples[key] = Sample(
+                sum: framePoint,
+                observationCount: 1,
+                lastSeenGeneration: generation,
+                stablePoint: stablePoint,
+                isProtected: false
+            )
+            if stablePoint != nil {
+                newlyStabilizedCount += 1
+            }
+        }
+        return newlyStabilizedCount
     }
 
-    /// One averaged point per occupied voxel that has been observed at least `minObservations` times.
     func points(minObservations: Int = 1) -> [SIMD3<Float>] {
         var result: [SIMD3<Float>] = []
         result.reserveCapacity(samples.count)
         for sample in samples.values {
-            if sample.count >= Int32(minObservations) {
-                result.append(sample.sum / Float(sample.count))
+            if sample.observationCount >= Int32(minObservations) {
+                result.append(
+                    sample.stablePoint
+                        ?? sample.sum / Float(sample.observationCount)
+                )
             }
         }
         return result
     }
 
-    /// Drops voxels observed fewer than `minCount` times — transient noise that was never
-    /// reconfirmed. Keeps the buffer lean and stops the box creeping outward from stray points.
+    mutating func protect(_ points: [SIMD3<Float>]) {
+        for point in points {
+            let key = key(for: point)
+            guard var sample = samples[key],
+                  sample.stablePoint != nil,
+                  !sample.isProtected else {
+                continue
+            }
+            sample.isProtected = true
+            samples[key] = sample
+        }
+    }
+
     mutating func pruneTransient(below minCount: Int, olderThan minimumAge: Int = 0) {
         let oldestRecentGeneration = generation - Int32(max(minimumAge, 0))
         let stale: [Key] = samples.compactMap { entry in
             let (key, sample) = entry
-            guard sample.count < Int32(minCount),
+            guard sample.observationCount < Int32(minCount),
                   sample.lastSeenGeneration <= oldestRecentGeneration else {
                 return nil
             }
@@ -560,8 +638,6 @@ struct PointAccumulator {
         remove(stale)
     }
 
-    /// Removes geometry that has not been confirmed during the recent scan window. Lifetime
-    /// accumulation made old boundary mistakes permanent, allowing a fitted box to grow forever.
     mutating func pruneStale(olderThan maximumAge: Int) {
         let oldestAllowedGeneration = generation - Int32(max(maximumAge, 1))
         let stale: [Key] = samples.compactMap {
@@ -578,13 +654,11 @@ struct PointAccumulator {
 
     mutating func reset() {
         generation = 0
+        lastAddedTimestamp = nil
         samples.removeAll(keepingCapacity: true)
     }
 }
 
-/// Connected-component extraction over a voxel grid. Occupied voxels are nodes; 26-connected
-/// neighbours are edges. Growing the component from the seed voxel keeps only points that are
-/// spatially connected to the aimed object.
 enum VoxelCluster {
     private struct Key: Hashable {
         let x: Int
@@ -592,14 +666,12 @@ enum VoxelCluster {
         let z: Int
     }
 
-    /// - Returns: the points of the connected component containing (or nearest) the seed, plus the
-    ///   center of each occupied voxel in that component (for lightweight visualization). `nil` when
-    ///   there are no points or no occupied voxel can be found near the seed.
     static func connectedComponent(
         points: [SIMD3<Float>],
         seed: SIMD3<Float>,
-        voxelSize: Float
-    ) -> (points: [SIMD3<Float>], voxelCenters: [SIMD3<Float>])? {
+        voxelSize: Float,
+        neighborRadius: Int = 1
+    ) -> (points: [SIMD3<Float>], representativePoints: [SIMD3<Float>])? {
         guard !points.isEmpty, voxelSize > 0 else {
             return nil
         }
@@ -622,47 +694,61 @@ enum VoxelCluster {
             return nil
         }
 
-        // Breadth-first flood fill across occupied 26-neighbours.
+        let neighborRadius = max(neighborRadius, 1)
+        let neighborRadiusSquared = neighborRadius * neighborRadius
+        var neighborOffsets: [(x: Int, y: Int, z: Int)] = []
+        for dx in -neighborRadius...neighborRadius {
+            for dy in -neighborRadius...neighborRadius {
+                for dz in -neighborRadius...neighborRadius {
+                    let distanceSquared = dx * dx + dy * dy + dz * dz
+                    if distanceSquared > 0, distanceSquared <= neighborRadiusSquared {
+                        neighborOffsets.append((dx, dy, dz))
+                    }
+                }
+            }
+        }
+
         var visited: Set<Key> = [seedKey]
         var queue: [Key] = [seedKey]
         var head = 0
         while head < queue.count {
             let voxel = queue[head]
             head += 1
-            for dx in -1...1 {
-                for dy in -1...1 {
-                    for dz in -1...1 where !(dx == 0 && dy == 0 && dz == 0) {
-                        let neighbour = Key(x: voxel.x + dx, y: voxel.y + dy, z: voxel.z + dz)
-                        if occupied.contains(neighbour), !visited.contains(neighbour) {
-                            visited.insert(neighbour)
-                            queue.append(neighbour)
-                        }
-                    }
+            for offset in neighborOffsets {
+                let neighbour = Key(
+                    x: voxel.x + offset.x,
+                    y: voxel.y + offset.y,
+                    z: voxel.z + offset.z
+                )
+                if occupied.contains(neighbour), !visited.contains(neighbour) {
+                    visited.insert(neighbour)
+                    queue.append(neighbour)
                 }
             }
         }
 
         var componentPoints: [SIMD3<Float>] = []
-        var voxelCenters: [SIMD3<Float>] = []
-        for voxel in visited {
+        var representativePoints: [SIMD3<Float>] = []
+        let orderedVoxels = visited.sorted { left, right in
+            if left.x != right.x { return left.x < right.x }
+            if left.y != right.y { return left.y < right.y }
+            return left.z < right.z
+        }
+        for voxel in orderedVoxels {
             guard let indices = voxelToPoints[voxel] else {
                 continue
             }
+            var representative = SIMD3<Float>(repeating: 0)
             for index in indices {
                 componentPoints.append(points[index])
+                representative += points[index]
             }
-            voxelCenters.append(SIMD3<Float>(
-                (Float(voxel.x) + 0.5) * voxelSize,
-                (Float(voxel.y) + 0.5) * voxelSize,
-                (Float(voxel.z) + 0.5) * voxelSize
-            ))
+            representativePoints.append(representative / Float(indices.count))
         }
 
-        return (componentPoints, voxelCenters)
+        return (componentPoints, representativePoints)
     }
 
-    /// The seed voxel if it is occupied, otherwise the nearest occupied voxel within a small ring
-    /// (handles the aimer landing slightly off the object, or on the just-removed support surface).
     private static func seedVoxel(for key: Key, in occupied: Set<Key>) -> Key? {
         if occupied.contains(key) {
             return key
@@ -686,15 +772,7 @@ enum VoxelCluster {
     }
 }
 
-/// Builds a gravity-aligned oriented bounding box from a set of world-space points.
 enum ObjectBoundingBox {
-    /// - Parameters:
-    ///   - points: world-space points belonging to the object.
-    ///   - up: world up (gravity) unit vector; height is measured along this axis.
-    ///   - groundHeight: if provided, the box's base along `up` is anchored to this height (the
-    ///     support surface), so the height reflects the full object even though points near the
-    ///     surface were dropped during isolation.
-    /// - Returns: the oriented box, or `nil` if there are too few points or the box is degenerate.
     static func make(
         from points: [SIMD3<Float>],
         up: SIMD3<Float>,
@@ -706,23 +784,19 @@ enum ObjectBoundingBox {
 
         let upAxis = simd_length(up) > 0 ? simd_normalize(up) : SIMD3<Float>(0, 1, 0)
 
-        // Horizontal reference basis (e1, e2) spanning the plane perpendicular to `up`.
         var e1 = projectOntoPlane(SIMD3<Float>(1, 0, 0), normal: upAxis)
         if simd_length(e1) < 1e-4 {
-            // `up` was ~parallel to world X; fall back to world Z for the reference direction.
             e1 = projectOntoPlane(SIMD3<Float>(0, 0, 1), normal: upAxis)
         }
         e1 = simd_normalize(e1)
         let e2 = simd_normalize(simd_cross(upAxis, e1))
 
-        // Centroid of the points.
         var centroid = SIMD3<Float>(repeating: 0)
         for point in points {
             centroid += point
         }
         centroid /= Float(points.count)
 
-        // Symmetric 2x2 covariance of the horizontal projection (a along e1, b along e2).
         var cxx: Float = 0
         var cxy: Float = 0
         var cyy: Float = 0
@@ -735,7 +809,6 @@ enum ObjectBoundingBox {
             cyy += b * b
         }
 
-        // Principal horizontal direction from the closed-form 2x2 symmetric eigenproblem.
         let theta = 0.5 * atan2(2 * cxy, cxx - cyy)
         let widthAxis = simd_normalize(e1 * cos(theta) + e2 * sin(theta))
         let depthAxis = simd_normalize(simd_cross(upAxis, widthAxis))
@@ -745,7 +818,6 @@ enum ObjectBoundingBox {
         var heightExtent = extent(of: points, around: centroid, along: upAxis)
 
         if let groundHeight {
-            // Projection of the support height onto the up axis, relative to the centroid.
             let groundProjection = groundHeight - simd_dot(centroid, upAxis)
             let highest = heightExtent.mid + heightExtent.span / 2
             let lowest = min(groundProjection, heightExtent.mid - heightExtent.span / 2)
@@ -800,9 +872,6 @@ enum ObjectBoundingBox {
         vector - normal * simd_dot(vector, normal)
     }
 
-    /// Projects points onto an axis and returns a robust span and midpoint offset from the
-    /// centroid, trimming the extreme `trim` fraction at each end so a few noisy depth points can
-    /// not stretch the box.
     private static func extent(
         of points: [SIMD3<Float>],
         around centroid: SIMD3<Float>,
