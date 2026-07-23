@@ -195,8 +195,9 @@ struct MesOverlayView: View {
                     if let trackedObjectID = layer.trackedObjectID {
                         if captureEngine.showsLockedMaskPreviews,
                            let marker = captureEngine.objectMaskMarkers.first(where: {
-                            $0.id == trackedObjectID
-                        }) {
+                               $0.id == trackedObjectID
+                           }),
+                           marker.isMaskVisible {
                             trackedObjectMaskPreview(layer, marker: marker)
                         }
                     } else if captureEngine.showsLiveMaskPreview {
@@ -433,9 +434,6 @@ struct MesOverlayView: View {
         }
 
         if isAutomaticCaptureSupported {
-            if captureEngine.isCapturing, captureEngine.lockedObjectMaskCount == 0 {
-                return "Selecting the object under the center point…"
-            }
             if captureEngine.lockedObjectMaskCount > 0 {
                 return "\(captureEngine.statusText) Move around it and vary phone height to capture more than one visible face."
             }

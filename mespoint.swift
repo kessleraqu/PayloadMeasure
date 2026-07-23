@@ -6,5 +6,4 @@ struct MesPoint: Identifiable, Equatable {
     let index: Int
     var position: SIMD3<Float>
     var isRefining = true
-    let createdAt = Date()
 }

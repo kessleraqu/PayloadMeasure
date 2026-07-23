@@ -7,7 +7,6 @@ import simd
 @Observable
 final class ObjectCaptureEngine {
     private(set) var capturedObjectsByID: [UUID: CapturedObject] = [:]
-    private(set) var previewObject: CapturedObject?
     private(set) var objectMaskPreview: ObjectMaskPreview?
     private(set) var lockedObjectMaskCount = 0
     private(set) var visibleObjectMaskCount = 0
@@ -16,13 +15,11 @@ final class ObjectCaptureEngine {
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
-    private(set) var showsSelectedPoints = false
+    private(set) var showsSelectedPoints = true
     private(set) var showsLiveMaskPreview = true
     private(set) var showsLockedMaskPreviews = true
     private(set) var showsBoundingBoxes = true
     private(set) var showsObjectMaskMarkers = true
-    private(set) var isCapturing = false
-    private(set) var captureRequestRevision = 0
     private(set) var resetRevision = 0
     private(set) var objectMaskToggleRequestRevision = 0
     private var latestObjectMaskPreviewTimestamp: TimeInterval = -.greatestFiniteMagnitude
@@ -33,12 +30,8 @@ final class ObjectCaptureEngine {
     private var liveMaskLayer: ObjectMaskPreviewLayer?
 
     private static let defaultPrompt = "Center or tap a highlighted object to lock it."
-    private static let scanningPrompt = "Scanning masked depth — move slightly to reveal its sides."
 
     private var displayObject: CapturedObject? {
-        if let previewObject {
-            return previewObject
-        }
         if let focusedCaptureID, let focused = capturedObjectsByID[focusedCaptureID] {
             return focused
         }
@@ -47,10 +40,6 @@ final class ObjectCaptureEngine {
 
     var hasCapture: Bool {
         !capturedObjectsByID.isEmpty
-    }
-
-    var capturedObjectCount: Int {
-        capturedObjectsByID.count
     }
 
     var hasObjectMaskPreview: Bool {
@@ -66,16 +55,10 @@ final class ObjectCaptureEngine {
     }
 
     var canReset: Bool {
-        !capturedObjectsByID.isEmpty || previewObject != nil || lockedObjectMaskCount > 0
+        !capturedObjectsByID.isEmpty || lockedObjectMaskCount > 0
     }
 
     var statusHeadline: String {
-        if isCapturing {
-            return "Capturing"
-        }
-        if previewObject != nil {
-            return "Scanning masked objects"
-        }
         if !capturedObjectsByID.isEmpty {
             return capturedObjectsByID.count == 1
                 ? "1 object saved"
@@ -162,6 +145,8 @@ final class ObjectCaptureEngine {
         }
         latestObjectMaskPreviewTimestamp = preview.timestamp
         liveMaskLayer = nil
+        lockedMaskLayersByID.removeAll(keepingCapacity: true)
+        lockedMaskLayerOrder.removeAll(keepingCapacity: true)
         for layer in preview.layers {
             if let id = layer.trackedObjectID {
                 if lockedMaskLayersByID[id] == nil {
@@ -187,6 +172,7 @@ final class ObjectCaptureEngine {
     func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
         visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
         objectMaskMarkers = markers
+        retainVisibleLockedMaskLayers(for: markers)
         let lostCount = lostObjectMaskCount
         if lostCount > 0 {
             objectMaskFeedbackText = "\(lockedObjectMaskCount) locked · \(lostCount) currently outside the view. Their anchors are retained."
@@ -203,20 +189,18 @@ final class ObjectCaptureEngine {
         if objectMaskMarkers != markers {
             objectMaskMarkers = markers
         }
+        retainVisibleLockedMaskLayers(for: markers)
     }
 
     func reportObjectLockNeedsSurface() {
-        isCapturing = false
         objectMaskFeedbackText = "No stable surface was found at that point. Move slowly around it, then tap again."
     }
 
     func reportObjectLockNotFound() {
-        isCapturing = false
         objectMaskFeedbackText = "No separate object mask was found there. Keep the object fully visible and tap near its center."
     }
 
     func reportObjectLimitReached() {
-        isCapturing = false
         objectMaskFeedbackText = "Maximum 15 objects locked. Remove one before adding another."
     }
 
@@ -229,7 +213,6 @@ final class ObjectCaptureEngine {
     }
 
     func finishObjectSelection(didAdd: Bool) {
-        isCapturing = false
         statusText = didAdd
             ? "Object locked. Point at another highlighted object to add it."
             : "Object removed. Its mask and LiDAR box were cleared."
@@ -264,43 +247,20 @@ final class ObjectCaptureEngine {
             : ObjectMaskPreview(layers: layers, timestamp: timestamp)
     }
 
-    func showPreview(_ object: CapturedObject) {
-        previewObject = object
-        if statusText != Self.scanningPrompt {
-            statusText = Self.scanningPrompt
+    private func retainVisibleLockedMaskLayers(for markers: [ObjectMaskMarker]) {
+        let visibleMaskIDs = Set(
+            markers.lazy.filter(\.isMaskVisible).map(\.id)
+        )
+        let previousLayerCount = lockedMaskLayersByID.count
+        lockedMaskLayersByID = lockedMaskLayersByID.filter {
+            visibleMaskIDs.contains($0.key)
         }
-    }
-
-    func clearPreview() {
-        previewObject = nil
-        let prompt = capturedObjectsByID.isEmpty
-            ? Self.defaultPrompt
-            : "\(capturedObjectsByID.count) boxes ready. Point at another object to add it."
-        if statusText != prompt {
-            statusText = prompt
+        lockedMaskLayerOrder.removeAll {
+            !visibleMaskIDs.contains($0)
         }
-    }
-
-    func requestCapture() {
-        objectMaskFeedbackText = nil
-        isCapturing = true
-        statusText = "Locking the object under the center point."
-        captureRequestRevision += 1
-    }
-
-    func cancelCapture() {
-        guard isCapturing else {
-            return
+        if lockedMaskLayersByID.count != previousLayerCount {
+            rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
         }
-        isCapturing = false
-        statusText = capturedObjectsByID.isEmpty
-            ? Self.defaultPrompt
-            : "\(capturedObjectsByID.count) boxes ready. Point at another object to add it."
-        captureRequestRevision += 1
-    }
-
-    func applyCapture(_ object: CapturedObject) {
-        updateCapture(id: UUID(), object: object)
     }
 
     func updateCapture(id: UUID, object: CapturedObject) {
@@ -309,8 +269,6 @@ final class ObjectCaptureEngine {
         }
         capturedObjectsByID[id] = object
         focusedCaptureID = id
-        previewObject = nil
-        isCapturing = false
         statusText = "\(capturedObjectsByID.count) LiDAR box\(capturedObjectsByID.count == 1 ? "" : "es") ready."
     }
 
@@ -330,26 +288,10 @@ final class ObjectCaptureEngine {
             : "\(capturedObjectsByID.count) LiDAR box\(capturedObjectsByID.count == 1 ? "" : "es") ready."
     }
 
-    func reportNoSupport() {
-        isCapturing = false
-        statusText = "Scan the surface the object rests on, then capture."
-    }
-
-    func reportNotEnoughMesh() {
-        isCapturing = false
-        statusText = "Not enough mesh yet. Move slowly around the object and retry."
-    }
-
-    func reportTrackingNotReady() {
-        isCapturing = false
-        statusText = "Wait for tracking to stabilise before capturing."
-    }
-
     func reset() {
         capturedObjectsByID.removeAll()
         captureOrder.removeAll()
         focusedCaptureID = nil
-        previewObject = nil
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
@@ -360,7 +302,6 @@ final class ObjectCaptureEngine {
         objectMaskMarkers = []
         objectMaskFeedbackText = nil
         objectMaskToggleRequest = nil
-        isCapturing = false
         statusText = Self.defaultPrompt
         resetRevision += 1
     }

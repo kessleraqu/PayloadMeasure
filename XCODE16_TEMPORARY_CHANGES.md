@@ -15,7 +15,7 @@ Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), th
 
 ## Temporary source compatibility adjustments
 
-Only 19 type declaration headers and one RealityKit initializer expression were changed. No segmentation, tracking, ARKit session flow, Vision, Core ML, depth processing, concurrency implementation, rendering behavior, constants, or thresholds were changed.
+Only 16 type declaration headers and one RealityKit initializer expression were changed. No segmentation, tracking, ARKit session flow, Vision, Core ML, depth processing, concurrency implementation, rendering behavior, constants, or thresholds were changed.
 
 ### objectmaskprocessor.swift
 
@@ -43,12 +43,6 @@ Xcode 16.2's Swift 6.0.3 compiler rejects the Xcode 26 declaration-level `noniso
   Temporary: `struct ObjectMaskDepthSnapshot: @unchecked Sendable {`
 - Original: `nonisolated struct ObjectMaskDepthPointCloud: @unchecked Sendable {`
   Temporary: `struct ObjectMaskDepthPointCloud: @unchecked Sendable {`
-- Original: `nonisolated struct ObjectMaskMotionLayer: @unchecked Sendable {`
-  Temporary: `struct ObjectMaskMotionLayer: @unchecked Sendable {`
-- Original: `nonisolated struct ObjectMaskMotionKeyframe: @unchecked Sendable {`
-  Temporary: `struct ObjectMaskMotionKeyframe: @unchecked Sendable {`
-- Original: `nonisolated struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {`
-  Temporary: `struct ObjectMaskMotionCatchUpFrame: @unchecked Sendable {`
 - Original: `nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {`
   Temporary: `struct ObjectMaskProcessingResult: @unchecked Sendable {`
 
@@ -71,6 +65,12 @@ Xcode 16.2's iPhoneOS RealityKit interface contains `AnchorEntity(anchor: ARAnch
   Temporary: `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))`
 
 The supported method-level `nonisolated` modifiers on the seven `ARSessionDelegate` methods in `arsessionmanager.swift` were intentionally retained. They are accepted by Swift 6.0 and are part of the existing concurrency architecture.
+
+## Later unreachable-code cleanup
+
+Date: 2026-07-23
+
+The uninstantiated optical-flow motion pipeline and unreachable EdgeTAM integration path were later removed from `objectmaskprocessor.swift`. The standalone EdgeTAM adapter, all three Core ML packages, and their target membership were retained. This cleanup was independent of Xcode 16 compatibility and did not change the temporary syntax replacements listed above.
 
 ## Project settings
 
@@ -106,7 +106,7 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 
 ## Restoring the Xcode 26 syntax next week
 
-1. In `objectmaskprocessor.swift`, restore `nonisolated ` immediately before each of the 15 type declarations listed above.
+1. In `objectmaskprocessor.swift`, restore `nonisolated ` immediately before each of the 12 type declarations listed above.
 2. In `PayloadMeasure/edgetamsegmenter.swift`, restore `nonisolated ` immediately before each of the four type declarations listed above.
 3. In `arcameraview.swift`, replace `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))` with `let anchorEntity = AnchorEntity(anchor: arAnchor)`.
 4. Do not change the retained method-level `nonisolated` modifiers in `arsessionmanager.swift`.

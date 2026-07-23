@@ -27,6 +27,12 @@ struct CapturedObject {
 struct CaptureResult {
     let object: CapturedObject
     let selectionPoints: [SIMD3<Float>]
+    let surfacePoints: [SIMD3<Float>]
+}
+
+struct AccumulatedDepthPoint {
+    let position: SIMD3<Float>
+    let observedPosition: SIMD3<Float>
 }
 
 enum CaptureOutcome {
@@ -36,46 +42,39 @@ enum CaptureOutcome {
 }
 
 enum ObjectCapturePipeline {
-    static let voxelSize: Float = 0.01
+    static let voxelSize: Float = 0.005
     static let supportVoxelSize: Float = 0.02
     static let accumulationRadius: Float = 0.4
     static let maxHeight: Float = 1.5
-    static let floorClearance: Float = 0.025
+    static let floorClearance: Float = 0.005
     static let minimumClusterPoints = 30
     private static let connectivityRadiusInVoxels = 2
-    static let minObservations = 3
+    private static let surfaceBridgeRadiusInVoxels = 4
+    private static let minimumBridgedSurfacePoints = 12
+    private static let minimumSurfaceBridgeContacts = 6
+    static let minObservations = 2
     static let selectionTolerance: Float = voxelSize * 0.5
+    static let maxObjectVoxels = 64_000
     private static let supportRadius: Float = 0.24
 
     static func capture(
-        points: [SIMD3<Float>],
-        seed: SIMD3<Float>,
-        up: SIMD3<Float>
-    ) -> CaptureOutcome {
-        capture(
-            objectPoints: points,
-            supportPoints: points,
-            seed: seed,
-            up: up
-        )
-    }
-
-    static func capture(
-        objectPoints: [SIMD3<Float>],
+        objectPoints: [AccumulatedDepthPoint],
         supportPoints: [SIMD3<Float>],
         seed: SIMD3<Float>,
-        up: SIMD3<Float>
+        up: SIMD3<Float>,
+        supportHeight: Float? = nil
     ) -> CaptureOutcome {
         guard objectPoints.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
-        guard let supportHeight = estimateSupportHeight(points: supportPoints, seed: seed) else {
+        guard let resolvedSupportHeight = supportHeight
+            ?? estimateSupportHeight(points: supportPoints, seed: seed) else {
             return .noSupport
         }
 
         let candidates = objectPoints.filter { point in
-            let heightAboveSupport = point.y - supportHeight
+            let heightAboveSupport = point.position.y - resolvedSupportHeight
             return heightAboveSupport > floorClearance && heightAboveSupport < maxHeight
         }
 
@@ -84,28 +83,63 @@ enum ObjectCapturePipeline {
         }
 
         guard let cluster = VoxelCluster.connectedComponent(
-            points: candidates,
+            points: candidates.map(\.position),
             seed: seed,
             voxelSize: voxelSize,
-            neighborRadius: connectivityRadiusInVoxels
+            neighborRadius: connectivityRadiusInVoxels,
+            bridgeRadius: surfaceBridgeRadiusInVoxels,
+            minimumBridgedPointCount: minimumBridgedSurfacePoints,
+            minimumBridgeContactCount: minimumSurfaceBridgeContacts
         ), cluster.points.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
+        let selectedPoints = cluster.pointIndices.map { candidates[$0].position }
+        let surfacePoints = cluster.pointIndices.map { candidates[$0].observedPosition }
         guard let object = ObjectBoundingBox.make(
             from: cluster.points,
+            enclosing: surfacePoints,
             up: up,
-            groundHeight: supportHeight
+            groundHeight: resolvedSupportHeight
         ) else {
             return .notEnoughMesh
         }
 
         return .success(CaptureResult(
             object: object,
-            selectionPoints: cluster.representativePoints.filter {
-                object.contains($0, tolerance: selectionTolerance)
-            }
+            selectionPoints: selectedPoints,
+            surfacePoints: surfacePoints
         ))
+    }
+
+    static func supportPlaneHeight(
+        from anchors: [ARAnchor],
+        beneath referencePoint: SIMD3<Float>
+    ) -> Float? {
+        var bestHeight: Float?
+        for case let anchor as ARPlaneAnchor in anchors where anchor.alignment == .horizontal {
+            let local = anchor.transform.inverse * SIMD4<Float>(referencePoint, 1)
+            let boundary = anchor.geometry.boundaryVertices
+            guard boundaryContains(
+                SIMD2<Float>(local.x, local.z),
+                vertices: boundary,
+                tolerance: 0.03
+            ) else {
+                continue
+            }
+
+            let worldPlanePoint = anchor.transform * SIMD4<Float>(local.x, 0, local.z, 1)
+            let height = worldPlanePoint.y
+            let distanceBelowReference = referencePoint.y - height
+            guard distanceBelowReference >= 0.008,
+                  distanceBelowReference <= 0.5 else {
+                continue
+            }
+            if bestHeight == nil || height > bestHeight! {
+                bestHeight = height
+            }
+        }
+        return bestHeight
     }
 
     private static func estimateSupportHeight(points: [SIMD3<Float>], seed: SIMD3<Float>) -> Float? {
@@ -146,6 +180,47 @@ enum ObjectCapturePipeline {
         inliers.sort()
         return inliers[inliers.count / 2]
     }
+
+    private static func boundaryContains(
+        _ point: SIMD2<Float>,
+        vertices: [SIMD3<Float>],
+        tolerance: Float
+    ) -> Bool {
+        guard vertices.count >= 3 else {
+            return false
+        }
+
+        var isInside = false
+        var previous = vertices[vertices.count - 1]
+        var minimumDistanceSquared = Float.greatestFiniteMagnitude
+        for current in vertices {
+            let first = SIMD2<Float>(previous.x, previous.z)
+            let second = SIMD2<Float>(current.x, current.z)
+            let edge = second - first
+            let edgeLengthSquared = simd_length_squared(edge)
+            if edgeLengthSquared > 0 {
+                let projection = min(
+                    max(simd_dot(point - first, edge) / edgeLengthSquared, 0),
+                    1
+                )
+                minimumDistanceSquared = min(
+                    minimumDistanceSquared,
+                    simd_length_squared(point - (first + edge * projection))
+                )
+            }
+            if (current.z > point.y) != (previous.z > point.y) {
+                let intersectionX = (previous.x - current.x)
+                    * (point.y - current.z)
+                    / (previous.z - current.z)
+                    + current.x
+                if point.x < intersectionX {
+                    isInside.toggle()
+                }
+            }
+            previous = current
+        }
+        return isInside || minimumDistanceSquared <= tolerance * tolerance
+    }
 }
 
 enum DepthPointCloud {
@@ -155,7 +230,7 @@ enum DepthPointCloud {
         interfaceOrientation: UIInterfaceOrientation,
         viewportSize: CGSize
     ) -> SIMD3<Float>? {
-        guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth,
+        guard let sceneDepth = frame.sceneDepth,
               viewportSize.width > 0,
               viewportSize.height > 0 else {
             return nil
@@ -241,101 +316,12 @@ enum DepthPointCloud {
 
     static func worldPoints(
         from frame: ARFrame,
-        near seed: SIMD3<Float>,
-        radius: Float,
-        pixelStride: Int = 2
-    ) -> [SIMD3<Float>] {
-        guard let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
-            return []
-        }
-
-        let depthMap = sceneDepth.depthMap
-        let confidenceMap = sceneDepth.confidenceMap
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-
-        let imageResolution = frame.camera.imageResolution
-        let intrinsics = frame.camera.intrinsics
-        let scaleX = Float(width) / Float(imageResolution.width)
-        let scaleY = Float(height) / Float(imageResolution.height)
-        let fx = intrinsics.columns.0.x * scaleX
-        let fy = intrinsics.columns.1.y * scaleY
-        let cx = intrinsics.columns.2.x * scaleX
-        let cy = intrinsics.columns.2.y * scaleY
-
-        guard fx > 0, fy > 0 else {
-            return []
-        }
-
-        let cameraTransform = frame.camera.transform
-
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        if let confidenceMap {
-            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
-        }
-        defer {
-            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-            if let confidenceMap {
-                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
-            }
-        }
-
-        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
-            return []
-        }
-        let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
-        let confidenceBase = confidenceMap.flatMap { CVPixelBufferGetBaseAddress($0) }
-        let confidenceRowBytes = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
-
-        var points: [SIMD3<Float>] = []
-        let radiusSquared = radius * radius
-
-        var row = 0
-        while row < height {
-            let depthRow = depthBase
-                .advanced(by: row * depthRowBytes)
-                .assumingMemoryBound(to: Float32.self)
-            let confidenceRow = confidenceBase?
-                .advanced(by: row * confidenceRowBytes)
-                .assumingMemoryBound(to: UInt8.self)
-
-            var column = 0
-            while column < width {
-                let depth = depthRow[column]
-
-                if depth > 0.15, depth < 2.5, (confidenceRow?[column] ?? 2) >= 1 {
-                    let x = (Float(column) - cx) * depth / fx
-                    let y = (Float(row) - cy) * depth / fy
-                    let cameraPoint = SIMD4<Float>(x, -y, -depth, 1)
-                    let world = cameraTransform * cameraPoint
-
-                    let deltaX = world.x - seed.x
-                    let deltaY = world.y - seed.y
-                    let deltaZ = world.z - seed.z
-                    let distanceSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ
-                    if distanceSquared < radiusSquared,
-                       world.x.isFinite, world.y.isFinite, world.z.isFinite {
-                        points.append(SIMD3<Float>(world.x, world.y, world.z))
-                    }
-                }
-
-                column += pixelStride
-            }
-
-            row += pixelStride
-        }
-
-        return points
-    }
-
-    static func worldPoints(
-        from frame: ARFrame,
         near seeds: [UUID: SIMD3<Float>],
         radius: Float,
         pixelStride: Int = 2
     ) -> [UUID: [SIMD3<Float>]] {
         guard !seeds.isEmpty,
-              let sceneDepth = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+              let sceneDepth = frame.sceneDepth else {
             return [:]
         }
 
@@ -423,6 +409,7 @@ struct PointAccumulator {
     private struct FrameSample {
         var sum: SIMD3<Float>
         var count: Int32
+        var observedPoint: SIMD3<Float>
     }
 
     private struct Sample {
@@ -430,20 +417,29 @@ struct PointAccumulator {
         var observationCount: Int32
         var lastSeenGeneration: Int32
         var stablePoint: SIMD3<Float>?
-        var isProtected: Bool
+        var observedPoint: SIMD3<Float>
+        var stableObservedPoint: SIMD3<Float>?
     }
 
     private var samples: [Key: Sample] = [:]
     private var generation: Int32 = 0
     private var lastAddedTimestamp: TimeInterval?
     private let voxelSize: Float
-    private let maxVoxels: Int
+    private let maxVoxels: Int?
 
     private func key(for point: SIMD3<Float>) -> Key {
         Key(
             x: Int32(floor(point.x / voxelSize)),
             y: Int32(floor(point.y / voxelSize)),
             z: Int32(floor(point.z / voxelSize))
+        )
+    }
+
+    private func center(for key: Key) -> SIMD3<Float> {
+        SIMD3<Float>(
+            (Float(key.x) + 0.5) * voxelSize,
+            (Float(key.y) + 0.5) * voxelSize,
+            (Float(key.z) + 0.5) * voxelSize
         )
     }
 
@@ -456,13 +452,16 @@ struct PointAccumulator {
         return hash
     }
 
-    init(voxelSize: Float, maxVoxels: Int = 8_000) {
+    init(voxelSize: Float, maxVoxels: Int? = 8_000) {
         self.voxelSize = voxelSize
         self.maxVoxels = maxVoxels
     }
 
-    var isEmpty: Bool {
-        samples.isEmpty
+    var isAtCapacity: Bool {
+        guard let maxVoxels else {
+            return false
+        }
+        return samples.count >= maxVoxels
     }
 
     @discardableResult
@@ -481,17 +480,27 @@ struct PointAccumulator {
 
         var frameSamples: [Key: FrameSample] = [:]
         var frameKeyOrder: [Key] = []
-        frameSamples.reserveCapacity(min(points.count, maxVoxels))
-        frameKeyOrder.reserveCapacity(min(points.count, maxVoxels))
+        let frameCapacity = min(points.count, maxVoxels ?? points.count)
+        frameSamples.reserveCapacity(frameCapacity)
+        frameKeyOrder.reserveCapacity(frameCapacity)
 
         for point in points {
             let key = key(for: point)
             if var frameSample = frameSamples[key] {
                 frameSample.sum += point
                 frameSample.count &+= 1
+                let voxelCenter = center(for: key)
+                if simd_length_squared(point - voxelCenter)
+                    < simd_length_squared(frameSample.observedPoint - voxelCenter) {
+                    frameSample.observedPoint = point
+                }
                 frameSamples[key] = frameSample
             } else {
-                frameSamples[key] = FrameSample(sum: point, count: 1)
+                frameSamples[key] = FrameSample(
+                    sum: point,
+                    count: 1,
+                    observedPoint: point
+                )
                 frameKeyOrder.append(key)
             }
         }
@@ -510,24 +519,37 @@ struct PointAccumulator {
             sample.sum += framePoint
             sample.observationCount &+= 1
             sample.lastSeenGeneration = generation
+            let runningMean = sample.sum / Float(sample.observationCount)
+            if simd_length_squared(frameSample.observedPoint - runningMean)
+                < simd_length_squared(sample.observedPoint - runningMean) {
+                sample.observedPoint = frameSample.observedPoint
+            }
             if sample.stablePoint == nil,
                let stabilizationThreshold,
                sample.observationCount >= stabilizationThreshold {
-                sample.stablePoint = sample.sum / Float(sample.observationCount)
+                sample.stablePoint = runningMean
+                sample.stableObservedPoint = sample.observedPoint
                 newlyStabilizedCount += 1
             }
             samples[key] = sample
         }
 
-        let newKeys = frameKeyOrder.filter { samples[$0] == nil }.sorted { left, right in
-            let leftPriority = Self.stablePriority(for: left)
-            let rightPriority = Self.stablePriority(for: right)
-            if leftPriority != rightPriority { return leftPriority < rightPriority }
-            if left.x != right.x { return left.x < right.x }
-            if left.y != right.y { return left.y < right.y }
-            return left.z < right.z
+        let unsortedNewKeys = frameKeyOrder.filter { samples[$0] == nil }
+        let newKeys: [Key]
+        if let maxVoxels,
+           samples.count + unsortedNewKeys.count > maxVoxels {
+            newKeys = unsortedNewKeys.sorted { left, right in
+                let leftPriority = Self.stablePriority(for: left)
+                let rightPriority = Self.stablePriority(for: right)
+                if leftPriority != rightPriority { return leftPriority < rightPriority }
+                if left.x != right.x { return left.x < right.x }
+                if left.y != right.y { return left.y < right.y }
+                return left.z < right.z
+            }
+        } else {
+            newKeys = unsortedNewKeys
         }
-        if stabilizationThreshold != nil {
+        if stabilizationThreshold != nil, let maxVoxels {
             var requiredSlots = max(samples.count + newKeys.count - maxVoxels, 0)
             if requiredSlots > 0 {
                 let removableUnconfirmed = samples.compactMap { entry in
@@ -551,9 +573,8 @@ struct PointAccumulator {
                 requiredSlots -= unconfirmedKeys.count
 
                 if requiredSlots > 0 {
-                    let removableUnprotected = samples.compactMap { entry in
+                    let removableStable = samples.compactMap { entry in
                         entry.value.stablePoint != nil
-                            && !entry.value.isProtected
                             && entry.value.lastSeenGeneration < generation
                             ? (key: entry.key, sample: entry.value)
                             : nil
@@ -570,7 +591,7 @@ struct PointAccumulator {
                     }
                     let maximumStableReplacementsPerFrame = 256
                     remove(
-                        removableUnprotected
+                        removableStable
                             .prefix(min(requiredSlots, maximumStableReplacementsPerFrame))
                             .map(\.key)
                     )
@@ -578,7 +599,10 @@ struct PointAccumulator {
             }
         }
 
-        for key in newKeys where samples.count < maxVoxels {
+        for key in newKeys {
+            if let maxVoxels, samples.count >= maxVoxels {
+                break
+            }
             guard let frameSample = frameSamples[key] else {
                 continue
             }
@@ -589,7 +613,8 @@ struct PointAccumulator {
                 observationCount: 1,
                 lastSeenGeneration: generation,
                 stablePoint: stablePoint,
-                isProtected: false
+                observedPoint: frameSample.observedPoint,
+                stableObservedPoint: stablePoint == nil ? nil : frameSample.observedPoint
             )
             if stablePoint != nil {
                 newlyStabilizedCount += 1
@@ -612,17 +637,20 @@ struct PointAccumulator {
         return result
     }
 
-    mutating func protect(_ points: [SIMD3<Float>]) {
-        for point in points {
-            let key = key(for: point)
-            guard var sample = samples[key],
-                  sample.stablePoint != nil,
-                  !sample.isProtected else {
-                continue
-            }
-            sample.isProtected = true
-            samples[key] = sample
+    func confirmedPoints(minObservations: Int = 1) -> [AccumulatedDepthPoint] {
+        var result: [AccumulatedDepthPoint] = []
+        result.reserveCapacity(samples.count)
+        for sample in samples.values where sample.observationCount >= Int32(minObservations) {
+            result.append(
+                AccumulatedDepthPoint(
+                    position: sample.stablePoint
+                        ?? sample.sum / Float(sample.observationCount),
+                    observedPosition: sample.stableObservedPoint
+                        ?? sample.observedPoint
+                )
+            )
         }
+        return result
     }
 
     mutating func pruneTransient(below minCount: Int, olderThan minimumAge: Int = 0) {
@@ -652,11 +680,6 @@ struct PointAccumulator {
         }
     }
 
-    mutating func reset() {
-        generation = 0
-        lastAddedTimestamp = nil
-        samples.removeAll(keepingCapacity: true)
-    }
 }
 
 enum VoxelCluster {
@@ -670,8 +693,11 @@ enum VoxelCluster {
         points: [SIMD3<Float>],
         seed: SIMD3<Float>,
         voxelSize: Float,
-        neighborRadius: Int = 1
-    ) -> (points: [SIMD3<Float>], representativePoints: [SIMD3<Float>])? {
+        neighborRadius: Int = 1,
+        bridgeRadius: Int? = nil,
+        minimumBridgedPointCount: Int = 0,
+        minimumBridgeContactCount: Int = 1
+    ) -> (points: [SIMD3<Float>], pointIndices: [Int])? {
         guard !points.isEmpty, voxelSize > 0 else {
             return nil
         }
@@ -708,28 +734,98 @@ enum VoxelCluster {
             }
         }
 
-        var visited: Set<Key> = [seedKey]
-        var queue: [Key] = [seedKey]
-        var head = 0
-        while head < queue.count {
-            let voxel = queue[head]
-            head += 1
-            for offset in neighborOffsets {
-                let neighbour = Key(
-                    x: voxel.x + offset.x,
-                    y: voxel.y + offset.y,
-                    z: voxel.z + offset.z
-                )
-                if occupied.contains(neighbour), !visited.contains(neighbour) {
-                    visited.insert(neighbour)
-                    queue.append(neighbour)
+        func takeComponent(start: Key, from remaining: inout Set<Key>) -> [Key] {
+            var component: [Key] = [start]
+            var head = 0
+            remaining.remove(start)
+            while head < component.count {
+                let voxel = component[head]
+                head += 1
+                for offset in neighborOffsets {
+                    let neighbour = Key(
+                        x: voxel.x + offset.x,
+                        y: voxel.y + offset.y,
+                        z: voxel.z + offset.z
+                    )
+                    if remaining.remove(neighbour) != nil {
+                        component.append(neighbour)
+                    }
                 }
+            }
+            return component
+        }
+
+        var remaining = occupied
+        var selected = Set(takeComponent(start: seedKey, from: &remaining))
+        var secondaryComponents: [[Key]] = []
+        while let start = remaining.first {
+            let component = takeComponent(start: start, from: &remaining)
+            let pointCount = component.reduce(into: 0) { count, voxel in
+                count += voxelToPoints[voxel]?.count ?? 0
+            }
+            if pointCount >= max(minimumBridgedPointCount, 1) {
+                secondaryComponents.append(component)
+            }
+        }
+
+        let bridgeRadius = max(bridgeRadius ?? neighborRadius, neighborRadius)
+        if bridgeRadius > neighborRadius, !secondaryComponents.isEmpty {
+            let bridgeRadiusSquared = bridgeRadius * bridgeRadius
+            var bridgeOffsets: [(x: Int, y: Int, z: Int)] = []
+            for dx in -bridgeRadius...bridgeRadius {
+                for dy in -bridgeRadius...bridgeRadius {
+                    for dz in -bridgeRadius...bridgeRadius {
+                        let distanceSquared = dx * dx + dy * dy + dz * dz
+                        if distanceSquared > neighborRadiusSquared,
+                           distanceSquared <= bridgeRadiusSquared {
+                            bridgeOffsets.append((dx, dy, dz))
+                        }
+                    }
+                }
+            }
+
+            let requiredContacts = max(minimumBridgeContactCount, 1)
+            var pendingComponents = secondaryComponents
+            var addedComponent = true
+            while addedComponent, !pendingComponents.isEmpty {
+                addedComponent = false
+                var remainingComponents: [[Key]] = []
+                for component in pendingComponents {
+                    var contactCount = 0
+                    for voxel in component {
+                        var touchesSelection = false
+                        for offset in bridgeOffsets {
+                            if selected.contains(
+                                Key(
+                                    x: voxel.x + offset.x,
+                                    y: voxel.y + offset.y,
+                                    z: voxel.z + offset.z
+                                )
+                            ) {
+                                touchesSelection = true
+                                break
+                            }
+                        }
+                        if touchesSelection {
+                            contactCount += 1
+                            if contactCount >= requiredContacts {
+                                selected.formUnion(component)
+                                addedComponent = true
+                                break
+                            }
+                        }
+                    }
+                    if contactCount < requiredContacts {
+                        remainingComponents.append(component)
+                    }
+                }
+                pendingComponents = remainingComponents
             }
         }
 
         var componentPoints: [SIMD3<Float>] = []
-        var representativePoints: [SIMD3<Float>] = []
-        let orderedVoxels = visited.sorted { left, right in
+        var pointIndices: [Int] = []
+        let orderedVoxels = selected.sorted { left, right in
             if left.x != right.x { return left.x < right.x }
             if left.y != right.y { return left.y < right.y }
             return left.z < right.z
@@ -738,15 +834,13 @@ enum VoxelCluster {
             guard let indices = voxelToPoints[voxel] else {
                 continue
             }
-            var representative = SIMD3<Float>(repeating: 0)
             for index in indices {
                 componentPoints.append(points[index])
-                representative += points[index]
+                pointIndices.append(index)
             }
-            representativePoints.append(representative / Float(indices.count))
         }
 
-        return (componentPoints, representativePoints)
+        return (componentPoints, pointIndices)
     }
 
     private static func seedVoxel(for key: Key, in occupied: Set<Key>) -> Key? {
@@ -775,6 +869,7 @@ enum VoxelCluster {
 enum ObjectBoundingBox {
     static func make(
         from points: [SIMD3<Float>],
+        enclosing enclosurePoints: [SIMD3<Float>] = [],
         up: SIMD3<Float>,
         groundHeight: Float? = nil
     ) -> CapturedObject? {
@@ -813,9 +908,24 @@ enum ObjectBoundingBox {
         let widthAxis = simd_normalize(e1 * cos(theta) + e2 * sin(theta))
         let depthAxis = simd_normalize(simd_cross(upAxis, widthAxis))
 
-        let widthExtent = extent(of: points, around: centroid, along: widthAxis)
-        let depthExtent = extent(of: points, around: centroid, along: depthAxis)
-        var heightExtent = extent(of: points, around: centroid, along: upAxis)
+        let widthExtent = extent(
+            of: points,
+            enclosing: enclosurePoints,
+            around: centroid,
+            along: widthAxis
+        )
+        let depthExtent = extent(
+            of: points,
+            enclosing: enclosurePoints,
+            around: centroid,
+            along: depthAxis
+        )
+        var heightExtent = extent(
+            of: points,
+            enclosing: enclosurePoints,
+            around: centroid,
+            along: upAxis
+        )
 
         if let groundHeight {
             let groundProjection = groundHeight - simd_dot(centroid, upAxis)
@@ -868,24 +978,84 @@ enum ObjectBoundingBox {
         )
     }
 
+    static func enclosing(
+        _ points: [SIMD3<Float>],
+        around object: CapturedObject
+    ) -> CapturedObject {
+        guard !points.isEmpty else {
+            return object
+        }
+
+        var minimum = -object.dimensions / 2
+        var maximum = object.dimensions / 2
+        for point in points {
+            let relative = point - object.center
+            let projection = SIMD3<Float>(
+                simd_dot(relative, object.axes.width),
+                simd_dot(relative, object.axes.depth),
+                simd_dot(relative, object.axes.height)
+            )
+            minimum = simd_min(minimum, projection)
+            maximum = simd_max(maximum, projection)
+        }
+
+        let dimensions = maximum - minimum
+        let midpoint = (minimum + maximum) / 2
+        let center = object.center
+            + object.axes.width * midpoint.x
+            + object.axes.depth * midpoint.y
+            + object.axes.height * midpoint.z
+        let half = dimensions / 2
+        var corners: [SIMD3<Float>] = []
+        corners.reserveCapacity(8)
+        for k in 0...1 {
+            for j in 0...1 {
+                for i in 0...1 {
+                    let signX = Float(i) * 2 - 1
+                    let signY = Float(j) * 2 - 1
+                    let signZ = Float(k) * 2 - 1
+                    corners.append(
+                        center
+                            + object.axes.width * (signX * half.x)
+                            + object.axes.depth * (signY * half.y)
+                            + object.axes.height * (signZ * half.z)
+                    )
+                }
+            }
+        }
+
+        return CapturedObject(
+            dimensions: dimensions,
+            center: center,
+            axes: object.axes,
+            corners: corners,
+            volume: dimensions.x * dimensions.y * dimensions.z,
+            sampleCount: max(object.sampleCount, points.count)
+        )
+    }
+
     private static func projectOntoPlane(_ vector: SIMD3<Float>, normal: SIMD3<Float>) -> SIMD3<Float> {
         vector - normal * simd_dot(vector, normal)
     }
 
     private static func extent(
         of points: [SIMD3<Float>],
+        enclosing enclosurePoints: [SIMD3<Float>],
         around centroid: SIMD3<Float>,
-        along axis: SIMD3<Float>,
-        trim: Float = 0.04
+        along axis: SIMD3<Float>
     ) -> (span: Float, mid: Float) {
-        var projections = points.map { simd_dot($0 - centroid, axis) }
-        projections.sort()
-
-        let lastIndex = projections.count - 1
-        let lowIndex = min(lastIndex, Int(Float(projections.count) * trim))
-        let highIndex = max(0, lastIndex - lowIndex)
-        let lowest = projections[lowIndex]
-        let highest = projections[highIndex]
+        var lowest = Float.greatestFiniteMagnitude
+        var highest = -Float.greatestFiniteMagnitude
+        for point in points {
+            let projection = simd_dot(point - centroid, axis)
+            lowest = min(lowest, projection)
+            highest = max(highest, projection)
+        }
+        for point in enclosurePoints {
+            let projection = simd_dot(point - centroid, axis)
+            lowest = min(lowest, projection)
+            highest = max(highest, projection)
+        }
         return (highest - lowest, (lowest + highest) / 2)
     }
 }

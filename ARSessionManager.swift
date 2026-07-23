@@ -113,12 +113,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         isSceneDepthSupported
     }
 
-    var automaticObjectCaptureAvailabilityText: String {
-        isAutomaticObjectCaptureSupported
-            ? "Automatic object capture available"
-            : "RGB object detection is available. LiDAR is required for 3D dimensions."
-    }
-
     var depthStatusText: String {
         if isSceneDepthEnabled {
             "Scene depth enabled"
@@ -173,9 +167,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
         if isSceneDepthSupported {
             configuration.frameSemantics.insert(.sceneDepth)
-            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-                configuration.frameSemantics.insert(.smoothedSceneDepth)
-            }
             isSceneDepthEnabled = true
         } else {
             isSceneDepthEnabled = false
@@ -211,27 +202,25 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
     }
 
-    nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+    func updateFrameStatus(from frame: ARFrame) {
         let mappingStatus = frame.worldMappingStatus
-        let depthData = frame.sceneDepth ?? frame.smoothedSceneDepth
+        let depthData = frame.sceneDepth
         let receivedDepth = depthData != nil
         let depthResolutionText = depthData.map {
             "\(CVPixelBufferGetWidth($0.depthMap)) × \(CVPixelBufferGetHeight($0.depthMap)) px"
         }
-        Task { @MainActor in
-            guard worldMappingStatus != mappingStatus
-                    || (receivedDepth && !hasReceivedSceneDepth)
-                    || (depthResolutionText != nil
-                        && depthResolutionText != sceneDepthResolutionText) else {
-                return
-            }
-            worldMappingStatus = mappingStatus
-            hasReceivedSceneDepth = hasReceivedSceneDepth || receivedDepth
-            if let depthResolutionText {
-                sceneDepthResolutionText = depthResolutionText
-            }
-            refreshEnvironmentReadiness()
+        guard worldMappingStatus != mappingStatus
+                || (receivedDepth && !hasReceivedSceneDepth)
+                || (depthResolutionText != nil
+                    && depthResolutionText != sceneDepthResolutionText) else {
+            return
         }
+        worldMappingStatus = mappingStatus
+        hasReceivedSceneDepth = hasReceivedSceneDepth || receivedDepth
+        if let depthResolutionText {
+            sceneDepthResolutionText = depthResolutionText
+        }
+        refreshEnvironmentReadiness()
     }
 
     nonisolated func sessionWasInterrupted(_ session: ARSession) {
