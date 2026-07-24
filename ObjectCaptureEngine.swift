@@ -11,6 +11,7 @@ final class ObjectCaptureEngine {
     private(set) var lockedObjectMaskCount = 0
     private(set) var visibleObjectMaskCount = 0
     private(set) var objectMaskMarkers: [ObjectMaskMarker] = []
+    private(set) var objectMaskDisplayBoundingBoxes: [UUID: CGRect] = [:]
     private(set) var objectMaskFeedbackText: String?
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var statusText = defaultPrompt
@@ -28,6 +29,7 @@ final class ObjectCaptureEngine {
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
     private var liveMaskLayer: ObjectMaskPreviewLayer?
+    private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
     private static let defaultPrompt = "Center or tap a highlighted object to lock it."
 
@@ -144,9 +146,6 @@ final class ObjectCaptureEngine {
             return
         }
         latestObjectMaskPreviewTimestamp = preview.timestamp
-        liveMaskLayer = nil
-        lockedMaskLayersByID.removeAll(keepingCapacity: true)
-        lockedMaskLayerOrder.removeAll(keepingCapacity: true)
         for layer in preview.layers {
             if let id = layer.trackedObjectID {
                 if lockedMaskLayersByID[id] == nil {
@@ -154,10 +153,25 @@ final class ObjectCaptureEngine {
                 }
                 lockedMaskLayersByID[id] = layer
             } else {
+                if let liveMaskLayer, liveMaskLayer.id != layer.id {
+                    objectMaskDisplayBoundingBoxes.removeValue(
+                        forKey: liveMaskLayer.id
+                    )
+                }
                 liveMaskLayer = layer
+            }
+            if objectMaskDisplayBoundingBoxes[layer.id] == nil,
+               let referenceBoundingBox = layer.referenceViewportBoundingBox {
+                objectMaskDisplayBoundingBoxes[layer.id] = referenceBoundingBox
             }
         }
         rebuildObjectMaskPreview(timestamp: preview.timestamp)
+    }
+
+    func updateObjectMaskDisplayBoundingBoxes(_ boundingBoxes: [UUID: CGRect]) {
+        if objectMaskDisplayBoundingBoxes != boundingBoxes {
+            objectMaskDisplayBoundingBoxes = boundingBoxes
+        }
     }
 
     func updateLockedObjectMaskCount(_ count: Int) {
@@ -165,14 +179,14 @@ final class ObjectCaptureEngine {
         visibleObjectMaskCount = min(visibleObjectMaskCount, count)
         if count == 0 {
             objectMaskMarkers = []
+            objectMaskMarkerMissCounts.removeAll()
             objectMaskFeedbackText = nil
         }
     }
 
     func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
         visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
-        objectMaskMarkers = markers
-        retainVisibleLockedMaskLayers(for: markers)
+        objectMaskMarkers = stabilizedObjectMaskMarkers(markers)
         let lostCount = lostObjectMaskCount
         if lostCount > 0 {
             objectMaskFeedbackText = "\(lockedObjectMaskCount) locked · \(lostCount) currently outside the view. Their anchors are retained."
@@ -186,10 +200,10 @@ final class ObjectCaptureEngine {
     }
 
     func updateObjectMaskMarkers(_ markers: [ObjectMaskMarker]) {
-        if objectMaskMarkers != markers {
-            objectMaskMarkers = markers
+        let stabilizedMarkers = stabilizedObjectMaskMarkers(markers)
+        if objectMaskMarkers != stabilizedMarkers {
+            objectMaskMarkers = stabilizedMarkers
         }
-        retainVisibleLockedMaskLayers(for: markers)
     }
 
     func reportObjectLockNeedsSurface() {
@@ -223,10 +237,14 @@ final class ObjectCaptureEngine {
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
         liveMaskLayer = nil
+        objectMaskDisplayBoundingBoxes.removeAll()
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
 
     func clearLiveObjectMaskPreview() {
+        if let liveMaskLayer {
+            objectMaskDisplayBoundingBoxes.removeValue(forKey: liveMaskLayer.id)
+        }
         liveMaskLayer = nil
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
     }
@@ -234,6 +252,9 @@ final class ObjectCaptureEngine {
     func removeObjectMaskLayer(id: UUID) {
         lockedMaskLayersByID.removeValue(forKey: id)
         lockedMaskLayerOrder.removeAll(where: { $0 == id })
+        objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
+        objectMaskMarkers.removeAll(where: { $0.id == id })
+        objectMaskMarkerMissCounts.removeValue(forKey: id)
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
     }
 
@@ -247,20 +268,24 @@ final class ObjectCaptureEngine {
             : ObjectMaskPreview(layers: layers, timestamp: timestamp)
     }
 
-    private func retainVisibleLockedMaskLayers(for markers: [ObjectMaskMarker]) {
-        let visibleMaskIDs = Set(
-            markers.lazy.filter(\.isMaskVisible).map(\.id)
-        )
-        let previousLayerCount = lockedMaskLayersByID.count
-        lockedMaskLayersByID = lockedMaskLayersByID.filter {
-            visibleMaskIDs.contains($0.key)
+    private func stabilizedObjectMaskMarkers(
+        _ incoming: [ObjectMaskMarker]
+    ) -> [ObjectMaskMarker] {
+        let incomingIDs = Set(incoming.map(\.id))
+        var result = incoming
+        for marker in objectMaskMarkers where !incomingIDs.contains(marker.id) {
+            let misses = (objectMaskMarkerMissCounts[marker.id] ?? 0) + 1
+            if misses <= 3 {
+                objectMaskMarkerMissCounts[marker.id] = misses
+                result.append(marker)
+            } else {
+                objectMaskMarkerMissCounts.removeValue(forKey: marker.id)
+            }
         }
-        lockedMaskLayerOrder.removeAll {
-            !visibleMaskIDs.contains($0)
+        for id in incomingIDs {
+            objectMaskMarkerMissCounts.removeValue(forKey: id)
         }
-        if lockedMaskLayersByID.count != previousLayerCount {
-            rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
-        }
+        return result
     }
 
     func updateCapture(id: UUID, object: CapturedObject) {
@@ -296,10 +321,12 @@ final class ObjectCaptureEngine {
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
         liveMaskLayer = nil
+        objectMaskDisplayBoundingBoxes.removeAll()
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
         lockedObjectMaskCount = 0
         visibleObjectMaskCount = 0
         objectMaskMarkers = []
+        objectMaskMarkerMissCounts.removeAll()
         objectMaskFeedbackText = nil
         objectMaskToggleRequest = nil
         statusText = Self.defaultPrompt

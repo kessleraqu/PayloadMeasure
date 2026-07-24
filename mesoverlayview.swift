@@ -191,17 +191,26 @@ struct MesOverlayView: View {
     private var objectMaskPreview: some View {
         if isScanning, let preview = captureEngine.objectMaskPreview {
             ZStack {
-                ForEach(Array(preview.layers.enumerated()), id: \.offset) { _, layer in
+                ForEach(preview.layers, id: \.id) { layer in
                     if let trackedObjectID = layer.trackedObjectID {
                         if captureEngine.showsLockedMaskPreviews,
                            let marker = captureEngine.objectMaskMarkers.first(where: {
                                $0.id == trackedObjectID
-                           }),
-                           marker.isMaskVisible {
-                            trackedObjectMaskPreview(layer, marker: marker)
+                           }) {
+                            trackedObjectMaskPreview(
+                                layer,
+                                marker: marker,
+                                currentBoundingBox: captureEngine
+                                    .objectMaskDisplayBoundingBoxes[layer.id]
+                            )
                         }
                     } else if captureEngine.showsLiveMaskPreview {
-                        trackedObjectMaskPreview(layer, marker: nil)
+                        trackedObjectMaskPreview(
+                            layer,
+                            marker: nil,
+                            currentBoundingBox: captureEngine
+                                .objectMaskDisplayBoundingBoxes[layer.id]
+                        )
                     }
                 }
             }
@@ -210,7 +219,8 @@ struct MesOverlayView: View {
 
     private func trackedObjectMaskPreview(
         _ layer: ObjectMaskPreviewLayer,
-        marker: ObjectMaskMarker?
+        marker: ObjectMaskMarker?,
+        currentBoundingBox: CGRect?
     ) -> some View {
         GeometryReader { proxy in
             let referencePoint = layer.referenceAnchorPoint ?? CGPoint(x: 0.5, y: 0.5)
@@ -224,18 +234,44 @@ struct MesOverlayView: View {
                 }
                 return min(max(CGFloat(referenceDistance / currentDistance), 0.4), 2.5)
             }()
+            let trackedPosition: (
+                anchor: UnitPoint,
+                xOffset: CGFloat,
+                yOffset: CGFloat
+            )? = {
+                guard let reference = layer.referenceViewportBoundingBox,
+                      let current = currentBoundingBox,
+                      reference.width >= 0.005,
+                      reference.height >= 0.005,
+                      current.width >= 0.005,
+                      current.height >= 0.005 else {
+                    return nil
+                }
+                return (
+                    UnitPoint(x: reference.midX, y: reference.midY),
+                    (current.midX - reference.midX) * proxy.size.width,
+                    (current.midY - reference.midY) * proxy.size.height
+                )
+            }()
+            let uniformScale = marker == nil ? 1 : distanceScale
+            let anchor = trackedPosition?.anchor
+                ?? UnitPoint(x: referencePoint.x, y: referencePoint.y)
+            let xOffset = trackedPosition?.xOffset
+                ?? (currentPoint.x - referencePoint.x) * proxy.size.width
+            let yOffset = trackedPosition?.yOffset
+                ?? (currentPoint.y - referencePoint.y) * proxy.size.height
 
             ZStack {
                 Image(decorative: layer.image, scale: 1, orientation: .up)
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .scaleEffect(
-                        distanceScale,
-                        anchor: UnitPoint(x: referencePoint.x, y: referencePoint.y)
+                        uniformScale,
+                        anchor: anchor
                     )
                     .offset(
-                        x: (currentPoint.x - referencePoint.x) * proxy.size.width,
-                        y: (currentPoint.y - referencePoint.y) * proxy.size.height
+                        x: xOffset,
+                        y: yOffset
                     )
             }
             .frame(width: proxy.size.width, height: proxy.size.height)

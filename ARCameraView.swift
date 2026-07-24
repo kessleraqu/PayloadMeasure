@@ -99,10 +99,17 @@ struct ARCameraView: UIViewRepresentable {
         private var liveResultsByObject: [UUID: CaptureResult] = [:]
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
+        private let objectMaskDisplayTracker = ObjectMaskDisplayTracker()
         private var scanTickCounter = 0
         private var consecutiveMaskMisses = 0
+        private var consecutiveLiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
         private var objectMaskTaskGeneration = 0
+        private var objectMaskDisplayTask: Task<Void, Never>?
+        private var objectMaskDisplayTaskGeneration = 0
+        private var objectMaskDisplaySeedsByID: [UUID: ObjectMaskDisplaySeed] = [:]
+        private var liveObjectMaskDisplayID: UUID?
+        private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
         private var objectMaskCameraBufferPool: CVPixelBufferPool?
         private var objectMaskDepthBufferPool: CVPixelBufferPool?
         private var objectMaskConfidenceBufferPool: CVPixelBufferPool?
@@ -164,6 +171,7 @@ struct ARCameraView: UIViewRepresentable {
 
                 Task { @MainActor in
                     self.updateFastObjectMaskMarkers(in: arView)
+                    self.updateFastObjectMaskPreview(in: arView)
                     self.updateObjectMaskPreview(in: arView)
                 }
             }
@@ -196,6 +204,20 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            objectMaskDisplayTask?.cancel()
+            objectMaskDisplayTaskGeneration &+= 1
+            objectMaskDisplayTask = nil
+            objectMaskDisplaySeedsByID.removeAll()
+            liveObjectMaskDisplayID = nil
+            consecutiveLiveMaskMisses = 0
+            objectMaskDisplayOrientation = nil
+            let displayTracker = objectMaskDisplayTracker
+            let trackingGeneration = objectMaskTrackingGeneration
+            Task {
+                await displayTracker.reset(
+                    trackingGeneration: trackingGeneration
+                )
+            }
             objectMaskCameraBufferPool = nil
             objectMaskDepthBufferPool = nil
             objectMaskConfidenceBufferPool = nil
@@ -219,6 +241,20 @@ struct ARCameraView: UIViewRepresentable {
 
         private func releaseRebuildableScanCaches() {
             objectMaskTask?.cancel()
+            objectMaskDisplayTask?.cancel()
+            objectMaskDisplayTaskGeneration &+= 1
+            objectMaskDisplayTask = nil
+            objectMaskDisplaySeedsByID.removeAll()
+            liveObjectMaskDisplayID = nil
+            consecutiveLiveMaskMisses = 0
+            objectMaskDisplayOrientation = nil
+            let displayTracker = objectMaskDisplayTracker
+            let trackingGeneration = objectMaskTrackingGeneration
+            Task {
+                await displayTracker.reset(
+                    trackingGeneration: trackingGeneration
+                )
+            }
             objectMaskCameraBufferPool = nil
             objectMaskDepthBufferPool = nil
             objectMaskConfidenceBufferPool = nil
@@ -229,6 +265,7 @@ struct ARCameraView: UIViewRepresentable {
             liveResultsByObject.removeAll(keepingCapacity: false)
             acceptedSurfaceVoxelKeysByObject.removeAll(keepingCapacity: false)
             captureEngine.clearObjectMaskPreview()
+            captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
             lastSelectionPoints.removeAll(keepingCapacity: false)
             lastSelectionObjectID = nil
             removeSelectionPointEntity()
@@ -458,12 +495,41 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 }
 
-                if let preview = result.preview {
+                if let preview = result.preview,
+                   preview.layers.allSatisfy({
+                       $0.trackingOrientation
+                           == self.objectMaskDisplayOrientation
+                   }) {
                     self.consecutiveMaskMisses = 0
+                    let includesLiveMask = preview.layers.contains {
+                        $0.trackedObjectID == nil
+                    }
+                    let didAddLock = result.lockChange.map {
+                        if case .added = $0.kind {
+                            return true
+                        }
+                        return false
+                    } ?? false
+                    if includesLiveMask {
+                        self.consecutiveLiveMaskMisses = 0
+                    } else if didAddLock {
+                        self.consecutiveLiveMaskMisses = 3
+                    } else {
+                        self.consecutiveLiveMaskMisses += 1
+                    }
+                    self.updateObjectMaskDisplaySeeds(from: preview)
                     self.captureEngine.showObjectMaskPreview(preview)
-                } else {
+                    if self.consecutiveLiveMaskMisses >= 3 {
+                        self.removeLiveObjectMaskDisplaySeed()
+                        self.captureEngine.clearLiveObjectMaskPreview()
+                    }
+                } else if result.preview == nil {
                     self.consecutiveMaskMisses += 1
-                    self.captureEngine.clearLiveObjectMaskPreview()
+                    self.consecutiveLiveMaskMisses += 1
+                    if self.consecutiveLiveMaskMisses >= 3 {
+                        self.removeLiveObjectMaskDisplaySeed()
+                        self.captureEngine.clearLiveObjectMaskPreview()
+                    }
                     if result.lockedObjectCount == 0,
                        result.didToggleLock
                         || result.lockedObjectCount < previousLockedObjectCount
@@ -472,6 +538,113 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 }
             }
+        }
+
+        private func updateFastObjectMaskPreview(in arView: ARView) {
+            guard mesEngine.mode == .scan,
+                  let frame = arView.session.currentFrame else {
+                return
+            }
+            let orientation = cameraImageOrientation(in: arView)
+            if objectMaskDisplayOrientation != orientation {
+                objectMaskDisplayOrientation = orientation
+                objectMaskDisplayTask?.cancel()
+                objectMaskDisplayTaskGeneration &+= 1
+                objectMaskDisplayTask = nil
+                captureEngine.clearObjectMaskPreview()
+            }
+            guard objectMaskDisplayTask == nil,
+                  !objectMaskDisplaySeedsByID.isEmpty else {
+                if objectMaskDisplaySeedsByID.isEmpty {
+                    captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
+                }
+                return
+            }
+
+            let input = ObjectMaskDisplayFrame(
+                pixelBuffer: frame.capturedImage,
+                orientation: orientation,
+                imageToViewportTransform: frame.displayTransform(
+                    for: interfaceOrientation(in: arView),
+                    viewportSize: arView.bounds.size
+                ),
+                timestamp: frame.timestamp,
+                trackingGeneration: objectMaskTrackingGeneration
+            )
+            let seeds = Array(objectMaskDisplaySeedsByID.values)
+            let submittedSeedTimestamps = Dictionary(
+                uniqueKeysWithValues: seeds.map { ($0.id, $0.timestamp) }
+            )
+            let tracker = objectMaskDisplayTracker
+            objectMaskDisplayTaskGeneration &+= 1
+            let taskGeneration = objectMaskDisplayTaskGeneration
+
+            objectMaskDisplayTask = Task { [weak self] in
+                let boundingBoxes = await tracker.boundingBoxes(
+                    for: input,
+                    seeds: seeds
+                )
+                let wasCancelled = Task.isCancelled
+                guard let self,
+                      self.objectMaskDisplayTaskGeneration == taskGeneration else {
+                    return
+                }
+
+                self.objectMaskDisplayTask = nil
+                guard !wasCancelled, self.mesEngine.mode == .scan else {
+                    return
+                }
+                var applicableBoundingBoxes = self.captureEngine
+                    .objectMaskDisplayBoundingBoxes
+                    .filter {
+                        self.objectMaskDisplaySeedsByID[$0.key] != nil
+                    }
+                for (id, timestamp) in submittedSeedTimestamps
+                where self.objectMaskDisplaySeedsByID[id]?.timestamp == timestamp {
+                    if let boundingBox = boundingBoxes[id] {
+                        applicableBoundingBoxes[id] = boundingBox
+                    }
+                }
+                self.captureEngine.updateObjectMaskDisplayBoundingBoxes(
+                    applicableBoundingBoxes
+                )
+            }
+        }
+
+        private func updateObjectMaskDisplaySeeds(from preview: ObjectMaskPreview) {
+            if let incomingLiveLayer = preview.layers.first(where: {
+                $0.trackedObjectID == nil
+            }) {
+                if let liveObjectMaskDisplayID,
+                   liveObjectMaskDisplayID != incomingLiveLayer.id {
+                    objectMaskDisplaySeedsByID.removeValue(
+                        forKey: liveObjectMaskDisplayID
+                    )
+                }
+                liveObjectMaskDisplayID = incomingLiveLayer.id
+            }
+            for layer in preview.layers {
+                guard let boundingBox = layer.trackingBoundingBox else {
+                    continue
+                }
+                objectMaskDisplaySeedsByID[layer.id] = ObjectMaskDisplaySeed(
+                    id: layer.id,
+                    boundingBox: boundingBox,
+                    orientation: layer.trackingOrientation,
+                    preservesState: layer.trackedObjectID != nil,
+                    timestamp: preview.timestamp
+                )
+            }
+        }
+
+        private func removeLiveObjectMaskDisplaySeed() {
+            guard let liveObjectMaskDisplayID else {
+                return
+            }
+            objectMaskDisplaySeedsByID.removeValue(
+                forKey: liveObjectMaskDisplayID
+            )
+            self.liveObjectMaskDisplayID = nil
         }
 
         private func updateFastObjectMaskMarkers(in arView: ARView) {
@@ -816,6 +989,7 @@ struct ARCameraView: UIViewRepresentable {
                 if let anchor = objectMaskAnchors.removeValue(forKey: change.id) {
                     arView.session.remove(anchor: anchor)
                 }
+                objectMaskDisplaySeedsByID.removeValue(forKey: change.id)
                 maskedAccumulators.removeValue(forKey: change.id)
                 supportAccumulators.removeValue(forKey: change.id)
                 newestMaskedPointTimestamp.removeValue(forKey: change.id)
@@ -1198,8 +1372,23 @@ struct ARCameraView: UIViewRepresentable {
         private func resetObjectMaskTracking() {
             objectMaskTrackingGeneration &+= 1
             objectMaskTask?.cancel()
+            objectMaskDisplayTask?.cancel()
+            objectMaskDisplayTaskGeneration &+= 1
+            objectMaskDisplayTask = nil
+            objectMaskDisplaySeedsByID.removeAll()
+            liveObjectMaskDisplayID = nil
+            consecutiveLiveMaskMisses = 0
+            objectMaskDisplayOrientation = nil
+            let displayTracker = objectMaskDisplayTracker
+            let trackingGeneration = objectMaskTrackingGeneration
+            Task {
+                await displayTracker.reset(
+                    trackingGeneration: trackingGeneration
+                )
+            }
             pendingObjectMaskToggleRequest = nil
             consecutiveMaskMisses = 0
+            consecutiveLiveMaskMisses = 0
             maskedAccumulators.removeAll()
             supportAccumulators.removeAll()
             newestMaskedPointTimestamp.removeAll()
@@ -1210,6 +1399,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskMarkerStates.removeAll()
             captureEngine.updateLockedObjectMaskCount(0)
             captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
+            captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
             captureEngine.clearObjectMaskPreview()
         }
 

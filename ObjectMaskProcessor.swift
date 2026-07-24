@@ -7,10 +7,14 @@ import simd
 import Vision
 
 struct ObjectMaskPreviewLayer: @unchecked Sendable {
+    let id: UUID
     let image: CGImage
     let trackedObjectID: UUID?
     let referenceAnchorPoint: CGPoint?
     let referenceCameraDistance: Float?
+    let referenceViewportBoundingBox: CGRect?
+    let trackingBoundingBox: NormalizedRect?
+    let trackingOrientation: CGImagePropertyOrientation
 }
 
 struct ObjectMaskPreview: @unchecked Sendable {
@@ -100,6 +104,22 @@ struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let timestamp: TimeInterval
 }
 
+struct ObjectMaskDisplaySeed: @unchecked Sendable {
+    let id: UUID
+    let boundingBox: NormalizedRect
+    let orientation: CGImagePropertyOrientation
+    let preservesState: Bool
+    let timestamp: TimeInterval
+}
+
+struct ObjectMaskDisplayFrame: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let orientation: CGImagePropertyOrientation
+    let imageToViewportTransform: CGAffineTransform
+    let timestamp: TimeInterval
+    let trackingGeneration: Int
+}
+
 struct ObjectMaskProcessingResult: @unchecked Sendable {
     let preview: ObjectMaskPreview?
     let lockedObjectCount: Int
@@ -109,6 +129,388 @@ struct ObjectMaskProcessingResult: @unchecked Sendable {
     let lockChange: ObjectMaskLockChange?
     let needsWorldSurface: Bool
     let maskedPointClouds: [ObjectMaskDepthPointCloud]
+}
+
+actor ObjectMaskDisplayTracker {
+    private struct Tracker {
+        var request: TrackObjectRequest
+        var lastBoundingBox: NormalizedRect
+        var displayBoundingBox: NormalizedRect
+        var authoritativeBoundingBox: NormalizedRect
+        var orientation: CGImagePropertyOrientation
+        var seedTimestamp: TimeInterval
+        var lastFrameTimestamp: TimeInterval
+        var missedFrames: Int
+        var history: [(timestamp: TimeInterval, boundingBox: NormalizedRect)]
+    }
+
+    private var trackers: [UUID: Tracker] = [:]
+    private var trackingGeneration: Int?
+
+    func boundingBoxes(
+        for frame: ObjectMaskDisplayFrame,
+        seeds: [ObjectMaskDisplaySeed]
+    ) async -> [UUID: CGRect] {
+        synchronize(with: seeds, trackingGeneration: frame.trackingGeneration)
+        guard !trackers.isEmpty else {
+            return [:]
+        }
+
+        let eligible = trackers.filter {
+            $0.value.orientation == frame.orientation
+                && $0.value.missedFrames <= 2
+                && frame.timestamp > $0.value.lastFrameTimestamp
+        }
+        guard !eligible.isEmpty else {
+            return currentBoundingBoxes(for: frame)
+        }
+
+        let handler = ImageRequestHandler(
+            frame.pixelBuffer,
+            orientation: frame.orientation
+        )
+        var idsByRequest: [ObjectIdentifier: UUID] = [:]
+        let requests: [any VisionRequest] = eligible.map { id, tracker in
+            idsByRequest[ObjectIdentifier(tracker.request)] = id
+            return tracker.request
+        }
+        let submittedRequests = Dictionary(
+            uniqueKeysWithValues: eligible.map {
+                ($0.key, ObjectIdentifier($0.value.request))
+            }
+        )
+        let submittedGeneration = trackingGeneration
+        var observations: [UUID: DetectedObjectObservation] = [:]
+
+        for await result in handler.performAll(requests) {
+            guard case .trackObject(let request, let observation) = result,
+                  let id = idsByRequest[ObjectIdentifier(request)],
+                  let observation else {
+                continue
+            }
+            observations[id] = observation
+        }
+
+        guard trackingGeneration == submittedGeneration,
+              trackingGeneration == frame.trackingGeneration else {
+            return [:]
+        }
+
+        for id in eligible.keys {
+            guard var tracker = trackers[id],
+                  let submittedRequest = submittedRequests[id],
+                  ObjectIdentifier(tracker.request) == submittedRequest else {
+                continue
+            }
+            tracker.lastFrameTimestamp = frame.timestamp
+            if let observation = observations[id],
+               let accepted = acceptedBoundingBox(
+                   observation,
+                   relativeTo: tracker.lastBoundingBox,
+                   authoritative: tracker.authoritativeBoundingBox
+               ) {
+                tracker.lastBoundingBox = accepted
+                tracker.displayBoundingBox = smoothedBoundingBox(
+                    from: tracker.displayBoundingBox,
+                    to: accepted
+                )
+                tracker.missedFrames = 0
+                tracker.history.append((frame.timestamp, accepted))
+                if tracker.history.count > 60 {
+                    tracker.history.removeFirst(tracker.history.count - 60)
+                }
+            } else {
+                tracker.missedFrames += 1
+            }
+            trackers[id] = tracker
+        }
+
+        return currentBoundingBoxes(for: frame)
+    }
+
+    func reset(trackingGeneration: Int) {
+        trackers.removeAll()
+        self.trackingGeneration = trackingGeneration
+    }
+
+    private func synchronize(
+        with seeds: [ObjectMaskDisplaySeed],
+        trackingGeneration: Int
+    ) {
+        if self.trackingGeneration != trackingGeneration {
+            trackers.removeAll()
+            self.trackingGeneration = trackingGeneration
+        }
+
+        let seedIDs = Set(seeds.map(\.id))
+        trackers = trackers.filter {
+            seedIDs.contains($0.key)
+        }
+
+        for seed in seeds {
+            guard (trackers[seed.id]?.seedTimestamp ?? -.greatestFiniteMagnitude)
+                < seed.timestamp else {
+                continue
+            }
+            if var tracker = trackers[seed.id],
+               tracker.orientation == seed.orientation,
+               tracker.missedFrames <= 2,
+               seed.timestamp <= tracker.lastFrameTimestamp {
+                let historicalBoundingBox = tracker.history.min {
+                    abs($0.timestamp - seed.timestamp)
+                        < abs($1.timestamp - seed.timestamp)
+                }.flatMap {
+                    abs($0.timestamp - seed.timestamp) <= 0.12
+                        ? $0.boundingBox
+                        : nil
+                }
+                let identityReference = historicalBoundingBox
+                    ?? tracker.lastBoundingBox
+                if seed.preservesState
+                    || isConsistentDelayedSeed(
+                        seed.boundingBox,
+                        relativeTo: identityReference
+                    ) {
+                    if let historicalBoundingBox {
+                        let rebased = rebasedBoundingBox(
+                            tracker.lastBoundingBox,
+                            predictedAtSeed: historicalBoundingBox,
+                            authoritativeAtSeed: seed.boundingBox
+                        )
+                        tracker.request = TrackObjectRequest(
+                            detectedObject: DetectedObjectObservation(
+                                boundingBox: rebased
+                            )
+                        )
+                        tracker.lastBoundingBox = rebased
+                        tracker.authoritativeBoundingBox = rebased
+                        tracker.displayBoundingBox = smoothedBoundingBox(
+                            from: tracker.displayBoundingBox,
+                            to: rebased
+                        )
+                        tracker.history = [
+                            (tracker.lastFrameTimestamp, rebased)
+                        ]
+                    }
+                    tracker.seedTimestamp = seed.timestamp
+                    trackers[seed.id] = tracker
+                    continue
+                }
+            }
+            let observation = DetectedObjectObservation(
+                boundingBox: seed.boundingBox
+            )
+            trackers[seed.id] = Tracker(
+                request: TrackObjectRequest(detectedObject: observation),
+                lastBoundingBox: seed.boundingBox,
+                displayBoundingBox: seed.boundingBox,
+                authoritativeBoundingBox: seed.boundingBox,
+                orientation: seed.orientation,
+                seedTimestamp: seed.timestamp,
+                lastFrameTimestamp: seed.timestamp,
+                missedFrames: 0,
+                history: [(seed.timestamp, seed.boundingBox)]
+            )
+        }
+    }
+
+    private func acceptedBoundingBox(
+        _ observation: DetectedObjectObservation,
+        relativeTo previous: NormalizedRect,
+        authoritative: NormalizedRect
+    ) -> NormalizedRect? {
+        guard observation.confidence >= 0.5 else {
+            return nil
+        }
+
+        let candidate = observation.boundingBox.cgRect
+        let old = previous.cgRect
+        guard candidate.width >= 0.005,
+              candidate.height >= 0.005,
+              candidate.width <= 1,
+              candidate.height <= 1,
+              candidate.minX.isFinite,
+              candidate.minY.isFinite,
+              candidate.maxX.isFinite,
+              candidate.maxY.isFinite else {
+            return nil
+        }
+
+        let widthRatio = candidate.width / max(old.width, 0.005)
+        let heightRatio = candidate.height / max(old.height, 0.005)
+        let authoritativeRect = authoritative.cgRect
+        let authoritativeWidthRatio = candidate.width
+            / max(authoritativeRect.width, 0.005)
+        let authoritativeHeightRatio = candidate.height
+            / max(authoritativeRect.height, 0.005)
+        let centerDistance = hypot(
+            candidate.midX - old.midX,
+            candidate.midY - old.midY
+        )
+        let maximumCenterDistance = max(hypot(old.width, old.height) * 0.65, 0.08)
+        guard (0.65 ... 1.55).contains(widthRatio),
+              (0.65 ... 1.55).contains(heightRatio),
+              (0.72 ... 1.4).contains(authoritativeWidthRatio),
+              (0.72 ... 1.4).contains(authoritativeHeightRatio),
+              centerDistance <= maximumCenterDistance else {
+            return nil
+        }
+        return observation.boundingBox
+    }
+
+    private func isConsistentDelayedSeed(
+        _ seed: NormalizedRect,
+        relativeTo prediction: NormalizedRect
+    ) -> Bool {
+        let candidate = seed.cgRect
+        let previous = prediction.cgRect
+        let widthRatio = candidate.width / max(previous.width, 0.005)
+        let heightRatio = candidate.height / max(previous.height, 0.005)
+        let centerDistance = hypot(
+            candidate.midX - previous.midX,
+            candidate.midY - previous.midY
+        )
+        return (0.55 ... 1.8).contains(widthRatio)
+            && (0.55 ... 1.8).contains(heightRatio)
+            && centerDistance <= max(
+                hypot(previous.width, previous.height) * 0.8,
+                0.12
+            )
+    }
+
+    private func rebasedBoundingBox(
+        _ current: NormalizedRect,
+        predictedAtSeed: NormalizedRect,
+        authoritativeAtSeed: NormalizedRect
+    ) -> NormalizedRect {
+        let currentRect = current.cgRect
+        let predicted = predictedAtSeed.cgRect
+        let authoritative = authoritativeAtSeed.cgRect
+        let widthScale = min(
+            max(authoritative.width / max(predicted.width, 0.005), 0.75),
+            1.33
+        )
+        let heightScale = min(
+            max(authoritative.height / max(predicted.height, 0.005), 0.75),
+            1.33
+        )
+        let maximumCorrection = max(
+            hypot(predicted.width, predicted.height) * 0.35,
+            0.04
+        )
+        let xCorrection = min(
+            max(authoritative.midX - predicted.midX, -maximumCorrection),
+            maximumCorrection
+        )
+        let yCorrection = min(
+            max(authoritative.midY - predicted.midY, -maximumCorrection),
+            maximumCorrection
+        )
+        let width = min(max(currentRect.width * widthScale, 0.005), 1)
+        let height = min(max(currentRect.height * heightScale, 0.005), 1)
+        let centerX = min(
+            max(currentRect.midX + xCorrection, width / 2),
+            1 - width / 2
+        )
+        let centerY = min(
+            max(currentRect.midY + yCorrection, height / 2),
+            1 - height / 2
+        )
+        return NormalizedRect(
+            x: centerX - width / 2,
+            y: centerY - height / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    private func smoothedBoundingBox(
+        from previous: NormalizedRect,
+        to current: NormalizedRect
+    ) -> NormalizedRect {
+        let old = previous.cgRect
+        let new = current.cgRect
+        let alpha: CGFloat = 0.6
+        return NormalizedRect(
+            x: old.minX + (new.minX - old.minX) * alpha,
+            y: old.minY + (new.minY - old.minY) * alpha,
+            width: old.width + (new.width - old.width) * alpha,
+            height: old.height + (new.height - old.height) * alpha
+        )
+    }
+
+    private func currentBoundingBoxes(
+        for frame: ObjectMaskDisplayFrame
+    ) -> [UUID: CGRect] {
+        var result: [UUID: CGRect] = [:]
+        for (id, tracker) in trackers
+        where tracker.orientation == frame.orientation
+            && tracker.missedFrames <= 2 {
+            if let boundingBox = objectMaskViewportBoundingBox(
+                tracker.displayBoundingBox,
+                orientation: frame.orientation,
+                imageToViewportTransform: frame.imageToViewportTransform
+            ) {
+                result[id] = boundingBox
+            }
+        }
+        return result
+    }
+}
+
+private func objectMaskViewportBoundingBox(
+    _ boundingBox: NormalizedRect,
+    orientation: CGImagePropertyOrientation,
+    imageToViewportTransform: CGAffineTransform
+) -> CGRect? {
+    let rect = boundingBox.cgRect
+    let uprightPoints = [
+        CGPoint(x: rect.minX, y: 1 - rect.minY),
+        CGPoint(x: rect.maxX, y: 1 - rect.minY),
+        CGPoint(x: rect.minX, y: 1 - rect.maxY),
+        CGPoint(x: rect.maxX, y: 1 - rect.maxY)
+    ]
+    let viewportPoints = uprightPoints.map {
+        objectMaskRawTopLeftPoint(
+            fromUprightTopLeft: $0,
+            orientation: orientation
+        ).applying(imageToViewportTransform)
+    }
+    guard viewportPoints.allSatisfy({
+        $0.x.isFinite && $0.y.isFinite
+    }),
+    let first = viewportPoints.first else {
+        return nil
+    }
+    let minX = viewportPoints.dropFirst().reduce(first.x) { min($0, $1.x) }
+    let maxX = viewportPoints.dropFirst().reduce(first.x) { max($0, $1.x) }
+    let minY = viewportPoints.dropFirst().reduce(first.y) { min($0, $1.y) }
+    let maxY = viewportPoints.dropFirst().reduce(first.y) { max($0, $1.y) }
+    guard maxX - minX >= 0.001, maxY - minY >= 0.001 else {
+        return nil
+    }
+    return CGRect(
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY
+    )
+}
+
+private func objectMaskRawTopLeftPoint(
+    fromUprightTopLeft point: CGPoint,
+    orientation: CGImagePropertyOrientation
+) -> CGPoint {
+    switch orientation {
+    case .up: point
+    case .upMirrored: CGPoint(x: 1 - point.x, y: point.y)
+    case .down: CGPoint(x: 1 - point.x, y: 1 - point.y)
+    case .downMirrored: CGPoint(x: point.x, y: 1 - point.y)
+    case .left: CGPoint(x: 1 - point.y, y: point.x)
+    case .leftMirrored: CGPoint(x: point.y, y: point.x)
+    case .right: CGPoint(x: point.y, y: 1 - point.x)
+    case .rightMirrored: CGPoint(x: 1 - point.y, y: 1 - point.x)
+    }
 }
 
 actor ObjectMaskProcessor {
@@ -141,6 +543,7 @@ actor ObjectMaskProcessor {
         let instances: IndexSet
         let color: ObjectMaskDisplayColor
         let fillAlpha: CGFloat
+        let boundingBox: NormalizedRect
     }
 
     private struct RenderedMask {
@@ -184,6 +587,7 @@ actor ObjectMaskProcessor {
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let segmentationRequest = GenerateForegroundInstanceMaskRequest()
+    private let livePreviewID = UUID()
     private var trackedObjects: [TrackedObject] = []
     private var trackingGeneration: Int?
 
@@ -260,10 +664,18 @@ actor ObjectMaskProcessor {
                             )
                         }
                         return ObjectMaskPreviewLayer(
+                            id: renderedMask.lockID ?? livePreviewID,
                             image: image,
                             trackedObjectID: renderedMask.lockID,
                             referenceAnchorPoint: trackingReference?.point,
-                            referenceCameraDistance: trackingReference?.cameraDistance
+                            referenceCameraDistance: trackingReference?.cameraDistance,
+                            referenceViewportBoundingBox: objectMaskViewportBoundingBox(
+                                selection.boundingBox,
+                                orientation: frame.orientation,
+                                imageToViewportTransform: frame.imageToViewportTransform
+                            ),
+                            trackingBoundingBox: selection.boundingBox,
+                            trackingOrientation: frame.orientation
                         )
                     }
                     let cloud = makeMaskedPointClouds(
@@ -332,6 +744,7 @@ actor ObjectMaskProcessor {
                     cameraDistance: cameraDistance,
                     color: Self.lockedColors[trackedObject.colorIndex],
                     isMaskVisible: trackedObject.currentInstance != nil
+                        || trackedObject.missedFrames <= 2
                 )
             )
         }
@@ -360,6 +773,7 @@ actor ObjectMaskProcessor {
                     ?? trackedObject.referenceCameraDistance,
                 color: Self.lockedColors[trackedObject.colorIndex],
                 isMaskVisible: trackedObject.currentInstance != nil
+                    || trackedObject.missedFrames <= 2
             )
         }
     }
@@ -1166,7 +1580,8 @@ actor ObjectMaskProcessor {
                     lockID: trackedObject.id,
                     instances: IndexSet(integer: instance),
                     color: Self.lockedColors[trackedObject.colorIndex],
-                    fillAlpha: 0.24
+                    fillAlpha: 0.24,
+                    boundingBox: trackedObject.lastGeometry.boundingBox
                 )
             )
         }
@@ -1180,7 +1595,7 @@ actor ObjectMaskProcessor {
             let claimedInstances = Set(trackedObjects.compactMap(\.currentInstance))
             let nearbyInstances = instances(near: centerPoint, in: observation)
                 .filter { !claimedInstances.contains($0) }
-            var bestPreview: (instance: Int, score: CGFloat)?
+            var bestPreview: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
 
             for instance in nearbyInstances {
                 let mask = try observation.generateMask(for: IndexSet(integer: instance))
@@ -1195,7 +1610,7 @@ actor ObjectMaskProcessor {
                     geometry.centroid.y - centerPoint.y
                 ) + geometry.area * 0.02
                 if bestPreview == nil || score < bestPreview!.score {
-                    bestPreview = (instance, score)
+                    bestPreview = (instance, geometry, score)
                 }
             }
 
@@ -1205,7 +1620,8 @@ actor ObjectMaskProcessor {
                         lockID: nil,
                         instances: IndexSet(integer: bestPreview.instance),
                         color: Self.lockedColors[firstAvailableColorIndex()],
-                        fillAlpha: 0.16
+                        fillAlpha: 0.16,
+                        boundingBox: bestPreview.geometry.boundingBox
                     )
                 )
             }
