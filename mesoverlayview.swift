@@ -65,7 +65,17 @@ struct MesOverlayView: View {
                         scanQuickVisualControls
                     }
                     Spacer()
-                    modeMenu
+                    VStack(alignment: .trailing, spacing: 10) {
+                        if isScanning,
+                           isAutomaticCaptureSupported,
+                           captureEngine.hasCapture,
+                           captureEngine.visibleObjectMaskCount > 0,
+                           captureEngine.showsSelectedPoints,
+                           captureEngine.showsLockedMaskPreviews {
+                            pointCleanupButton
+                        }
+                        modeMenu
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 32)
@@ -465,6 +475,10 @@ struct MesOverlayView: View {
     }
 
     private var scanStatusText: String {
+        if let cleanupFeedback = captureEngine.pointCleanupFeedbackText {
+            return cleanupFeedback
+        }
+
         if let feedback = captureEngine.objectMaskFeedbackText {
             return feedback
         }
@@ -481,6 +495,33 @@ struct MesOverlayView: View {
         }
 
         return "Center an object to preview its next color, then tap it to lock."
+    }
+
+    private var pointCleanupButton: some View {
+        Button {
+            captureEngine.requestVisiblePointCleanup()
+        } label: {
+            HStack(spacing: 6) {
+                if captureEngine.isPointCleanupInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.cyan)
+                } else {
+                    Image(systemName: "eraser.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                Text("Clean")
+                    .font(.caption.weight(.semibold))
+            }
+            .padding(.horizontal, 12)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.cyan)
+        .background(.ultraThinMaterial, in: Capsule())
+        .disabled(captureEngine.isPointCleanupInProgress)
+        .accessibilityLabel("Remove visible cyan points outside the object mask")
     }
 
     private var nonLiDARLimitationsSheet: some View {

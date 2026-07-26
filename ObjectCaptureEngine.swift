@@ -23,7 +23,11 @@ final class ObjectCaptureEngine {
     private(set) var showsObjectMaskMarkers = true
     private(set) var resetRevision = 0
     private(set) var objectMaskToggleRequestRevision = 0
+    private(set) var pointCleanupRequestRevision = 0
+    private(set) var isPointCleanupInProgress = false
+    private(set) var pointCleanupFeedbackText: String?
     private var latestObjectMaskPreviewTimestamp: TimeInterval = -.greatestFiniteMagnitude
+    private var pointCleanupFeedbackTask: Task<Void, Never>?
     private var captureOrder: [UUID] = []
     private var focusedCaptureID: UUID?
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
@@ -121,6 +125,32 @@ final class ObjectCaptureEngine {
 
     func toggleObjectMaskMarkers() {
         showsObjectMaskMarkers.toggle()
+    }
+
+    func requestVisiblePointCleanup() {
+        guard !isPointCleanupInProgress else {
+            return
+        }
+        pointCleanupFeedbackTask?.cancel()
+        isPointCleanupInProgress = true
+        pointCleanupFeedbackText = "Checking visible cyan points against the current mask…"
+        pointCleanupRequestRevision += 1
+    }
+
+    func finishVisiblePointCleanup(removedCount: Int) {
+        isPointCleanupInProgress = false
+        if removedCount == 0 {
+            pointCleanupFeedbackText = "All visible cyan points are inside the current mask."
+        } else {
+            pointCleanupFeedbackText = "\(removedCount) outside point\(removedCount == 1 ? "" : "s") removed."
+        }
+        schedulePointCleanupFeedbackClear()
+    }
+
+    func failVisiblePointCleanup() {
+        isPointCleanupInProgress = false
+        pointCleanupFeedbackText = "Keep a locked mask and its cyan points in view, then try again."
+        schedulePointCleanupFeedbackClear()
     }
 
     func hideAllScanVisuals() {
@@ -313,7 +343,20 @@ final class ObjectCaptureEngine {
             : "\(capturedObjectsByID.count) LiDAR box\(capturedObjectsByID.count == 1 ? "" : "es") ready."
     }
 
+    private func schedulePointCleanupFeedbackClear() {
+        pointCleanupFeedbackTask?.cancel()
+        pointCleanupFeedbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else {
+                return
+            }
+            self?.pointCleanupFeedbackText = nil
+        }
+    }
+
     func reset() {
+        pointCleanupFeedbackTask?.cancel()
+        pointCleanupFeedbackTask = nil
         capturedObjectsByID.removeAll()
         captureOrder.removeAll()
         focusedCaptureID = nil
@@ -328,6 +371,8 @@ final class ObjectCaptureEngine {
         objectMaskMarkers = []
         objectMaskMarkerMissCounts.removeAll()
         objectMaskFeedbackText = nil
+        pointCleanupFeedbackText = nil
+        isPointCleanupInProgress = false
         objectMaskToggleRequest = nil
         statusText = Self.defaultPrompt
         resetRevision += 1

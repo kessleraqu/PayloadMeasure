@@ -61,6 +61,63 @@ struct ARCameraView: UIViewRepresentable {
             let z: Int32
         }
 
+        private struct ObjectMaskAlphaMap {
+            let width: Int
+            let height: Int
+            let bytesPerRow: Int
+            let bytesPerPixel: Int
+            let alphaOffset: Int
+            let pixels: Data
+
+            init?(_ image: CGImage) {
+                guard image.bitsPerComponent == 8,
+                      image.bitsPerPixel % 8 == 0,
+                      let data = image.dataProvider?.data else {
+                    return nil
+                }
+                let bytesPerPixel = image.bitsPerPixel / 8
+                let alphaOffset: Int
+                switch image.alphaInfo {
+                case .premultipliedLast, .last:
+                    alphaOffset = bytesPerPixel - 1
+                case .premultipliedFirst, .first:
+                    alphaOffset = 0
+                default:
+                    return nil
+                }
+                guard bytesPerPixel > alphaOffset,
+                      CFDataGetLength(data) >= image.bytesPerRow * image.height else {
+                    return nil
+                }
+                width = image.width
+                height = image.height
+                bytesPerRow = image.bytesPerRow
+                self.bytesPerPixel = bytesPerPixel
+                self.alphaOffset = alphaOffset
+                pixels = data as Data
+            }
+
+            func contains(_ point: CGPoint, radius: Int = 2) -> Bool {
+                guard (0 ... 1).contains(point.x),
+                      (0 ... 1).contains(point.y),
+                      width > 0,
+                      height > 0 else {
+                    return false
+                }
+                let centerX = min(Int(point.x * CGFloat(width)), width - 1)
+                let centerY = min(Int(point.y * CGFloat(height)), height - 1)
+                for y in max(centerY - radius, 0) ... min(centerY + radius, height - 1) {
+                    for x in max(centerX - radius, 0) ... min(centerX + radius, width - 1) {
+                        let index = y * bytesPerRow + x * bytesPerPixel + alphaOffset
+                        if pixels[index] > 16 {
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+        }
+
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
         fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
@@ -98,9 +155,11 @@ struct ARCameraView: UIViewRepresentable {
         private var fittedMaskedPointTimestamp: [UUID: TimeInterval] = [:]
         private var liveResultsByObject: [UUID: CaptureResult] = [:]
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
+        private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
         private let objectMaskDisplayTracker = ObjectMaskDisplayTracker()
         private var scanTickCounter = 0
+        private var lastAutomaticPointCleanupTimestamp: TimeInterval = -.greatestFiniteMagnitude
         private var consecutiveMaskMisses = 0
         private var consecutiveLiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
@@ -128,6 +187,7 @@ struct ARCameraView: UIViewRepresentable {
         private var observedMode: MesMode = .scan
         private var observedCaptureResetRevision = 0
         private var observedObjectMaskToggleRequestRevision = 0
+        private var observedPointCleanupRequestRevision = 0
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
         private var observedShowsBoundingBoxes = true
@@ -264,6 +324,7 @@ struct ARCameraView: UIViewRepresentable {
             fittedMaskedPointTimestamp.removeAll(keepingCapacity: false)
             liveResultsByObject.removeAll(keepingCapacity: false)
             acceptedSurfaceVoxelKeysByObject.removeAll(keepingCapacity: false)
+            manuallyRejectedVoxelKeysByObject.removeAll(keepingCapacity: false)
             captureEngine.clearObjectMaskPreview()
             captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
             lastSelectionPoints.removeAll(keepingCapacity: false)
@@ -278,6 +339,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = mesEngine.mode
                 _ = captureEngine.resetRevision
                 _ = captureEngine.objectMaskToggleRequestRevision
+                _ = captureEngine.pointCleanupRequestRevision
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
                 _ = captureEngine.showsBoundingBoxes
@@ -325,6 +387,19 @@ struct ARCameraView: UIViewRepresentable {
                 observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
                 pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
                 objectMaskToggleAttemptsRemaining = 4
+            }
+
+            if captureEngine.pointCleanupRequestRevision
+                != observedPointCleanupRequestRevision {
+                observedPointCleanupRequestRevision = captureEngine.pointCleanupRequestRevision
+                if let arView {
+                    removeVisiblePointsOutsideCurrentMask(
+                        in: arView,
+                        reportsFeedback: true
+                    )
+                } else {
+                    captureEngine.failVisiblePointCleanup()
+                }
             }
 
             if captureEngine.isMeshVisible != observedMeshVisible {
@@ -428,6 +503,20 @@ struct ARCameraView: UIViewRepresentable {
                 let previousLockedObjectCount = self.captureEngine.lockedObjectMaskCount
                 self.applyObjectMaskLockChange(result.lockChange, in: arView)
                 for cloud in result.maskedPointClouds {
+                    let acceptedPoints: [SIMD3<Float>]
+                    if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
+                       !rejectedKeys.isEmpty {
+                        acceptedPoints = cloud.points.filter {
+                            !rejectedKeys.contains(
+                                self.selectionVoxelKey(for: $0)
+                            )
+                        }
+                    } else {
+                        acceptedPoints = cloud.points
+                    }
+                    guard !acceptedPoints.isEmpty else {
+                        continue
+                    }
                     if self.maskedAccumulators[cloud.id] == nil {
                         self.maskedAccumulators[cloud.id] = PointAccumulator(
                             voxelSize: ObjectCapturePipeline.voxelSize,
@@ -435,7 +524,7 @@ struct ARCameraView: UIViewRepresentable {
                         )
                     }
                     let newlyStablePointCount = self.maskedAccumulators[cloud.id]?.add(
-                        cloud.points,
+                        acceptedPoints,
                         timestamp: cloud.timestamp,
                         stabilizationObservations: ObjectCapturePipeline.minObservations
                     ) ?? 0
@@ -673,6 +762,348 @@ struct ARCameraView: UIViewRepresentable {
                     cameraDistance: hint.cameraDistance,
                     color: state.color,
                     isMaskVisible: state.isMaskVisible
+                )
+            }
+        }
+
+        private func removeVisiblePointsOutsideCurrentMask(
+            in arView: ARView,
+            reportsFeedback: Bool
+        ) {
+            guard mesEngine.mode == .scan,
+                  sessionManager.isAutomaticObjectCaptureSupported,
+                  sessionManager.isTrackingReady,
+                  let frame = arView.session.currentFrame,
+                  let objectID = lastSelectionObjectID,
+                  var accumulator = maskedAccumulators[objectID],
+                  let result = liveResultsByObject[objectID],
+                  result.selectionPoints.count == result.surfacePoints.count,
+                  !result.surfacePoints.isEmpty,
+                  let layer = captureEngine.objectMaskPreview?.layers.first(where: {
+                      $0.trackedObjectID == objectID
+                  }),
+                  layer.trackingOrientation == cameraImageOrientation(in: arView),
+                  let marker = captureEngine.objectMaskMarkers.first(where: {
+                      $0.id == objectID
+                  }),
+                  marker.isMaskVisible,
+                  objectMaskMarkerStates[objectID]?.isMaskVisible == true,
+                  let alphaMap = ObjectMaskAlphaMap(layer.image),
+                  let sceneDepth = frame.sceneDepth,
+                  arView.bounds.width > 0,
+                  arView.bounds.height > 0 else {
+                if reportsFeedback {
+                    captureEngine.failVisiblePointCleanup()
+                }
+                return
+            }
+
+            let viewportSize = arView.bounds.size
+            let orientation = interfaceOrientation(in: arView)
+            let imageToViewport = frame.displayTransform(
+                for: orientation,
+                viewportSize: viewportSize
+            )
+            guard abs(
+                imageToViewport.a * imageToViewport.d
+                    - imageToViewport.b * imageToViewport.c
+            ) > 0.000001 else {
+                if reportsFeedback {
+                    captureEngine.failVisiblePointCleanup()
+                }
+                return
+            }
+            let viewportToImage = imageToViewport.inverted()
+            let referencePoint = layer.referenceAnchorPoint
+                ?? CGPoint(x: 0.5, y: 0.5)
+            let distanceScale: CGFloat
+            if let referenceDistance = layer.referenceCameraDistance,
+               referenceDistance > 0.05,
+               marker.cameraDistance > 0.05 {
+                distanceScale = min(
+                    max(CGFloat(referenceDistance / marker.cameraDistance), 0.4),
+                    2.5
+                )
+            } else {
+                distanceScale = 1
+            }
+
+            let transformAnchor: CGPoint
+            let transformOffset: CGPoint
+            if let referenceBox = layer.referenceViewportBoundingBox,
+               let currentBox = captureEngine.objectMaskDisplayBoundingBoxes[layer.id],
+               referenceBox.width >= 0.005,
+               referenceBox.height >= 0.005,
+               currentBox.width >= 0.005,
+               currentBox.height >= 0.005 {
+                transformAnchor = CGPoint(
+                    x: referenceBox.midX,
+                    y: referenceBox.midY
+                )
+                transformOffset = CGPoint(
+                    x: currentBox.midX - referenceBox.midX,
+                    y: currentBox.midY - referenceBox.midY
+                )
+            } else {
+                transformAnchor = referencePoint
+                transformOffset = CGPoint(
+                    x: marker.normalizedViewportPoint.x - referencePoint.x,
+                    y: marker.normalizedViewportPoint.y - referencePoint.y
+                )
+            }
+
+            let depthMap = sceneDepth.depthMap
+            let confidenceMap = sceneDepth.confidenceMap
+            let depthWidth = CVPixelBufferGetWidth(depthMap)
+            let depthHeight = CVPixelBufferGetHeight(depthMap)
+            let confidenceWidth = confidenceMap.map(CVPixelBufferGetWidth) ?? 0
+            let confidenceHeight = confidenceMap.map(CVPixelBufferGetHeight) ?? 0
+            let worldToCamera = frame.camera.transform.inverse
+            let pairs = zip(
+                result.selectionPoints,
+                result.surfacePoints
+            ).map { (selection: $0.0, surface: $0.1) }
+            let maskSampleRadius = 2
+            let viewportBorderX = max(
+                2 / viewportSize.width,
+                CGFloat(maskSampleRadius) * distanceScale / CGFloat(alphaMap.width)
+            )
+            let viewportBorderY = max(
+                2 / viewportSize.height,
+                CGFloat(maskSampleRadius) * distanceScale / CGFloat(alphaMap.height)
+            )
+
+            guard CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+                == kCVReturnSuccess else {
+                if reportsFeedback {
+                    captureEngine.failVisiblePointCleanup()
+                }
+                return
+            }
+            if let confidenceMap {
+                guard CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+                    == kCVReturnSuccess else {
+                    CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                    if reportsFeedback {
+                        captureEngine.failVisiblePointCleanup()
+                    }
+                    return
+                }
+            }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
+                CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                if let confidenceMap {
+                    CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+                }
+                if reportsFeedback {
+                    captureEngine.failVisiblePointCleanup()
+                }
+                return
+            }
+            let confidenceBase: UnsafeMutableRawPointer?
+            if let confidenceMap {
+                guard let base = CVPixelBufferGetBaseAddress(confidenceMap) else {
+                    CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                    CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+                    if reportsFeedback {
+                        captureEngine.failVisiblePointCleanup()
+                    }
+                    return
+                }
+                confidenceBase = base
+            } else {
+                confidenceBase = nil
+            }
+            let removedIndices: Set<Int> = {
+                defer {
+                    CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                    if let confidenceMap {
+                        CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+                    }
+                }
+                let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+                let confidenceRowBytes = confidenceMap.map {
+                    CVPixelBufferGetBytesPerRow($0)
+                } ?? 0
+                var removed: Set<Int> = []
+
+                for index in pairs.indices {
+                    let surfacePoint = pairs[index].surface
+                    let cameraPoint = worldToCamera * SIMD4<Float>(surfacePoint, 1)
+                    guard cameraPoint.z < -0.02 else {
+                        continue
+                    }
+                    let projected = frame.camera.projectPoint(
+                        surfacePoint,
+                        orientation: orientation,
+                        viewportSize: viewportSize
+                    )
+                    let viewportPoint = CGPoint(
+                        x: projected.x / viewportSize.width,
+                        y: projected.y / viewportSize.height
+                    )
+                    guard viewportPoint.x >= viewportBorderX,
+                          viewportPoint.x <= 1 - viewportBorderX,
+                          viewportPoint.y >= viewportBorderY,
+                          viewportPoint.y <= 1 - viewportBorderY else {
+                        continue
+                    }
+
+                    let imagePoint = viewportPoint.applying(viewportToImage)
+                    guard (0 ... 1).contains(imagePoint.x),
+                          (0 ... 1).contains(imagePoint.y) else {
+                        continue
+                    }
+                    let centerX = min(
+                        max(Int(imagePoint.x * CGFloat(depthWidth)), 0),
+                        depthWidth - 1
+                    )
+                    let centerY = min(
+                        max(Int(imagePoint.y * CGFloat(depthHeight)), 0),
+                        depthHeight - 1
+                    )
+                    let pointDepth = -cameraPoint.z
+                    func validDepth(x: Int, y: Int) -> Float? {
+                        let depthRow = depthBase
+                            .advanced(by: y * depthRowBytes)
+                            .assumingMemoryBound(to: Float32.self)
+                        if let confidenceBase,
+                           confidenceWidth > 0,
+                           confidenceHeight > 0 {
+                            let confidenceX = min(
+                                x * confidenceWidth / depthWidth,
+                                confidenceWidth - 1
+                            )
+                            let confidenceY = min(
+                                y * confidenceHeight / depthHeight,
+                                confidenceHeight - 1
+                            )
+                            let confidenceRow = confidenceBase
+                                .advanced(by: confidenceY * confidenceRowBytes)
+                                .assumingMemoryBound(to: UInt8.self)
+                            if confidenceRow[confidenceX] < 1 {
+                                return nil
+                            }
+                        }
+                        let measuredDepth = depthRow[x]
+                        guard measuredDepth > 0.15,
+                              measuredDepth < 3.5 else {
+                            return nil
+                        }
+                        return measuredDepth
+                    }
+
+                    let visibleDepth: Float?
+                    if let centerDepth = validDepth(x: centerX, y: centerY) {
+                        visibleDepth = centerDepth
+                    } else {
+                        var neighborhoodDepths: [Float] = []
+                        neighborhoodDepths.reserveCapacity(8)
+                        for y in max(centerY - 1, 0) ... min(centerY + 1, depthHeight - 1) {
+                            for x in max(centerX - 1, 0) ... min(centerX + 1, depthWidth - 1)
+                            where x != centerX || y != centerY {
+                                if let depth = validDepth(x: x, y: y) {
+                                    neighborhoodDepths.append(depth)
+                                }
+                            }
+                        }
+                        neighborhoodDepths.sort()
+                        if neighborhoodDepths.isEmpty {
+                            visibleDepth = nil
+                        } else {
+                            visibleDepth = neighborhoodDepths[
+                                neighborhoodDepths.count / 2
+                            ]
+                        }
+                    }
+                    guard let visibleDepth else {
+                        continue
+                    }
+                    let occlusionTolerance = max(0.025, visibleDepth * 0.03)
+                    guard pointDepth <= visibleDepth + occlusionTolerance else {
+                        continue
+                    }
+
+                    let sourcePoint = CGPoint(
+                        x: transformAnchor.x
+                            + (
+                                viewportPoint.x
+                                    - transformOffset.x
+                                    - transformAnchor.x
+                            ) / distanceScale,
+                        y: transformAnchor.y
+                            + (
+                                viewportPoint.y
+                                    - transformOffset.y
+                                    - transformAnchor.y
+                            ) / distanceScale
+                    )
+                    if !alphaMap.contains(sourcePoint, radius: maskSampleRadius) {
+                        removed.insert(index)
+                    }
+                }
+                return removed
+            }()
+
+            guard !removedIndices.isEmpty else {
+                if reportsFeedback {
+                    captureEngine.finishVisiblePointCleanup(removedCount: 0)
+                }
+                return
+            }
+
+            let removedPairs = pairs.enumerated().compactMap {
+                removedIndices.contains($0.offset) ? $0.element : nil
+            }
+            let retainedPairs = pairs.enumerated().compactMap {
+                removedIndices.contains($0.offset) ? nil : $0.element
+            }
+            let removedSelections = removedPairs.map(\.selection)
+            accumulator.removeVoxels(
+                containing: removedPairs.flatMap {
+                    [$0.selection, $0.surface]
+                }
+            )
+            maskedAccumulators[objectID] = accumulator
+            manuallyRejectedVoxelKeysByObject[objectID, default: []].formUnion(
+                removedPairs.flatMap {
+                    [
+                        selectionVoxelKey(for: $0.selection),
+                        selectionVoxelKey(for: $0.surface)
+                    ]
+                }
+            )
+
+            let retainedSelectionPoints = retainedPairs.map(\.selection)
+            let retainedSurfacePoints = retainedPairs.map(\.surface)
+            let cleanedObject = CapturedObject(
+                dimensions: result.object.dimensions,
+                center: result.object.center,
+                axes: result.object.axes,
+                corners: result.object.corners,
+                volume: result.object.volume,
+                sampleCount: retainedSurfacePoints.count
+            )
+            liveResultsByObject[objectID] = CaptureResult(
+                object: cleanedObject,
+                selectionPoints: retainedSelectionPoints,
+                surfacePoints: retainedSurfacePoints
+            )
+            acceptedSurfaceVoxelKeysByObject[objectID] = Set(
+                retainedSelectionPoints.filter {
+                    result.object.contains(
+                        $0,
+                        tolerance: ObjectCapturePipeline.selectionTolerance
+                    )
+                }.map(selectionVoxelKey(for:))
+            )
+            fittedMaskedPointTimestamp[objectID] = -.greatestFiniteMagnitude
+            lastSelectionPoints = retainedSurfacePoints
+            updateSelectionVisualization()
+            captureEngine.updateCapture(id: objectID, object: cleanedObject)
+            if reportsFeedback {
+                captureEngine.finishVisiblePointCleanup(
+                    removedCount: removedSelections.count
                 )
             }
         }
@@ -982,6 +1413,7 @@ struct ARCameraView: UIViewRepresentable {
                 fittedMaskedPointTimestamp.removeValue(forKey: change.id)
                 liveResultsByObject.removeValue(forKey: change.id)
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
+                manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
                 arView.session.add(anchor: anchor)
                 objectMaskAnchors[change.id] = anchor
@@ -996,6 +1428,7 @@ struct ARCameraView: UIViewRepresentable {
                 fittedMaskedPointTimestamp.removeValue(forKey: change.id)
                 liveResultsByObject.removeValue(forKey: change.id)
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
+                manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
                 if lastSelectionObjectID == change.id {
                     lastSelectionObjectID = nil
                     lastSelectionPoints = []
@@ -1038,6 +1471,16 @@ struct ARCameraView: UIViewRepresentable {
                   let frame = arView.session.currentFrame,
                   !objectMaskAnchors.isEmpty else {
                 return
+            }
+
+            if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 2 {
+                lastAutomaticPointCleanupTimestamp = frame.timestamp
+                if !captureEngine.isPointCleanupInProgress {
+                    removeVisiblePointsOutsideCurrentMask(
+                        in: arView,
+                        reportsFeedback: false
+                    )
+                }
             }
 
             let visibleHints = objectMaskAnchorHints(frame: frame, in: arView).filter {
@@ -1365,6 +1808,7 @@ struct ARCameraView: UIViewRepresentable {
             fittedMaskedPointTimestamp.removeAll()
             liveResultsByObject.removeAll()
             acceptedSurfaceVoxelKeysByObject.removeAll()
+            manuallyRejectedVoxelKeysByObject.removeAll()
             scanTickCounter = 0
             resetObjectMaskTracking()
         }
@@ -1395,6 +1839,7 @@ struct ARCameraView: UIViewRepresentable {
             fittedMaskedPointTimestamp.removeAll()
             liveResultsByObject.removeAll()
             acceptedSurfaceVoxelKeysByObject.removeAll()
+            manuallyRejectedVoxelKeysByObject.removeAll()
             removeAllObjectMaskAnchors()
             objectMaskMarkerStates.removeAll()
             captureEngine.updateLockedObjectMaskCount(0)

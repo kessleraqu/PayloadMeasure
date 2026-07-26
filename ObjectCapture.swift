@@ -674,6 +674,14 @@ struct PointAccumulator {
         remove(stale)
     }
 
+    @discardableResult
+    mutating func removeVoxels(containing points: [SIMD3<Float>]) -> Int {
+        let keys = Set(points.map(key(for:)))
+        let removedCount = keys.count(where: { samples[$0] != nil })
+        remove(Array(keys))
+        return removedCount
+    }
+
     private mutating func remove(_ keys: [Key]) {
         for key in keys {
             samples[key] = nil
