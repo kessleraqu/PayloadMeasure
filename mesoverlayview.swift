@@ -67,11 +67,7 @@ struct MesOverlayView: View {
                     Spacer()
                     VStack(alignment: .trailing, spacing: 10) {
                         if isScanning,
-                           isAutomaticCaptureSupported,
-                           captureEngine.hasCapture,
-                           captureEngine.visibleObjectMaskCount > 0,
-                           captureEngine.showsSelectedPoints,
-                           captureEngine.showsLockedMaskPreviews {
+                           isAutomaticCaptureSupported {
                             pointCleanupButton
                         }
                         modeMenu
@@ -510,7 +506,7 @@ struct MesOverlayView: View {
                     Image(systemName: "eraser.fill")
                         .font(.system(size: 13, weight: .semibold))
                 }
-                Text("Clean")
+                Text("Enhance")
                     .font(.caption.weight(.semibold))
             }
             .padding(.horizontal, 12)
@@ -521,7 +517,7 @@ struct MesOverlayView: View {
         .foregroundStyle(.cyan)
         .background(.ultraThinMaterial, in: Capsule())
         .disabled(captureEngine.isPointCleanupInProgress)
-        .accessibilityLabel("Remove visible cyan points outside the object mask")
+        .accessibilityLabel("Enhance cyan points using the object mask")
     }
 
     private var nonLiDARLimitationsSheet: some View {
