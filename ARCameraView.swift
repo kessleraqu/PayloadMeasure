@@ -476,6 +476,32 @@ struct ARCameraView: UIViewRepresentable {
                     -.greatestFiniteMagnitude
                 removeLiveObjectMaskDisplaySeed()
                 captureEngine.clearLiveObjectMaskPreview()
+            case .remove:
+                objectMaskDisplayTask?.cancel()
+                objectMaskDisplayTaskGeneration &+= 1
+                objectMaskDisplayTask = nil
+                objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
+                captureEngine.clearObjectMaskDisplayTracking(id: request.id)
+                if let anchor = objectMaskAnchors.removeValue(
+                    forKey: request.id
+                ), let arView {
+                    arView.session.remove(anchor: anchor)
+                }
+                objectMaskMarkerStates.removeValue(forKey: request.id)
+                objectMaskColorsByID.removeValue(forKey: request.id)
+                supportAccumulators.removeValue(forKey: request.id)
+                maskedAccumulators.removeValue(forKey: request.id)
+                newestMaskedPointTimestamp.removeValue(forKey: request.id)
+                fittedMaskedPointTimestamp.removeValue(forKey: request.id)
+                liveResultsByObject.removeValue(forKey: request.id)
+                acceptedSurfaceVoxelKeysByObject.removeValue(
+                    forKey: request.id
+                )
+                manuallyRejectedVoxelKeysByObject.removeValue(
+                    forKey: request.id
+                )
+                selectionPointsByObject.removeValue(forKey: request.id)
+                clearCaptureContent(for: request.id)
             }
             updateSelectionVisualization()
         }
@@ -2597,6 +2623,14 @@ struct ARCameraView: UIViewRepresentable {
             captureBoxRearEdgeStatesByObject.removeAll()
             hideAllSelectionMarkers()
             selectionPointsByObject.removeAll()
+        }
+
+        private func clearCaptureContent(for id: UUID) {
+            for entity in captureEntitiesByObject.removeValue(forKey: id) ?? [] {
+                entity.removeFromParent()
+            }
+            captureBoxActiveSpanCountsByObject.removeValue(forKey: id)
+            captureBoxRearEdgeStatesByObject.removeValue(forKey: id)
         }
 
         private func updateSelectionVisualization() {

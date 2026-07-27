@@ -6,6 +6,7 @@ import simd
 enum ObjectWorkflowRequestKind: Sendable {
     case finalize
     case reactivate
+    case remove
 }
 
 struct ObjectWorkflowRequest: Sendable {
@@ -44,6 +45,8 @@ final class ObjectCaptureEngine {
     private var latestObjectMaskPreviewTimestamp: TimeInterval = -.greatestFiniteMagnitude
     private var pointCleanupFeedbackTask: Task<Void, Never>?
     private var captureOrder: [UUID] = []
+    private var objectColorsByID: [UUID: ObjectMaskDisplayColor] = [:]
+    private var objectWeightsInKilogramsByID: [UUID: Double] = [:]
     private(set) var focusedCaptureID: UUID?
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
@@ -95,6 +98,25 @@ final class ObjectCaptureEngine {
         }
         return finalizedObjectIDs.contains(focusedCaptureID)
             && capturedObjectsByID[focusedCaptureID] != nil
+    }
+
+    var measuredObjectIDs: [UUID] {
+        captureOrder.filter {
+            finalizedObjectIDs.contains($0)
+                && capturedObjectsByID[$0] != nil
+        }
+    }
+
+    func objectNumber(for id: UUID) -> Int? {
+        captureOrder.firstIndex(of: id).map { $0 + 1 }
+    }
+
+    func objectColor(for id: UUID) -> ObjectMaskDisplayColor? {
+        objectColorsByID[id]
+    }
+
+    func weightInKilograms(for id: UUID) -> Double? {
+        return objectWeightsInKilogramsByID[id]
     }
 
     var statusHeadline: String {
@@ -272,7 +294,9 @@ final class ObjectCaptureEngine {
 
     func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
         visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
-        objectMaskMarkers = stabilizedObjectMaskMarkers(markers)
+        let retainedMarkers = retainedObjectMaskMarkers(markers)
+        cacheObjectMaskColors(from: retainedMarkers)
+        objectMaskMarkers = stabilizedObjectMaskMarkers(retainedMarkers)
         let lostCount = lostObjectMaskCount
         if isObjectSelectionPending {
             objectMaskFeedbackText = "Selecting object…"
@@ -292,7 +316,9 @@ final class ObjectCaptureEngine {
     }
 
     func updateObjectMaskMarkers(_ markers: [ObjectMaskMarker]) {
-        let stabilizedMarkers = stabilizedObjectMaskMarkers(markers)
+        let retainedMarkers = retainedObjectMaskMarkers(markers)
+        cacheObjectMaskColors(from: retainedMarkers)
+        let stabilizedMarkers = stabilizedObjectMaskMarkers(retainedMarkers)
         if objectMaskMarkers != stabilizedMarkers {
             objectMaskMarkers = stabilizedMarkers
         }
@@ -362,7 +388,12 @@ final class ObjectCaptureEngine {
         objectMaskFeedbackText = "This object is locked. Unlock it to continue measuring it."
     }
 
-    func finalizeActiveObject() {
+    func finalizeActiveObject(weightInKilograms: Double) {
+        guard weightInKilograms.isFinite,
+              weightInKilograms > 0 else {
+            objectMaskFeedbackText = "Enter a valid weight greater than zero before locking this object."
+            return
+        }
         guard let id = activeObjectID else {
             objectMaskFeedbackText = "Select an object to measure before locking it."
             return
@@ -373,6 +404,7 @@ final class ObjectCaptureEngine {
         }
         activeObjectID = nil
         finalizedObjectIDs.insert(id)
+        objectWeightsInKilogramsByID[id] = weightInKilograms
         focusedCaptureID = id
         isObjectSelectionPending = false
         objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .finalize)
@@ -381,6 +413,58 @@ final class ObjectCaptureEngine {
             ? "1 object locked. Select another object to measure."
             : "\(finalizedObjectIDs.count) objects locked. Select another object to measure."
         objectMaskFeedbackText = statusText
+    }
+
+    func updateWeight(id: UUID, weightInKilograms: Double) {
+        guard finalizedObjectIDs.contains(id) else {
+            objectMaskFeedbackText = "Only a locked object can have its saved weight updated."
+            return
+        }
+        guard weightInKilograms.isFinite,
+              weightInKilograms > 0 else {
+            objectMaskFeedbackText = "Enter a valid weight greater than zero."
+            return
+        }
+        objectWeightsInKilogramsByID[id] = weightInKilograms
+        objectMaskFeedbackText = "Object weight updated."
+    }
+
+    func removeFinalizedObject(id: UUID) {
+        guard finalizedObjectIDs.contains(id) else {
+            return
+        }
+        guard !isObjectSelectionPending else {
+            objectMaskFeedbackText = "Wait for the current object selection to finish before removing a locked object."
+            return
+        }
+        finalizedObjectIDs.remove(id)
+        capturedObjectsByID.removeValue(forKey: id)
+        captureOrder.removeAll(where: { $0 == id })
+        objectWeightsInKilogramsByID.removeValue(forKey: id)
+        objectColorsByID.removeValue(forKey: id)
+        lockedMaskLayersByID.removeValue(forKey: id)
+        lockedMaskLayerOrder.removeAll(where: { $0 == id })
+        objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
+        objectMaskMarkers.removeAll(where: { $0.id == id })
+        objectMaskMarkerMissCounts.removeValue(forKey: id)
+        if focusedCaptureID == id {
+            focusedCaptureID = activeObjectID ?? measuredObjectIDs.last
+        }
+        rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
+        objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .remove)
+        objectWorkflowRequestRevision += 1
+        if activeObjectID != nil {
+            statusText = "Measuring object."
+            objectMaskFeedbackText = "Locked object removed. The active measurement was not changed."
+        } else if finalizedObjectIDs.isEmpty {
+            statusText = Self.defaultPrompt
+            objectMaskFeedbackText = "Locked object removed."
+        } else {
+            statusText = finalizedObjectIDs.count == 1
+                ? "1 object locked."
+                : "\(finalizedObjectIDs.count) objects locked."
+            objectMaskFeedbackText = "Locked object removed."
+        }
     }
 
     func reactivateFocusedObject() {
@@ -471,6 +555,25 @@ final class ObjectCaptureEngine {
         return result
     }
 
+    private func cacheObjectMaskColors(from markers: [ObjectMaskMarker]) {
+        for marker in markers
+        where activeObjectID == marker.id
+            || finalizedObjectIDs.contains(marker.id)
+            || capturedObjectsByID[marker.id] != nil {
+            objectColorsByID[marker.id] = marker.color
+        }
+    }
+
+    private func retainedObjectMaskMarkers(
+        _ markers: [ObjectMaskMarker]
+    ) -> [ObjectMaskMarker] {
+        markers.filter {
+            activeObjectID == $0.id
+                || finalizedObjectIDs.contains($0.id)
+                || capturedObjectsByID[$0.id] != nil
+        }
+    }
+
     func updateCapture(id: UUID, object: CapturedObject) {
         guard activeObjectID == id else {
             return
@@ -506,6 +609,8 @@ final class ObjectCaptureEngine {
         activeObjectID = nil
         finalizedObjectIDs.removeAll()
         captureOrder.removeAll()
+        objectColorsByID.removeAll()
+        objectWeightsInKilogramsByID.removeAll()
         focusedCaptureID = nil
         isObjectSelectionPending = false
         objectWorkflowRequest = nil

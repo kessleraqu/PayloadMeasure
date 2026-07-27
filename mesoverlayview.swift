@@ -1,12 +1,28 @@
 import SwiftUI
+import UIKit
 
 struct MesOverlayView: View {
+    private enum WeightEntryContext {
+        case finalize(UUID)
+        case edit(UUID)
+
+        var objectID: UUID {
+            switch self {
+            case .finalize(let id), .edit(let id):
+                id
+            }
+        }
+    }
+
     let sessionManager: ARSessionManager
     let mesEngine: MesEngine
     let captureEngine: ObjectCaptureEngine
 
     @State private var showsPanel = false
     @State private var showsLiDARLimitations = false
+    @State private var weightEntryContext: WeightEntryContext?
+    @State private var weightText = ""
+    @State private var pendingRemovalObjectID: UUID?
 
     private var isScanning: Bool {
         mesEngine.mode == .scan
@@ -67,6 +83,10 @@ struct MesOverlayView: View {
                     Spacer()
                     VStack(alignment: .trailing, spacing: 10) {
                         if isScanning,
+                           !finalizedMeasuredObjectIDs.isEmpty {
+                            boxesMenu
+                        }
+                        if isScanning,
                            isAutomaticCaptureSupported {
                             if captureEngine.activeObjectID != nil
                                 || captureEngine.canReactivateFocusedObject {
@@ -106,6 +126,42 @@ struct MesOverlayView: View {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+        }
+        .alert(
+            weightEntryTitle,
+            isPresented: weightEntryIsPresented
+        ) {
+            TextField("Weight in kg", text: $weightText)
+                .keyboardType(.decimalPad)
+            Button("Cancel", role: .cancel) {
+                weightEntryContext = nil
+                weightText = ""
+            }
+            Button("Save") {
+                saveWeightEntry()
+            }
+            .disabled(parsedWeightInKilograms == nil)
+        } message: {
+            Text("Enter a finite weight greater than zero in kilograms.")
+        }
+        .confirmationDialog(
+            removalConfirmationTitle,
+            isPresented: removalConfirmationIsPresented,
+            titleVisibility: .visible
+        ) {
+            if let id = pendingRemovalObjectID {
+                Button(removalButtonTitle(for: id), role: .destructive) {
+                    captureEngine.removeFinalizedObject(id: id)
+                    pendingRemovalObjectID = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRemovalObjectID = nil
+            }
+        } message: {
+            if let id = pendingRemovalObjectID {
+                Text("\(boxSummary(for: id)) and its saved measurement data will be removed.")
+            }
         }
     }
 
@@ -536,7 +592,7 @@ struct MesOverlayView: View {
     private var objectWorkflowButton: some View {
         if captureEngine.activeObjectID != nil {
             Button {
-                captureEngine.finalizeActiveObject()
+                presentFinalizationWeightEntry()
             } label: {
                 Label("Lock", systemImage: "lock.fill")
                     .font(.caption.weight(.semibold))
@@ -574,6 +630,196 @@ struct MesOverlayView: View {
             .accessibilityLabel("Unlock focused object for measurement")
             .accessibilityHint("Only one object can be unlocked at a time.")
         }
+    }
+
+    private var finalizedMeasuredObjectIDs: [UUID] {
+        captureEngine.measuredObjectIDs.filter {
+            captureEngine.finalizedObjectIDs.contains($0)
+        }
+    }
+
+    private var boxesMenu: some View {
+        Menu {
+            ForEach(finalizedMeasuredObjectIDs, id: \.self) { id in
+                Menu {
+                    Button {
+                        captureEngine.focusCapture(id: id)
+                    } label: {
+                        Label("Select", systemImage: "scope")
+                    }
+                    .disabled(
+                        captureEngine.activeObjectID != nil
+                            || captureEngine.isObjectSelectionPending
+                    )
+
+                    Button {
+                        presentWeightEditor(for: id)
+                    } label: {
+                        Label("Edit weight", systemImage: "pencil")
+                    }
+
+                    Button(role: .destructive) {
+                        pendingRemovalObjectID = id
+                    } label: {
+                        Label("Remove", systemImage: "trash")
+                    }
+                } label: {
+                    Label {
+                        Text(boxSummary(for: id))
+                    } icon: {
+                        boxColorImage(for: id)
+                            .renderingMode(.original)
+                    }
+                }
+            }
+        } label: {
+            Label(
+                "Boxes \(finalizedMeasuredObjectIDs.count)",
+                systemImage: "shippingbox.fill"
+            )
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .background(.ultraThinMaterial, in: Capsule())
+        .accessibilityLabel(
+            "\(finalizedMeasuredObjectIDs.count) saved box\(finalizedMeasuredObjectIDs.count == 1 ? "" : "es")"
+        )
+    }
+
+    private var weightEntryIsPresented: Binding<Bool> {
+        Binding(
+            get: {
+                weightEntryContext != nil
+            },
+            set: { isPresented in
+                if !isPresented {
+                    weightEntryContext = nil
+                    weightText = ""
+                }
+            }
+        )
+    }
+
+    private var removalConfirmationIsPresented: Binding<Bool> {
+        Binding(
+            get: {
+                pendingRemovalObjectID != nil
+            },
+            set: { isPresented in
+                if !isPresented {
+                    pendingRemovalObjectID = nil
+                }
+            }
+        )
+    }
+
+    private var parsedWeightInKilograms: Double? {
+        let normalized = weightText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard let weight = Double(normalized),
+              weight.isFinite,
+              weight > 0 else {
+            return nil
+        }
+        return weight
+    }
+
+    private var weightEntryTitle: String {
+        guard let weightEntryContext else {
+            return "Object weight"
+        }
+        let number = boxNumber(for: weightEntryContext.objectID)
+        switch weightEntryContext {
+        case .finalize:
+            return "Lock Box \(number)"
+        case .edit:
+            return "Edit Box \(number)"
+        }
+    }
+
+    private var removalConfirmationTitle: String {
+        guard let id = pendingRemovalObjectID else {
+            return "Remove box?"
+        }
+        return "Remove Box \(boxNumber(for: id))?"
+    }
+
+    private func presentFinalizationWeightEntry() {
+        guard let id = captureEngine.activeObjectID,
+              captureEngine.canFinalizeActiveObject else {
+            return
+        }
+        weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
+        weightEntryContext = .finalize(id)
+    }
+
+    private func presentWeightEditor(for id: UUID) {
+        weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
+        weightEntryContext = .edit(id)
+    }
+
+    private func saveWeightEntry() {
+        guard let weightEntryContext,
+              let weight = parsedWeightInKilograms else {
+            return
+        }
+        switch weightEntryContext {
+        case .finalize(let id):
+            guard captureEngine.activeObjectID == id else {
+                self.weightEntryContext = nil
+                weightText = ""
+                return
+            }
+            captureEngine.finalizeActiveObject(weightInKilograms: weight)
+        case .edit(let id):
+            captureEngine.updateWeight(id: id, weightInKilograms: weight)
+        }
+        self.weightEntryContext = nil
+        weightText = ""
+    }
+
+    private func boxNumber(for id: UUID) -> String {
+        captureEngine.objectNumber(for: id).map { String($0) } ?? "?"
+    }
+
+    private func boxSummary(for id: UUID) -> String {
+        let weightText = captureEngine.weightInKilograms(for: id)
+            .map { "\(formattedWeight($0)) kg" }
+            ?? "No weight"
+        return "Box \(boxNumber(for: id)) · \(weightText)"
+    }
+
+    private func removalButtonTitle(for id: UUID) -> String {
+        "Remove Box \(boxNumber(for: id))"
+    }
+
+    private func boxColorImage(for id: UUID) -> Image {
+        let color = captureEngine.objectColor(for: id)
+            ?? ObjectMaskDisplayColor(red: 0.20, green: 0.95, blue: 0.42)
+        let image = UIImage(systemName: "circle.fill")?.withTintColor(
+            UIColor(
+                red: color.red,
+                green: color.green,
+                blue: color.blue,
+                alpha: 1
+            ),
+            renderingMode: .alwaysOriginal
+        )
+        return image.map(Image.init(uiImage:))
+            ?? Image(systemName: "circle.fill")
+    }
+
+    private func formattedWeight(_ weight: Double) -> String {
+        weight.formatted(
+            .number
+                .grouping(.never)
+                .precision(.fractionLength(0...3))
+        )
     }
 
     private var pointCleanupButton: some View {
