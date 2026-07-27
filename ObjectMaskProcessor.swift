@@ -69,7 +69,7 @@ struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
 
 enum ObjectMaskLockChangeKind: Sendable {
     case added
-    case removed
+    case focused
 }
 
 struct ObjectMaskLockChange: @unchecked Sendable {
@@ -85,6 +85,8 @@ struct ObjectMaskFrame: @unchecked Sendable {
     let imageToViewportTransform: CGAffineTransform
     let toggleRequest: ObjectMaskToggleRequest?
     let anchorHints: [ObjectMaskAnchorHint]
+    let activeObjectID: UUID?
+    let finalizedObjectIDs: Set<UUID>
     let timestamp: TimeInterval
     let trackingGeneration: Int
     let depthSnapshot: ObjectMaskDepthSnapshot?
@@ -596,6 +598,13 @@ actor ObjectMaskProcessor {
             trackedObjects.removeAll()
             trackingGeneration = frame.trackingGeneration
         }
+        var retainedObjectIDs = frame.finalizedObjectIDs
+        if let activeObjectID = frame.activeObjectID {
+            retainedObjectIDs.insert(activeObjectID)
+        }
+        trackedObjects.removeAll {
+            !retainedObjectIDs.contains($0.id)
+        }
 
         return await makeNativeVisionPreview(from: frame)
     }
@@ -606,10 +615,11 @@ actor ObjectMaskProcessor {
 
         let cameraImage = CIImage(cvPixelBuffer: frame.pixelBuffer).oriented(frame.orientation)
         let handler = ImageRequestHandler(cameraImage)
+        var addedTrackerID: UUID?
 
         do {
             guard let observation = try await handler.perform(segmentationRequest) else {
-                ageUnmatchedTrackers()
+                ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
                 return result(preview: nil, frame: frame)
             }
 
@@ -636,8 +646,25 @@ actor ObjectMaskProcessor {
             } else {
                 toggleOutcome = .unchanged
             }
+            if case .changed(let change) = toggleOutcome,
+               case .added = change.kind {
+                addedTrackerID = change.id
+            }
 
-            let selections = try renderSelections(in: observation, frame: frame)
+            let effectiveActiveObjectID: UUID?
+            if let activeObjectID = frame.activeObjectID {
+                effectiveActiveObjectID = activeObjectID
+            } else if case .changed(let change) = toggleOutcome,
+                      case .added = change.kind {
+                effectiveActiveObjectID = change.id
+            } else {
+                effectiveActiveObjectID = nil
+            }
+            let selections = try renderSelections(
+                in: observation,
+                frame: frame,
+                activeObjectID: effectiveActiveObjectID
+            )
             var previewLayers: [ObjectMaskPreviewLayer] = []
             var maskedPointClouds: [ObjectMaskDepthPointCloud] = []
             previewLayers.reserveCapacity(selections.count)
@@ -680,7 +707,8 @@ actor ObjectMaskProcessor {
                     }
                     let cloud = makeMaskedPointClouds(
                         from: [renderedMask],
-                        frame: frame
+                        frame: frame,
+                        activeObjectID: effectiveActiveObjectID
                     ).first
                     return (layer, cloud)
                 }
@@ -694,6 +722,15 @@ actor ObjectMaskProcessor {
             let preview = previewLayers.isEmpty
                 ? nil
                 : ObjectMaskPreview(layers: previewLayers, timestamp: frame.timestamp)
+
+            if Task.isCancelled {
+                if let addedTrackerID {
+                    trackedObjects.removeAll {
+                        $0.id == addedTrackerID
+                    }
+                }
+                return result(preview: nil, frame: frame)
+            }
 
             switch toggleOutcome {
             case .changed(let change):
@@ -718,7 +755,12 @@ actor ObjectMaskProcessor {
                 )
             }
         } catch {
-            ageUnmatchedTrackers()
+            if let addedTrackerID {
+                trackedObjects.removeAll {
+                    $0.id == addedTrackerID
+                }
+            }
+            ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
             return result(preview: nil, frame: frame)
         }
     }
@@ -804,229 +846,129 @@ actor ObjectMaskProcessor {
         cameraImage: CIImage,
         frame: ObjectMaskFrame
     ) async {
+        guard let activeObjectID = frame.activeObjectID,
+              let index = trackedObjects.firstIndex(where: {
+                  $0.id == activeObjectID
+              }) else {
+            return
+        }
         var geometryCache: [Int: MaskGeometry] = [:]
         var appearanceCache: [Int: AppearanceSignature] = [:]
         let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
-        var candidateLists = [[CandidateMatch]](repeating: [], count: trackedObjects.count)
+        let anchorPoint: NormalizedPoint
+        let cameraDistance: Float
+        if let hint = hintsByID[activeObjectID] {
+            guard let viewportPoint = hint.normalizedViewportPoint,
+                  let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
+                trackedObjects[index].currentInstance = nil
+                trackedObjects[index].missedFrames += 1
+                return
+            }
+            anchorPoint = projectedPoint
+            cameraDistance = hint.cameraDistance
+        } else {
+            anchorPoint = NormalizedPoint(
+                x: trackedObjects[index].lastGeometry.centroid.x,
+                y: trackedObjects[index].lastGeometry.centroid.y
+            )
+            cameraDistance = trackedObjects[index].referenceCameraDistance
+        }
 
-        for index in trackedObjects.indices {
-            let anchorPoint: NormalizedPoint
-            let cameraDistance: Float
-            if let hint = hintsByID[trackedObjects[index].id] {
-                guard let viewportPoint = hint.normalizedViewportPoint,
-                      let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
-                    trackedObjects[index].currentInstance = nil
-                    trackedObjects[index].missedFrames += 1
+        let anchorSearchBox = projectedSearchBox(
+            for: trackedObjects[index],
+            anchorPoint: anchorPoint,
+            cameraDistance: cameraDistance
+        )
+        let trackedObservation = try? await handler.perform(trackedObjects[index].request)
+        let predictedBox = validatedPrediction(
+            trackedObservation?.boundingBox,
+            relativeTo: trackedObjects[index].lastGeometry.boundingBox
+        )
+        var candidateCounts = candidateInstanceCounts(
+            in: observation,
+            inside: anchorSearchBox
+        )
+        if trackedObjects[index].missedFrames <= 3 {
+            mergeCandidateCounts(
+                candidateInstanceCounts(in: observation, inside: predictedBox),
+                into: &candidateCounts
+            )
+        }
+        for instance in instances(near: anchorPoint, in: observation) {
+            candidateCounts[instance, default: 0] += 16
+        }
+        var candidates: [CandidateMatch] = []
+        for (instance, sampleCount) in candidateCounts {
+            let geometry: MaskGeometry
+            if let cachedGeometry = geometryCache[instance] {
+                geometry = cachedGeometry
+            } else {
+                guard let mask = try? observation.generateMask(
+                    for: IndexSet(integer: instance)
+                ), let measuredGeometry = maskGeometry(of: mask) else {
                     continue
                 }
-                anchorPoint = projectedPoint
-                cameraDistance = hint.cameraDistance
+                geometryCache[instance] = measuredGeometry
+                geometry = measuredGeometry
+            }
+
+            let appearance: AppearanceSignature
+            if let cachedAppearance = appearanceCache[instance] {
+                appearance = cachedAppearance
             } else {
-                anchorPoint = NormalizedPoint(
-                    x: trackedObjects[index].lastGeometry.centroid.x,
-                    y: trackedObjects[index].lastGeometry.centroid.y
-                )
-                cameraDistance = trackedObjects[index].referenceCameraDistance
-            }
-
-            let anchorSearchBox = projectedSearchBox(
-                for: trackedObjects[index],
-                anchorPoint: anchorPoint,
-                cameraDistance: cameraDistance
-            )
-            let trackedObservation = try? await handler.perform(trackedObjects[index].request)
-            let predictedBox = validatedPrediction(
-                trackedObservation?.boundingBox,
-                relativeTo: trackedObjects[index].lastGeometry.boundingBox
-            )
-            var candidateCounts = candidateInstanceCounts(
-                in: observation,
-                inside: anchorSearchBox
-            )
-            if trackedObjects[index].missedFrames <= 3 {
-                mergeCandidateCounts(
-                    candidateInstanceCounts(in: observation, inside: predictedBox),
-                    into: &candidateCounts
-                )
-            }
-            for instance in instances(near: anchorPoint, in: observation) {
-                candidateCounts[instance, default: 0] += 16
-            }
-            for (instance, sampleCount) in candidateCounts {
-                let geometry: MaskGeometry
-                if let cachedGeometry = geometryCache[instance] {
-                    geometry = cachedGeometry
-                } else {
-                    guard let mask = try? observation.generateMask(
-                        for: IndexSet(integer: instance)
-                    ), let measuredGeometry = maskGeometry(of: mask) else {
-                        continue
-                    }
-                    geometryCache[instance] = measuredGeometry
-                    geometry = measuredGeometry
-                }
-
-                let appearance: AppearanceSignature
-                if let cachedAppearance = appearanceCache[instance] {
-                    appearance = cachedAppearance
-                } else {
-                    guard let measuredAppearance = appearanceSignature(
-                        of: cameraImage,
-                        inside: geometry.boundingBox
-                    ) else {
-                        continue
-                    }
-                    appearanceCache[instance] = measuredAppearance
-                    appearance = measuredAppearance
-                }
-
-                guard let score = matchScore(
-                    candidate: geometry,
-                    appearance: appearance,
-                    trackedObject: trackedObjects[index],
-                    anchorPoint: anchorPoint,
-                    anchorSearchBox: anchorSearchBox,
-                    visualPrediction: predictedBox,
-                    cameraDistance: cameraDistance,
-                    sampleCount: sampleCount,
-                    timestamp: frame.timestamp
+                guard let measuredAppearance = appearanceSignature(
+                    of: cameraImage,
+                    inside: geometry.boundingBox
                 ) else {
                     continue
                 }
-
-                candidateLists[index].append(
-                    CandidateMatch(
-                        instance: instance,
-                        geometry: geometry,
-                        appearance: appearance,
-                        score: score
-                    )
-                )
+                appearanceCache[instance] = measuredAppearance
+                appearance = measuredAppearance
             }
 
-            candidateLists[index] = Array(
-                candidateLists[index].sorted { $0.score > $1.score }.prefix(4)
+            guard let score = matchScore(
+                candidate: geometry,
+                appearance: appearance,
+                trackedObject: trackedObjects[index],
+                anchorPoint: anchorPoint,
+                anchorSearchBox: anchorSearchBox,
+                visualPrediction: predictedBox,
+                cameraDistance: cameraDistance,
+                sampleCount: sampleCount,
+                timestamp: frame.timestamp
+            ) else {
+                continue
+            }
+
+            candidates.append(
+                CandidateMatch(
+                    instance: instance,
+                    geometry: geometry,
+                    appearance: appearance,
+                    score: score
+                )
             )
         }
 
-        let assignments = globallyOptimalAssignments(candidateLists)
-        for index in trackedObjects.indices {
-            let bestMatch = assignments[index]
-            if let bestMatch {
-                let correctedObservation = DetectedObjectObservation(
-                    boundingBox: bestMatch.geometry.boundingBox
-                )
-                trackedObjects[index].request = TrackObjectRequest(
-                    detectedObject: correctedObservation
-                )
-                trackedObjects[index].lastGeometry = bestMatch.geometry
-                trackedObjects[index].currentInstance = bestMatch.instance
-                trackedObjects[index].missedFrames = 0
-                trackedObjects[index].lastAcceptedTimestamp = frame.timestamp
-                trackedObjects[index].appearance = blendedAppearance(
-                    previous: trackedObjects[index].appearance,
-                    current: bestMatch.appearance
-                )
-            } else {
-                trackedObjects[index].currentInstance = nil
-                trackedObjects[index].missedFrames += 1
-            }
+        if let bestMatch = candidates.max(by: { $0.score < $1.score }) {
+            let correctedObservation = DetectedObjectObservation(
+                boundingBox: bestMatch.geometry.boundingBox
+            )
+            trackedObjects[index].request = TrackObjectRequest(
+                detectedObject: correctedObservation
+            )
+            trackedObjects[index].lastGeometry = bestMatch.geometry
+            trackedObjects[index].currentInstance = bestMatch.instance
+            trackedObjects[index].missedFrames = 0
+            trackedObjects[index].lastAcceptedTimestamp = frame.timestamp
+            trackedObjects[index].appearance = blendedAppearance(
+                previous: trackedObjects[index].appearance,
+                current: bestMatch.appearance
+            )
+        } else {
+            trackedObjects[index].currentInstance = nil
+            trackedObjects[index].missedFrames += 1
         }
-    }
-
-    private func globallyOptimalAssignments(
-        _ candidates: [[CandidateMatch]]
-    ) -> [CandidateMatch?] {
-        guard !candidates.isEmpty else {
-            return []
-        }
-
-        let instances = Array(Set(candidates.flatMap { $0.map(\.instance) })).sorted()
-        guard !instances.isEmpty else {
-            return [CandidateMatch?](repeating: nil, count: candidates.count)
-        }
-        let instanceColumn = Dictionary(
-            uniqueKeysWithValues: instances.enumerated().map { ($0.element, $0.offset) }
-        )
-        let rowCount = candidates.count
-        let columnCount = instances.count + rowCount
-        let invalidWeight: CGFloat = -1_000_000
-        var weights = Array(
-            repeating: Array(repeating: invalidWeight, count: columnCount),
-            count: rowCount
-        )
-        var candidateByColumn = Array(
-            repeating: [Int: CandidateMatch](),
-            count: rowCount
-        )
-        for row in 0 ..< rowCount {
-            for candidate in candidates[row] {
-                guard let column = instanceColumn[candidate.instance] else { continue }
-                if candidate.score > weights[row][column] {
-                    weights[row][column] = candidate.score
-                    candidateByColumn[row][column] = candidate
-                }
-            }
-            for dummyColumn in instances.count ..< columnCount {
-                weights[row][dummyColumn] = 0
-            }
-        }
-
-        var rowPotential = [CGFloat](repeating: 0, count: rowCount + 1)
-        var columnPotential = [CGFloat](repeating: 0, count: columnCount + 1)
-        var matchedRow = [Int](repeating: 0, count: columnCount + 1)
-        var predecessor = [Int](repeating: 0, count: columnCount + 1)
-
-        for row in 1 ... rowCount {
-            matchedRow[0] = row
-            var currentColumn = 0
-            var minimum = [CGFloat](repeating: .greatestFiniteMagnitude, count: columnCount + 1)
-            var used = [Bool](repeating: false, count: columnCount + 1)
-
-            repeat {
-                used[currentColumn] = true
-                let currentRow = matchedRow[currentColumn]
-                var delta = CGFloat.greatestFiniteMagnitude
-                var nextColumn = 0
-                for column in 1 ... columnCount where !used[column] {
-                    let cost = -weights[currentRow - 1][column - 1]
-                    let reducedCost = cost
-                        - rowPotential[currentRow]
-                        - columnPotential[column]
-                    if reducedCost < minimum[column] {
-                        minimum[column] = reducedCost
-                        predecessor[column] = currentColumn
-                    }
-                    if minimum[column] < delta {
-                        delta = minimum[column]
-                        nextColumn = column
-                    }
-                }
-                for column in 0 ... columnCount {
-                    if used[column] {
-                        rowPotential[matchedRow[column]] += delta
-                        columnPotential[column] -= delta
-                    } else {
-                        minimum[column] -= delta
-                    }
-                }
-                currentColumn = nextColumn
-            } while matchedRow[currentColumn] != 0
-
-            repeat {
-                let previousColumn = predecessor[currentColumn]
-                matchedRow[currentColumn] = matchedRow[previousColumn]
-                currentColumn = previousColumn
-            } while currentColumn != 0
-        }
-
-        var result = [CandidateMatch?](repeating: nil, count: rowCount)
-        for column in 1 ... columnCount {
-            let row = matchedRow[column]
-            guard row > 0 else { continue }
-            result[row - 1] = candidateByColumn[row - 1][column - 1]
-        }
-        return result
     }
 
     private func mergeCandidateCounts(_ source: [Int: Int], into destination: inout [Int: Int]) {
@@ -1098,11 +1040,15 @@ actor ObjectMaskProcessor {
         return prediction
     }
 
-    private func ageUnmatchedTrackers() {
-        for index in trackedObjects.indices {
-            trackedObjects[index].currentInstance = nil
-            trackedObjects[index].missedFrames += 1
+    private func ageUnmatchedTracker(activeObjectID: UUID?) {
+        guard let activeObjectID,
+              let index = trackedObjects.firstIndex(where: {
+                  $0.id == activeObjectID
+              }) else {
+            return
         }
+        trackedObjects[index].currentInstance = nil
+        trackedObjects[index].missedFrames += 1
     }
 
     private func toggleLock(
@@ -1112,27 +1058,33 @@ actor ObjectMaskProcessor {
         cameraImage: CIImage,
         frame: ObjectMaskFrame
     ) throws -> ToggleOutcome {
-        let tappedInstances = instances(near: point, in: observation)
+        guard frame.activeObjectID == nil else {
+            return .unchanged
+        }
         let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
-
-        if let existingIndex = trackedObjects.firstIndex(where: { trackedObject in
-            if let currentInstance = trackedObject.currentInstance,
-               tappedInstances.contains(currentInstance) {
-                return true
+        let tappedInstances = instances(near: point, in: observation)
+        let tappedBoundingBoxes = tappedInstances.compactMap { instance -> CGRect? in
+            guard let mask = try? observation.generateMask(
+                for: IndexSet(integer: instance)
+            ) else {
+                return nil
             }
-            if tappedInstances.isEmpty,
-               trackedObject.lastGeometry.boundingBox.cgRect.contains(point.cgPoint) {
-                return true
-            }
-            guard let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint,
+            return maskGeometry(of: mask)?.boundingBox.cgRect
+        }
+        if let existing = trackedObjects.first(where: { trackedObject in
+            guard frame.finalizedObjectIDs.contains(trackedObject.id),
+                  let viewportPoint = hintsByID[trackedObject.id]?.normalizedViewportPoint,
                   let projectedPoint = imagePoint(for: viewportPoint, frame: frame) else {
                 return false
             }
             return hypot(projectedPoint.x - point.x, projectedPoint.y - point.y) <= 0.065
+                || tappedBoundingBoxes.contains {
+                    $0.insetBy(dx: -0.02, dy: -0.02)
+                        .contains(projectedPoint.cgPoint)
+                }
         }) {
-            let removed = trackedObjects.remove(at: existingIndex)
             return .changed(
-                ObjectMaskLockChange(id: removed.id, kind: .removed, worldTransform: nil)
+                ObjectMaskLockChange(id: existing.id, kind: .focused, worldTransform: nil)
             )
         }
 
@@ -1143,15 +1095,6 @@ actor ObjectMaskProcessor {
                   in: observation
               ) else {
             return .unchanged
-        }
-
-        if let existingIndex = trackedObjects.firstIndex(where: {
-            $0.currentInstance == candidate.instance
-        }) {
-            let removed = trackedObjects.remove(at: existingIndex)
-            return .changed(
-                ObjectMaskLockChange(id: removed.id, kind: .removed, worldTransform: nil)
-            )
         }
 
         guard let proposedLockID = request.proposedLockID,
@@ -1567,14 +1510,16 @@ actor ObjectMaskProcessor {
 
     private func renderSelections(
         in observation: InstanceMaskObservation,
-        frame: ObjectMaskFrame
+        frame: ObjectMaskFrame,
+        activeObjectID: UUID?
     ) throws -> [RenderSelection] {
         var selections: [RenderSelection] = []
 
-        for trackedObject in trackedObjects {
-            guard let instance = trackedObject.currentInstance else {
-                continue
-            }
+        if let activeObjectID,
+           let trackedObject = trackedObjects.first(where: {
+               $0.id == activeObjectID
+           }),
+           let instance = trackedObject.currentInstance {
             selections.append(
                 RenderSelection(
                     lockID: trackedObject.id,
@@ -1586,15 +1531,30 @@ actor ObjectMaskProcessor {
             )
         }
 
-        if trackedObjects.count < Self.lockedColors.count,
+        if activeObjectID == nil,
+           trackedObjects.count < Self.lockedColors.count,
            !frame.anchorHints.contains(where: { hint in
                guard let point = hint.normalizedViewportPoint else { return false }
                return hypot(point.x - 0.5, point.y - 0.5) < 0.075
            }),
            let centerPoint = imagePoint(for: CGPoint(x: 0.5, y: 0.5), frame: frame) {
-            let claimedInstances = Set(trackedObjects.compactMap(\.currentInstance))
+            let finalizedInstances = Set(
+                frame.anchorHints
+                    .filter { frame.finalizedObjectIDs.contains($0.id) }
+                    .compactMap { hint -> IndexSet? in
+                        guard let viewportPoint = hint.normalizedViewportPoint,
+                              let projectedPoint = imagePoint(
+                                  for: viewportPoint,
+                                  frame: frame
+                              ) else {
+                            return nil
+                        }
+                        return observation.instanceAtPoint(projectedPoint)
+                    }
+                    .flatMap { $0 }
+            )
             let nearbyInstances = instances(near: centerPoint, in: observation)
-                .filter { !claimedInstances.contains($0) }
+                .filter { !finalizedInstances.contains($0) }
             var bestPreview: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
 
             for instance in nearbyInstances {
@@ -1782,15 +1742,18 @@ actor ObjectMaskProcessor {
 
     private func makeMaskedPointClouds(
         from renderedMasks: [RenderedMask],
-        frame: ObjectMaskFrame
+        frame: ObjectMaskFrame,
+        activeObjectID: UUID?
     ) -> [ObjectMaskDepthPointCloud] {
-        guard let depth = frame.depthSnapshot else {
+        guard let activeObjectID,
+              let depth = frame.depthSnapshot else {
             return []
         }
 
         let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
         return renderedMasks.compactMap { renderedMask in
             guard let lockID = renderedMask.lockID,
+                  lockID == activeObjectID,
                   let hint = hintsByID[lockID] else {
                 return nil
             }

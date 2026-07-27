@@ -46,7 +46,6 @@ enum ObjectCapturePipeline {
     static let supportVoxelSize: Float = 0.02
     static let accumulationRadius: Float = 0.4
     static let maxHeight: Float = 1.5
-    static let floorClearance: Float = 0.005
     static let minimumClusterPoints = 30
     private static let connectivityRadiusInVoxels = 2
     private static let surfaceBridgeRadiusInVoxels = 4
@@ -75,7 +74,7 @@ enum ObjectCapturePipeline {
 
         let candidates = objectPoints.filter { point in
             let heightAboveSupport = point.position.y - resolvedSupportHeight
-            return heightAboveSupport > floorClearance && heightAboveSupport < maxHeight
+            return heightAboveSupport > 0 && heightAboveSupport < maxHeight
         }
 
         guard candidates.count >= minimumClusterPoints else {

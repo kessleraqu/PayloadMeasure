@@ -68,6 +68,10 @@ struct MesOverlayView: View {
                     VStack(alignment: .trailing, spacing: 10) {
                         if isScanning,
                            isAutomaticCaptureSupported {
+                            if captureEngine.activeObjectID != nil
+                                || captureEngine.canReactivateFocusedObject {
+                                objectWorkflowButton
+                            }
                             pointCleanupButton
                         }
                         modeMenu
@@ -117,6 +121,8 @@ struct MesOverlayView: View {
                         green: marker.color.green,
                         blue: marker.color.blue
                     )
+                    let isActive = captureEngine.activeObjectID == marker.id
+                    let isFinalized = captureEngine.finalizedObjectIDs.contains(marker.id)
                     ZStack {
                         Circle()
                             .fill(color.opacity(marker.isMaskVisible ? 0.92 : 0.28))
@@ -125,8 +131,14 @@ struct MesOverlayView: View {
                                 lineWidth: marker.isMaskVisible ? 2 : 3,
                                 dash: marker.isMaskVisible ? [] : [4, 3]
                             ))
-                        Image(systemName: marker.isMaskVisible ? "lock.fill" : "location.fill")
-                            .font(.system(size: marker.isMaskVisible ? 8 : 11, weight: .bold))
+                        Image(systemName: isActive
+                            ? "viewfinder"
+                            : isFinalized ? "lock.fill" : "location.fill"
+                        )
+                            .font(.system(
+                                size: isFinalized ? 8 : 11,
+                                weight: .bold
+                            ))
                             .foregroundStyle(.white)
                     }
                     .frame(
@@ -176,7 +188,9 @@ struct MesOverlayView: View {
                     .gesture(
                         SpatialTapGesture()
                             .onEnded { value in
-                                guard proxy.size.width > 0, proxy.size.height > 0 else {
+                                guard captureEngine.activeObjectID == nil,
+                                      proxy.size.width > 0,
+                                      proxy.size.height > 0 else {
                                     return
                                 }
                                 captureEngine.requestObjectMaskToggle(
@@ -187,7 +201,16 @@ struct MesOverlayView: View {
                                 )
                             }
                     )
-                    .accessibilityLabel("Tap an object to lock or remove its mask")
+                    .accessibilityLabel(
+                        captureEngine.activeObjectID == nil
+                            ? "Tap an object to select it for measurement"
+                            : "Current object selected for measurement"
+                    )
+                    .accessibilityHint(
+                        captureEngine.activeObjectID == nil
+                            ? "Only one object can be measured at a time."
+                            : "Lock the current object before selecting another."
+                    )
             }
             .ignoresSafeArea()
         }
@@ -433,7 +456,7 @@ struct MesOverlayView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.primary)
                 .background(.ultraThinMaterial, in: Circle())
-                .accessibilityLabel("Clear all locked objects and boxes")
+                .accessibilityLabel("Clear all selected and locked objects, points, and boxes")
             }
         }
         .padding(.horizontal, 12)
@@ -446,8 +469,12 @@ struct MesOverlayView: View {
     }
 
     private var scanStatusHeadline: String {
-        if captureEngine.lockedObjectMaskCount > 0 {
-            let count = captureEngine.lockedObjectMaskCount
+        if captureEngine.activeObjectID != nil {
+            return "Measuring selected object"
+        }
+
+        let count = captureEngine.finalizedObjectIDs.count
+        if count > 0 {
             return "\(count) object\(count == 1 ? "" : "s") locked"
         }
 
@@ -463,11 +490,16 @@ struct MesOverlayView: View {
             return captureEngine.primaryText
         }
 
-        if captureEngine.lockedObjectMaskCount > 0 {
-            return "\(captureEngine.lockedObjectMaskCount) colored RGB mask\(captureEngine.lockedObjectMaskCount == 1 ? "" : "s")"
+        if captureEngine.activeObjectID != nil {
+            return "Selected RGB object"
         }
 
-        return captureEngine.hasObjectMaskPreview ? "RGB mask selected" : "--"
+        let count = captureEngine.finalizedObjectIDs.count
+        if count > 0 {
+            return "\(count) locked RGB object\(count == 1 ? "" : "s")"
+        }
+
+        return captureEngine.hasObjectMaskPreview ? "RGB object detected" : "--"
     }
 
     private var scanStatusText: String {
@@ -480,17 +512,68 @@ struct MesOverlayView: View {
         }
 
         if isAutomaticCaptureSupported {
-            if captureEngine.lockedObjectMaskCount > 0 {
-                return "\(captureEngine.statusText) Move around it and vary phone height to capture more than one visible face."
+            if captureEngine.activeObjectID != nil {
+                return "\(captureEngine.statusText) Only this object is being measured. Move around all sides, then tap Lock."
             }
-            return "\(captureEngine.statusText) Tap a highlighted object to add or remove it."
+            if !captureEngine.finalizedObjectIDs.isEmpty {
+                return "\(captureEngine.statusText) Locked measurements stay fixed. Tap another highlighted object to measure it."
+            }
+            return "\(captureEngine.statusText) Tap a highlighted object to select it for measurement."
         }
 
-        if captureEngine.lockedObjectMaskCount > 0 {
-            return "Locked masks persist in the AR map. Point at another colored preview and tap to add it."
+        if captureEngine.activeObjectID != nil {
+            return "Only the selected object is active. Lock it before selecting another."
         }
 
-        return "Center an object to preview its next color, then tap it to lock."
+        if !captureEngine.finalizedObjectIDs.isEmpty {
+            return "Locked objects stay fixed. Point at another colored preview and tap to select it."
+        }
+
+        return "Center an object to preview its color, then tap it to start measuring."
+    }
+
+    @ViewBuilder
+    private var objectWorkflowButton: some View {
+        if captureEngine.activeObjectID != nil {
+            Button {
+                captureEngine.finalizeActiveObject()
+            } label: {
+                Label("Lock", systemImage: "lock.fill")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(
+                captureEngine.canFinalizeActiveObject
+                    ? Color.orange
+                    : Color.secondary
+            )
+            .background(.ultraThinMaterial, in: Capsule())
+            .disabled(!captureEngine.canFinalizeActiveObject)
+            .accessibilityLabel("Finish and lock current object")
+            .accessibilityHint(
+                captureEngine.canFinalizeActiveObject
+                    ? "Stops measurement updates so you can select another object."
+                    : "Keep scanning until a LiDAR box is ready."
+            )
+        } else if captureEngine.canReactivateFocusedObject {
+            Button {
+                captureEngine.reactivateFocusedObject()
+            } label: {
+                Label("Unlock", systemImage: "lock.open.fill")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.orange)
+            .background(.ultraThinMaterial, in: Capsule())
+            .accessibilityLabel("Unlock focused object for measurement")
+            .accessibilityHint("Only one object can be unlocked at a time.")
+        }
     }
 
     private var pointCleanupButton: some View {

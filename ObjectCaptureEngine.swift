@@ -3,10 +3,22 @@ import Foundation
 import Observation
 import simd
 
+enum ObjectWorkflowRequestKind: Sendable {
+    case finalize
+    case reactivate
+}
+
+struct ObjectWorkflowRequest: Sendable {
+    let id: UUID
+    let kind: ObjectWorkflowRequestKind
+}
+
 @MainActor
 @Observable
 final class ObjectCaptureEngine {
     private(set) var capturedObjectsByID: [UUID: CapturedObject] = [:]
+    private(set) var activeObjectID: UUID?
+    private(set) var finalizedObjectIDs: Set<UUID> = []
     private(set) var objectMaskPreview: ObjectMaskPreview?
     private(set) var lockedObjectMaskCount = 0
     private(set) var visibleObjectMaskCount = 0
@@ -14,6 +26,8 @@ final class ObjectCaptureEngine {
     private(set) var objectMaskDisplayBoundingBoxes: [UUID: CGRect] = [:]
     private(set) var objectMaskFeedbackText: String?
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
+    private(set) var objectWorkflowRequest: ObjectWorkflowRequest?
+    private(set) var isObjectSelectionPending = false
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
     private(set) var showsSelectedPoints = true
@@ -23,19 +37,20 @@ final class ObjectCaptureEngine {
     private(set) var showsObjectMaskMarkers = true
     private(set) var resetRevision = 0
     private(set) var objectMaskToggleRequestRevision = 0
+    private(set) var objectWorkflowRequestRevision = 0
     private(set) var pointCleanupRequestRevision = 0
     private(set) var isPointCleanupInProgress = false
     private(set) var pointCleanupFeedbackText: String?
     private var latestObjectMaskPreviewTimestamp: TimeInterval = -.greatestFiniteMagnitude
     private var pointCleanupFeedbackTask: Task<Void, Never>?
     private var captureOrder: [UUID] = []
-    private var focusedCaptureID: UUID?
+    private(set) var focusedCaptureID: UUID?
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
     private var liveMaskLayer: ObjectMaskPreviewLayer?
     private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
-    private static let defaultPrompt = "Center or tap a highlighted object to lock it."
+    private static let defaultPrompt = "Center or tap a highlighted object to select it for measurement."
 
     private var displayObject: CapturedObject? {
         if let focusedCaptureID, let focused = capturedObjectsByID[focusedCaptureID] {
@@ -61,14 +76,35 @@ final class ObjectCaptureEngine {
     }
 
     var canReset: Bool {
-        !capturedObjectsByID.isEmpty || lockedObjectMaskCount > 0
+        !capturedObjectsByID.isEmpty
+            || activeObjectID != nil
+            || !finalizedObjectIDs.isEmpty
+            || isObjectSelectionPending
+            || lockedObjectMaskCount > 0
+    }
+
+    var canFinalizeActiveObject: Bool {
+        activeObjectID.flatMap { capturedObjectsByID[$0] } != nil
+    }
+
+    var canReactivateFocusedObject: Bool {
+        guard activeObjectID == nil,
+              !isObjectSelectionPending,
+              let focusedCaptureID else {
+            return false
+        }
+        return finalizedObjectIDs.contains(focusedCaptureID)
+            && capturedObjectsByID[focusedCaptureID] != nil
     }
 
     var statusHeadline: String {
-        if !capturedObjectsByID.isEmpty {
-            return capturedObjectsByID.count == 1
-                ? "1 object saved"
-                : "\(capturedObjectsByID.count) objects saved"
+        if activeObjectID != nil {
+            return "Measuring object"
+        }
+        if !finalizedObjectIDs.isEmpty {
+            return finalizedObjectIDs.count == 1
+                ? "1 object locked"
+                : "\(finalizedObjectIDs.count) objects locked"
         }
         return "Scan mode"
     }
@@ -89,8 +125,15 @@ final class ObjectCaptureEngine {
         guard let object = displayObject else {
             return nil
         }
-        let saved = capturedObjectsByID.isEmpty ? "" : "Ready \(capturedObjectsByID.count) · "
-        return saved + String(
+        let prefix: String
+        if activeObjectID != nil {
+            prefix = "Measuring · "
+        } else if finalizedObjectIDs.isEmpty {
+            prefix = ""
+        } else {
+            prefix = "Locked \(finalizedObjectIDs.count) · "
+        }
+        return prefix + String(
             format: "Volume %.1f L · %d pts",
             object.volume * 1000,
             object.sampleCount
@@ -131,6 +174,13 @@ final class ObjectCaptureEngine {
         guard !isPointCleanupInProgress else {
             return
         }
+        guard let activeObjectID,
+              capturedObjectsByID[activeObjectID] != nil else {
+            pointCleanupFeedbackTask?.cancel()
+            pointCleanupFeedbackText = "Select an object to measure, or unlock a finished object, before enhancing its cyan points."
+            schedulePointCleanupFeedbackClear()
+            return
+        }
         pointCleanupFeedbackTask?.cancel()
         isPointCleanupInProgress = true
         pointCleanupFeedbackText = "Checking visible cyan points against the current mask…"
@@ -149,7 +199,7 @@ final class ObjectCaptureEngine {
 
     func failVisiblePointCleanup() {
         isPointCleanupInProgress = false
-        pointCleanupFeedbackText = "Keep a locked mask and its cyan points in view, then try again."
+        pointCleanupFeedbackText = "Keep the object being measured and its cyan points in view, then try again."
         schedulePointCleanupFeedbackClear()
     }
 
@@ -178,6 +228,9 @@ final class ObjectCaptureEngine {
         latestObjectMaskPreviewTimestamp = preview.timestamp
         for layer in preview.layers {
             if let id = layer.trackedObjectID {
+                if finalizedObjectIDs.contains(id), lockedMaskLayersByID[id] != nil {
+                    continue
+                }
                 if lockedMaskLayersByID[id] == nil {
                     lockedMaskLayerOrder.append(id)
                 }
@@ -199,8 +252,11 @@ final class ObjectCaptureEngine {
     }
 
     func updateObjectMaskDisplayBoundingBoxes(_ boundingBoxes: [UUID: CGRect]) {
-        if objectMaskDisplayBoundingBoxes != boundingBoxes {
-            objectMaskDisplayBoundingBoxes = boundingBoxes
+        let activeBoundingBoxes = boundingBoxes.filter {
+            !finalizedObjectIDs.contains($0.key)
+        }
+        if objectMaskDisplayBoundingBoxes != activeBoundingBoxes {
+            objectMaskDisplayBoundingBoxes = activeBoundingBoxes
         }
     }
 
@@ -218,12 +274,18 @@ final class ObjectCaptureEngine {
         visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
         objectMaskMarkers = stabilizedObjectMaskMarkers(markers)
         let lostCount = lostObjectMaskCount
-        if lostCount > 0 {
-            objectMaskFeedbackText = "\(lockedObjectMaskCount) locked · \(lostCount) currently outside the view. Their anchors are retained."
-        } else if lockedObjectMaskCount >= 15 {
-            objectMaskFeedbackText = "Maximum 15 objects locked. Tap a locked object to remove it before adding another."
-        } else if lockedObjectMaskCount > 0 {
-            objectMaskFeedbackText = "\(lockedObjectMaskCount) object\(lockedObjectMaskCount == 1 ? "" : "s") locked. Point at another preview to add it."
+        if isObjectSelectionPending {
+            objectMaskFeedbackText = "Selecting object…"
+        } else if activeObjectID != nil {
+            objectMaskFeedbackText = lostCount > 0
+                ? "The object being measured is currently outside the view. Its anchor is retained."
+                : "Measuring one object. Lock it before selecting another."
+        } else if lostCount > 0 {
+            objectMaskFeedbackText = "\(finalizedObjectIDs.count) locked · \(lostCount) currently outside the view. Their results are retained."
+        } else if finalizedObjectIDs.count >= 15 {
+            objectMaskFeedbackText = "Maximum 15 objects reached."
+        } else if !finalizedObjectIDs.isEmpty {
+            objectMaskFeedbackText = "\(finalizedObjectIDs.count) object\(finalizedObjectIDs.count == 1 ? "" : "s") locked. Select another object to measure."
         } else {
             objectMaskFeedbackText = nil
         }
@@ -237,18 +299,30 @@ final class ObjectCaptureEngine {
     }
 
     func reportObjectLockNeedsSurface() {
+        isObjectSelectionPending = false
         objectMaskFeedbackText = "No stable surface was found at that point. Move slowly around it, then tap again."
     }
 
     func reportObjectLockNotFound() {
+        isObjectSelectionPending = false
         objectMaskFeedbackText = "No separate object mask was found there. Keep the object fully visible and tap near its center."
     }
 
     func reportObjectLimitReached() {
-        objectMaskFeedbackText = "Maximum 15 objects locked. Remove one before adding another."
+        isObjectSelectionPending = false
+        objectMaskFeedbackText = "Maximum 15 objects reached."
     }
 
     func requestObjectMaskToggle(at normalizedViewportPoint: CGPoint) {
+        guard activeObjectID == nil else {
+            objectMaskFeedbackText = "Lock the object being measured before selecting another."
+            return
+        }
+        guard !isObjectSelectionPending else {
+            objectMaskFeedbackText = "Object selection is already in progress."
+            return
+        }
+        isObjectSelectionPending = true
         objectMaskToggleRequest = ObjectMaskToggleRequest(
             normalizedViewportPoint: normalizedViewportPoint
         )
@@ -256,10 +330,81 @@ final class ObjectCaptureEngine {
         objectMaskToggleRequestRevision += 1
     }
 
-    func finishObjectSelection(didAdd: Bool) {
-        statusText = didAdd
-            ? "Object locked. Point at another highlighted object to add it."
-            : "Object removed. Its mask and LiDAR box were cleared."
+    func cancelObjectSelection() {
+        guard isObjectSelectionPending else {
+            return
+        }
+        isObjectSelectionPending = false
+        objectMaskFeedbackText = "Object selection was interrupted. Tap the object again."
+    }
+
+    func beginObjectMeasurement(id: UUID) {
+        guard isObjectSelectionPending,
+              !finalizedObjectIDs.contains(id),
+              activeObjectID == nil || activeObjectID == id else {
+            return
+        }
+        activeObjectID = id
+        focusedCaptureID = id
+        isObjectSelectionPending = false
+        statusText = "Move around the selected object to measure all visible surfaces."
+        objectMaskFeedbackText = "Measuring one object. Lock it before selecting another."
+    }
+
+    func focusFinalizedObject(id: UUID) {
+        guard activeObjectID == nil,
+              finalizedObjectIDs.contains(id),
+              capturedObjectsByID[id] != nil else {
+            return
+        }
+        focusedCaptureID = id
+        isObjectSelectionPending = false
+        objectMaskFeedbackText = "This object is locked. Unlock it to continue measuring it."
+    }
+
+    func finalizeActiveObject() {
+        guard let id = activeObjectID else {
+            objectMaskFeedbackText = "Select an object to measure before locking it."
+            return
+        }
+        guard capturedObjectsByID[id] != nil else {
+            objectMaskFeedbackText = "Keep measuring until the object has a LiDAR box, then lock it."
+            return
+        }
+        activeObjectID = nil
+        finalizedObjectIDs.insert(id)
+        focusedCaptureID = id
+        isObjectSelectionPending = false
+        objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .finalize)
+        objectWorkflowRequestRevision += 1
+        statusText = finalizedObjectIDs.count == 1
+            ? "1 object locked. Select another object to measure."
+            : "\(finalizedObjectIDs.count) objects locked. Select another object to measure."
+        objectMaskFeedbackText = statusText
+    }
+
+    func reactivateFocusedObject() {
+        guard activeObjectID == nil else {
+            objectMaskFeedbackText = "Lock the object being measured before unlocking another."
+            return
+        }
+        guard !isObjectSelectionPending else {
+            objectMaskFeedbackText = "Wait for the current object selection to finish."
+            return
+        }
+        guard let id = focusedCaptureID,
+              finalizedObjectIDs.contains(id),
+              capturedObjectsByID[id] != nil else {
+            objectMaskFeedbackText = "Select a locked object to unlock it."
+            return
+        }
+        finalizedObjectIDs.remove(id)
+        activeObjectID = id
+        isObjectSelectionPending = false
+        objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .reactivate)
+        objectWorkflowRequestRevision += 1
+        statusText = "Object unlocked. Continue measuring it."
+        objectMaskFeedbackText = "Measuring one object. Lock it before selecting another."
     }
 
     func clearObjectMaskPreview() {
@@ -279,13 +424,21 @@ final class ObjectCaptureEngine {
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
     }
 
-    func removeObjectMaskLayer(id: UUID) {
-        lockedMaskLayersByID.removeValue(forKey: id)
-        lockedMaskLayerOrder.removeAll(where: { $0 == id })
-        objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
-        objectMaskMarkers.removeAll(where: { $0.id == id })
-        objectMaskMarkerMissCounts.removeValue(forKey: id)
+    func clearTransientObjectMaskPreviews() {
+        if let liveMaskLayer {
+            objectMaskDisplayBoundingBoxes.removeValue(forKey: liveMaskLayer.id)
+        }
+        liveMaskLayer = nil
+        if let activeObjectID {
+            lockedMaskLayersByID.removeValue(forKey: activeObjectID)
+            lockedMaskLayerOrder.removeAll(where: { $0 == activeObjectID })
+            objectMaskDisplayBoundingBoxes.removeValue(forKey: activeObjectID)
+        }
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
+    }
+
+    func clearObjectMaskDisplayTracking(id: UUID) {
+        objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
     }
 
     private func rebuildObjectMaskPreview(timestamp: TimeInterval) {
@@ -319,28 +472,20 @@ final class ObjectCaptureEngine {
     }
 
     func updateCapture(id: UUID, object: CapturedObject) {
+        guard activeObjectID == id else {
+            return
+        }
         if capturedObjectsByID[id] == nil {
             captureOrder.append(id)
         }
         capturedObjectsByID[id] = object
         focusedCaptureID = id
-        statusText = "\(capturedObjectsByID.count) LiDAR box\(capturedObjectsByID.count == 1 ? "" : "es") ready."
+        statusText = "LiDAR box ready. Continue scanning or lock this object."
     }
 
     func focusCapture(id: UUID) {
         guard capturedObjectsByID[id] != nil else { return }
         focusedCaptureID = id
-    }
-
-    func removeCapture(id: UUID) {
-        capturedObjectsByID.removeValue(forKey: id)
-        captureOrder.removeAll(where: { $0 == id })
-        if focusedCaptureID == id {
-            focusedCaptureID = captureOrder.last
-        }
-        statusText = capturedObjectsByID.isEmpty
-            ? Self.defaultPrompt
-            : "\(capturedObjectsByID.count) LiDAR box\(capturedObjectsByID.count == 1 ? "" : "es") ready."
     }
 
     private func schedulePointCleanupFeedbackClear() {
@@ -358,8 +503,12 @@ final class ObjectCaptureEngine {
         pointCleanupFeedbackTask?.cancel()
         pointCleanupFeedbackTask = nil
         capturedObjectsByID.removeAll()
+        activeObjectID = nil
+        finalizedObjectIDs.removeAll()
         captureOrder.removeAll()
         focusedCaptureID = nil
+        isObjectSelectionPending = false
+        objectWorkflowRequest = nil
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()

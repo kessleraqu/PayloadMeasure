@@ -116,11 +116,25 @@ struct ARCameraView: UIViewRepresentable {
                 }
                 return false
             }
+
         }
 
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
         fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
+        fileprivate static let captureBoxEdgeThickness: Float = 0.006
+        fileprivate static let captureBoxDashTargetPeriod: Float = 0.018
+        fileprivate static let captureBoxMaximumDashCount = 24
+        fileprivate static let captureBoxEdges = [
+            (0, 1), (1, 3), (2, 3), (0, 2),
+            (4, 5), (5, 7), (6, 7), (4, 6),
+            (0, 4), (1, 5), (2, 6), (3, 7)
+        ]
+        fileprivate static let captureBoxEdgeFaces = [
+            (2, 4), (1, 4), (3, 4), (0, 4),
+            (2, 5), (1, 5), (3, 5), (0, 5),
+            (0, 2), (1, 2), (0, 3), (1, 3)
+        ]
         fileprivate static let selectionPointRadius: Float = 0.00075
         fileprivate static let selectionPointOffsets = [
             SIMD3<Float>(1, 1, 1),
@@ -144,11 +158,12 @@ struct ARCameraView: UIViewRepresentable {
         private var mesEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
         private var captureEntitiesByObject: [UUID: [ModelEntity]] = [:]
+        private var captureBoxActiveSpanCountsByObject: [UUID: Int] = [:]
+        private var captureBoxRearEdgeStatesByObject: [UUID: [Bool]] = [:]
         private var selectionPointMesh: LowLevelMesh?
         private var selectionPointEntity: ModelEntity?
         private var selectionPointMeshCapacity = 0
-        private var lastSelectionPoints: [SIMD3<Float>] = []
-        private var lastSelectionObjectID: UUID?
+        private var selectionPointsByObject: [UUID: [SIMD3<Float>]] = [:]
         private var supportAccumulators: [UUID: PointAccumulator] = [:]
         private var maskedAccumulators: [UUID: PointAccumulator] = [:]
         private var newestMaskedPointTimestamp: [UUID: TimeInterval] = [:]
@@ -176,6 +191,7 @@ struct ARCameraView: UIViewRepresentable {
         private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
         private var objectMaskMarkerStates: [UUID: ObjectMaskMarkerState] = [:]
+        private var objectMaskColorsByID: [UUID: ObjectMaskDisplayColor] = [:]
         private var objectMaskTrackingGeneration = 0
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
@@ -187,6 +203,7 @@ struct ARCameraView: UIViewRepresentable {
         private var observedMode: MesMode = .scan
         private var observedCaptureResetRevision = 0
         private var observedObjectMaskToggleRequestRevision = 0
+        private var observedObjectWorkflowRequestRevision = 0
         private var observedPointCleanupRequestRevision = 0
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
@@ -208,6 +225,8 @@ struct ARCameraView: UIViewRepresentable {
             observedMeshVisible = captureEngine.isMeshVisible
             observedShowsSelectedPoints = captureEngine.showsSelectedPoints
             observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
+            observedObjectWorkflowRequestRevision =
+                captureEngine.objectWorkflowRequestRevision
             createContentAnchorIfNeeded(in: arView)
             updateMeshVisibility()
 
@@ -221,6 +240,7 @@ struct ARCameraView: UIViewRepresentable {
                     self.updateAimerSurface(in: arView)
                     self.updatePlacedPointBillboards(in: arView)
                     self.updateScanLive(in: arView)
+                    self.updateCaptureBoxLineStyles(in: arView)
                 }
             }
 
@@ -264,6 +284,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
@@ -301,6 +322,11 @@ struct ARCameraView: UIViewRepresentable {
 
         private func releaseRebuildableScanCaches() {
             objectMaskTask?.cancel()
+            objectMaskTaskGeneration &+= 1
+            objectMaskTask = nil
+            pendingObjectMaskToggleRequest = nil
+            objectMaskToggleAttemptsRemaining = 0
+            captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
@@ -318,18 +344,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskCameraBufferPool = nil
             objectMaskDepthBufferPool = nil
             objectMaskConfidenceBufferPool = nil
-            supportAccumulators.removeAll(keepingCapacity: false)
-            maskedAccumulators.removeAll(keepingCapacity: false)
-            newestMaskedPointTimestamp.removeAll(keepingCapacity: false)
-            fittedMaskedPointTimestamp.removeAll(keepingCapacity: false)
-            liveResultsByObject.removeAll(keepingCapacity: false)
-            acceptedSurfaceVoxelKeysByObject.removeAll(keepingCapacity: false)
-            manuallyRejectedVoxelKeysByObject.removeAll(keepingCapacity: false)
-            captureEngine.clearObjectMaskPreview()
             captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
-            lastSelectionPoints.removeAll(keepingCapacity: false)
-            lastSelectionObjectID = nil
-            removeSelectionPointEntity()
         }
 
         private func observeEngineRevisions() {
@@ -339,6 +354,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = mesEngine.mode
                 _ = captureEngine.resetRevision
                 _ = captureEngine.objectMaskToggleRequestRevision
+                _ = captureEngine.objectWorkflowRequestRevision
                 _ = captureEngine.pointCleanupRequestRevision
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
@@ -383,6 +399,13 @@ struct ARCameraView: UIViewRepresentable {
                 resetScanState()
             }
 
+            if captureEngine.objectWorkflowRequestRevision
+                != observedObjectWorkflowRequestRevision {
+                observedObjectWorkflowRequestRevision =
+                    captureEngine.objectWorkflowRequestRevision
+                applyObjectWorkflowRequest(captureEngine.objectWorkflowRequest)
+            }
+
             if captureEngine.objectMaskToggleRequestRevision != observedObjectMaskToggleRequestRevision {
                 observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
                 pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
@@ -416,7 +439,45 @@ struct ARCameraView: UIViewRepresentable {
             if captureEngine.showsBoundingBoxes != observedShowsBoundingBoxes {
                 observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
                 updateCaptureBoxVisibility()
+                updateMeshVisibility()
             }
+        }
+
+        private func applyObjectWorkflowRequest(
+            _ request: ObjectWorkflowRequest?
+        ) {
+            guard let request else {
+                return
+            }
+            objectMaskTask?.cancel()
+            objectMaskTaskGeneration &+= 1
+            objectMaskTask = nil
+            pendingObjectMaskToggleRequest = nil
+            objectMaskToggleAttemptsRemaining = 0
+
+            switch request.kind {
+            case .finalize:
+                if let points = liveResultsByObject[request.id]?.surfacePoints {
+                    selectionPointsByObject[request.id] = points
+                }
+                objectMaskDisplayTask?.cancel()
+                objectMaskDisplayTaskGeneration &+= 1
+                objectMaskDisplayTask = nil
+                objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
+                captureEngine.clearObjectMaskDisplayTracking(id: request.id)
+                if let state = objectMaskMarkerStates[request.id] {
+                    objectMaskMarkerStates[request.id] = ObjectMaskMarkerState(
+                        color: state.color,
+                        isMaskVisible: false
+                    )
+                }
+            case .reactivate:
+                fittedMaskedPointTimestamp[request.id] =
+                    -.greatestFiniteMagnitude
+                removeLiveObjectMaskDisplaySeed()
+                captureEngine.clearLiveObjectMaskPreview()
+            }
+            updateSelectionVisualization()
         }
 
         private func updateMeshVisibility() {
@@ -435,6 +496,7 @@ struct ARCameraView: UIViewRepresentable {
             let shouldOcclude = mesEngine.mode == .scan
                 && sessionManager.isSceneReconstructionEnabled
                 && captureEngine.showsSelectedPoints
+                && !captureEngine.showsBoundingBoxes
             if shouldOcclude {
                 arView.environment.sceneUnderstanding.options.insert(.occlusion)
             } else {
@@ -475,15 +537,21 @@ struct ARCameraView: UIViewRepresentable {
                 imageToViewportTransform: imageToViewportTransform,
                 toggleRequest: toggleRequest,
                 anchorHints: objectMaskAnchorHints(frame: frame, in: arView),
+                activeObjectID: captureEngine.activeObjectID,
+                finalizedObjectIDs: captureEngine.finalizedObjectIDs,
                 timestamp: frame.timestamp,
                 trackingGeneration: objectMaskTrackingGeneration,
-                depthSnapshot: objectMaskDepthSnapshot(from: frame)
+                depthSnapshot: captureEngine.activeObjectID != nil
+                    || toggleRequest != nil
+                    ? objectMaskDepthSnapshot(from: frame)
+                    : nil
             )
             if submittedToggleRequest != nil {
                 pendingObjectMaskToggleRequest = nil
                 objectMaskToggleAttemptsRemaining = max(objectMaskToggleAttemptsRemaining - 1, 0)
             }
             let processor = objectMaskProcessor
+            let submittedResetRevision = captureEngine.resetRevision
             objectMaskTaskGeneration &+= 1
             let taskGeneration = objectMaskTaskGeneration
 
@@ -496,13 +564,28 @@ struct ARCameraView: UIViewRepresentable {
                 }
 
                 self.objectMaskTask = nil
+                guard self.captureEngine.resetRevision
+                        == submittedResetRevision else {
+                    return
+                }
                 guard !wasCancelled, self.mesEngine.mode == .scan else {
                     return
                 }
 
                 let previousLockedObjectCount = self.captureEngine.lockedObjectMaskCount
                 self.applyObjectMaskLockChange(result.lockChange, in: arView)
+                if let lockChange = result.lockChange {
+                    switch lockChange.kind {
+                    case .added:
+                        self.captureEngine.beginObjectMeasurement(id: lockChange.id)
+                    case .focused:
+                        self.captureEngine.focusFinalizedObject(id: lockChange.id)
+                    }
+                }
                 for cloud in result.maskedPointClouds {
+                    guard cloud.id == self.captureEngine.activeObjectID else {
+                        continue
+                    }
                     let acceptedPoints: [SIMD3<Float>]
                     if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
                        !rejectedKeys.isEmpty {
@@ -536,6 +619,7 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 }
                 for marker in result.markers {
+                    self.objectMaskColorsByID[marker.id] = marker.color
                     self.objectMaskMarkerStates[marker.id] = ObjectMaskMarkerState(
                         color: marker.color,
                         isMaskVisible: marker.isMaskVisible
@@ -573,15 +657,6 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 } else if result.needsWorldSurface {
                     self.captureEngine.reportObjectLockNeedsSurface()
-                }
-
-                if submittedToggleRequest != nil, let lockChange = result.lockChange {
-                    switch lockChange.kind {
-                    case .added:
-                        self.captureEngine.finishObjectSelection(didAdd: true)
-                    case .removed:
-                        self.captureEngine.finishObjectSelection(didAdd: false)
-                    }
                 }
 
                 if let preview = result.preview,
@@ -640,7 +715,9 @@ struct ARCameraView: UIViewRepresentable {
                 objectMaskDisplayTask?.cancel()
                 objectMaskDisplayTaskGeneration &+= 1
                 objectMaskDisplayTask = nil
-                captureEngine.clearObjectMaskPreview()
+                objectMaskDisplaySeedsByID.removeAll()
+                liveObjectMaskDisplayID = nil
+                captureEngine.clearTransientObjectMaskPreviews()
             }
             guard objectMaskDisplayTask == nil,
                   !objectMaskDisplaySeedsByID.isEmpty else {
@@ -774,7 +851,7 @@ struct ARCameraView: UIViewRepresentable {
                   sessionManager.isAutomaticObjectCaptureSupported,
                   sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
-                  let objectID = lastSelectionObjectID,
+                  let objectID = captureEngine.activeObjectID,
                   var accumulator = maskedAccumulators[objectID],
                   let result = liveResultsByObject[objectID],
                   result.selectionPoints.count == result.surfacePoints.count,
@@ -1098,7 +1175,7 @@ struct ARCameraView: UIViewRepresentable {
                 }.map(selectionVoxelKey(for:))
             )
             fittedMaskedPointTimestamp[objectID] = -.greatestFiniteMagnitude
-            lastSelectionPoints = retainedSurfacePoints
+            selectionPointsByObject[objectID] = retainedSurfacePoints
             updateSelectionVisualization()
             captureEngine.updateCapture(id: objectID, object: cleanedObject)
             if reportsFeedback {
@@ -1417,26 +1494,8 @@ struct ARCameraView: UIViewRepresentable {
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
                 arView.session.add(anchor: anchor)
                 objectMaskAnchors[change.id] = anchor
-            case .removed:
-                if let anchor = objectMaskAnchors.removeValue(forKey: change.id) {
-                    arView.session.remove(anchor: anchor)
-                }
-                objectMaskDisplaySeedsByID.removeValue(forKey: change.id)
-                maskedAccumulators.removeValue(forKey: change.id)
-                supportAccumulators.removeValue(forKey: change.id)
-                newestMaskedPointTimestamp.removeValue(forKey: change.id)
-                fittedMaskedPointTimestamp.removeValue(forKey: change.id)
-                liveResultsByObject.removeValue(forKey: change.id)
-                acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
-                manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
-                if lastSelectionObjectID == change.id {
-                    lastSelectionObjectID = nil
-                    lastSelectionPoints = []
-                    hideAllSelectionMarkers()
-                }
-                clearCaptureContent(for: change.id)
-                captureEngine.removeObjectMaskLayer(id: change.id)
-                captureEngine.removeCapture(id: change.id)
+            case .focused:
+                break
             }
         }
 
@@ -1469,7 +1528,8 @@ struct ARCameraView: UIViewRepresentable {
 
             guard sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
-                  !objectMaskAnchors.isEmpty else {
+                  let activeObjectID = captureEngine.activeObjectID,
+                  objectMaskAnchors[activeObjectID] != nil else {
                 return
             }
 
@@ -1484,7 +1544,7 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             let visibleHints = objectMaskAnchorHints(frame: frame, in: arView).filter {
-                $0.normalizedViewportPoint != nil
+                $0.id == activeObjectID && $0.normalizedViewportPoint != nil
             }
             let seeds = Dictionary(uniqueKeysWithValues: visibleHints.compactMap { hint in
                 objectMaskAnchors[hint.id].map { (hint.id, $0.transform.translation) }
@@ -1513,19 +1573,15 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             if scanTickCounter % 45 == 0 {
-                for id in Array(supportAccumulators.keys) {
-                    supportAccumulators[id]?.pruneTransient(
+                supportAccumulators[activeObjectID]?.pruneTransient(
                         below: ObjectCapturePipeline.minObservations,
                         olderThan: 8
                     )
-                    supportAccumulators[id]?.pruneStale(olderThan: 90)
-                }
-                for id in Array(maskedAccumulators.keys) {
-                    maskedAccumulators[id]?.pruneTransient(
+                supportAccumulators[activeObjectID]?.pruneStale(olderThan: 90)
+                maskedAccumulators[activeObjectID]?.pruneTransient(
                         below: ObjectCapturePipeline.minObservations,
                         olderThan: 8
                     )
-                }
             }
 
             guard scanTickCounter % 3 == 0 else {
@@ -1612,6 +1668,9 @@ struct ARCameraView: UIViewRepresentable {
                                 )
                             )
                             liveResultsByObject[id] = retainedResult
+                            selectionPointsByObject[id] =
+                                retainedResult.surfacePoints
+                            updateSelectionVisualization()
                             continue
                         }
                     }
@@ -1633,6 +1692,8 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
                 liveResultsByObject[id] = acceptedResult
+                selectionPointsByObject[id] = acceptedResult.surfacePoints
+                updateSelectionVisualization()
                 if acceptedSurfaceVoxelKeysByObject[id] == nil
                     || acceptedSurfaceExpansion {
                     acceptedSurfaceVoxelKeysByObject[id] = Set(
@@ -1657,18 +1718,8 @@ struct ARCameraView: UIViewRepresentable {
                 captureEngine.updateCapture(id: id, object: acceptedResult.object)
             }
 
-            if let centeredID = visibleHints.compactMap({ hint -> (UUID, CGFloat)? in
-                guard let point = hint.normalizedViewportPoint else { return nil }
-                return (hint.id, hypot(point.x - 0.5, point.y - 0.5))
-            }).min(by: { $0.1 < $1.1 })?.0,
-               let centeredResult = liveResultsByObject[centeredID] {
-                if lastSelectionObjectID != centeredID
-                    || lastSelectionPoints != centeredResult.surfacePoints {
-                    lastSelectionObjectID = centeredID
-                    lastSelectionPoints = centeredResult.surfacePoints
-                    updateSelectionVisualization()
-                }
-                captureEngine.focusCapture(id: centeredID)
+            if liveResultsByObject[activeObjectID] != nil {
+                captureEngine.focusCapture(id: activeObjectID)
             }
         }
 
@@ -1816,6 +1867,8 @@ struct ARCameraView: UIViewRepresentable {
         private func resetObjectMaskTracking() {
             objectMaskTrackingGeneration &+= 1
             objectMaskTask?.cancel()
+            objectMaskTaskGeneration &+= 1
+            objectMaskTask = nil
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
@@ -1842,6 +1895,7 @@ struct ARCameraView: UIViewRepresentable {
             manuallyRejectedVoxelKeysByObject.removeAll()
             removeAllObjectMaskAnchors()
             objectMaskMarkerStates.removeAll()
+            objectMaskColorsByID.removeAll()
             captureEngine.updateLockedObjectMaskCount(0)
             captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
             captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
@@ -1858,6 +1912,7 @@ struct ARCameraView: UIViewRepresentable {
             }
             objectMaskAnchors.removeAll()
             objectMaskMarkerStates.removeAll()
+            objectMaskColorsByID.removeAll()
             maskedAccumulators.removeAll()
             supportAccumulators.removeAll()
         }
@@ -2266,55 +2321,216 @@ struct ARCameraView: UIViewRepresentable {
             previewMeasurementEntities.removeAll()
         }
 
+        private func updateCaptureBoxLineStyles(in arView: ARView) {
+            let objectIDs = Array(captureEntitiesByObject.keys)
+            guard captureEngine.showsBoundingBoxes, !objectIDs.isEmpty else {
+                return
+            }
+            let cameraPosition = arView.cameraTransform.translation
+            for objectID in objectIDs {
+                guard let object = liveResultsByObject[objectID]?.object
+                        ?? captureEngine.capturedObjectsByID[objectID] else {
+                    continue
+                }
+                renderCapturedBox(
+                    object,
+                    for: objectID,
+                    cameraPosition: cameraPosition
+                )
+            }
+        }
+
+        private func captureBoxLineSpans(
+            for object: CapturedObject,
+            objectID: UUID,
+            cameraPosition: SIMD3<Float>
+        ) -> [(start: SIMD3<Float>, end: SIMD3<Float>)] {
+            guard object.corners.count == 8 else {
+                return []
+            }
+            let rearEdges = captureBoxRearEdges(
+                for: object,
+                objectID: objectID,
+                cameraPosition: cameraPosition
+            )
+            var spans: [(start: SIMD3<Float>, end: SIMD3<Float>)] = []
+            spans.reserveCapacity(Self.captureBoxEdges.count * 3)
+            for (edgeIndex, edge) in Self.captureBoxEdges.enumerated() {
+                let start = object.corners[edge.0]
+                let end = object.corners[edge.1]
+                if rearEdges[edgeIndex] {
+                    spans.append(contentsOf: dashedCaptureBoxSpans(from: start, to: end))
+                } else {
+                    spans.append((start: start, end: end))
+                }
+            }
+            return spans
+        }
+
+        private func captureBoxRearEdges(
+            for object: CapturedObject,
+            objectID: UUID,
+            cameraPosition: SIMD3<Float>
+        ) -> [Bool] {
+            let half = object.dimensions / 2
+            let normals = [
+                -object.axes.width,
+                object.axes.width,
+                -object.axes.depth,
+                object.axes.depth,
+                -object.axes.height,
+                object.axes.height
+            ]
+            let centers = [
+                object.center - object.axes.width * half.x,
+                object.center + object.axes.width * half.x,
+                object.center - object.axes.depth * half.y,
+                object.center + object.axes.depth * half.y,
+                object.center - object.axes.height * half.z,
+                object.center + object.axes.height * half.z
+            ]
+            let faceDistances = zip(normals, centers).map {
+                simd_dot(cameraPosition - $0.1, $0.0)
+            }
+            let previous = captureBoxRearEdgeStatesByObject[objectID]
+            let margin: Float = 0.004
+            let states = Self.captureBoxEdgeFaces.enumerated().map { index, faces in
+                let first = faceDistances[faces.0]
+                let second = faceDistances[faces.1]
+                guard previous?.count == Self.captureBoxEdges.count else {
+                    return first <= 0 && second <= 0
+                }
+                if previous![index] {
+                    return first <= margin && second <= margin
+                }
+                return first < -margin && second < -margin
+            }
+            captureBoxRearEdgeStatesByObject[objectID] = states
+            return states
+        }
+
+        private func dashedCaptureBoxSpans(
+            from start: SIMD3<Float>,
+            to end: SIMD3<Float>
+        ) -> [(start: SIMD3<Float>, end: SIMD3<Float>)] {
+            let delta = end - start
+            let length = simd_length(delta)
+            guard length > 0.001 else {
+                return []
+            }
+            let dashCount = min(
+                max(Int((length / Self.captureBoxDashTargetPeriod).rounded()), 2),
+                Self.captureBoxMaximumDashCount
+            )
+            let intervalCount = dashCount * 2 - 1
+            return (0..<dashCount).map { index in
+                let firstT = Float(index * 2) / Float(intervalCount)
+                let lastT = Float(index * 2 + 1) / Float(intervalCount)
+                return (
+                    start: start + delta * firstT,
+                    end: start + delta * lastT
+                )
+            }
+        }
+
+        private func capturedBoxMaterial(for id: UUID) -> UnlitMaterial {
+            let color = objectMaskColorsByID[id]
+                ?? objectMaskMarkerStates[id]?.color
+                ?? ObjectMaskDisplayColor(red: 0.20, green: 0.95, blue: 0.42)
+            return UnlitMaterial(
+                color: UIColor(
+                    red: CGFloat(color.red),
+                    green: CGFloat(color.green),
+                    blue: CGFloat(color.blue),
+                    alpha: 1
+                ),
+                applyPostProcessToneMap: false
+            )
+        }
+
+        private func renderCapturedBoxSpans(
+            _ spans: [(start: SIMD3<Float>, end: SIMD3<Float>)],
+            for objectID: UUID,
+            material: UnlitMaterial? = nil
+        ) {
+            guard let contentAnchor else {
+                return
+            }
+            let renderableSpans = spans.filter {
+                simd_length($0.end - $0.start) > 0.001
+            }
+            var entities = captureEntitiesByObject[objectID] ?? []
+            if entities.count < renderableSpans.count {
+                let entityMaterial = material
+                    ?? capturedBoxMaterial(for: objectID)
+                while entities.count < renderableSpans.count {
+                    let entity = ModelEntity(
+                        mesh: Self.unitCubeMesh,
+                        materials: [entityMaterial]
+                    )
+                    contentAnchor.addChild(entity)
+                    entities.append(entity)
+                }
+            }
+            for (index, span) in renderableSpans.enumerated() {
+                updateCapturedBoxEdge(
+                    entities[index],
+                    from: span.start,
+                    to: span.end,
+                    material: material
+                )
+            }
+            if entities.count > renderableSpans.count {
+                for index in renderableSpans.count..<entities.count {
+                    entities[index].isEnabled = false
+                }
+            }
+            captureEntitiesByObject[objectID] = entities
+            captureBoxActiveSpanCountsByObject[objectID] = renderableSpans.count
+        }
+
+        private func renderCapturedBox(
+            _ object: CapturedObject,
+            for id: UUID,
+            cameraPosition: SIMD3<Float>?,
+            material: UnlitMaterial? = nil
+        ) {
+            let spans: [(start: SIMD3<Float>, end: SIMD3<Float>)]
+            if let cameraPosition {
+                spans = captureBoxLineSpans(
+                    for: object,
+                    objectID: id,
+                    cameraPosition: cameraPosition
+                )
+            } else {
+                spans = Self.captureBoxEdges.map {
+                    (
+                        start: object.corners[$0.0],
+                        end: object.corners[$0.1]
+                    )
+                }
+            }
+            renderCapturedBoxSpans(spans, for: id, material: material)
+        }
+
         private func addCapturedBox(_ object: CapturedObject, for id: UUID) {
             guard object.corners.count == 8 else {
                 return
             }
 
-            let displayColor = objectMaskMarkerStates[id]?.color
-                ?? ObjectMaskDisplayColor(red: 0.20, green: 0.95, blue: 0.42)
-            let material = UnlitMaterial(
-                color: UIColor(
-                    red: CGFloat(displayColor.red),
-                    green: CGFloat(displayColor.green),
-                    blue: CGFloat(displayColor.blue),
-                    alpha: 1
-                ),
-                applyPostProcessToneMap: false
+            renderCapturedBox(
+                object,
+                for: id,
+                cameraPosition: arView?.cameraTransform.translation,
+                material: capturedBoxMaterial(for: id)
             )
-
-            let edges = [
-                (0, 1), (1, 3), (2, 3), (0, 2),
-                (4, 5), (5, 7), (6, 7), (4, 6),
-                (0, 4), (1, 5), (2, 6), (3, 7)
-            ]
-
-            var bars = captureEntitiesByObject[id] ?? []
-            while bars.count < edges.count {
-                let bar = ModelEntity(
-                    mesh: Coordinator.unitCubeMesh,
-                    materials: [material]
-                )
-                contentAnchor?.addChild(bar)
-                bars.append(bar)
-            }
-
-            for (index, edge) in edges.enumerated() {
-                updateCapturedBoxEdge(
-                    bars[index],
-                    from: object.corners[edge.0],
-                    to: object.corners[edge.1],
-                    material: material
-                )
-            }
-            captureEntitiesByObject[id] = bars
         }
 
         private func updateCapturedBoxEdge(
             _ bar: ModelEntity,
             from start: SIMD3<Float>,
             to end: SIMD3<Float>,
-            material: UnlitMaterial
+            material: UnlitMaterial?
         ) {
             let delta = end - start
             let length = simd_length(delta)
@@ -2324,21 +2540,37 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            let thickness: Float = 0.006
-            if var model = bar.model {
+            if let material, var model = bar.model {
                 model.materials = [material]
                 bar.model = model
             }
-            bar.scale = SIMD3<Float>(length, thickness, thickness)
+            bar.scale = SIMD3<Float>(
+                length,
+                Self.captureBoxEdgeThickness,
+                Self.captureBoxEdgeThickness
+            )
             bar.position = start + delta / 2
             bar.orientation = orientation(alongX: delta)
             bar.isEnabled = captureEngine.showsBoundingBoxes
         }
 
         private func updateCaptureBoxVisibility() {
-            for entities in captureEntitiesByObject.values {
-                for entity in entities {
-                    entity.isEnabled = captureEngine.showsBoundingBoxes
+            if captureEngine.showsBoundingBoxes {
+                if let arView {
+                    updateCaptureBoxLineStyles(in: arView)
+                } else {
+                    for (objectID, entities) in captureEntitiesByObject {
+                        let activeCount = captureBoxActiveSpanCountsByObject[objectID] ?? 0
+                        for (index, entity) in entities.enumerated() {
+                            entity.isEnabled = index < activeCount
+                        }
+                    }
+                }
+            } else {
+                for entities in captureEntitiesByObject.values {
+                    for entity in entities {
+                        entity.isEnabled = false
+                    }
                 }
             }
         }
@@ -2354,12 +2586,6 @@ struct ARCameraView: UIViewRepresentable {
             return simd_quatf(simd_float3x3(columns: (xAxis, yAxis, zAxis)))
         }
 
-        private func clearCaptureContent(for id: UUID) {
-            for entity in captureEntitiesByObject.removeValue(forKey: id) ?? [] {
-                entity.removeFromParent()
-            }
-        }
-
         private func clearAllCaptureContent() {
             for entities in captureEntitiesByObject.values {
                 for entity in entities {
@@ -2367,13 +2593,17 @@ struct ARCameraView: UIViewRepresentable {
                 }
             }
             captureEntitiesByObject.removeAll()
+            captureBoxActiveSpanCountsByObject.removeAll()
+            captureBoxRearEdgeStatesByObject.removeAll()
             hideAllSelectionMarkers()
-            lastSelectionPoints = []
-            lastSelectionObjectID = nil
+            selectionPointsByObject.removeAll()
         }
 
         private func updateSelectionVisualization() {
-            guard captureEngine.showsSelectedPoints, !lastSelectionPoints.isEmpty,
+            let selectionPoints = selectionPointsByObject.keys
+                .sorted { $0.uuidString < $1.uuidString }
+                .flatMap { selectionPointsByObject[$0] ?? [] }
+            guard captureEngine.showsSelectedPoints, !selectionPoints.isEmpty,
                   let contentAnchor else {
                 hideAllSelectionMarkers()
                 return
@@ -2381,7 +2611,7 @@ struct ARCameraView: UIViewRepresentable {
 
             guard let mesh = selectionPointMesh(
                 in: contentAnchor,
-                minimumCapacity: lastSelectionPoints.count
+                minimumCapacity: selectionPoints.count
             ) else {
                 return
             }
@@ -2391,7 +2621,7 @@ struct ARCameraView: UIViewRepresentable {
             let radius = Self.selectionPointRadius
             mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { buffer in
                 let positions = buffer.bindMemory(to: SIMD3<Float>.self)
-                for (pointIndex, point) in lastSelectionPoints.enumerated() {
+                for (pointIndex, point) in selectionPoints.enumerated() {
                     let vertexBase = pointIndex * verticesPerPoint
                     for offsetIndex in Self.selectionPointOffsets.indices {
                         positions[vertexBase + offsetIndex] =
@@ -2401,9 +2631,9 @@ struct ARCameraView: UIViewRepresentable {
             }
             mesh.parts.replaceAll([
                 LowLevelMesh.Part(
-                    indexCount: lastSelectionPoints.count * indicesPerPoint,
+                    indexCount: selectionPoints.count * indicesPerPoint,
                     topology: .triangle,
-                    bounds: selectionPointBounds(lastSelectionPoints)
+                    bounds: selectionPointBounds(selectionPoints)
                 )
             ])
             selectionPointEntity?.isEnabled = true
