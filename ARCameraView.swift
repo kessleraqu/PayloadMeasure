@@ -61,6 +61,26 @@ struct ARCameraView: UIViewRepresentable {
             let z: Int32
         }
 
+        /// The masked surface of one object, in the form RealityKit needs.
+        private struct ObjectMaskSurfelSet {
+            var surfels: [ObjectMaskSurfel]
+            var color: ObjectMaskDisplayColor
+            var fillAlpha: CGFloat
+            var timestamp: TimeInterval
+        }
+
+        /// GPU-resident overlay for one object's mask.
+        ///
+        /// The vertex buffer is rewritten only when Vision produces a new
+        /// keyframe. Between keyframes RealityKit redraws this geometry from the
+        /// live camera pose at display rate, so the mask stays registered to the
+        /// object with no per-frame CPU work and no latency of its own.
+        private struct ObjectMaskSurfelEntity {
+            let mesh: LowLevelMesh
+            let entity: ModelEntity
+            var capacity: Int
+        }
+
         private struct ObjectMaskAlphaMap {
             let width: Int
             let height: Int
@@ -148,6 +168,32 @@ struct ARCameraView: UIViewRepresentable {
             0, 2, 3,
             1, 3, 2
         ]
+        /// Mask surfels are octahedra rather than the tetrahedra used for
+        /// selection points: an octahedron presents the same silhouette radius
+        /// from every direction, so the overlay keeps a uniform density however
+        /// the operator circles the object, for only six vertices.
+        fileprivate static let maskSurfelOffsets = [
+            SIMD3<Float>(1, 0, 0),
+            SIMD3<Float>(-1, 0, 0),
+            SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(0, -1, 0),
+            SIMD3<Float>(0, 0, 1),
+            SIMD3<Float>(0, 0, -1)
+        ]
+        fileprivate static let maskSurfelIndices: [UInt32] = [
+            0, 2, 4,  2, 1, 4,  1, 3, 4,  3, 0, 4,
+            2, 0, 5,  1, 2, 5,  3, 1, 5,  0, 3, 5
+        ]
+        /// The silhouette tier is drawn slightly larger and far more opaque so
+        /// the mask keeps the crisp outline the 2D overlay had.
+        fileprivate static let maskSurfelBoundaryRadiusScale: Float = 1.35
+        fileprivate static let maskSurfelBoundaryAlpha: CGFloat = 0.9
+        /// Ceiling on splats drawn per object. Each depth sample of the mask
+        /// wants one splat, so an object filling a third of the frame reaches
+        /// roughly this many. Beyond it the fill is thinned rather than the
+        /// buffers grown, which keeps the per-object mesh under ~3 MB.
+        fileprivate static let maskSurfelDisplayLimit = 16_000
+        fileprivate static let maskSurfelMinimumCapacity = 2_048
 
         private let sessionManager: ARSessionManager
         private let mesEngine: MesEngine
@@ -173,20 +219,21 @@ struct ARCameraView: UIViewRepresentable {
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
         private let objectMaskDisplayTracker = ObjectMaskDisplayTracker()
+        private var objectMaskSurfelSetsByID: [UUID: ObjectMaskSurfelSet] = [:]
+        private var objectMaskSurfelEntitiesByID: [UUID: ObjectMaskSurfelEntity] = [:]
         private var scanTickCounter = 0
         private var lastAutomaticPointCleanupTimestamp: TimeInterval = -.greatestFiniteMagnitude
         private var consecutiveMaskMisses = 0
         private var consecutiveLiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
         private var objectMaskTaskGeneration = 0
+        private var lastObjectMaskSubmittedFrameTimestamp: TimeInterval =
+            -.greatestFiniteMagnitude
         private var objectMaskDisplayTask: Task<Void, Never>?
         private var objectMaskDisplayTaskGeneration = 0
         private var objectMaskDisplaySeedsByID: [UUID: ObjectMaskDisplaySeed] = [:]
         private var liveObjectMaskDisplayID: UUID?
         private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
-        private var objectMaskCameraBufferPool: CVPixelBufferPool?
-        private var objectMaskDepthBufferPool: CVPixelBufferPool?
-        private var objectMaskConfidenceBufferPool: CVPixelBufferPool?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
@@ -196,7 +243,7 @@ struct ARCameraView: UIViewRepresentable {
         private var previewTargetPosition: SIMD3<Float>?
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
-        private var maskUpdateTimer: Timer?
+        private var maskDisplayLink: CADisplayLink?
         private var memoryWarningObserver: NSObjectProtocol?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
@@ -208,6 +255,7 @@ struct ARCameraView: UIViewRepresentable {
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
         private var observedShowsBoundingBoxes = true
+        private var observedShowsLockedMaskPreviews = true
 
         init(
             sessionManager: ARSessionManager,
@@ -225,6 +273,8 @@ struct ARCameraView: UIViewRepresentable {
             observedMeshVisible = captureEngine.isMeshVisible
             observedShowsSelectedPoints = captureEngine.showsSelectedPoints
             observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
+            observedShowsLockedMaskPreviews =
+                captureEngine.showsLockedMaskPreviews
             observedObjectWorkflowRequestRevision =
                 captureEngine.objectWorkflowRequestRevision
             createContentAnchorIfNeeded(in: arView)
@@ -244,20 +294,17 @@ struct ARCameraView: UIViewRepresentable {
                 }
             }
 
-            let maskTimer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self, weak arView] _ in
-                guard let self, let arView else {
-                    return
-                }
-
-                Task { @MainActor in
-                    self.updateFastObjectMaskMarkers(in: arView)
-                    self.updateFastObjectMaskPreview(in: arView)
-                    self.updateObjectMaskPreview(in: arView)
-                }
-            }
-            maskTimer.tolerance = 1.0 / 120.0
-            RunLoop.main.add(maskTimer, forMode: .common)
-            maskUpdateTimer = maskTimer
+            let maskDisplayLink = CADisplayLink(
+                target: self,
+                selector: #selector(updateMaskDisplay)
+            )
+            maskDisplayLink.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 30,
+                maximum: 60,
+                preferred: 60
+            )
+            maskDisplayLink.add(to: .main, forMode: .common)
+            self.maskDisplayLink = maskDisplayLink
 
             memoryWarningObserver = NotificationCenter.default.addObserver(
                 forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -272,11 +319,20 @@ struct ARCameraView: UIViewRepresentable {
             observeEngineRevisions()
         }
 
+        @objc private func updateMaskDisplay() {
+            guard let arView else {
+                return
+            }
+            updateFastObjectMaskMarkers(in: arView)
+            updateFastObjectMaskPreview(in: arView)
+            updateObjectMaskPreview(in: arView)
+        }
+
         func detach() {
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
-            maskUpdateTimer?.invalidate()
-            maskUpdateTimer = nil
+            maskDisplayLink?.invalidate()
+            maskDisplayLink = nil
             if let memoryWarningObserver {
                 NotificationCenter.default.removeObserver(memoryWarningObserver)
                 self.memoryWarningObserver = nil
@@ -289,6 +345,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
+            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -299,9 +356,6 @@ struct ARCameraView: UIViewRepresentable {
                     trackingGeneration: trackingGeneration
                 )
             }
-            objectMaskCameraBufferPool = nil
-            objectMaskDepthBufferPool = nil
-            objectMaskConfidenceBufferPool = nil
             pendingObjectMaskToggleRequest = nil
             removeAllObjectMaskAnchors()
             captureEngine.updateLockedObjectMaskCount(0)
@@ -331,6 +385,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
+            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -341,9 +396,6 @@ struct ARCameraView: UIViewRepresentable {
                     trackingGeneration: trackingGeneration
                 )
             }
-            objectMaskCameraBufferPool = nil
-            objectMaskDepthBufferPool = nil
-            objectMaskConfidenceBufferPool = nil
             captureEngine.updateObjectMaskDisplayBoundingBoxes([:])
         }
 
@@ -359,6 +411,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
                 _ = captureEngine.showsBoundingBoxes
+                _ = captureEngine.showsLockedMaskPreviews
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else {
@@ -441,6 +494,13 @@ struct ARCameraView: UIViewRepresentable {
                 updateCaptureBoxVisibility()
                 updateMeshVisibility()
             }
+
+            if captureEngine.showsLockedMaskPreviews
+                != observedShowsLockedMaskPreviews {
+                observedShowsLockedMaskPreviews =
+                    captureEngine.showsLockedMaskPreviews
+                updateObjectMaskSurfelVisibility()
+            }
         }
 
         private func applyObjectWorkflowRequest(
@@ -474,6 +534,7 @@ struct ARCameraView: UIViewRepresentable {
             case .reactivate:
                 fittedMaskedPointTimestamp[request.id] =
                     -.greatestFiniteMagnitude
+                removeObjectMaskSurfelOverlay(id: request.id)
                 removeLiveObjectMaskDisplaySeed()
                 captureEngine.clearLiveObjectMaskPreview()
             case .remove:
@@ -482,6 +543,7 @@ struct ARCameraView: UIViewRepresentable {
                 objectMaskDisplayTask = nil
                 objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
                 captureEngine.clearObjectMaskDisplayTracking(id: request.id)
+                removeObjectMaskSurfelOverlay(id: request.id)
                 if let anchor = objectMaskAnchors.removeValue(
                     forKey: request.id
                 ), let arView {
@@ -533,7 +595,8 @@ struct ARCameraView: UIViewRepresentable {
         private func updateObjectMaskPreview(in arView: ARView) {
             guard mesEngine.mode == .scan,
                   objectMaskTask == nil,
-                  let frame = arView.session.currentFrame else {
+                  let frame = arView.session.currentFrame,
+                  frame.timestamp > lastObjectMaskSubmittedFrameTimestamp else {
                 return
             }
 
@@ -550,14 +613,8 @@ struct ARCameraView: UIViewRepresentable {
                 frame: frame,
                 in: arView
             )
-            guard let cameraImage = Self.copiedPixelBuffer(
-                frame.capturedImage,
-                using: &objectMaskCameraBufferPool
-            ) else {
-                return
-            }
             let input = ObjectMaskFrame(
-                pixelBuffer: cameraImage,
+                pixelBuffer: frame.capturedImage,
                 orientation: orientation,
                 viewportSize: viewportSize,
                 imageToViewportTransform: imageToViewportTransform,
@@ -578,6 +635,7 @@ struct ARCameraView: UIViewRepresentable {
             }
             let processor = objectMaskProcessor
             let submittedResetRevision = captureEngine.resetRevision
+            lastObjectMaskSubmittedFrameTimestamp = frame.timestamp
             objectMaskTaskGeneration &+= 1
             let taskGeneration = objectMaskTaskGeneration
 
@@ -612,19 +670,54 @@ struct ARCameraView: UIViewRepresentable {
                     guard cloud.id == self.captureEngine.activeObjectID else {
                         continue
                     }
+                    // `points` and `surfels` are index-parallel, so the manual
+                    // rejection filter has to drop the same indices from both or
+                    // the overlay would keep painting discarded surface.
                     let acceptedPoints: [SIMD3<Float>]
+                    let acceptedSurfels: [ObjectMaskSurfel]
                     if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
-                       !rejectedKeys.isEmpty {
+                       !rejectedKeys.isEmpty,
+                       cloud.surfels.count == cloud.points.count {
+                        var keptPoints: [SIMD3<Float>] = []
+                        var keptSurfels: [ObjectMaskSurfel] = []
+                        keptPoints.reserveCapacity(cloud.points.count)
+                        keptSurfels.reserveCapacity(cloud.surfels.count)
+                        for index in cloud.points.indices
+                        where !rejectedKeys.contains(
+                            self.selectionVoxelKey(for: cloud.points[index])
+                        ) {
+                            keptPoints.append(cloud.points[index])
+                            keptSurfels.append(cloud.surfels[index])
+                        }
+                        acceptedPoints = keptPoints
+                        acceptedSurfels = keptSurfels
+                    } else if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
+                              !rejectedKeys.isEmpty {
                         acceptedPoints = cloud.points.filter {
                             !rejectedKeys.contains(
                                 self.selectionVoxelKey(for: $0)
                             )
                         }
+                        acceptedSurfels = []
                     } else {
                         acceptedPoints = cloud.points
+                        acceptedSurfels = cloud.surfels
                     }
                     guard !acceptedPoints.isEmpty else {
                         continue
+                    }
+                    if !acceptedSurfels.isEmpty,
+                       cloud.timestamp >= (
+                           self.objectMaskSurfelSetsByID[cloud.id]?.timestamp
+                               ?? -.greatestFiniteMagnitude
+                       ) {
+                        self.objectMaskSurfelSetsByID[cloud.id] = ObjectMaskSurfelSet(
+                            surfels: acceptedSurfels,
+                            color: cloud.color,
+                            fillAlpha: cloud.fillAlpha,
+                            timestamp: cloud.timestamp
+                        )
+                        self.updateObjectMaskSurfelOverlay(for: cloud.id)
                     }
                     if self.maskedAccumulators[cloud.id] == nil {
                         self.maskedAccumulators[cloud.id] = PointAccumulator(
@@ -644,6 +737,7 @@ struct ARCameraView: UIViewRepresentable {
                         )
                     }
                 }
+                self.pruneObjectMaskSurfelOverlays()
                 for marker in result.markers {
                     self.objectMaskColorsByID[marker.id] = marker.color
                     self.objectMaskMarkerStates[marker.id] = ObjectMaskMarkerState(
@@ -1341,157 +1435,13 @@ struct ARCameraView: UIViewRepresentable {
                   let sceneDepth = frame.sceneDepth else {
                 return nil
             }
-            guard let depthMap = Self.copiedPixelBuffer(
-                sceneDepth.depthMap,
-                using: &objectMaskDepthBufferPool
-            ) else {
-                return nil
-            }
-            let confidenceMap: CVPixelBuffer?
-            if let sourceConfidenceMap = sceneDepth.confidenceMap {
-                guard let copiedConfidenceMap = Self.copiedPixelBuffer(
-                    sourceConfidenceMap,
-                    using: &objectMaskConfidenceBufferPool
-                ) else {
-                    return nil
-                }
-                confidenceMap = copiedConfidenceMap
-            } else {
-                confidenceMap = nil
-            }
             return ObjectMaskDepthSnapshot(
-                depthMap: depthMap,
-                confidenceMap: confidenceMap,
+                depthMap: sceneDepth.depthMap,
+                confidenceMap: sceneDepth.confidenceMap,
                 cameraTransform: frame.camera.transform,
                 cameraIntrinsics: frame.camera.intrinsics,
                 cameraImageResolution: frame.camera.imageResolution
             )
-        }
-
-        private static func copiedPixelBuffer(
-            _ source: CVPixelBuffer,
-            using pool: inout CVPixelBufferPool?
-        ) -> CVPixelBuffer? {
-            let width = CVPixelBufferGetWidth(source)
-            let height = CVPixelBufferGetHeight(source)
-            let pixelFormat = CVPixelBufferGetPixelFormatType(source)
-            var destination: CVPixelBuffer?
-
-            if let pool,
-               CVPixelBufferPoolCreatePixelBuffer(
-                   kCFAllocatorDefault,
-                   pool,
-                   &destination
-               ) != kCVReturnSuccess
-                    || destination.map({
-                        CVPixelBufferGetWidth($0) != width
-                            || CVPixelBufferGetHeight($0) != height
-                            || CVPixelBufferGetPixelFormatType($0) != pixelFormat
-                    }) == true {
-                destination = nil
-            }
-
-            if destination == nil {
-                let poolAttributes: [CFString: Any] = [
-                    kCVPixelBufferPoolMinimumBufferCountKey: 2
-                ]
-                let pixelBufferAttributes: [CFString: Any] = [
-                    kCVPixelBufferWidthKey: width,
-                    kCVPixelBufferHeightKey: height,
-                    kCVPixelBufferPixelFormatTypeKey: pixelFormat,
-                    kCVPixelBufferIOSurfacePropertiesKey: [:]
-                ]
-                var newPool: CVPixelBufferPool?
-                guard CVPixelBufferPoolCreate(
-                    kCFAllocatorDefault,
-                    poolAttributes as CFDictionary,
-                    pixelBufferAttributes as CFDictionary,
-                    &newPool
-                ) == kCVReturnSuccess,
-                      let newPool,
-                      CVPixelBufferPoolCreatePixelBuffer(
-                          kCFAllocatorDefault,
-                          newPool,
-                          &destination
-                      ) == kCVReturnSuccess else {
-                    pool = nil
-                    return nil
-                }
-                pool = newPool
-            }
-
-            guard let destination else {
-                return nil
-            }
-
-            guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess else {
-                return nil
-            }
-            guard CVPixelBufferLockBaseAddress(destination, []) == kCVReturnSuccess else {
-                CVPixelBufferUnlockBaseAddress(source, .readOnly)
-                return nil
-            }
-            defer {
-                CVPixelBufferUnlockBaseAddress(destination, [])
-                CVPixelBufferUnlockBaseAddress(source, .readOnly)
-            }
-
-            let planeCount = CVPixelBufferGetPlaneCount(source)
-            if planeCount > 0 {
-                guard planeCount == CVPixelBufferGetPlaneCount(destination) else {
-                    return nil
-                }
-                for plane in 0..<planeCount {
-                    guard let sourceAddress = CVPixelBufferGetBaseAddressOfPlane(source, plane),
-                          let destinationAddress = CVPixelBufferGetBaseAddressOfPlane(
-                              destination,
-                              plane
-                          ) else {
-                        return nil
-                    }
-                    let rowCount = min(
-                        CVPixelBufferGetHeightOfPlane(source, plane),
-                        CVPixelBufferGetHeightOfPlane(destination, plane)
-                    )
-                    let sourceRowBytes = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-                    let destinationRowBytes = CVPixelBufferGetBytesPerRowOfPlane(
-                        destination,
-                        plane
-                    )
-                    let copiedRowBytes = min(sourceRowBytes, destinationRowBytes)
-                    for row in 0..<rowCount {
-                        destinationAddress
-                            .advanced(by: row * destinationRowBytes)
-                            .copyMemory(
-                                from: sourceAddress.advanced(by: row * sourceRowBytes),
-                                byteCount: copiedRowBytes
-                            )
-                    }
-                }
-            } else {
-                guard let sourceAddress = CVPixelBufferGetBaseAddress(source),
-                      let destinationAddress = CVPixelBufferGetBaseAddress(destination) else {
-                    return nil
-                }
-                let rowCount = min(
-                    CVPixelBufferGetHeight(source),
-                    CVPixelBufferGetHeight(destination)
-                )
-                let sourceRowBytes = CVPixelBufferGetBytesPerRow(source)
-                let destinationRowBytes = CVPixelBufferGetBytesPerRow(destination)
-                let copiedRowBytes = min(sourceRowBytes, destinationRowBytes)
-                for row in 0..<rowCount {
-                    destinationAddress
-                        .advanced(by: row * destinationRowBytes)
-                        .copyMemory(
-                            from: sourceAddress.advanced(by: row * sourceRowBytes),
-                            byteCount: copiedRowBytes
-                        )
-                }
-            }
-
-            CVBufferPropagateAttachments(source, destination)
-            return destination
         }
 
         private func applyObjectMaskLockChange(_ change: ObjectMaskLockChange?, in arView: ARView) {
@@ -1508,6 +1458,7 @@ struct ARCameraView: UIViewRepresentable {
                     arView.session.remove(anchor: previousAnchor)
                 }
                 maskedAccumulators.removeValue(forKey: change.id)
+                removeObjectMaskSurfelOverlay(id: change.id)
                 supportAccumulators[change.id] = PointAccumulator(
                     voxelSize: ObjectCapturePipeline.supportVoxelSize,
                     maxVoxels: 4_000
@@ -1895,10 +1846,12 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            lastObjectMaskSubmittedFrameTimestamp = -.greatestFiniteMagnitude
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
+            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -1941,6 +1894,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskColorsByID.removeAll()
             maskedAccumulators.removeAll()
             supportAccumulators.removeAll()
+            removeAllObjectMaskSurfelOverlays()
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -2734,6 +2688,354 @@ struct ARCameraView: UIViewRepresentable {
             selectionPointEntity = entity
             selectionPointMeshCapacity = capacity
             return mesh
+        }
+
+        // MARK: - World-anchored mask overlay
+        //
+        // The mask used to be a bitmap of an older camera frame that the overlay
+        // stretched to guess where the object had moved. A similarity transform
+        // cannot express perspective, so the silhouette always trailed the
+        // object and skewed as soon as two faces of a box were visible at once.
+        //
+        // Instead the mask-admitted LiDAR surface is uploaded as world-space
+        // geometry. RealityKit then draws it in the same pass as the camera
+        // background, from the same pose, so registration is exact and free:
+        // Vision only has to say *which* surface is masked, and it can take as
+        // long as it likes doing so.
+
+        private func updateObjectMaskSurfelOverlay(for id: UUID) {
+            guard let set = objectMaskSurfelSetsByID[id],
+                  !set.surfels.isEmpty,
+                  captureEngine.showsLockedMaskPreviews,
+                  let contentAnchor else {
+                objectMaskSurfelEntitiesByID[id]?.entity.isEnabled = false
+                refreshWorldSurfelMaskObjectIDs()
+                return
+            }
+
+            let (ordered, fillCount, fillRadiusScale, boundaryRadiusScale) =
+                objectMaskSurfelDrawOrder(set.surfels)
+            guard !ordered.isEmpty else {
+                objectMaskSurfelEntitiesByID[id]?.entity.isEnabled = false
+                refreshWorldSurfelMaskObjectIDs()
+                return
+            }
+
+            guard let overlay = objectMaskSurfelEntity(
+                for: id,
+                in: contentAnchor,
+                minimumCapacity: ordered.count,
+                color: set.color,
+                fillAlpha: set.fillAlpha
+            ) else {
+                return
+            }
+            let verticesPerSurfel = Self.maskSurfelOffsets.count
+            let indicesPerSurfel = Self.maskSurfelIndices.count
+
+            overlay.mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { buffer in
+                let positions = buffer.bindMemory(to: SIMD3<Float>.self)
+                for (surfelIndex, surfel) in ordered.enumerated() {
+                    let vertexBase = surfelIndex * verticesPerSurfel
+                    let radius = surfel.isBoundary
+                        ? surfel.radius * Self.maskSurfelBoundaryRadiusScale
+                            * boundaryRadiusScale
+                        : surfel.radius * fillRadiusScale
+                    for offsetIndex in Self.maskSurfelOffsets.indices {
+                        positions[vertexBase + offsetIndex] = surfel.position
+                            + Self.maskSurfelOffsets[offsetIndex] * radius
+                    }
+                }
+            }
+
+            let bounds = objectMaskSurfelBounds(
+                ordered,
+                largestRadiusScale: max(
+                    fillRadiusScale,
+                    Self.maskSurfelBoundaryRadiusScale * boundaryRadiusScale
+                )
+            )
+            var parts: [LowLevelMesh.Part] = []
+            if fillCount > 0 {
+                parts.append(
+                    LowLevelMesh.Part(
+                        indexOffset: 0,
+                        indexCount: fillCount * indicesPerSurfel,
+                        topology: .triangle,
+                        materialIndex: 0,
+                        bounds: bounds
+                    )
+                )
+            }
+            let boundaryCount = ordered.count - fillCount
+            if boundaryCount > 0 {
+                parts.append(
+                    LowLevelMesh.Part(
+                        indexOffset: fillCount * indicesPerSurfel
+                            * MemoryLayout<UInt32>.stride,
+                        indexCount: boundaryCount * indicesPerSurfel,
+                        topology: .triangle,
+                        materialIndex: 1,
+                        bounds: bounds
+                    )
+                )
+            }
+            overlay.mesh.parts.replaceAll(parts)
+            overlay.entity.isEnabled = true
+            refreshWorldSurfelMaskObjectIDs()
+        }
+
+        /// Orders surfels so fill precedes silhouette, and thins the fill if the
+        /// object covers more of the frame than the mesh budget allows.
+        ///
+        /// Fill surfels occupy the low vertex blocks and silhouette surfels the
+        /// high ones, which lets the index buffer stay static: it is written once
+        /// per capacity, and a keyframe only rewrites positions before splitting
+        /// the fixed index range into a fill part and a rim part.
+        ///
+        /// The silhouette tier gets the budget first — the rim is one sample wide,
+        /// so thinning it is immediately visible, whereas thinned fill can be
+        /// compensated. Whichever tier is thinned has its splats grown by the
+        /// square root of the drop ratio, which preserves covered area and keeps
+        /// the overlay solid. The total is capped unconditionally, so the mesh
+        /// buffers can never grow past the budget however noisy the depth is.
+        private func objectMaskSurfelDrawOrder(
+            _ surfels: [ObjectMaskSurfel]
+        ) -> (
+            ordered: [ObjectMaskSurfel],
+            fillCount: Int,
+            fillRadiusScale: Float,
+            boundaryRadiusScale: Float
+        ) {
+            var fill: [ObjectMaskSurfel] = []
+            var boundary: [ObjectMaskSurfel] = []
+            fill.reserveCapacity(surfels.count)
+            for surfel in surfels {
+                if surfel.isBoundary {
+                    boundary.append(surfel)
+                } else {
+                    fill.append(surfel)
+                }
+            }
+
+            let budget = Self.maskSurfelDisplayLimit
+            var boundaryRadiusScale: Float = 1
+            if boundary.count > budget {
+                (boundary, boundaryRadiusScale) = Self.thinned(boundary, to: budget)
+            }
+            var fillRadiusScale: Float = 1
+            let fillBudget = max(budget - boundary.count, 0)
+            if fill.count > fillBudget {
+                (fill, fillRadiusScale) = Self.thinned(fill, to: fillBudget)
+            }
+
+            return (
+                fill + boundary,
+                fill.count,
+                fillRadiusScale,
+                boundaryRadiusScale
+            )
+        }
+
+        /// Uniformly strides `surfels` down to at most `limit`, returning the
+        /// radius scale that keeps the thinned set covering the same area.
+        private static func thinned(
+            _ surfels: [ObjectMaskSurfel],
+            to limit: Int
+        ) -> ([ObjectMaskSurfel], Float) {
+            guard limit > 0 else {
+                return ([], 1)
+            }
+            guard surfels.count > limit else {
+                return (surfels, 1)
+            }
+            let step = max(
+                Int((Double(surfels.count) / Double(limit)).rounded(.up)),
+                1
+            )
+            var kept: [ObjectMaskSurfel] = []
+            kept.reserveCapacity(limit)
+            for index in Swift.stride(from: 0, to: surfels.count, by: step) {
+                kept.append(surfels[index])
+            }
+            let scale = (Float(surfels.count) / Float(max(kept.count, 1)))
+                .squareRoot()
+            return (kept, scale)
+        }
+
+        private func objectMaskSurfelEntity(
+            for id: UUID,
+            in contentAnchor: AnchorEntity,
+            minimumCapacity: Int,
+            color: ObjectMaskDisplayColor,
+            fillAlpha: CGFloat
+        ) -> ObjectMaskSurfelEntity? {
+            if let existing = objectMaskSurfelEntitiesByID[id],
+               existing.capacity >= minimumCapacity {
+                existing.entity.model?.materials = objectMaskSurfelMaterials(
+                    color: color,
+                    fillAlpha: fillAlpha
+                )
+                return existing
+            }
+
+            var capacity = Self.maskSurfelMinimumCapacity
+            while capacity < minimumCapacity {
+                capacity *= 2
+            }
+            let verticesPerSurfel = Self.maskSurfelOffsets.count
+            let indicesPerSurfel = Self.maskSurfelIndices.count
+            let descriptor = LowLevelMesh.Descriptor(
+                vertexCapacity: capacity * verticesPerSurfel,
+                vertexAttributes: [
+                    LowLevelMesh.Attribute(
+                        semantic: .position,
+                        format: .float3,
+                        offset: 0
+                    )
+                ],
+                vertexLayouts: [
+                    LowLevelMesh.Layout(
+                        bufferIndex: 0,
+                        bufferStride: MemoryLayout<SIMD3<Float>>.stride
+                    )
+                ],
+                indexCapacity: capacity * indicesPerSurfel,
+                indexType: .uint32
+            )
+            guard let mesh = try? LowLevelMesh(descriptor: descriptor) else {
+                return nil
+            }
+            mesh.replaceUnsafeMutableIndices { buffer in
+                let indices = buffer.bindMemory(to: UInt32.self)
+                for surfelIndex in 0 ..< capacity {
+                    let vertexBase = UInt32(surfelIndex * verticesPerSurfel)
+                    let indexBase = surfelIndex * indicesPerSurfel
+                    for localIndex in Self.maskSurfelIndices.indices {
+                        indices[indexBase + localIndex] =
+                            vertexBase + Self.maskSurfelIndices[localIndex]
+                    }
+                }
+            }
+            guard let resource = try? MeshResource(from: mesh) else {
+                return nil
+            }
+
+            let entity = ModelEntity(
+                mesh: resource,
+                materials: objectMaskSurfelMaterials(
+                    color: color,
+                    fillAlpha: fillAlpha
+                )
+            )
+            objectMaskSurfelEntitiesByID[id]?.entity.removeFromParent()
+            contentAnchor.addChild(entity)
+            let overlay = ObjectMaskSurfelEntity(
+                mesh: mesh,
+                entity: entity,
+                capacity: capacity
+            )
+            objectMaskSurfelEntitiesByID[id] = overlay
+            return overlay
+        }
+
+        private func objectMaskSurfelMaterials(
+            color: ObjectMaskDisplayColor,
+            fillAlpha: CGFloat
+        ) -> [UnlitMaterial] {
+            [
+                UnlitMaterial(
+                    color: UIColor(
+                        red: CGFloat(color.red),
+                        green: CGFloat(color.green),
+                        blue: CGFloat(color.blue),
+                        alpha: fillAlpha
+                    ),
+                    applyPostProcessToneMap: false
+                ),
+                UnlitMaterial(
+                    color: UIColor(
+                        red: CGFloat(color.red),
+                        green: CGFloat(color.green),
+                        blue: CGFloat(color.blue),
+                        alpha: Self.maskSurfelBoundaryAlpha
+                    ),
+                    applyPostProcessToneMap: false
+                )
+            ]
+        }
+
+        private func objectMaskSurfelBounds(
+            _ surfels: [ObjectMaskSurfel],
+            largestRadiusScale: Float
+        ) -> BoundingBox {
+            var minimum = surfels[0].position
+            var maximum = surfels[0].position
+            var largestRadius = surfels[0].radius
+            for surfel in surfels.dropFirst() {
+                minimum = simd_min(minimum, surfel.position)
+                maximum = simd_max(maximum, surfel.position)
+                largestRadius = max(largestRadius, surfel.radius)
+            }
+            let padding = SIMD3<Float>(
+                repeating: largestRadius * largestRadiusScale
+            )
+            return BoundingBox(min: minimum - padding, max: maximum + padding)
+        }
+
+        private func removeObjectMaskSurfelOverlay(id: UUID) {
+            objectMaskSurfelSetsByID.removeValue(forKey: id)
+            objectMaskSurfelEntitiesByID.removeValue(forKey: id)?
+                .entity.removeFromParent()
+            refreshWorldSurfelMaskObjectIDs()
+        }
+
+        private func removeAllObjectMaskSurfelOverlays() {
+            objectMaskSurfelSetsByID.removeAll()
+            for overlay in objectMaskSurfelEntitiesByID.values {
+                overlay.entity.removeFromParent()
+            }
+            objectMaskSurfelEntitiesByID.removeAll()
+            refreshWorldSurfelMaskObjectIDs()
+        }
+
+        private func updateObjectMaskSurfelVisibility() {
+            for id in Array(objectMaskSurfelSetsByID.keys) {
+                updateObjectMaskSurfelOverlay(for: id)
+            }
+            refreshWorldSurfelMaskObjectIDs()
+        }
+
+        /// Drops overlays for objects that are no longer being measured or kept.
+        ///
+        /// A surfel overlay is world geometry, so a stale one keeps painting a
+        /// surface the app has stopped tracking. Objects that are merely lost
+        /// from view are deliberately left alone: their geometry is still correct
+        /// where it stands, and it reappears registered when the camera returns.
+        private func pruneObjectMaskSurfelOverlays() {
+            let retained = Set([captureEngine.activeObjectID].compactMap { $0 })
+                .union(captureEngine.finalizedObjectIDs)
+            for id in Array(objectMaskSurfelSetsByID.keys)
+            where !retained.contains(id) {
+                removeObjectMaskSurfelOverlay(id: id)
+            }
+            for id in Array(objectMaskSurfelEntitiesByID.keys)
+            where !retained.contains(id) {
+                removeObjectMaskSurfelOverlay(id: id)
+            }
+        }
+
+        /// Tells the 2D overlay which objects it must not draw. Only objects with
+        /// a live, enabled surfel overlay qualify, so if the geometry path ever
+        /// fails to build the bitmap path stays visible rather than the mask
+        /// disappearing.
+        private func refreshWorldSurfelMaskObjectIDs() {
+            let ids = Set(
+                objectMaskSurfelEntitiesByID
+                    .filter { $0.value.entity.isEnabled }
+                    .keys
+            )
+            captureEngine.updateWorldSurfelMaskObjectIDs(ids)
         }
 
         private func selectionPointBounds(_ points: [SIMD3<Float>]) -> BoundingBox {

@@ -100,9 +100,33 @@ struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let cameraImageResolution: CGSize
 }
 
+/// One display-only splat of the masked LiDAR surface.
+///
+/// Surfels are handed to RealityKit as world-space geometry so the mask is drawn
+/// by the same render pass that draws the camera background. That makes the
+/// overlay pose-correct for free: it cannot lag behind the camera, and it
+/// follows perspective, parallax and rotation exactly, which a warped 2D
+/// bitmap of an older frame never can.
+///
+/// `radius` is chosen so the splat covers roughly one depth-map sample at its
+/// own distance, which keeps the on-screen footprint constant as the operator
+/// walks in and out. `isBoundary` marks samples on the screen-space silhouette
+/// so the renderer can outline the mask the same way the 2D path did.
+struct ObjectMaskSurfel: Sendable {
+    let position: SIMD3<Float>
+    let radius: Float
+    let isBoundary: Bool
+}
+
 struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let id: UUID
+    /// Exact mask-admitted depth points. These feed measurement and must stay
+    /// untouched by any display concern.
     let points: [SIMD3<Float>]
+    /// Display splats, index-parallel to `points`.
+    let surfels: [ObjectMaskSurfel]
+    let color: ObjectMaskDisplayColor
+    let fillAlpha: CGFloat
     let timestamp: TimeInterval
 }
 
@@ -432,7 +456,7 @@ actor ObjectMaskDisplayTracker {
     ) -> NormalizedRect {
         let old = previous.cgRect
         let new = current.cgRect
-        let alpha: CGFloat = 0.6
+        let alpha: CGFloat = 0.85
         return NormalizedRect(
             x: old.minX + (new.minX - old.minX) * alpha,
             y: old.minY + (new.minY - old.minY) * alpha,
@@ -622,6 +646,9 @@ actor ObjectMaskProcessor {
                 ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
                 return result(preview: nil, frame: frame)
             }
+            guard !Task.isCancelled else {
+                return result(preview: nil, frame: frame)
+            }
 
             await updateTrackedObjects(
                 using: observation,
@@ -629,6 +656,9 @@ actor ObjectMaskProcessor {
                 cameraImage: cameraImage,
                 frame: frame
             )
+            guard !Task.isCancelled else {
+                return result(preview: nil, frame: frame)
+            }
 
             let toggleOutcome: ToggleOutcome
             if let toggleRequest = frame.toggleRequest,
@@ -665,16 +695,31 @@ actor ObjectMaskProcessor {
                 frame: frame,
                 activeObjectID: effectiveActiveObjectID
             )
+            if Task.isCancelled {
+                if let addedTrackerID {
+                    trackedObjects.removeAll {
+                        $0.id == addedTrackerID
+                    }
+                }
+                return result(preview: nil, frame: frame)
+            }
             var previewLayers: [ObjectMaskPreviewLayer] = []
             var maskedPointClouds: [ObjectMaskDepthPointCloud] = []
             previewLayers.reserveCapacity(selections.count)
             maskedPointClouds.reserveCapacity(selections.count)
 
             for selection in selections {
+                if Task.isCancelled {
+                    if let addedTrackerID {
+                        trackedObjects.removeAll {
+                            $0.id == addedTrackerID
+                        }
+                    }
+                    return result(preview: nil, frame: frame)
+                }
                 let processed = try autoreleasepool {
-                    let pixelBuffer = try observation.generateScaledMask(
-                        for: selection.instances,
-                        scaledToImageFrom: handler
+                    let pixelBuffer = try observation.generateMask(
+                        for: selection.instances
                     )
                     let renderedMask = RenderedMask(
                         lockID: selection.lockID,
@@ -705,11 +750,28 @@ actor ObjectMaskProcessor {
                             trackingOrientation: frame.orientation
                         )
                     }
-                    let cloud = makeMaskedPointClouds(
-                        from: [renderedMask],
-                        frame: frame,
-                        activeObjectID: effectiveActiveObjectID
-                    ).first
+                    let cloud: ObjectMaskDepthPointCloud?
+                    if selection.lockID == effectiveActiveObjectID,
+                       frame.depthSnapshot != nil {
+                        let sourceAlignedBuffer = try observation
+                            .generateScaledMask(
+                                for: selection.instances,
+                                scaledToImageFrom: handler
+                            )
+                        let sourceAlignedMask = RenderedMask(
+                            lockID: selection.lockID,
+                            color: selection.color,
+                            fillAlpha: selection.fillAlpha,
+                            pixelBuffer: sourceAlignedBuffer
+                        )
+                        cloud = makeMaskedPointClouds(
+                            from: [sourceAlignedMask],
+                            frame: frame,
+                            activeObjectID: effectiveActiveObjectID
+                        ).first
+                    } else {
+                        cloud = nil
+                    }
                     return (layer, cloud)
                 }
                 if let layer = processed.0 {
@@ -759,6 +821,9 @@ actor ObjectMaskProcessor {
                 trackedObjects.removeAll {
                     $0.id == addedTrackerID
                 }
+            }
+            if Task.isCancelled {
+                return result(preview: nil, frame: frame)
             }
             ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
             return result(preview: nil, frame: frame)
@@ -880,6 +945,9 @@ actor ObjectMaskProcessor {
             cameraDistance: cameraDistance
         )
         let trackedObservation = try? await handler.perform(trackedObjects[index].request)
+        guard !Task.isCancelled else {
+            return
+        }
         let predictedBox = validatedPrediction(
             trackedObservation?.boundingBox,
             relativeTo: trackedObjects[index].lastGeometry.boundingBox
@@ -1757,27 +1825,41 @@ actor ObjectMaskProcessor {
                   let hint = hintsByID[lockID] else {
                 return nil
             }
-            let points = maskedWorldPoints(
+            let surface = maskedWorldSurface(
                 mask: renderedMask.pixelBuffer,
                 anchor: hint,
                 frame: frame,
                 depth: depth
             )
-            guard !points.isEmpty else {
+            guard !surface.points.isEmpty else {
                 return nil
             }
-            return ObjectMaskDepthPointCloud(id: lockID, points: points, timestamp: frame.timestamp)
+            return ObjectMaskDepthPointCloud(
+                id: lockID,
+                points: surface.points,
+                surfels: surface.surfels,
+                color: renderedMask.color,
+                fillAlpha: renderedMask.fillAlpha,
+                timestamp: frame.timestamp
+            )
         }
     }
 
-    private func maskedWorldPoints(
+    /// Mask-admitted LiDAR surface, in both measurement and display form.
+    ///
+    /// `points` is the untouched metric point set the box fitter consumes.
+    /// `surfels` is index-parallel to it and adds only presentation data: a
+    /// world radius that holds a constant on-screen footprint, and a silhouette
+    /// flag taken from the depth-grid neighbourhood of each admitted sample.
+    private func maskedWorldSurface(
         mask: CVPixelBuffer,
         anchor: ObjectMaskAnchorHint,
         frame: ObjectMaskFrame,
         depth: ObjectMaskDepthSnapshot
-    ) -> [SIMD3<Float>] {
+    ) -> (points: [SIMD3<Float>], surfels: [ObjectMaskSurfel]) {
+        let empty: (points: [SIMD3<Float>], surfels: [ObjectMaskSurfel]) = ([], [])
         guard CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float else {
-            return []
+            return empty
         }
 
         let depthMap = depth.depthMap
@@ -1794,7 +1876,7 @@ actor ObjectMaskProcessor {
         let cx = depth.cameraIntrinsics.columns.2.x * scaleX
         let cy = depth.cameraIntrinsics.columns.2.y * scaleY
         guard fx > 0, fy > 0 else {
-            return []
+            return empty
         }
 
         CVPixelBufferLockBaseAddress(mask, .readOnly)
@@ -1812,7 +1894,7 @@ actor ObjectMaskProcessor {
 
         guard let maskBase = CVPixelBufferGetBaseAddress(mask)?.assumingMemoryBound(to: Float.self),
               let depthBase = CVPixelBufferGetBaseAddress(depthMap) else {
-            return []
+            return empty
         }
         let maskStride = CVPixelBufferGetBytesPerRow(mask) / MemoryLayout<Float>.stride
         let depthRowBytes = CVPixelBufferGetBytesPerRow(depthMap)
@@ -1824,8 +1906,16 @@ actor ObjectMaskProcessor {
         let anchorDepth = max(-anchorInCamera.z, 0.05)
         let maximumDepthDifference = max(min(anchorDepth * 0.22, 0.32), 0.10)
         let maximumWorldDistanceSquared: Float = 0.42 * 0.42
-        var points: [SIMD3<Float>] = []
-        points.reserveCapacity(depthWidth * depthHeight / 5)
+
+        // Pass one records which depth samples the mask admits, keeping the
+        // grid layout so pass two can ask each survivor about its neighbours.
+        var admitted = [Bool](repeating: false, count: depthWidth * depthHeight)
+        var worldPoints = [SIMD3<Float>](
+            repeating: .zero,
+            count: depthWidth * depthHeight
+        )
+        var sampleDepths = [Float](repeating: 0, count: depthWidth * depthHeight)
+        var admittedCount = 0
 
         for row in 0 ..< depthHeight {
             let depthRow = depthBase
@@ -1869,10 +1959,56 @@ actor ObjectMaskProcessor {
                       worldPoint.z.isFinite else {
                     continue
                 }
-                points.append(worldPoint)
+                let index = row * depthWidth + column
+                admitted[index] = true
+                worldPoints[index] = worldPoint
+                sampleDepths[index] = measuredDepth
+                admittedCount += 1
             }
         }
-        return points
+
+        guard admittedCount > 0 else {
+            return empty
+        }
+
+        // A splat wide enough to close the gap to its grid neighbours keeps the
+        // overlay continuous; `spacingFactor` above 0.5 guarantees overlap on a
+        // fronto-parallel surface without visibly fattening the silhouette.
+        let spacingFactor: Float = 0.9
+        var points: [SIMD3<Float>] = []
+        var surfels: [ObjectMaskSurfel] = []
+        points.reserveCapacity(admittedCount)
+        surfels.reserveCapacity(admittedCount)
+
+        for row in 0 ..< depthHeight {
+            for column in 0 ..< depthWidth {
+                let index = row * depthWidth + column
+                guard admitted[index] else {
+                    continue
+                }
+                let isBoundary = column == 0
+                    || column == depthWidth - 1
+                    || row == 0
+                    || row == depthHeight - 1
+                    || !admitted[index - 1]
+                    || !admitted[index + 1]
+                    || !admitted[index - depthWidth]
+                    || !admitted[index + depthWidth]
+                let sampleSpacing = sampleDepths[index] / fx
+                points.append(worldPoints[index])
+                surfels.append(
+                    ObjectMaskSurfel(
+                        position: worldPoints[index],
+                        radius: min(
+                            max(sampleSpacing * spacingFactor, 0.0015),
+                            0.02
+                        ),
+                        isBoundary: isBoundary
+                    )
+                )
+            }
+        }
+        return (points, surfels)
     }
 
 }

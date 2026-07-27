@@ -278,7 +278,12 @@ struct MesOverlayView: View {
             ZStack {
                 ForEach(preview.layers, id: \.id) { layer in
                     if let trackedObjectID = layer.trackedObjectID {
+                        // Objects with a world-anchored surfel overlay are drawn
+                        // by RealityKit instead; warping their older bitmap on
+                        // top would only reintroduce the lag it replaced.
                         if captureEngine.showsLockedMaskPreviews,
+                           !captureEngine.worldSurfelMaskObjectIDs
+                               .contains(trackedObjectID),
                            let marker = captureEngine.objectMaskMarkers.first(where: {
                                $0.id == trackedObjectID
                            }) {
@@ -319,8 +324,10 @@ struct MesOverlayView: View {
                 }
                 return min(max(CGFloat(referenceDistance / currentDistance), 0.4), 2.5)
             }()
-            let trackedPosition: (
+            let trackedTransform: (
                 anchor: UnitPoint,
+                xScale: CGFloat,
+                yScale: CGFloat,
                 xOffset: CGFloat,
                 yOffset: CGFloat
             )? = {
@@ -334,16 +341,20 @@ struct MesOverlayView: View {
                 }
                 return (
                     UnitPoint(x: reference.midX, y: reference.midY),
+                    min(max(current.width / reference.width, 0.4), 2.5),
+                    min(max(current.height / reference.height, 0.4), 2.5),
                     (current.midX - reference.midX) * proxy.size.width,
                     (current.midY - reference.midY) * proxy.size.height
                 )
             }()
-            let uniformScale = marker == nil ? 1 : distanceScale
-            let anchor = trackedPosition?.anchor
+            let fallbackScale = marker == nil ? 1 : distanceScale
+            let xScale = trackedTransform?.xScale ?? fallbackScale
+            let yScale = trackedTransform?.yScale ?? fallbackScale
+            let anchor = trackedTransform?.anchor
                 ?? UnitPoint(x: referencePoint.x, y: referencePoint.y)
-            let xOffset = trackedPosition?.xOffset
+            let xOffset = trackedTransform?.xOffset
                 ?? (currentPoint.x - referencePoint.x) * proxy.size.width
-            let yOffset = trackedPosition?.yOffset
+            let yOffset = trackedTransform?.yOffset
                 ?? (currentPoint.y - referencePoint.y) * proxy.size.height
 
             ZStack {
@@ -351,7 +362,8 @@ struct MesOverlayView: View {
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .scaleEffect(
-                        uniformScale,
+                        x: xScale,
+                        y: yScale,
                         anchor: anchor
                     )
                     .offset(

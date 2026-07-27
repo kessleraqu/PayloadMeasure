@@ -50,6 +50,11 @@ final class ObjectCaptureEngine {
     private(set) var focusedCaptureID: UUID?
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
+    /// Objects whose mask is currently drawn as world-anchored RealityKit
+    /// surfels. Their 2D layer is still produced — the visible-point cleanup
+    /// samples its alpha — but the overlay must not draw it, or a stale bitmap
+    /// would smear on top of the pose-correct geometry.
+    private(set) var worldSurfelMaskObjectIDs: Set<UUID> = []
     private var liveMaskLayer: ObjectMaskPreviewLayer?
     private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
@@ -273,6 +278,13 @@ final class ObjectCaptureEngine {
         rebuildObjectMaskPreview(timestamp: preview.timestamp)
     }
 
+    func updateWorldSurfelMaskObjectIDs(_ ids: Set<UUID>) {
+        guard worldSurfelMaskObjectIDs != ids else {
+            return
+        }
+        worldSurfelMaskObjectIDs = ids
+    }
+
     func updateObjectMaskDisplayBoundingBoxes(_ boundingBoxes: [UUID: CGRect]) {
         let activeBoundingBoxes = boundingBoxes.filter {
             !finalizedObjectIDs.contains($0.key)
@@ -444,6 +456,7 @@ final class ObjectCaptureEngine {
         objectColorsByID.removeValue(forKey: id)
         lockedMaskLayersByID.removeValue(forKey: id)
         lockedMaskLayerOrder.removeAll(where: { $0 == id })
+        worldSurfelMaskObjectIDs.remove(id)
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
         objectMaskMarkers.removeAll(where: { $0.id == id })
         objectMaskMarkerMissCounts.removeValue(forKey: id)
@@ -495,6 +508,7 @@ final class ObjectCaptureEngine {
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
+        worldSurfelMaskObjectIDs.removeAll()
         liveMaskLayer = nil
         objectMaskDisplayBoundingBoxes.removeAll()
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
@@ -617,6 +631,7 @@ final class ObjectCaptureEngine {
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
+        worldSurfelMaskObjectIDs.removeAll()
         liveMaskLayer = nil
         objectMaskDisplayBoundingBoxes.removeAll()
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
