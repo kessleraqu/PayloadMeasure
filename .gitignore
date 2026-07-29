@@ -1,3 +1,7 @@
 # Xcode per-user state
 **/xcuserdata/
 *.xcuserstate
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/ 
