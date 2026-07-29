@@ -50,6 +50,16 @@ struct ARCameraView: UIViewRepresentable {
             var trackedRaycast: ARTrackedRaycast?
         }
 
+        /// A horizontal footprint (width × length + yaw + XZ position) captured from a top-down view.
+        /// Height is stored separately and captured from a side view, so each dimension is measured
+        /// from the viewpoint that sees it best and is not disturbed by the other.
+        private struct ObjectFootprint {
+            var widthAxis: SIMD3<Float>
+            var width: Float
+            var depth: Float
+            var centerXZ: SIMD2<Float>
+        }
+
         private struct ObjectMaskMarkerState {
             let color: ObjectMaskDisplayColor
             let isMaskVisible: Bool
@@ -215,6 +225,13 @@ struct ARCameraView: UIViewRepresentable {
         private var newestMaskedPointTimestamp: [UUID: TimeInterval] = [:]
         private var fittedMaskedPointTimestamp: [UUID: TimeInterval] = [:]
         private var liveResultsByObject: [UUID: CaptureResult] = [:]
+        // View-gated per-dimension memory: the footprint (width/length/yaw/position) is captured from
+        // a top-down view and the height from a side view, and each is remembered so the other
+        // viewpoint cannot disturb it (this also stops side-view background points widening W/L).
+        private var capturedFootprintByObject: [UUID: ObjectFootprint] = [:]
+        private var capturedHeightByObject: [UUID: Float] = [:]
+        private var footprintFromTopObjects: Set<UUID> = []
+        private var heightFromSideObjects: Set<UUID> = []
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
@@ -670,54 +687,21 @@ struct ARCameraView: UIViewRepresentable {
                     guard cloud.id == self.captureEngine.activeObjectID else {
                         continue
                     }
-                    // `points` and `surfels` are index-parallel, so the manual
-                    // rejection filter has to drop the same indices from both or
-                    // the overlay would keep painting discarded surface.
+                    // The yellow world-space mask surfels were removed: they rebuilt
+                    // up to ~96k vertices per frame purely to visualize the mask and
+                    // had no effect on the measurement (which uses `acceptedPoints`
+                    // below). The lightweight 2D mask preview remains as the highlight.
                     let acceptedPoints: [SIMD3<Float>]
-                    let acceptedSurfels: [ObjectMaskSurfel]
                     if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
-                       !rejectedKeys.isEmpty,
-                       cloud.surfels.count == cloud.points.count {
-                        var keptPoints: [SIMD3<Float>] = []
-                        var keptSurfels: [ObjectMaskSurfel] = []
-                        keptPoints.reserveCapacity(cloud.points.count)
-                        keptSurfels.reserveCapacity(cloud.surfels.count)
-                        for index in cloud.points.indices
-                        where !rejectedKeys.contains(
-                            self.selectionVoxelKey(for: cloud.points[index])
-                        ) {
-                            keptPoints.append(cloud.points[index])
-                            keptSurfels.append(cloud.surfels[index])
-                        }
-                        acceptedPoints = keptPoints
-                        acceptedSurfels = keptSurfels
-                    } else if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
-                              !rejectedKeys.isEmpty {
+                       !rejectedKeys.isEmpty {
                         acceptedPoints = cloud.points.filter {
-                            !rejectedKeys.contains(
-                                self.selectionVoxelKey(for: $0)
-                            )
+                            !rejectedKeys.contains(self.selectionVoxelKey(for: $0))
                         }
-                        acceptedSurfels = []
                     } else {
                         acceptedPoints = cloud.points
-                        acceptedSurfels = cloud.surfels
                     }
                     guard !acceptedPoints.isEmpty else {
                         continue
-                    }
-                    if !acceptedSurfels.isEmpty,
-                       cloud.timestamp >= (
-                           self.objectMaskSurfelSetsByID[cloud.id]?.timestamp
-                               ?? -.greatestFiniteMagnitude
-                       ) {
-                        self.objectMaskSurfelSetsByID[cloud.id] = ObjectMaskSurfelSet(
-                            surfels: acceptedSurfels,
-                            color: cloud.color,
-                            fillAlpha: cloud.fillAlpha,
-                            timestamp: cloud.timestamp
-                        )
-                        self.updateObjectMaskSurfelOverlay(for: cloud.id)
                     }
                     if self.maskedAccumulators[cloud.id] == nil {
                         self.maskedAccumulators[cloud.id] = PointAccumulator(
@@ -1466,6 +1450,10 @@ struct ARCameraView: UIViewRepresentable {
                 newestMaskedPointTimestamp.removeValue(forKey: change.id)
                 fittedMaskedPointTimestamp.removeValue(forKey: change.id)
                 liveResultsByObject.removeValue(forKey: change.id)
+                capturedFootprintByObject.removeValue(forKey: change.id)
+                capturedHeightByObject.removeValue(forKey: change.id)
+                footprintFromTopObjects.remove(change.id)
+                heightFromSideObjects.remove(change.id)
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
                 manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
@@ -1691,8 +1679,15 @@ struct ARCameraView: UIViewRepresentable {
                         )
                     }
                 }
-                addCapturedBox(acceptedResult.object, for: id)
-                captureEngine.updateCapture(id: id, object: acceptedResult.object)
+                let displayBox = viewGatedBox(
+                    fitted: acceptedResult.object,
+                    id: id,
+                    base: planeSupportHeight,
+                    camera: frame.camera.transform,
+                    isActive: id == activeObjectID
+                )
+                addCapturedBox(displayBox, for: id)
+                captureEngine.updateCapture(id: id, object: displayBox)
             }
 
             if liveResultsByObject[activeObjectID] != nil {
@@ -2575,6 +2570,10 @@ struct ARCameraView: UIViewRepresentable {
             captureEntitiesByObject.removeAll()
             captureBoxActiveSpanCountsByObject.removeAll()
             captureBoxRearEdgeStatesByObject.removeAll()
+            capturedFootprintByObject.removeAll()
+            capturedHeightByObject.removeAll()
+            footprintFromTopObjects.removeAll()
+            heightFromSideObjects.removeAll()
             hideAllSelectionMarkers()
             selectionPointsByObject.removeAll()
         }
@@ -2585,6 +2584,173 @@ struct ARCameraView: UIViewRepresentable {
             }
             captureBoxActiveSpanCountsByObject.removeValue(forKey: id)
             captureBoxRearEdgeStatesByObject.removeValue(forKey: id)
+            capturedFootprintByObject.removeValue(forKey: id)
+            capturedHeightByObject.removeValue(forKey: id)
+            footprintFromTopObjects.remove(id)
+            heightFromSideObjects.remove(id)
+        }
+
+        // MARK: - View-gated per-dimension capture
+
+        /// Classifies the camera viewpoint relative to gravity: a top-down view sees the footprint
+        /// (width × length), a side view sees the height. `camera` is the ARKit camera transform.
+        private func classifyView(_ camera: simd_float4x4) -> ObjectCaptureEngine.ScanViewHint {
+            // ARKit cameras look down their local -Z. Its world Y component tells us the pitch.
+            let forwardY = -camera.columns.2.y
+            if forwardY < -0.55 {
+                return .topDown
+            }
+            if abs(forwardY) < 0.4 {
+                return .side
+            }
+            return .other
+        }
+
+        /// Wraps a freshly fitted box with per-dimension memory: width/length come from the last
+        /// top-down view and height from the last side view. This is what makes the measurement
+        /// "remember" each face and stops a side view (where background points can appear behind the
+        /// object) from widening the footprint, and a top view from disturbing the height.
+        private func viewGatedBox(
+            fitted: CapturedObject,
+            id: UUID,
+            base: Float?,
+            camera: simd_float4x4,
+            isActive: Bool
+        ) -> CapturedObject {
+            let up = SIMD3<Float>(0, 1, 0)
+            let view = classifyView(camera)
+
+            var candidateAxis = SIMD3<Float>(fitted.axes.width.x, 0, fitted.axes.width.z)
+            if simd_length(candidateAxis) < 1e-4 {
+                candidateAxis = SIMD3<Float>(1, 0, 0)
+            }
+            candidateAxis = simd_normalize(candidateAxis)
+            let candidateFootprint = ObjectFootprint(
+                widthAxis: candidateAxis,
+                width: fitted.dimensions.x,
+                depth: fitted.dimensions.y,
+                centerXZ: SIMD2<Float>(fitted.center.x, fitted.center.z)
+            )
+            let candidateHeight = fitted.dimensions.z
+            let baseY = base ?? (fitted.center.y - fitted.dimensions.z / 2)
+
+            // Bootstrap so a box appears immediately, before an ideal view has been shown.
+            if capturedFootprintByObject[id] == nil {
+                capturedFootprintByObject[id] = candidateFootprint
+            }
+            if capturedHeightByObject[id] == nil {
+                capturedHeightByObject[id] = candidateHeight
+            }
+
+            switch view {
+            case .topDown:
+                capturedFootprintByObject[id] = alignFootprint(
+                    candidateFootprint,
+                    to: capturedFootprintByObject[id]
+                )
+                footprintFromTopObjects.insert(id)
+            case .side:
+                capturedHeightByObject[id] = candidateHeight
+                heightFromSideObjects.insert(id)
+            case .other:
+                break
+            }
+
+            if isActive {
+                captureEngine.updateScanGuidance(
+                    view: view,
+                    footprintFromTop: footprintFromTopObjects.contains(id),
+                    heightFromSide: heightFromSideObjects.contains(id)
+                )
+            }
+
+            let footprint = capturedFootprintByObject[id] ?? candidateFootprint
+            let height = capturedHeightByObject[id] ?? candidateHeight
+            return makeViewBox(
+                footprint: footprint,
+                height: height,
+                base: baseY,
+                up: up,
+                sampleCount: fitted.sampleCount
+            )
+        }
+
+        /// Re-expresses a fresh footprint in the orientation closest to the remembered one, so the
+        /// box yaw stays stable across ticks instead of flipping between the min-area axes.
+        private func alignFootprint(
+            _ candidate: ObjectFootprint,
+            to previous: ObjectFootprint?
+        ) -> ObjectFootprint {
+            guard let previous else {
+                return candidate
+            }
+            let up = SIMD3<Float>(0, 1, 0)
+            let perpendicular = simd_normalize(simd_cross(up, candidate.widthAxis))
+            let options: [(axis: SIMD3<Float>, width: Float, depth: Float)] = [
+                (candidate.widthAxis, candidate.width, candidate.depth),
+                (-candidate.widthAxis, candidate.width, candidate.depth),
+                (perpendicular, candidate.depth, candidate.width),
+                (-perpendicular, candidate.depth, candidate.width)
+            ]
+            let best = options.max {
+                simd_dot($0.axis, previous.widthAxis) < simd_dot($1.axis, previous.widthAxis)
+            } ?? options[0]
+            return ObjectFootprint(
+                widthAxis: best.axis,
+                width: best.width,
+                depth: best.depth,
+                centerXZ: candidate.centerXZ
+            )
+        }
+
+        /// Builds an axis-aligned-in-its-own-frame box from a horizontal footprint, a height above
+        /// the support, and the support height. Corner order matches `ObjectBoundingBox.make`.
+        private func makeViewBox(
+            footprint: ObjectFootprint,
+            height: Float,
+            base: Float,
+            up: SIMD3<Float>,
+            sampleCount: Int
+        ) -> CapturedObject {
+            let widthAxis = simd_normalize(footprint.widthAxis)
+            let depthAxis = simd_normalize(simd_cross(up, widthAxis))
+            let clampedHeight = max(height, 0.001)
+            let dimensions = SIMD3<Float>(
+                max(footprint.width, 0.001),
+                max(footprint.depth, 0.001),
+                clampedHeight
+            )
+            let center = SIMD3<Float>(
+                footprint.centerXZ.x,
+                base + clampedHeight / 2,
+                footprint.centerXZ.y
+            )
+            let half = dimensions / 2
+            var corners: [SIMD3<Float>] = []
+            corners.reserveCapacity(8)
+            for k in 0 ... 1 {
+                for j in 0 ... 1 {
+                    for i in 0 ... 1 {
+                        let signX = Float(i) * 2 - 1
+                        let signY = Float(j) * 2 - 1
+                        let signZ = Float(k) * 2 - 1
+                        corners.append(
+                            center
+                                + widthAxis * (signX * half.x)
+                                + depthAxis * (signY * half.y)
+                                + up * (signZ * half.z)
+                        )
+                    }
+                }
+            }
+            return CapturedObject(
+                dimensions: dimensions,
+                center: center,
+                axes: (widthAxis, depthAxis, up),
+                corners: corners,
+                volume: dimensions.x * dimensions.y * dimensions.z,
+                sampleCount: sampleCount
+            )
         }
 
         private func updateSelectionVisualization() {

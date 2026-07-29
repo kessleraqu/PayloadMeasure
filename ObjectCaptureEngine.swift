@@ -58,6 +58,20 @@ final class ObjectCaptureEngine {
     private var liveMaskLayer: ObjectMaskPreviewLayer?
     private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
+    /// Which camera viewpoint the operator currently holds relative to the active object. Drives the
+    /// on-screen face guide: width/length are captured from a top-down view, height from a side view.
+    enum ScanViewHint: Equatable {
+        case topDown
+        case side
+        case other
+    }
+
+    private(set) var scanViewHint: ScanViewHint = .other
+    /// Whether the active object's footprint (width × length) has been captured from a top view, and
+    /// its height from a side view, at least once. Used only for guidance, not measurement.
+    private(set) var footprintCapturedFromTop = false
+    private(set) var heightCapturedFromSide = false
+
     private static let defaultPrompt = "Center or tap a highlighted object to select it for measurement."
 
     private var displayObject: CapturedObject? {
@@ -502,6 +516,25 @@ final class ObjectCaptureEngine {
         objectWorkflowRequestRevision += 1
         statusText = "Object unlocked. Continue measuring it."
         objectMaskFeedbackText = "Measuring one object. Lock it before selecting another."
+    }
+
+    /// Publishes the current viewpoint and per-dimension capture status for the face guide.
+    func updateScanGuidance(view: ScanViewHint, footprintFromTop: Bool, heightFromSide: Bool) {
+        if scanViewHint != view {
+            scanViewHint = view
+        }
+        if footprintCapturedFromTop != footprintFromTop {
+            footprintCapturedFromTop = footprintFromTop
+        }
+        if heightCapturedFromSide != heightFromSide {
+            heightCapturedFromSide = heightFromSide
+        }
+    }
+
+    func resetScanGuidance() {
+        scanViewHint = .other
+        footprintCapturedFromTop = false
+        heightCapturedFromSide = false
     }
 
     func clearObjectMaskPreview() {

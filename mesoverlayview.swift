@@ -115,6 +115,11 @@ struct MesOverlayView: View {
                    !sessionManager.isObjectTrackingEnvironmentReady {
                     environmentReadinessBanner
                         .padding(.top, 86)
+                } else if isScanning,
+                          isAutomaticCaptureSupported,
+                          captureEngine.activeObjectID != nil {
+                    faceCaptureGuide
+                        .padding(.top, 86)
                 }
                 Spacer()
             }
@@ -212,6 +217,70 @@ struct MesOverlayView: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
         }
+    }
+
+    private var faceCaptureGuide: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Show each face to measure it")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            faceGuideRow(
+                icon: "arrow.down.to.line",
+                label: "Top view",
+                detail: "width × length",
+                isActive: captureEngine.scanViewHint == .topDown,
+                isDone: captureEngine.footprintCapturedFromTop
+            )
+            faceGuideRow(
+                icon: "arrow.right.to.line",
+                label: "Side view",
+                detail: "height",
+                isActive: captureEngine.scanViewHint == .side,
+                isDone: captureEngine.heightCapturedFromSide
+            )
+        }
+        .padding(12)
+        .frame(maxWidth: 240, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func faceGuideRow(
+        icon: String,
+        label: String,
+        detail: String,
+        isActive: Bool,
+        isDone: Bool
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: isDone ? "checkmark.circle.fill" : icon)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(isDone ? .green : (isActive ? .yellow : .secondary))
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.caption.weight(.semibold))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 6)
+            if isActive {
+                Text("capturing")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.yellow)
+            } else if isDone {
+                Text("saved")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.green)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            isActive ? Color.yellow.opacity(0.14) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
     }
 
     private var environmentReadinessBanner: some View {

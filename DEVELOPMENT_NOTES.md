@@ -1913,3 +1913,43 @@ be off-screen or occluded, so such a test would again erase valid previously sca
 4. Turn the first face away from the camera and confirm its accepted points remain protected.
 5. Repeat with several simultaneous locks and watch memory pressure and thermal state because the
    per-object measurement allowance and optional RealityKit marker pool are both larger.
+
+---
+
+## 2026-07-29 - Remove yellow surfels; view-gated per-dimension capture; face guide
+
+### Removed the yellow mask surfels (performance)
+
+Selecting an object rendered its mask as a world-anchored surfel cloud (octahedra, up to ~16k =
+~96k vertices) rebuilt every Vision frame in the object's colour (the first colour is yellow). It
+was cosmetic — the measurement uses the separate `maskedAccumulators` / `acceptedPoints`. Dropped
+the surfel build in the depth loop in `ARCameraView`; the lightweight 2D mask preview remains as the
+highlight, and measurement is unchanged. The surfel overlay functions are now dormant (never fed).
+
+### View-gated per-dimension capture (fixes side-view widening + remembers faces)
+
+Problem: from a side view, background points behind the object were admitted and widened the box;
+from the top the mask removed them, but returning to the side re-admitted them. Root cause: the box
+was fully refit every tick from an accumulator that persists points.
+
+Fix (in `ARCameraView.Coordinator`): the fitted box is post-processed by `viewGatedBox(...)` which
+keeps per-object memory — a horizontal `ObjectFootprint` (width/length/yaw/XZ) captured only from a
+**top-down** view and a **height** captured only from a **side** view (`classifyView` uses the
+camera-forward · gravity). Each dimension is remembered and the other viewpoint cannot change it, so
+side-view background can no longer widen width/length, and a top view cannot disturb the height.
+`alignFootprint` keeps the yaw stable across ticks; `makeViewBox` rebuilds the box (corner order
+matches `ObjectBoundingBox.make`). Bootstraps from the first fit so a box still appears immediately.
+Per-object memory is cleared on remove / re-add / reset.
+
+### Face-capture guide (`MesOverlayView.faceCaptureGuide`)
+
+While measuring an object, a small HUD card shows two rows — “Top view → width × length” and
+“Side view → height” — highlighting the current viewpoint (`captureEngine.scanViewHint`) and marking
+each as saved once captured (`footprintCapturedFromTop` / `heightCapturedFromSide`).
+
+### Validation (on device, Xcode ⌘R)
+
+1. Select an object: the yellow point spam is gone and the app stays smooth; a light 2D highlight remains.
+2. Aim top-down: the guide highlights “Top view” and width×length lock in.
+3. Aim from the side: the guide highlights “Side view” and height locks in; width/length do NOT change.
+4. Returning to the side no longer widens the box; each face shows “saved”.
