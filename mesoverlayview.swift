@@ -221,23 +221,34 @@ struct MesOverlayView: View {
 
     private var faceCaptureGuide: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Show each face to measure it")
+            Text(captureEngine.measurementSatisfied
+                ? "Measurement ready"
+                : "Show each face to measure it")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(captureEngine.measurementSatisfied ? .green : .secondary)
             faceGuideRow(
                 icon: "arrow.down.to.line",
                 label: "Top view",
                 detail: "width × length",
                 isActive: captureEngine.scanViewHint == .topDown,
-                isDone: captureEngine.footprintCapturedFromTop
+                isDone: captureEngine.footprintSatisfied
             )
             faceGuideRow(
                 icon: "arrow.right.to.line",
                 label: "Side view",
                 detail: "height",
                 isActive: captureEngine.scanViewHint == .side,
-                isDone: captureEngine.heightCapturedFromSide
+                isDone: captureEngine.heightSatisfied
             )
+            if captureEngine.measurementSatisfied {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(.green)
+                    Text("All faces captured — lock it in")
+                        .font(.caption2.weight(.semibold))
+                }
+                .padding(.top, 2)
+            }
         }
         .padding(12)
         .frame(maxWidth: 240, alignment: .leading)
@@ -417,8 +428,12 @@ struct MesOverlayView: View {
                 )
             }()
             let fallbackScale = marker == nil ? 1 : distanceScale
-            let xScale = trackedTransform?.xScale ?? fallbackScale
-            let yScale = trackedTransform?.yScale ?? fallbackScale
+            // Scale by camera distance only. The tracked bounding-box ratio
+            // (current/reference) jitters between Vision frames and made the
+            // highlight visibly "breathe" a couple times a second; use it for
+            // position (offset) but not for size.
+            let xScale = fallbackScale
+            let yScale = fallbackScale
             let anchor = trackedTransform?.anchor
                 ?? UnitPoint(x: referencePoint.x, y: referencePoint.y)
             let xOffset = trackedTransform?.xOffset

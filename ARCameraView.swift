@@ -230,8 +230,16 @@ struct ARCameraView: UIViewRepresentable {
         // viewpoint cannot disturb it (this also stops side-view background points widening W/L).
         private var capturedFootprintByObject: [UUID: ObjectFootprint] = [:]
         private var capturedHeightByObject: [UUID: Float] = [:]
+        // "Satisfied" sets: a dimension is added once it has held steady for several fits in its
+        // ideal view (the convergence heuristic that tells the operator a face is done).
         private var footprintFromTopObjects: Set<UUID> = []
         private var heightFromSideObjects: Set<UUID> = []
+        private var footprintStableTicks: [UUID: Int] = [:]
+        private var heightStableTicks: [UUID: Int] = [:]
+        private static let dimensionDeadband: Float = 0.004
+        private static let dimensionRelativeDeadband: Float = 0.03
+        private static let dimensionBlend: Float = 0.35
+        private static let satisfiedTickCount = 6
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectMaskProcessor = ObjectMaskProcessor()
@@ -1454,6 +1462,8 @@ struct ARCameraView: UIViewRepresentable {
                 capturedHeightByObject.removeValue(forKey: change.id)
                 footprintFromTopObjects.remove(change.id)
                 heightFromSideObjects.remove(change.id)
+                footprintStableTicks.removeValue(forKey: change.id)
+                heightStableTicks.removeValue(forKey: change.id)
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
                 manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
@@ -2574,6 +2584,8 @@ struct ARCameraView: UIViewRepresentable {
             capturedHeightByObject.removeAll()
             footprintFromTopObjects.removeAll()
             heightFromSideObjects.removeAll()
+            footprintStableTicks.removeAll()
+            heightStableTicks.removeAll()
             hideAllSelectionMarkers()
             selectionPointsByObject.removeAll()
         }
@@ -2588,6 +2600,8 @@ struct ARCameraView: UIViewRepresentable {
             capturedHeightByObject.removeValue(forKey: id)
             footprintFromTopObjects.remove(id)
             heightFromSideObjects.remove(id)
+            footprintStableTicks.removeValue(forKey: id)
+            heightStableTicks.removeValue(forKey: id)
         }
 
         // MARK: - View-gated per-dimension capture
@@ -2644,14 +2658,39 @@ struct ARCameraView: UIViewRepresentable {
 
             switch view {
             case .topDown:
-                capturedFootprintByObject[id] = alignFootprint(
-                    candidateFootprint,
-                    to: capturedFootprintByObject[id]
-                )
-                footprintFromTopObjects.insert(id)
+                let aligned = alignFootprint(candidateFootprint, to: capturedFootprintByObject[id])
+                if var stored = capturedFootprintByObject[id] {
+                    let width = stabilize(stored.width, aligned.width)
+                    let depth = stabilize(stored.depth, aligned.depth)
+                    stored.width = width.value
+                    stored.depth = depth.value
+                    stored.widthAxis = aligned.widthAxis
+                    stored.centerXZ = aligned.centerXZ
+                    capturedFootprintByObject[id] = stored
+                    footprintStableTicks[id] = (width.stable && depth.stable)
+                        ? (footprintStableTicks[id, default: 0] + 1)
+                        : 0
+                } else {
+                    capturedFootprintByObject[id] = aligned
+                    footprintStableTicks[id] = 0
+                }
+                if (footprintStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
+                    footprintFromTopObjects.insert(id)
+                }
             case .side:
-                capturedHeightByObject[id] = candidateHeight
-                heightFromSideObjects.insert(id)
+                if let stored = capturedHeightByObject[id] {
+                    let height = stabilize(stored, candidateHeight)
+                    capturedHeightByObject[id] = height.value
+                    heightStableTicks[id] = height.stable
+                        ? (heightStableTicks[id, default: 0] + 1)
+                        : 0
+                } else {
+                    capturedHeightByObject[id] = candidateHeight
+                    heightStableTicks[id] = 0
+                }
+                if (heightStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
+                    heightFromSideObjects.insert(id)
+                }
             case .other:
                 break
             }
@@ -2659,8 +2698,8 @@ struct ARCameraView: UIViewRepresentable {
             if isActive {
                 captureEngine.updateScanGuidance(
                     view: view,
-                    footprintFromTop: footprintFromTopObjects.contains(id),
-                    heightFromSide: heightFromSideObjects.contains(id)
+                    footprintSatisfied: footprintFromTopObjects.contains(id),
+                    heightSatisfied: heightFromSideObjects.contains(id)
                 )
             }
 
@@ -2673,6 +2712,20 @@ struct ARCameraView: UIViewRepresentable {
                 up: up,
                 sampleCount: fitted.sampleCount
             )
+        }
+
+        /// Deadband + light smoothing for a remembered dimension: within tolerance the stored value
+        /// is held (so the box does not "breathe" on per-frame fit noise, and the tick counts as
+        /// stable for convergence); beyond it, the value eases toward the new measurement.
+        private func stabilize(_ stored: Float, _ candidate: Float) -> (value: Float, stable: Bool) {
+            let tolerance = max(
+                Self.dimensionDeadband,
+                stored * Self.dimensionRelativeDeadband
+            )
+            if abs(candidate - stored) <= tolerance {
+                return (stored, true)
+            }
+            return (stored + (candidate - stored) * Self.dimensionBlend, false)
         }
 
         /// Re-expresses a fresh footprint in the orientation closest to the remembered one, so the

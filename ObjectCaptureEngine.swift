@@ -67,10 +67,15 @@ final class ObjectCaptureEngine {
     }
 
     private(set) var scanViewHint: ScanViewHint = .other
-    /// Whether the active object's footprint (width × length) has been captured from a top view, and
-    /// its height from a side view, at least once. Used only for guidance, not measurement.
-    private(set) var footprintCapturedFromTop = false
-    private(set) var heightCapturedFromSide = false
+    /// Whether the active object's footprint (width × length, from a top view) and height (from a
+    /// side view) have converged — held steady for several fits. Guidance only, not measurement.
+    private(set) var footprintSatisfied = false
+    private(set) var heightSatisfied = false
+
+    /// True once both the footprint and height have converged — the object is fully measured.
+    var measurementSatisfied: Bool {
+        footprintSatisfied && heightSatisfied
+    }
 
     private static let defaultPrompt = "Center or tap a highlighted object to select it for measurement."
 
@@ -519,22 +524,22 @@ final class ObjectCaptureEngine {
     }
 
     /// Publishes the current viewpoint and per-dimension capture status for the face guide.
-    func updateScanGuidance(view: ScanViewHint, footprintFromTop: Bool, heightFromSide: Bool) {
+    func updateScanGuidance(view: ScanViewHint, footprintSatisfied: Bool, heightSatisfied: Bool) {
         if scanViewHint != view {
             scanViewHint = view
         }
-        if footprintCapturedFromTop != footprintFromTop {
-            footprintCapturedFromTop = footprintFromTop
+        if self.footprintSatisfied != footprintSatisfied {
+            self.footprintSatisfied = footprintSatisfied
         }
-        if heightCapturedFromSide != heightFromSide {
-            heightCapturedFromSide = heightFromSide
+        if self.heightSatisfied != heightSatisfied {
+            self.heightSatisfied = heightSatisfied
         }
     }
 
     func resetScanGuidance() {
         scanViewHint = .other
-        footprintCapturedFromTop = false
-        heightCapturedFromSide = false
+        footprintSatisfied = false
+        heightSatisfied = false
     }
 
     func clearObjectMaskPreview() {

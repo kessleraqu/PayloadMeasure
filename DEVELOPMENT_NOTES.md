@@ -1953,3 +1953,26 @@ each as saved once captured (`footprintCapturedFromTop` / `heightCapturedFromSid
 2. Aim top-down: the guide highlights “Top view” and width×length lock in.
 3. Aim from the side: the guide highlights “Side view” and height locks in; width/length do NOT change.
 4. Returning to the side no longer widens the box; each face shows “saved”.
+
+---
+
+## 2026-07-29 - Fix mask "breathing"; add convergence ("satisfied") heuristic
+
+### Mask breathing (visual + measurement)
+
+- Visual: the 2D mask preview scaled the bitmap by a tracked bounding-box ratio
+  (`current.width / reference.width`) that jitters between Vision frames, so the highlight pulsed a
+  couple times a second (now visible on the active object because the surfels were removed). Fixed in
+  `MesOverlayView.trackedObjectMaskPreview`: size follows camera **distance** only; the tracked box
+  is used for position, not scale.
+- Measurement: the box itself jittered because `viewGatedBox` overwrote the stored dimensions from
+  every fit. Added `stabilize(_:_:)` — a deadband (max(4 mm, 3%)) plus light easing (blend 0.35), so
+  within tolerance the stored value is held and the box stops breathing; larger changes ease in.
+
+### "Satisfied" convergence heuristic + guide
+
+A dimension is now considered **captured** only once it holds within the deadband for
+`satisfiedTickCount` (6) consecutive fits in its ideal view — a real convergence test rather than
+"seen once". The engine exposes `footprintSatisfied` / `heightSatisfied` / `measurementSatisfied`.
+The face guide marks each row done (green "saved") when its dimension converges and shows
+"Measurement ready — lock it in" once both are satisfied.
