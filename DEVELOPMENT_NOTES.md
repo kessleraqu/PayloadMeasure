@@ -1983,8 +1983,15 @@ The face guide marks each row done (green "saved") when its dimension converges 
 
 The single-pixel mask test still admitted stray points outside the object: the one-pixel silhouette
 ring (fuzzy mask edges) and LiDAR "flying pixels" straddling a depth discontinuity. In
-`ObjectMaskProcessor.maskedWorldSurface` pass two, a sample is now kept only if all four depth-grid
+`ObjectMaskProcessor.maskedWorldSurface` pass two, a sample is now kept only if at least three of four depth-grid
 neighbours are also admitted (erodes the silhouette ring) AND are depth-continuous with it
 (|Δdepth| ≤ max(3% of anchor depth, 2 cm), rejecting flying pixels at internal edges). This trims the
 fringe that was widening the box. Tunables: the neighbour depth delta, and — if still noisy — raise
 the confidence gate in pass one from `>= 1` (medium) to `>= 2` (high).
+
+### Follow-up: neighbour rejection relaxed (was starving the accumulator)
+
+Requiring all four neighbours admitted eroded the whole border ring, so too few points passed each
+frame and the box/points appeared very slowly. Relaxed to "at least 3 of 4 neighbours admitted" plus
+the depth-continuity check — drops only isolated/corner fringe and flying pixels, so points fill
+quickly again while most edge noise is still removed.

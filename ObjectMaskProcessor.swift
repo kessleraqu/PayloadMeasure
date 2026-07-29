@@ -1980,11 +1980,12 @@ actor ObjectMaskProcessor {
         points.reserveCapacity(admittedCount)
         surfels.reserveCapacity(admittedCount)
 
-        // Neighbour-based noise rejection. Most stray "outside the object" points
-        // come from the one-pixel silhouette ring (fuzzy mask edges) and from LiDAR
-        // "flying pixels" straddling a depth discontinuity. So a sample is kept only
-        // if all four depth-grid neighbours are also admitted (erodes the ring) and
-        // are depth-continuous with it (rejects flying pixels at internal edges).
+        // Light neighbour-based noise rejection. Most stray "outside the object"
+        // points are isolated silhouette-ring samples (fuzzy mask edges) or LiDAR
+        // "flying pixels" straddling a depth step. Keep a sample if at least THREE of
+        // its four depth-grid neighbours are admitted (drops only isolated/corner
+        // fringe, not the whole border, so points still fill quickly) and it is
+        // depth-continuous with the admitted ones (drops flying pixels).
         let maximumNeighbourDepthDelta = max(anchorDepth * 0.03, 0.02)
         for row in 1 ..< max(depthHeight - 1, 1) {
             for column in 1 ..< max(depthWidth - 1, 1) {
@@ -1992,19 +1993,17 @@ actor ObjectMaskProcessor {
                 guard admitted[index] else {
                     continue
                 }
-                let left = index - 1
-                let right = index + 1
-                let upIndex = index - depthWidth
-                let downIndex = index + depthWidth
-                guard admitted[left], admitted[right],
-                      admitted[upIndex], admitted[downIndex] else {
-                    continue
-                }
                 let depthHere = sampleDepths[index]
-                guard abs(depthHere - sampleDepths[left]) <= maximumNeighbourDepthDelta,
-                      abs(depthHere - sampleDepths[right]) <= maximumNeighbourDepthDelta,
-                      abs(depthHere - sampleDepths[upIndex]) <= maximumNeighbourDepthDelta,
-                      abs(depthHere - sampleDepths[downIndex]) <= maximumNeighbourDepthDelta else {
+                var admittedNeighbours = 0
+                var hasDepthEdge = false
+                for neighbour in [index - 1, index + 1, index - depthWidth, index + depthWidth]
+                where admitted[neighbour] {
+                    admittedNeighbours += 1
+                    if abs(depthHere - sampleDepths[neighbour]) > maximumNeighbourDepthDelta {
+                        hasDepthEdge = true
+                    }
+                }
+                guard admittedNeighbours >= 3, !hasDepthEdge else {
                     continue
                 }
                 let sampleSpacing = depthHere / fx
