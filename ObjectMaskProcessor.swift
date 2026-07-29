@@ -1980,21 +1980,34 @@ actor ObjectMaskProcessor {
         points.reserveCapacity(admittedCount)
         surfels.reserveCapacity(admittedCount)
 
-        for row in 0 ..< depthHeight {
-            for column in 0 ..< depthWidth {
+        // Neighbour-based noise rejection. Most stray "outside the object" points
+        // come from the one-pixel silhouette ring (fuzzy mask edges) and from LiDAR
+        // "flying pixels" straddling a depth discontinuity. So a sample is kept only
+        // if all four depth-grid neighbours are also admitted (erodes the ring) and
+        // are depth-continuous with it (rejects flying pixels at internal edges).
+        let maximumNeighbourDepthDelta = max(anchorDepth * 0.03, 0.02)
+        for row in 1 ..< max(depthHeight - 1, 1) {
+            for column in 1 ..< max(depthWidth - 1, 1) {
                 let index = row * depthWidth + column
                 guard admitted[index] else {
                     continue
                 }
-                let isBoundary = column == 0
-                    || column == depthWidth - 1
-                    || row == 0
-                    || row == depthHeight - 1
-                    || !admitted[index - 1]
-                    || !admitted[index + 1]
-                    || !admitted[index - depthWidth]
-                    || !admitted[index + depthWidth]
-                let sampleSpacing = sampleDepths[index] / fx
+                let left = index - 1
+                let right = index + 1
+                let upIndex = index - depthWidth
+                let downIndex = index + depthWidth
+                guard admitted[left], admitted[right],
+                      admitted[upIndex], admitted[downIndex] else {
+                    continue
+                }
+                let depthHere = sampleDepths[index]
+                guard abs(depthHere - sampleDepths[left]) <= maximumNeighbourDepthDelta,
+                      abs(depthHere - sampleDepths[right]) <= maximumNeighbourDepthDelta,
+                      abs(depthHere - sampleDepths[upIndex]) <= maximumNeighbourDepthDelta,
+                      abs(depthHere - sampleDepths[downIndex]) <= maximumNeighbourDepthDelta else {
+                    continue
+                }
+                let sampleSpacing = depthHere / fx
                 points.append(worldPoints[index])
                 surfels.append(
                     ObjectMaskSurfel(
@@ -2003,7 +2016,7 @@ actor ObjectMaskProcessor {
                             max(sampleSpacing * spacingFactor, 0.0015),
                             0.02
                         ),
-                        isBoundary: isBoundary
+                        isBoundary: false
                     )
                 )
             }

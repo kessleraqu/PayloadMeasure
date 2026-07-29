@@ -1976,3 +1976,15 @@ A dimension is now considered **captured** only once it holds within the deadban
 "seen once". The engine exposes `footprintSatisfied` / `heightSatisfied` / `measurementSatisfied`.
 The face guide marks each row done (green "saved") when its dimension converges and shows
 "Measurement ready — lock it in" once both are satisfied.
+
+---
+
+## 2026-07-29 - Neighbour-based depth-point noise rejection
+
+The single-pixel mask test still admitted stray points outside the object: the one-pixel silhouette
+ring (fuzzy mask edges) and LiDAR "flying pixels" straddling a depth discontinuity. In
+`ObjectMaskProcessor.maskedWorldSurface` pass two, a sample is now kept only if all four depth-grid
+neighbours are also admitted (erodes the silhouette ring) AND are depth-continuous with it
+(|Δdepth| ≤ max(3% of anchor depth, 2 cm), rejecting flying pixels at internal edges). This trims the
+fringe that was widening the box. Tunables: the neighbour depth delta, and — if still noisy — raise
+the confidence gate in pass one from `>= 1` (medium) to `>= 2` (high).
