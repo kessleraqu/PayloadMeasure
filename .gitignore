@@ -1,8 +1,10 @@
-# Xcode per-user state
+# Xcode per-user data (generated whenever Xcode opens the project)
 **/xcuserdata/
-UserInterfaceState.xcuserstate
+**/*.xcuserdatad/
+**/UserInterfaceState.xcuserstate
 *.xcuserstate
-# Xcode user data
-*.xcuserstate
-xcuserdata/
-*.xcworkspace/xcuserdata/ 
+
+# Local Xcode build output
+DerivedData/
+*.xccheckout
+*.xcscmblueprint
