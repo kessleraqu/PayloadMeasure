@@ -133,6 +133,10 @@ final class ObjectCaptureEngine {
         }
     }
 
+    var focusedObjectID: UUID? {
+        focusedCaptureID
+    }
+
     func objectNumber(for id: UUID) -> Int? {
         captureOrder.firstIndex(of: id).map { $0 + 1 }
     }

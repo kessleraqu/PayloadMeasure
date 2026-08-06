@@ -2170,3 +2170,31 @@ name.
 - Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
 - Physical iPhone 13 Pro validation is required for native coaching presentation, readiness timing
   and the final button appearance over the live camera.
+
+---
+
+## 2026-08-06 - Non-overlapping saved-object panel
+
+The nested saved-Boxes `Menu` compressed its launcher into a narrow vertical label at iPhone width.
+Because system menus are presented outside SwiftUI layout and were anchored beside the bottom
+actions, the expanded submenu also covered Reset and the visualization toolbar. The nested
+presentation made Select feedback unclear and made alerts launched during menu dismissal fragile.
+
+The menu is now a compact saved-object count button. It opens a width-constrained Liquid Glass panel
+as a normal sibling above the action row, so expansion grows upward and cannot cover Lock, Reset or
+the visualization toolbar. The list is height-capped and scrollable; each row shows the saved color,
+name and weight, provides visible focused-state feedback, and has direct Edit and Remove controls.
+Selection updates the focused measurement and therefore the object targeted by Unlock. Removal is
+disabled while a new object selection is pending, matching the engine guard.
+
+Lock/Unlock is now the approachable primary action at 116 × 50 points. Reset is narrower at
+80 × 44 points while retaining the minimum touch target. At Accessibility Dynamic Type sizes the
+saved-object launcher moves to its own row, both actions grow, names may use two lines and the list
+uses a larger height budget. Panel state is cleared by Lock, Unlock, Edit, Reset, last-object removal,
+AR coaching activation and external engine resets.
+
+### Validation
+
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- Physical iPhone 13 Pro validation is still required for final appearance over the live camera.

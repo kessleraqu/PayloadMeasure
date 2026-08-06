@@ -164,15 +164,17 @@ instead of an ambiguous icon-only arrow.
 received scene-depth frame. `worldMappingStatus` remains diagnostic and no longer blocks measurement;
 Apple's automatic tracking coach supplies standard initialization and limited-tracking guidance.
 
-✅ Bottom actions have their own row above the visualization toolbar, fixed readable widths and
-high-contrast neutral glass. New Lock dialogs begin with an empty name field.
+✅ Bottom actions have their own row above the visualization toolbar and use high-contrast neutral
+glass. Lock is the larger primary action while Reset is narrower but retains a 44-point tap target.
+At Accessibility text sizes, saved objects move to their own row so the actions cannot collide.
 
 ✅ Lock is transactional: tapping it immediately pauses mask, depth accumulation, automatic cleanup
 and box fitting at the displayed dimensions. Save finalizes that snapshot; Cancel resumes the same
 active object without discarding its accumulated measurement.
 
-✅ Every finalized box stores an operator-entered name and weight. Both can be edited later and the
-name is used in the saved Boxes list.
+✅ Every finalized box stores an operator-entered name and weight. A compact saved-object count opens
+a scrollable inline panel above the controls; full-width rows select the focused result and expose
+direct Edit and Remove actions without nested system menus.
 
 ✅ Mask-based point cleanup is an automatic part of the active scan loop. The former manual Enhance
 button and request/feedback plumbing have been removed. Cleanup uses rotating bounded batches so it

@@ -11,6 +11,7 @@ struct MesOverlayView: View {
     let mesEngine: MesEngine
     let captureEngine: ObjectCaptureEngine
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showsPanel = false
     @State private var showsLiDARLimitations = false
     @State private var objectDetailsContext: ObjectDetailsContext?
@@ -18,6 +19,7 @@ struct MesOverlayView: View {
     @State private var weightText = ""
     @State private var pendingRemovalObjectID: UUID?
     @State private var showsResetConfirmation = false
+    @State private var showsSavedObjects = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -50,22 +52,19 @@ struct MesOverlayView: View {
                     Spacer()
 
                     VStack(alignment: .leading, spacing: 10) {
+                        if showsSavedObjects,
+                           !finalizedMeasuredObjectIDs.isEmpty {
+                            savedObjectsPanel
+                                .transition(
+                                    .opacity.combined(
+                                        with: .scale(scale: 0.96, anchor: .bottom)
+                                    )
+                                )
+                        }
+
                         if !finalizedMeasuredObjectIDs.isEmpty
                             || captureEngine.canReset {
-                            HStack(spacing: 10) {
-                                if !finalizedMeasuredObjectIDs.isEmpty {
-                                    boxesMenu
-                                }
-                                Spacer(minLength: 8)
-                                if isAutomaticCaptureSupported,
-                                   captureEngine.activeObjectID != nil
-                                    || captureEngine.canReactivateFocusedObject {
-                                    objectWorkflowButton
-                                }
-                                if captureEngine.canReset {
-                                    resetButton
-                                }
-                            }
+                            bottomActionRow
                         }
 
                         HStack {
@@ -73,6 +72,7 @@ struct MesOverlayView: View {
                             Spacer(minLength: 0)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.bottom, 32)
                 }
@@ -80,11 +80,25 @@ struct MesOverlayView: View {
 
         }
         .animation(.snappy(duration: 0.22), value: showsPanel)
+        .animation(.snappy(duration: 0.22), value: showsSavedObjects)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
         .animation(
             .snappy(duration: 0.2),
             value: captureEngine.hasCompletedObjectRecognitionWarmup
         )
+        .onChange(of: captureEngine.resetRevision) { _, _ in
+            showsSavedObjects = false
+        }
+        .onChange(of: finalizedMeasuredObjectIDs.count) { _, count in
+            if count == 0 {
+                showsSavedObjects = false
+            }
+        }
+        .onChange(of: sessionManager.isCoachingActive) { _, isActive in
+            if isActive {
+                showsSavedObjects = false
+            }
+        }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
@@ -119,8 +133,12 @@ struct MesOverlayView: View {
             if let id = pendingRemovalObjectID {
                 Button(removalButtonTitle(for: id), role: .destructive) {
                     captureEngine.removeFinalizedObject(id: id)
+                    if finalizedMeasuredObjectIDs.isEmpty {
+                        showsSavedObjects = false
+                    }
                     pendingRemovalObjectID = nil
                 }
+                .disabled(captureEngine.isObjectSelectionPending)
             }
             Button("Cancel", role: .cancel) {
                 pendingRemovalObjectID = nil
@@ -136,6 +154,7 @@ struct MesOverlayView: View {
             titleVisibility: .visible
         ) {
             Button("Reset All", role: .destructive) {
+                showsSavedObjects = false
                 captureEngine.reset()
             }
             Button("Cancel", role: .cancel) {}
@@ -698,10 +717,50 @@ struct MesOverlayView: View {
     }
 
     @ViewBuilder
+    private var bottomActionRow: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 8) {
+                if !finalizedMeasuredObjectIDs.isEmpty {
+                    savedObjectsButton
+                }
+
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    workflowButtonIfAvailable
+                    if captureEngine.canReset {
+                        resetButton
+                    }
+                }
+            }
+        } else {
+            HStack(spacing: 8) {
+                if !finalizedMeasuredObjectIDs.isEmpty {
+                    savedObjectsButton
+                }
+                Spacer(minLength: 0)
+                workflowButtonIfAvailable
+                if captureEngine.canReset {
+                    resetButton
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var workflowButtonIfAvailable: some View {
+        if isAutomaticCaptureSupported,
+           captureEngine.activeObjectID != nil
+            || captureEngine.canReactivateFocusedObject {
+            objectWorkflowButton
+        }
+    }
+
+    @ViewBuilder
     private var objectWorkflowButton: some View {
         if captureEngine.activeObjectID != nil,
            !captureEngine.isFinalizationPending {
             Button {
+                showsSavedObjects = false
                 presentFinalizationDetailsEntry()
             } label: {
                 HStack(spacing: 6) {
@@ -709,11 +768,13 @@ struct MesOverlayView: View {
                         .foregroundStyle(.orange)
                     Text("Lock")
                         .foregroundStyle(.primary)
-                        .minimumScaleFactor(0.8)
                 }
-                    .font(.subheadline.weight(.semibold))
+                    .font(.body.weight(.semibold))
                     .lineLimit(1)
-                    .frame(width: 96, height: 44)
+                    .frame(
+                        width: dynamicTypeSize.isAccessibilitySize ? 164 : 116,
+                        height: dynamicTypeSize.isAccessibilitySize ? 56 : 50
+                    )
                     .contentShape(Capsule())
             }
             .buttonStyle(.glass)
@@ -727,6 +788,7 @@ struct MesOverlayView: View {
             )
         } else if captureEngine.canReactivateFocusedObject {
             Button {
+                showsSavedObjects = false
                 captureEngine.reactivateFocusedObject()
             } label: {
                 HStack(spacing: 6) {
@@ -734,11 +796,13 @@ struct MesOverlayView: View {
                         .foregroundStyle(.orange)
                     Text("Unlock")
                         .foregroundStyle(.primary)
-                        .minimumScaleFactor(0.8)
                 }
-                    .font(.subheadline.weight(.semibold))
+                    .font(.body.weight(.semibold))
                     .lineLimit(1)
-                    .frame(width: 96, height: 44)
+                    .frame(
+                        width: dynamicTypeSize.isAccessibilitySize ? 164 : 116,
+                        height: dynamicTypeSize.isAccessibilitySize ? 56 : 50
+                    )
                     .contentShape(Capsule())
             }
             .buttonStyle(.glass)
@@ -757,11 +821,13 @@ struct MesOverlayView: View {
                     .foregroundStyle(.red)
                 Text("Reset")
                     .foregroundStyle(.primary)
-                    .minimumScaleFactor(0.8)
             }
-                .font(.subheadline.weight(.semibold))
+                .font(.caption.weight(.semibold))
                 .lineLimit(1)
-                .frame(width: 96, height: 44)
+                .frame(
+                    width: dynamicTypeSize.isAccessibilitySize ? 124 : 80,
+                    height: dynamicTypeSize.isAccessibilitySize ? 52 : 44
+                )
                 .contentShape(Capsule())
         }
         .buttonStyle(.glass)
@@ -776,56 +842,198 @@ struct MesOverlayView: View {
         }
     }
 
-    private var boxesMenu: some View {
-        Menu {
-            ForEach(finalizedMeasuredObjectIDs, id: \.self) { id in
-                Menu {
-                    Button {
-                        captureEngine.focusCapture(id: id)
-                    } label: {
-                        Label("Select", systemImage: "scope")
-                    }
-                    .disabled(
-                        captureEngine.activeObjectID != nil
-                            || captureEngine.isObjectSelectionPending
-                    )
-
-                    Button {
-                        presentDetailsEditor(for: id)
-                    } label: {
-                        Label("Edit name and weight", systemImage: "pencil")
-                    }
-
-                    Button(role: .destructive) {
-                        pendingRemovalObjectID = id
-                    } label: {
-                        Label("Remove", systemImage: "trash")
-                    }
-                } label: {
-                    Label {
-                        Text(boxSummary(for: id))
-                    } icon: {
-                        boxColorImage(for: id)
-                            .renderingMode(.original)
-                    }
-                }
-            }
+    private var savedObjectsButton: some View {
+        Button {
+            showsSavedObjects.toggle()
         } label: {
-            Label(
-                "Boxes \(finalizedMeasuredObjectIDs.count)",
-                systemImage: "shippingbox.fill"
+            HStack(spacing: 5) {
+                Image(systemName: "shippingbox.fill")
+                    .foregroundStyle(.green)
+                Text("\(finalizedMeasuredObjectIDs.count)")
+                    .foregroundStyle(.primary)
+                    .monospacedDigit()
+                Image(systemName: showsSavedObjects ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .frame(
+                width: dynamicTypeSize.isAccessibilitySize ? 96 : 74,
+                height: dynamicTypeSize.isAccessibilitySize ? 52 : 44
             )
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 12)
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Capsule())
+            .contentShape(Capsule())
         }
         .buttonStyle(.glass)
         .buttonBorderShape(.capsule)
-        .foregroundStyle(.primary)
         .accessibilityLabel(
-            "\(finalizedMeasuredObjectIDs.count) saved box\(finalizedMeasuredObjectIDs.count == 1 ? "" : "es")"
+            "\(finalizedMeasuredObjectIDs.count) saved object\(finalizedMeasuredObjectIDs.count == 1 ? "" : "s")"
         )
+        .accessibilityValue(showsSavedObjects ? "Expanded" : "Collapsed")
+        .accessibilityHint("Shows names, weights and actions for locked objects.")
+    }
+
+    private var savedObjectsPanel: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Label("Saved objects", systemImage: "shippingbox.fill")
+                    .font(.subheadline.weight(.semibold))
+
+                Text("\(finalizedMeasuredObjectIDs.count)")
+                    .font(.caption.weight(.bold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    showsSavedObjects = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Close saved objects")
+            }
+
+            if captureEngine.activeObjectID != nil {
+                Text("Lock the object being measured before selecting a saved object.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 8) {
+                    ForEach(finalizedMeasuredObjectIDs, id: \.self) { id in
+                        savedObjectRow(for: id)
+                    }
+                }
+            }
+            .scrollIndicators(
+                finalizedMeasuredObjectIDs.count > 3
+                    || dynamicTypeSize.isAccessibilitySize
+                    ? .visible
+                    : .hidden
+            )
+            .frame(height: savedObjectsListHeight)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity)
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
+        .accessibilityElement(children: .contain)
+    }
+
+    private func savedObjectRow(for id: UUID) -> some View {
+        let isFocused = captureEngine.focusedObjectID == id
+        let canSelect = captureEngine.activeObjectID == nil
+            && !captureEngine.isObjectSelectionPending
+        let objectName = captureEngine.name(for: id) ?? "Unnamed object"
+
+        return HStack(spacing: 4) {
+            Button {
+                captureEngine.focusCapture(id: id)
+            } label: {
+                HStack(spacing: 9) {
+                    boxColorImage(for: id)
+                        .font(.system(size: 12))
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(objectName)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+                            .truncationMode(.tail)
+
+                        Text(objectWeightSummary(for: id))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Image(systemName: isFocused ? "checkmark.circle.fill" : "scope")
+                        .foregroundStyle(isFocused ? .green : .secondary)
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: savedObjectRowHeight,
+                    alignment: .leading
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSelect)
+            .opacity(canSelect ? 1 : 0.55)
+            .accessibilityLabel(
+                "\(objectName), \(objectWeightSummary(for: id))"
+            )
+            .accessibilityValue(isFocused ? "Selected" : "Not selected")
+            .accessibilityHint(
+                canSelect
+                    ? "Selects this object for viewing or unlocking."
+                    : "Lock the active object before selecting this one."
+            )
+
+            Button {
+                showsSavedObjects = false
+                presentDetailsEditor(for: id)
+            } label: {
+                Image(systemName: "pencil")
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
+            .accessibilityLabel("Edit \(objectName)")
+            .accessibilityHint("Changes this object's name and weight.")
+
+            Button(role: .destructive) {
+                pendingRemovalObjectID = id
+            } label: {
+                Image(systemName: "trash")
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .disabled(captureEngine.isObjectSelectionPending)
+            .opacity(captureEngine.isObjectSelectionPending ? 0.45 : 1)
+            .accessibilityLabel(
+                "Remove \(captureEngine.name(for: id) ?? "unnamed object")"
+            )
+            .accessibilityHint(
+                captureEngine.isObjectSelectionPending
+                    ? "Wait for the current object selection to finish."
+                    : "Asks for confirmation before removing this object."
+            )
+        }
+        .padding(.horizontal, 10)
+        .background(.primary.opacity(0.07), in: .rect(cornerRadius: 14))
+    }
+
+    private var savedObjectsListHeight: CGFloat {
+        let count = finalizedMeasuredObjectIDs.count
+        guard count > 0 else { return 0 }
+        let rowsHeight = CGFloat(count) * savedObjectRowHeight
+        let spacingHeight = CGFloat(max(count - 1, 0)) * 8
+        let maximumHeight: CGFloat = dynamicTypeSize.isAccessibilitySize ? 300 : 204
+        return min(rowsHeight + spacingHeight, maximumHeight)
+    }
+
+    private var savedObjectRowHeight: CGFloat {
+        dynamicTypeSize.isAccessibilitySize ? 116 : 52
+    }
+
+    private func objectWeightSummary(for id: UUID) -> String {
+        captureEngine.weightInKilograms(for: id)
+            .map { "\(formattedWeight($0)) kg" }
+            ?? "No weight"
     }
 
     private var objectDetailsIsPresented: Binding<Bool> {
