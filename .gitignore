@@ -1,5 +1,6 @@
 # Xcode per-user state
 **/xcuserdata/
+UserInterfaceState.xcuserstate
 *.xcuserstate
 # Xcode user data
 *.xcuserstate
