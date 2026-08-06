@@ -1995,3 +1995,178 @@ Requiring all four neighbours admitted eroded the whole border ring, so too few 
 frame and the box/points appeared very slowly. Relaxed to "at least 3 of 4 neighbours admitted" plus
 the depth-continuity check — drops only isolated/corner fringe and flying pixels, so points fill
 quickly again while most edge noise is still removed.
+
+---
+
+## 2026-08-06 - Restore iOS 26.5 and harden first-session reliability
+
+The temporary Xcode 16/iOS 18 compatibility period is complete. The project now targets iOS 26.5,
+uses the Xcode 26.5 concurrency defaults while retaining Swift 5 language mode, and uses native
+Liquid Glass effects and button styles throughout the measurement HUD.
+
+The unreliable first measurement was traced to lifecycle timing rather than the measurement math:
+selection and asynchronous Vision/depth work could begin before world tracking, a usable surface,
+or a laid-out camera view existed. A recreated `ARView` could also receive state retained from the
+previous AR world, while results started before an interruption could arrive afterward.
+
+The lifecycle cleanup now:
+
+- resets the measurement and capture engines when a new AR world is created;
+- snapshots one-shot command revisions when a coordinator attaches so old requests are not replayed;
+- rejects selection until tracking, environment data and view geometry are ready;
+- invalidates pending selection, mask, display and refinement work when the session epoch changes;
+- ignores stale async results and callbacks from detached AR sessions;
+- resumes the configured session after an interruption;
+- prefers a fresh raycast for manual placement and uses a cached result only as fallback;
+- synchronizes anchored points only during normal tracking; and
+- resets per-scan guidance and cleanup timing with the rest of capture state.
+
+Performance cleanup removed the already-unused world-surfel construction and renderer. The measured
+point admission, depth-neighbour filtering, voxel accumulation, view-gated dimensions, fitting rules,
+thresholds and capture algorithms were not changed. The inactive EdgeTAM adapter and model packages
+remain in the repository for future research but are excluded from target membership, avoiding their
+compile time and app-bundle cost. Development Markdown is likewise no longer bundled into the app.
+
+### Validation
+
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
+- Xcode 26.5 generic iOS device clean Release build with signing disabled: succeeded.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- The Release app contains no EdgeTAM model products or development Markdown files.
+- Physical iPhone 13 Pro testing remains required for real LiDAR depth, interruption recovery and
+  cold-launch first-measurement behavior.
+
+---
+
+## 2026-08-06 - Scan-only HUD and cold first-lock performance pass
+
+The operator interface is now scan-only. The Line/Box mode menu, non-scan readout and Add Point
+controls were removed from the overlay, and `MesEngine.mode` is immutable at `.scan`. The `Box`
+button in the visualization strip remains a display toggle for automatically fitted scan results;
+it is not a measurement mode.
+
+The top HUD now has one mutually exclusive slot:
+
+- environment preparation;
+- object-recognition preparation;
+- the active top/side capture guide; or
+- the compact scan readout.
+
+Opening Information replaces that slot across the available top width and contains its own close
+button. The verbose current-step text and diagnostics live inside Information instead of remaining
+stacked over the camera. Compact cards use smaller padding, widths and text limits.
+
+Finalizing an object now purges its cached 2D mask immediately. Late Vision results are rejected for
+finalized IDs, and SwiftUI independently verifies that only the active object's tracked mask can be
+drawn. The AR anchor, lock marker, fitted box, dimensions, weight and measured points remain stored.
+
+Cold-start selection had two separate delays. Vision/Core Image errors were previously converted to
+ordinary nil previews, while every submission consumed one of four no-match attempts. The app now:
+
+- distinguishes successful, cancelled and transiently failed recognition work;
+- consumes a no-match attempt only after Vision actually produced an observation;
+- warms the first appearance-signature and scaled-mask paths on a real live preview;
+- prevents taps until that recognition warmup succeeds;
+- acknowledges a newly selected object before performing its first depth back-projection on the
+  following frame;
+- requests camera permission before starting AR; and
+- retries one failed AR session automatically when no measurement exists yet.
+
+The later first-box hitch was reduced without altering capture data. Pure box fitting now runs on a
+dedicated actor and identical results are applied on the main actor only if the object, session epoch
+and reset revision are still current. Repeated unsuccessful fits of the same point snapshot are no
+longer rerun. The optional cyan debug mesh displays at most 600 evenly sampled points across objects,
+while the complete retained point sets still drive fitting. Renderer resources are prepared before
+the first capture, and unchanged front/rear box spans are no longer rewritten at 15 Hz. Box edges
+were reduced from 6 mm to 3 mm.
+
+No mask/depth admission rule, voxel accumulator, support-plane estimator, connectivity rule,
+outlier trim, dimension convergence threshold, view-gated fitting rule or measured result was
+changed by this pass.
+
+### Validation
+
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
+- Xcode 26.5 generic iOS device clean Release build with signing disabled: succeeded.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- The Release product still reports `MinimumOSVersion` 26.5.
+- Cold-launch recognition, first selection, first fitted box and final-mask disappearance still
+  require physical iPhone 13 Pro/LiDAR validation.
+
+---
+
+## 2026-08-06 - Transactional Lock, named boxes and automatic-only cleanup
+
+Lock now freezes the exact displayed measurement as soon as the operator taps it, before presenting
+the details dialog. The active object ID, AR anchor, tracker, accumulated voxels, current box and
+measurement samples remain intact, but mask generation/display, depth accumulation, automatic point
+cleanup and asynchronous box fitting stop. Late mask, display-tracking and fitter results are also
+rejected defensively while finalization is pending.
+
+Saving validates and stores a nonempty box name plus a finite positive weight, then finalizes the
+already-paused result. Cancelling either explicitly or through dialog dismissal clears the pending
+state and naturally resumes the same active object on the next frame. Finalized names and weights can
+be edited together and the saved Boxes menu displays the name.
+
+The manual Enhance button and its one-shot request, progress and feedback state were removed. Its
+mask-based cyan-point rejection remains in the active scan loop and runs automatically every two
+seconds, so cleanup is now a continuous workflow rather than an operator decision. Each pass checks
+at most 4,096 points and advances a per-object cursor, preserving the same rejection rules while
+preventing a maximum-size point cloud from monopolizing the main actor in a single timer tick.
+
+The compact top status now uses red for Understanding environment and green after readiness. Ready
+cards carry a green check and Information reflects the same environment state. Reset is a labeled
+red bottom control that remains available during an active measurement and asks for confirmation
+before deleting all measurements.
+
+The selection warmup now also executes the exact `lockCandidate` path against a real live foreground
+observation and discards the result. This prepares per-instance mask generation and geometry scanning
+before selection becomes available without changing candidate scoring, object identity, depth
+admission, fitting or measurement behavior.
+
+Renderer warmup now prepares 48 shared-mesh box-edge entities in batches of six, yielding between
+batches. This moves the bulk of first-box RealityKit allocation into idle startup time without a
+single large main-actor burst.
+
+### Validation
+
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
+- Xcode 26.5 generic iOS device clean Release build with signing disabled: succeeded.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- Physical iPhone 13 Pro validation is still required for Lock/Cancel resume behavior and cold-launch
+  interaction latency.
+
+---
+
+## 2026-08-06 - Apple-aligned AR readiness and readable bottom actions
+
+The persistent red “Understanding environment” state was caused by treating
+`ARFrame.WorldMappingStatus` as a live-measurement prerequisite. A measured box could already be
+running from normal camera tracking and synchronized LiDAR depth while the wider world map remained
+`.limited`; the HUD therefore contradicted the working capture pipeline. Apple documents normal
+camera tracking as the state in which ARKit features are available, while world-mapping quality is
+primarily relevant to saving and later relocalizing an `ARWorldMap`.
+
+LiDAR readiness now requires normal tracking and receipt of a scene-depth frame—the same inputs used
+by automatic capture. Mesh reconstruction and plane detection remain enabled and reported, but the
+wider mapping status is informational only. Non-LiDAR readiness still requires a detected surface.
+An automatically activating `ARCoachingOverlayView` with the `.tracking` goal now provides Apple's
+standard movement/speed guidance during initialization and limited tracking. Custom overlays and
+their full-screen gesture layer are hidden while coaching is active so the instructions do not stack
+or intercept the coach; the coach's reset request
+clears measurement state and restarts the configured world-tracking session safely.
+
+The screenshot's Lock and Reset pills were compressed because the visualization toolbar plus both
+actions exceeded the available iPhone width. Actions now occupy a separate row above the toolbar,
+use fixed 96 × 44 point labels, and use neutral Liquid Glass with primary text and colored icons.
+This keeps both labels readable without adding more saturated controls. New finalization dialogs use
+“Lock object” and begin with an empty name field; editing an existing object still loads its saved
+name.
+
+### Validation
+
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
+- Xcode 26.5 generic iOS device clean Release build with signing disabled: succeeded.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- Physical iPhone 13 Pro validation is required for native coaching presentation, readiness timing
+  and the final button appearance over the live camera.

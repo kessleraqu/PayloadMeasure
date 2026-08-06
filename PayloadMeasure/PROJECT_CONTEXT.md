@@ -34,8 +34,8 @@ The app should therefore act as an intelligent measurement and decision-support 
 
 ## Development machines
 
-- Primary development machine: MacBook Air M2 with Xcode 26.
-- A second, older-macOS laptop is intended for local development with Xcode 16.3/16.4.
+- Primary development machine: Apple-silicon M2 Mac with Xcode 26.5.
+- The older-macOS/Xcode 16 setup was temporary and is no longer a supported project configuration.
 
 ## Target and test devices
 
@@ -64,15 +64,14 @@ Avoid Unity unless explicitly requested.
 
 ## OS and toolchain compatibility
 
-- The application deployment target is iOS 18.0.
-- The core Vision foreground segmentation and object-tracking APIs establish that minimum.
-- LiDAR scene depth and scene reconstruction are runtime capability checked and do not require a
-  deployment target newer than iOS 18.
-- The HUD uses standard SwiftUI material backgrounds; iOS 26-only Liquid Glass is not required.
-- The exact pre-removal Liquid Glass implementation remains in `main` history at commit `00ed3f0`
-  and is named locally by tag `backup/ios26-liquid-glass-2026-07-17`.
-- Use Xcode 16.3/16.4 for compatible local development where necessary. Produce App Store archives
-  with Xcode 26 or newer to satisfy Apple's current upload requirement.
+- The application deployment target is iOS 26.5 and the supported development toolchain is Xcode 26.5.
+- The target uses Xcode 26 concurrency defaults while retaining Swift 5 language mode; moving the
+  complete AR/Vision pipeline to Swift 6 language mode is a separate migration.
+- The HUD uses native iOS 26 Liquid Glass effects and glass button styles.
+- LiDAR scene depth and scene reconstruction remain runtime capability checked because the RGB-only
+  fallback still needs to explain unavailable metric capture on devices without LiDAR.
+- The temporary Xcode 16/iOS 18 compatibility changes and their restoration are recorded in
+  `XCODE16_TEMPORARY_CHANGES.md`.
 
 ---
 
@@ -90,11 +89,12 @@ Current milestone:
 
 ✅ Camera permission (`NSCameraUsageDescription`) configured via build settings (`INFOPLIST_KEY_NSCameraUsageDescription`).
 
-✅ Manual Line and Box measurement workflows implemented.
+✅ The operator-facing app is scan-only. The former Line/Box mode picker and manual controls are no
+longer exposed, and the measurement mode is fixed to Scan.
 
 ✅ LiDAR depth-based automatic Scan workflow implemented with live multi-frame accumulation.
 
-✅ Scan is the default workflow and reports unsupported hardware explicitly on non-LiDAR devices.
+✅ Scan is the sole workflow and reports unsupported hardware explicitly on non-LiDAR devices.
 
 ✅ Live RGB foreground-instance mask preview runs in Scan mode on both LiDAR and non-LiDAR devices.
 
@@ -108,14 +108,15 @@ distance; the experimental EdgeTAM and dense optical-flow paths remain bypassed.
 ✅ On LiDAR hardware, automatic box geometry is fitted only from depth pixels admitted by the
 time-synchronized object mask. Unmasked depth is restricted to support-plane height estimation.
 
-✅ The center aimer previews the next object in its future lock color. Tapping adds that object;
-locked masks, anchors and same-colored 3D boxes remain while additional objects are selected.
+✅ The center aimer previews the next object in its future lock color. Tapping selects that object;
+its mask remains visible while measuring and disappears immediately when finalized, while its world
+anchor, marker and same-colored 3D box remain.
 
-✅ The live aimer preview can be hidden without stopping segmentation. Locked mask layers are cached
-per object and composited together whenever their retained AR anchors project into the camera view.
+✅ The live aimer and selected-object mask previews can be hidden without stopping segmentation.
+Finalized masks are purged and late asynchronous frames cannot restore them.
 
-✅ A display-only Visuals menu independently controls the live/locked masks, lock markers, LiDAR
-object points, reconstructed mesh and 3D boxes. Diagnostic points and mesh default to hidden.
+✅ A display-only Visuals menu independently controls the live/selected mask, lock markers, LiDAR
+object points, reconstructed mesh and 3D boxes.
 
 ✅ Mask-gated LiDAR uses direct registered-image coordinates, a conservative two-depth-pixel mask
 interior and depth-edge rejection. One-centimetre object voxels, temporal voxel expiry, dominant
@@ -128,8 +129,8 @@ and the diagnostics panel reports the device's actual ARKit depth-map resolution
 one-table voxel accumulators, per-object caps and a bounded debug-entity pool replace simultaneous
 full-resolution masks and unbounded scene data.
 
-✅ LiDAR frames are back-projected once and partitioned around every visible locked anchor. Each
-object owns independent synchronized mask points, support/table samples and an oriented 3D box.
+✅ LiDAR frames are back-projected for the active object. Each object owns independent synchronized
+mask points, support/table samples and an oriented 3D box retained after finalization.
 
 ✅ Non-LiDAR Scan mode is explicitly marked with a tappable limitations badge. RGB masking remains
 available, while the sheet explains the absence of metric depth, automatic boxes and 3D table removal.
@@ -137,8 +138,54 @@ available, while the sheet explains the absence of metric depth, automatic boxes
 ✅ Environment readiness is reported at runtime: LiDAR devices wait for depth/mesh data, while
 non-LiDAR devices guide the operator until camera-based plane mapping is stable.
 
-✅ The functional app targets iOS 18.0. iOS 26-only Liquid Glass styling has been removed without
-changing the segmentation, tracking, LiDAR capture or visualization controls.
+✅ The functional app targets iOS 26.5. Native Liquid Glass styling and the Xcode 26 concurrency
+configuration are restored without changing the segmentation, tracking, LiDAR measurement or box-fitting algorithms.
+
+✅ AR-session lifecycle guards prevent selections before tracking, depth and layout are ready; stale
+asynchronous frame results are discarded across interruption, failure and view recreation.
+
+✅ Camera authorization is resolved before starting AR. A first-start session failure gets one safe
+automatic recovery attempt before any measurement exists.
+
+✅ Object selection waits for a real-frame recognition warmup. Transient Vision failures no longer
+consume valid no-match retries, and a new selection is acknowledged before depth back-projection.
+
+✅ Box fitting runs away from the main UI actor with the same inputs and algorithm. Optional cyan
+debug rendering is capped at 600 displayed samples, and 3D box edges use a 3 mm thickness.
+
+✅ The top HUD shows exactly one compact contextual card at a time. Opening Information replaces the
+other top cards instead of squeezing or stacking beside them.
+
+✅ Environment preparation is explicitly red and the ready states are green. Reset is an
+always-available labeled neutral-glass control with a red icon and destructive-action confirmation
+instead of an ambiguous icon-only arrow.
+
+✅ Live LiDAR readiness follows the pipeline's real prerequisites: normal AR camera tracking plus a
+received scene-depth frame. `worldMappingStatus` remains diagnostic and no longer blocks measurement;
+Apple's automatic tracking coach supplies standard initialization and limited-tracking guidance.
+
+✅ Bottom actions have their own row above the visualization toolbar, fixed readable widths and
+high-contrast neutral glass. New Lock dialogs begin with an empty name field.
+
+✅ Lock is transactional: tapping it immediately pauses mask, depth accumulation, automatic cleanup
+and box fitting at the displayed dimensions. Save finalizes that snapshot; Cancel resumes the same
+active object without discarding its accumulated measurement.
+
+✅ Every finalized box stores an operator-entered name and weight. Both can be edited later and the
+name is used in the saved Boxes list.
+
+✅ Mask-based point cleanup is an automatic part of the active scan loop. The former manual Enhance
+button and request/feedback plumbing have been removed. Cleanup uses rotating bounded batches so it
+cannot synchronously inspect the complete maximum-size object cloud in one UI frame.
+
+✅ Recognition readiness now includes a real-frame warmup of the same exhaustive mask-candidate path
+used by the first selection tap, avoiding first-use Vision/Core Image cache work during interaction.
+
+✅ Selection-point buffers and a pool of shared-mesh box-edge entities are prepared in small idle-time
+batches before the first fit, avoiding a burst of first-box renderer allocation on the main actor.
+
+✅ The retained experimental EdgeTAM adapter and model packages are excluded from the app target so
+they remain available for future research without being compiled or shipped in the production app.
 
 ---
 

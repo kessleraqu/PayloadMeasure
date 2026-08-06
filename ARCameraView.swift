@@ -26,6 +26,7 @@ struct ARCameraView: UIViewRepresentable {
             cameraMode: .ar,
             automaticallyConfigureSession: false
         )
+        context.coordinator.prepareForNewWorld()
         sessionManager.configure(arView.session)
         context.coordinator.attach(to: arView)
         return arView
@@ -40,7 +41,7 @@ struct ARCameraView: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, ARCoachingOverlayViewDelegate {
         private struct PlacedPoint {
             let id: UUID
             let marker: ModelEntity
@@ -69,26 +70,6 @@ struct ARCameraView: UIViewRepresentable {
             let x: Int32
             let y: Int32
             let z: Int32
-        }
-
-        /// The masked surface of one object, in the form RealityKit needs.
-        private struct ObjectMaskSurfelSet {
-            var surfels: [ObjectMaskSurfel]
-            var color: ObjectMaskDisplayColor
-            var fillAlpha: CGFloat
-            var timestamp: TimeInterval
-        }
-
-        /// GPU-resident overlay for one object's mask.
-        ///
-        /// The vertex buffer is rewritten only when Vision produces a new
-        /// keyframe. Between keyframes RealityKit redraws this geometry from the
-        /// live camera pose at display rate, so the mask stays registered to the
-        /// object with no per-frame CPU work and no latency of its own.
-        private struct ObjectMaskSurfelEntity {
-            let mesh: LowLevelMesh
-            let entity: ModelEntity
-            var capacity: Int
         }
 
         private struct ObjectMaskAlphaMap {
@@ -152,9 +133,11 @@ struct ARCameraView: UIViewRepresentable {
         fileprivate static let iceWhiteMaterial = UnlitMaterial(color: .white, applyPostProcessToneMap: false)
         fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
-        fileprivate static let captureBoxEdgeThickness: Float = 0.006
+        fileprivate static let captureBoxEdgeThickness: Float = 0.003
         fileprivate static let captureBoxDashTargetPeriod: Float = 0.018
         fileprivate static let captureBoxMaximumDashCount = 24
+        fileprivate static let preparedCaptureBoxEntityCount = 48
+        fileprivate static let automaticPointCleanupBatchSize = 4_096
         fileprivate static let captureBoxEdges = [
             (0, 1), (1, 3), (2, 3), (0, 2),
             (4, 5), (5, 7), (6, 7), (4, 6),
@@ -166,6 +149,7 @@ struct ARCameraView: UIViewRepresentable {
             (0, 2), (1, 2), (0, 3), (1, 3)
         ]
         fileprivate static let selectionPointRadius: Float = 0.00075
+        fileprivate static let maximumDisplayedSelectionPointCount = 600
         fileprivate static let selectionPointOffsets = [
             SIMD3<Float>(1, 1, 1),
             SIMD3<Float>(1, -1, -1),
@@ -178,39 +162,14 @@ struct ARCameraView: UIViewRepresentable {
             0, 2, 3,
             1, 3, 2
         ]
-        /// Mask surfels are octahedra rather than the tetrahedra used for
-        /// selection points: an octahedron presents the same silhouette radius
-        /// from every direction, so the overlay keeps a uniform density however
-        /// the operator circles the object, for only six vertices.
-        fileprivate static let maskSurfelOffsets = [
-            SIMD3<Float>(1, 0, 0),
-            SIMD3<Float>(-1, 0, 0),
-            SIMD3<Float>(0, 1, 0),
-            SIMD3<Float>(0, -1, 0),
-            SIMD3<Float>(0, 0, 1),
-            SIMD3<Float>(0, 0, -1)
-        ]
-        fileprivate static let maskSurfelIndices: [UInt32] = [
-            0, 2, 4,  2, 1, 4,  1, 3, 4,  3, 0, 4,
-            2, 0, 5,  1, 2, 5,  3, 1, 5,  0, 3, 5
-        ]
-        /// The silhouette tier is drawn slightly larger and far more opaque so
-        /// the mask keeps the crisp outline the 2D overlay had.
-        fileprivate static let maskSurfelBoundaryRadiusScale: Float = 1.35
-        fileprivate static let maskSurfelBoundaryAlpha: CGFloat = 0.9
-        /// Ceiling on splats drawn per object. Each depth sample of the mask
-        /// wants one splat, so an object filling a third of the frame reaches
-        /// roughly this many. Beyond it the fill is thinned rather than the
-        /// buffers grown, which keeps the per-object mesh under ~3 MB.
-        fileprivate static let maskSurfelDisplayLimit = 16_000
-        fileprivate static let maskSurfelMinimumCapacity = 2_048
-
         private let sessionManager: ARSessionManager
         private let mesEngine: MesEngine
         private let captureEngine: ObjectCaptureEngine
         private weak var arView: ARView?
+        private var coachingOverlayView: ARCoachingOverlayView?
         private var contentAnchor: AnchorEntity?
         private var placedPoints: [PlacedPoint] = []
+        private var refinementTasks: [UUID: Task<Void, Never>] = [:]
         private var mesEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
         private var captureEntitiesByObject: [UUID: [ModelEntity]] = [:]
@@ -219,6 +178,8 @@ struct ARCameraView: UIViewRepresentable {
         private var selectionPointMesh: LowLevelMesh?
         private var selectionPointEntity: ModelEntity?
         private var selectionPointMeshCapacity = 0
+        private var rendererWarmupTask: Task<Void, Never>?
+        private var captureBoxEntityPool: [ModelEntity] = []
         private var selectionPointsByObject: [UUID: [SIMD3<Float>]] = [:]
         private var supportAccumulators: [UUID: PointAccumulator] = [:]
         private var maskedAccumulators: [UUID: PointAccumulator] = [:]
@@ -242,12 +203,14 @@ struct ARCameraView: UIViewRepresentable {
         private static let satisfiedTickCount = 6
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
+        private let objectCaptureFitter = ObjectCaptureFitter()
+        private var captureFitTask: Task<Void, Never>?
+        private var captureFitTaskGeneration = 0
         private let objectMaskProcessor = ObjectMaskProcessor()
         private let objectMaskDisplayTracker = ObjectMaskDisplayTracker()
-        private var objectMaskSurfelSetsByID: [UUID: ObjectMaskSurfelSet] = [:]
-        private var objectMaskSurfelEntitiesByID: [UUID: ObjectMaskSurfelEntity] = [:]
         private var scanTickCounter = 0
         private var lastAutomaticPointCleanupTimestamp: TimeInterval = -.greatestFiniteMagnitude
+        private var automaticPointCleanupCursorByObject: [UUID: Int] = [:]
         private var consecutiveMaskMisses = 0
         private var consecutiveLiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
@@ -261,6 +224,7 @@ struct ARCameraView: UIViewRepresentable {
         private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskToggleAttemptsRemaining = 0
+        private var objectMaskProcessingFailuresRemaining = 0
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
         private var objectMaskMarkerStates: [UUID: ObjectMaskMarkerState] = [:]
         private var objectMaskColorsByID: [UUID: ObjectMaskDisplayColor] = [:]
@@ -276,11 +240,10 @@ struct ARCameraView: UIViewRepresentable {
         private var observedCaptureResetRevision = 0
         private var observedObjectMaskToggleRequestRevision = 0
         private var observedObjectWorkflowRequestRevision = 0
-        private var observedPointCleanupRequestRevision = 0
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
         private var observedShowsBoundingBoxes = true
-        private var observedShowsLockedMaskPreviews = true
+        private var observedFrameEpoch = 0
 
         init(
             sessionManager: ARSessionManager,
@@ -292,18 +255,37 @@ struct ARCameraView: UIViewRepresentable {
             self.captureEngine = captureEngine
         }
 
+        func prepareForNewWorld() {
+            mesEngine.reset()
+            captureEngine.reset()
+        }
+
         func attach(to arView: ARView) {
             self.arView = arView
+            installCoachingOverlay(in: arView)
+            observedResetRevision = mesEngine.resetRevision
+            observedPlacementRequestRevision = mesEngine.placementRequestRevision
             observedMode = mesEngine.mode
+            observedCaptureResetRevision = captureEngine.resetRevision
+            observedObjectMaskToggleRequestRevision =
+                captureEngine.objectMaskToggleRequestRevision
             observedMeshVisible = captureEngine.isMeshVisible
             observedShowsSelectedPoints = captureEngine.showsSelectedPoints
             observedShowsBoundingBoxes = captureEngine.showsBoundingBoxes
-            observedShowsLockedMaskPreviews =
-                captureEngine.showsLockedMaskPreviews
             observedObjectWorkflowRequestRevision =
                 captureEngine.objectWorkflowRequestRevision
+            observedFrameEpoch = sessionManager.frameEpoch
             createContentAnchorIfNeeded(in: arView)
             updateMeshVisibility()
+
+            rendererWarmupTask?.cancel()
+            rendererWarmupTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(600))
+                guard !Task.isCancelled else {
+                    return
+                }
+                await self?.prepareRenderersForFirstCapture()
+            }
 
             aimerUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self, weak arView] _ in
                 guard let self, let arView else {
@@ -354,6 +336,11 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         func detach() {
+            coachingOverlayView?.delegate = nil
+            coachingOverlayView?.session = nil
+            coachingOverlayView?.removeFromSuperview()
+            coachingOverlayView = nil
+            sessionManager.updateCoachingState(isActive: false)
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
             maskDisplayLink?.invalidate()
@@ -365,12 +352,12 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            cancelCaptureFit()
             captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
-            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -382,6 +369,10 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             pendingObjectMaskToggleRequest = nil
+            objectMaskToggleAttemptsRemaining = 0
+            objectMaskProcessingFailuresRemaining = 0
+            rendererWarmupTask?.cancel()
+            rendererWarmupTask = nil
             removeAllObjectMaskAnchors()
             captureEngine.updateLockedObjectMaskCount(0)
             captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
@@ -390,27 +381,72 @@ struct ARCameraView: UIViewRepresentable {
             clearAllCaptureContent()
 
             removeSelectionPointEntity()
+            captureBoxEntityPool.removeAll()
 
             if let contentAnchor, let arView {
                 arView.scene.removeAnchor(contentAnchor)
+            }
+
+            if let arView {
+                sessionManager.detach(arView.session)
             }
 
             arView = nil
             contentAnchor = nil
         }
 
+        private func installCoachingOverlay(in arView: ARView) {
+            let coachingOverlay = ARCoachingOverlayView()
+            coachingOverlay.translatesAutoresizingMaskIntoConstraints = false
+            coachingOverlay.delegate = self
+            coachingOverlay.goal = .tracking
+            coachingOverlay.activatesAutomatically = true
+            coachingOverlay.session = arView.session
+            arView.addSubview(coachingOverlay)
+            NSLayoutConstraint.activate([
+                coachingOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
+                coachingOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
+                coachingOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
+                coachingOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor)
+            ])
+            coachingOverlayView = coachingOverlay
+        }
+
+        func coachingOverlayViewWillActivate(
+            _ coachingOverlayView: ARCoachingOverlayView
+        ) {
+            sessionManager.updateCoachingState(isActive: true)
+        }
+
+        func coachingOverlayViewDidDeactivate(
+            _ coachingOverlayView: ARCoachingOverlayView
+        ) {
+            sessionManager.updateCoachingState(isActive: false)
+        }
+
+        func coachingOverlayViewDidRequestSessionReset(
+            _ coachingOverlayView: ARCoachingOverlayView
+        ) {
+            guard let arView else {
+                return
+            }
+            prepareForNewWorld()
+            sessionManager.restartTracking(arView.session)
+        }
+
         private func releaseRebuildableScanCaches() {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            cancelCaptureFit()
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
+            objectMaskProcessingFailuresRemaining = 0
             captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
-            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -432,11 +468,10 @@ struct ARCameraView: UIViewRepresentable {
                 _ = captureEngine.resetRevision
                 _ = captureEngine.objectMaskToggleRequestRevision
                 _ = captureEngine.objectWorkflowRequestRevision
-                _ = captureEngine.pointCleanupRequestRevision
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
                 _ = captureEngine.showsBoundingBoxes
-                _ = captureEngine.showsLockedMaskPreviews
+                _ = sessionManager.frameEpoch
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
                     guard let self else {
@@ -449,6 +484,18 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func handleEngineRevisionChange() {
+            if sessionManager.frameEpoch != observedFrameEpoch {
+                observedFrameEpoch = sessionManager.frameEpoch
+                invalidateInFlightFrameWork()
+                if !captureEngine.hasCapture,
+                   captureEngine.activeObjectID == nil,
+                   let arView {
+                    _ = sessionManager.recoverFailedSessionIfPossible(
+                        arView.session
+                    )
+                }
+            }
+
             if mesEngine.mode != observedMode {
                 let wasScanning = observedMode == .scan
                 observedMode = mesEngine.mode
@@ -488,19 +535,7 @@ struct ARCameraView: UIViewRepresentable {
                 observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
                 pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
                 objectMaskToggleAttemptsRemaining = 4
-            }
-
-            if captureEngine.pointCleanupRequestRevision
-                != observedPointCleanupRequestRevision {
-                observedPointCleanupRequestRevision = captureEngine.pointCleanupRequestRevision
-                if let arView {
-                    removeVisiblePointsOutsideCurrentMask(
-                        in: arView,
-                        reportsFeedback: true
-                    )
-                } else {
-                    captureEngine.failVisiblePointCleanup()
-                }
+                objectMaskProcessingFailuresRemaining = 8
             }
 
             if captureEngine.isMeshVisible != observedMeshVisible {
@@ -520,12 +555,26 @@ struct ARCameraView: UIViewRepresentable {
                 updateMeshVisibility()
             }
 
-            if captureEngine.showsLockedMaskPreviews
-                != observedShowsLockedMaskPreviews {
-                observedShowsLockedMaskPreviews =
-                    captureEngine.showsLockedMaskPreviews
-                updateObjectMaskSurfelVisibility()
-            }
+        }
+
+        private func invalidateInFlightFrameWork() {
+            objectMaskTask?.cancel()
+            objectMaskTaskGeneration &+= 1
+            objectMaskTask = nil
+            objectMaskDisplayTask?.cancel()
+            objectMaskDisplayTaskGeneration &+= 1
+            objectMaskDisplayTask = nil
+            cancelCaptureFit()
+            pendingObjectMaskToggleRequest = nil
+            objectMaskToggleAttemptsRemaining = 0
+            objectMaskProcessingFailuresRemaining = 0
+            captureEngine.cancelObjectSelection()
+            lastObjectMaskSubmittedFrameTimestamp = -.greatestFiniteMagnitude
+            lastAutomaticPointCleanupTimestamp = -.greatestFiniteMagnitude
+            previewTargetPosition = nil
+            lastAimerRaycastTransform = nil
+            clearPreviewMeasurementEntities()
+            cancelRefinementTasks(markPointsFinished: true)
         }
 
         private func applyObjectWorkflowRequest(
@@ -537,10 +586,30 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
+            cancelCaptureFit()
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
+            objectMaskProcessingFailuresRemaining = 0
 
             switch request.kind {
+            case .pauseFinalization:
+                objectMaskDisplayTask?.cancel()
+                objectMaskDisplayTaskGeneration &+= 1
+                objectMaskDisplayTask = nil
+                objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
+                removeLiveObjectMaskDisplaySeed()
+                captureEngine.clearTransientObjectMaskPreviews()
+                captureEngine.clearObjectMaskDisplayTracking(id: request.id)
+                if let state = objectMaskMarkerStates[request.id] {
+                    objectMaskMarkerStates[request.id] = ObjectMaskMarkerState(
+                        color: state.color,
+                        isMaskVisible: false
+                    )
+                }
+            case .resumeFinalization:
+                objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
+                removeLiveObjectMaskDisplaySeed()
+                captureEngine.clearTransientObjectMaskPreviews()
             case .finalize:
                 if let points = liveResultsByObject[request.id]?.surfacePoints {
                     selectionPointsByObject[request.id] = points
@@ -559,7 +628,6 @@ struct ARCameraView: UIViewRepresentable {
             case .reactivate:
                 fittedMaskedPointTimestamp[request.id] =
                     -.greatestFiniteMagnitude
-                removeObjectMaskSurfelOverlay(id: request.id)
                 removeLiveObjectMaskDisplaySeed()
                 captureEngine.clearLiveObjectMaskPreview()
             case .remove:
@@ -568,7 +636,6 @@ struct ARCameraView: UIViewRepresentable {
                 objectMaskDisplayTask = nil
                 objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
                 captureEngine.clearObjectMaskDisplayTracking(id: request.id)
-                removeObjectMaskSurfelOverlay(id: request.id)
                 if let anchor = objectMaskAnchors.removeValue(
                     forKey: request.id
                 ), let arView {
@@ -585,6 +652,9 @@ struct ARCameraView: UIViewRepresentable {
                     forKey: request.id
                 )
                 manuallyRejectedVoxelKeysByObject.removeValue(
+                    forKey: request.id
+                )
+                automaticPointCleanupCursorByObject.removeValue(
                     forKey: request.id
                 )
                 selectionPointsByObject.removeValue(forKey: request.id)
@@ -619,8 +689,14 @@ struct ARCameraView: UIViewRepresentable {
 
         private func updateObjectMaskPreview(in arView: ARView) {
             guard mesEngine.mode == .scan,
+                  !captureEngine.isFinalizationPending,
                   objectMaskTask == nil,
+                  arView.window != nil,
+                  arView.bounds.width > 0,
+                  arView.bounds.height > 0,
+                  sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState,
                   frame.timestamp > lastObjectMaskSubmittedFrameTimestamp else {
                 return
             }
@@ -632,7 +708,17 @@ struct ARCameraView: UIViewRepresentable {
                 viewportSize: viewportSize
             )
 
-            let submittedToggleRequest = pendingObjectMaskToggleRequest
+            let submittedToggleRequest: ObjectMaskToggleRequest?
+            if pendingObjectMaskToggleRequest != nil,
+               !sessionManager.isObjectTrackingEnvironmentReady {
+                pendingObjectMaskToggleRequest = nil
+                objectMaskToggleAttemptsRemaining = 0
+                objectMaskProcessingFailuresRemaining = 0
+                captureEngine.reportObjectSelectionNotReady()
+                submittedToggleRequest = nil
+            } else {
+                submittedToggleRequest = pendingObjectMaskToggleRequest
+            }
             let toggleRequest = preparedObjectMaskToggleRequest(
                 submittedToggleRequest,
                 frame: frame,
@@ -649,17 +735,19 @@ struct ARCameraView: UIViewRepresentable {
                 finalizedObjectIDs: captureEngine.finalizedObjectIDs,
                 timestamp: frame.timestamp,
                 trackingGeneration: objectMaskTrackingGeneration,
+                requiresDepthWarmup: sessionManager.isAutomaticObjectCaptureSupported,
                 depthSnapshot: captureEngine.activeObjectID != nil
                     || toggleRequest != nil
+                    || !captureEngine.hasCompletedObjectRecognitionWarmup
                     ? objectMaskDepthSnapshot(from: frame)
                     : nil
             )
             if submittedToggleRequest != nil {
                 pendingObjectMaskToggleRequest = nil
-                objectMaskToggleAttemptsRemaining = max(objectMaskToggleAttemptsRemaining - 1, 0)
             }
             let processor = objectMaskProcessor
             let submittedResetRevision = captureEngine.resetRevision
+            let submittedFrameEpoch = sessionManager.frameEpoch
             lastObjectMaskSubmittedFrameTimestamp = frame.timestamp
             objectMaskTaskGeneration &+= 1
             let taskGeneration = objectMaskTaskGeneration
@@ -677,8 +765,45 @@ struct ARCameraView: UIViewRepresentable {
                         == submittedResetRevision else {
                     return
                 }
-                guard !wasCancelled, self.mesEngine.mode == .scan else {
+                guard self.sessionManager.frameEpoch == submittedFrameEpoch,
+                      !wasCancelled,
+                      self.mesEngine.mode == .scan,
+                      !self.captureEngine.isFinalizationPending,
+                      self.sessionManager.isTrackingReady,
+                      let currentFrame = arView.session.currentFrame,
+                      case .normal = currentFrame.camera.trackingState,
+                      currentFrame.timestamp >= input.timestamp else {
                     return
+                }
+
+                switch result.status {
+                case .cancelled:
+                    return
+                case .failed:
+                    if let submittedToggleRequest,
+                       self.captureEngine.isObjectSelectionPending {
+                        self.objectMaskProcessingFailuresRemaining = max(
+                            self.objectMaskProcessingFailuresRemaining - 1,
+                            0
+                        )
+                        if self.objectMaskProcessingFailuresRemaining > 0 {
+                            self.pendingObjectMaskToggleRequest = submittedToggleRequest
+                        } else {
+                            self.objectMaskToggleAttemptsRemaining = 0
+                            self.captureEngine.reportObjectRecognitionFailure()
+                        }
+                    }
+                    return
+                case .succeeded:
+                    if result.isSelectionPipelineWarmed {
+                        self.captureEngine.markObjectRecognitionWarmupCompleted()
+                    }
+                    if submittedToggleRequest != nil {
+                        self.objectMaskToggleAttemptsRemaining = max(
+                            self.objectMaskToggleAttemptsRemaining - 1,
+                            0
+                        )
+                    }
                 }
 
                 let previousLockedObjectCount = self.captureEngine.lockedObjectMaskCount
@@ -695,10 +820,6 @@ struct ARCameraView: UIViewRepresentable {
                     guard cloud.id == self.captureEngine.activeObjectID else {
                         continue
                     }
-                    // The yellow world-space mask surfels were removed: they rebuilt
-                    // up to ~96k vertices per frame purely to visualize the mask and
-                    // had no effect on the measurement (which uses `acceptedPoints`
-                    // below). The lightweight 2D mask preview remains as the highlight.
                     let acceptedPoints: [SIMD3<Float>]
                     if let rejectedKeys = self.manuallyRejectedVoxelKeysByObject[cloud.id],
                        !rejectedKeys.isEmpty {
@@ -729,7 +850,6 @@ struct ARCameraView: UIViewRepresentable {
                         )
                     }
                 }
-                self.pruneObjectMaskSurfelOverlays()
                 for marker in result.markers {
                     self.objectMaskColorsByID[marker.id] = marker.color
                     self.objectMaskMarkerStates[marker.id] = ObjectMaskMarkerState(
@@ -754,7 +874,12 @@ struct ARCameraView: UIViewRepresentable {
                     visibleCount: result.visibleObjectCount,
                     markers: self.currentObjectMaskMarkers(in: arView)
                 )
-                if submittedToggleRequest != nil,
+                if result.needsWorldSurface {
+                    self.pendingObjectMaskToggleRequest = nil
+                    self.objectMaskToggleAttemptsRemaining = 0
+                    self.objectMaskProcessingFailuresRemaining = 0
+                    self.captureEngine.reportObjectLockNeedsSurface()
+                } else if submittedToggleRequest != nil,
                    !result.didToggleLock,
                    self.pendingObjectMaskToggleRequest == nil,
                    self.objectMaskToggleAttemptsRemaining > 0 {
@@ -767,8 +892,6 @@ struct ARCameraView: UIViewRepresentable {
                     } else {
                         self.captureEngine.reportObjectLockNotFound()
                     }
-                } else if result.needsWorldSurface {
-                    self.captureEngine.reportObjectLockNeedsSurface()
                 }
 
                 if let preview = result.preview,
@@ -818,6 +941,7 @@ struct ARCameraView: UIViewRepresentable {
 
         private func updateFastObjectMaskPreview(in arView: ARView) {
             guard mesEngine.mode == .scan,
+                  !captureEngine.isFinalizationPending,
                   let frame = arView.session.currentFrame else {
                 return
             }
@@ -854,6 +978,7 @@ struct ARCameraView: UIViewRepresentable {
                 uniqueKeysWithValues: seeds.map { ($0.id, $0.timestamp) }
             )
             let tracker = objectMaskDisplayTracker
+            let submittedFrameEpoch = sessionManager.frameEpoch
             objectMaskDisplayTaskGeneration &+= 1
             let taskGeneration = objectMaskDisplayTaskGeneration
 
@@ -869,7 +994,14 @@ struct ARCameraView: UIViewRepresentable {
                 }
 
                 self.objectMaskDisplayTask = nil
-                guard !wasCancelled, self.mesEngine.mode == .scan else {
+                guard self.sessionManager.frameEpoch == submittedFrameEpoch,
+                      !wasCancelled,
+                      self.mesEngine.mode == .scan,
+                      !self.captureEngine.isFinalizationPending,
+                      self.sessionManager.isTrackingReady,
+                      let currentFrame = arView.session.currentFrame,
+                      case .normal = currentFrame.camera.trackingState,
+                      currentFrame.timestamp >= input.timestamp else {
                     return
                 }
                 var applicableBoundingBoxes = self.captureEngine
@@ -955,10 +1087,7 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        private func removeVisiblePointsOutsideCurrentMask(
-            in arView: ARView,
-            reportsFeedback: Bool
-        ) {
+        private func removeVisiblePointsOutsideCurrentMask(in arView: ARView) {
             guard mesEngine.mode == .scan,
                   sessionManager.isAutomaticObjectCaptureSupported,
                   sessionManager.isTrackingReady,
@@ -981,9 +1110,6 @@ struct ARCameraView: UIViewRepresentable {
                   let sceneDepth = frame.sceneDepth,
                   arView.bounds.width > 0,
                   arView.bounds.height > 0 else {
-                if reportsFeedback {
-                    captureEngine.failVisiblePointCleanup()
-                }
                 return
             }
 
@@ -997,9 +1123,6 @@ struct ARCameraView: UIViewRepresentable {
                 imageToViewport.a * imageToViewport.d
                     - imageToViewport.b * imageToViewport.c
             ) > 0.000001 else {
-                if reportsFeedback {
-                    captureEngine.failVisiblePointCleanup()
-                }
                 return
             }
             let viewportToImage = imageToViewport.inverted()
@@ -1048,10 +1171,19 @@ struct ARCameraView: UIViewRepresentable {
             let confidenceWidth = confidenceMap.map(CVPixelBufferGetWidth) ?? 0
             let confidenceHeight = confidenceMap.map(CVPixelBufferGetHeight) ?? 0
             let worldToCamera = frame.camera.transform.inverse
-            let pairs = zip(
-                result.selectionPoints,
-                result.surfacePoints
-            ).map { (selection: $0.0, surface: $0.1) }
+            let pointCount = result.surfacePoints.count
+            let batchCount = min(
+                pointCount,
+                Self.automaticPointCleanupBatchSize
+            )
+            let batchStart = automaticPointCleanupCursorByObject[
+                objectID,
+                default: 0
+            ] % pointCount
+            let candidateIndices = (0..<batchCount).map {
+                (batchStart + $0) % pointCount
+            }
+            let nextCursor = (batchStart + batchCount) % pointCount
             let maskSampleRadius = 2
             let viewportBorderX = max(
                 2 / viewportSize.width,
@@ -1064,18 +1196,12 @@ struct ARCameraView: UIViewRepresentable {
 
             guard CVPixelBufferLockBaseAddress(depthMap, .readOnly)
                 == kCVReturnSuccess else {
-                if reportsFeedback {
-                    captureEngine.failVisiblePointCleanup()
-                }
                 return
             }
             if let confidenceMap {
                 guard CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
                     == kCVReturnSuccess else {
                     CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-                    if reportsFeedback {
-                        captureEngine.failVisiblePointCleanup()
-                    }
                     return
                 }
             }
@@ -1084,9 +1210,6 @@ struct ARCameraView: UIViewRepresentable {
                 if let confidenceMap {
                     CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
                 }
-                if reportsFeedback {
-                    captureEngine.failVisiblePointCleanup()
-                }
                 return
             }
             let confidenceBase: UnsafeMutableRawPointer?
@@ -1094,9 +1217,6 @@ struct ARCameraView: UIViewRepresentable {
                 guard let base = CVPixelBufferGetBaseAddress(confidenceMap) else {
                     CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
                     CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
-                    if reportsFeedback {
-                        captureEngine.failVisiblePointCleanup()
-                    }
                     return
                 }
                 confidenceBase = base
@@ -1116,8 +1236,8 @@ struct ARCameraView: UIViewRepresentable {
                 } ?? 0
                 var removed: Set<Int> = []
 
-                for index in pairs.indices {
-                    let surfacePoint = pairs[index].surface
+                for index in candidateIndices {
+                    let surfacePoint = result.surfacePoints[index]
                     let cameraPoint = worldToCamera * SIMD4<Float>(surfacePoint, 1)
                     guard cameraPoint.z < -0.02 else {
                         continue
@@ -1233,21 +1353,18 @@ struct ARCameraView: UIViewRepresentable {
                 }
                 return removed
             }()
+            automaticPointCleanupCursorByObject[objectID] = nextCursor
 
             guard !removedIndices.isEmpty else {
-                if reportsFeedback {
-                    captureEngine.finishVisiblePointCleanup(removedCount: 0)
-                }
                 return
             }
 
-            let removedPairs = pairs.enumerated().compactMap {
-                removedIndices.contains($0.offset) ? $0.element : nil
+            let removedPairs = removedIndices.map {
+                (
+                    selection: result.selectionPoints[$0],
+                    surface: result.surfacePoints[$0]
+                )
             }
-            let retainedPairs = pairs.enumerated().compactMap {
-                removedIndices.contains($0.offset) ? nil : $0.element
-            }
-            let removedSelections = removedPairs.map(\.selection)
             accumulator.removeVoxels(
                 containing: removedPairs.flatMap {
                     [$0.selection, $0.surface]
@@ -1263,8 +1380,26 @@ struct ARCameraView: UIViewRepresentable {
                 }
             )
 
-            let retainedSelectionPoints = retainedPairs.map(\.selection)
-            let retainedSurfacePoints = retainedPairs.map(\.surface)
+            let retainedSelectionPoints = result.selectionPoints.enumerated().compactMap {
+                removedIndices.contains($0.offset) ? nil : $0.element
+            }
+            let retainedSurfacePoints = result.surfacePoints.enumerated().compactMap {
+                removedIndices.contains($0.offset) ? nil : $0.element
+            }
+            if retainedSurfacePoints.isEmpty {
+                automaticPointCleanupCursorByObject.removeValue(forKey: objectID)
+            } else if let nextRetainedOriginalIndex = (0..<pointCount)
+                .lazy
+                .map({ (nextCursor + $0) % pointCount })
+                .first(where: { !removedIndices.contains($0) }) {
+                let removedBeforeNext = removedIndices.reduce(into: 0) {
+                    if $1 < nextRetainedOriginalIndex {
+                        $0 += 1
+                    }
+                }
+                automaticPointCleanupCursorByObject[objectID] =
+                    nextRetainedOriginalIndex - removedBeforeNext
+            }
             let cleanedObject = CapturedObject(
                 dimensions: result.object.dimensions,
                 center: result.object.center,
@@ -1290,11 +1425,6 @@ struct ARCameraView: UIViewRepresentable {
             selectionPointsByObject[objectID] = retainedSurfacePoints
             updateSelectionVisualization()
             captureEngine.updateCapture(id: objectID, object: cleanedObject)
-            if reportsFeedback {
-                captureEngine.finishVisiblePointCleanup(
-                    removedCount: removedSelections.count
-                )
-            }
         }
 
         private func updateSessionFrameStatus(in arView: ARView) {
@@ -1450,7 +1580,6 @@ struct ARCameraView: UIViewRepresentable {
                     arView.session.remove(anchor: previousAnchor)
                 }
                 maskedAccumulators.removeValue(forKey: change.id)
-                removeObjectMaskSurfelOverlay(id: change.id)
                 supportAccumulators[change.id] = PointAccumulator(
                     voxelSize: ObjectCapturePipeline.supportVoxelSize,
                     maxVoxels: 4_000
@@ -1495,6 +1624,7 @@ struct ARCameraView: UIViewRepresentable {
 
         private func updateScanLive(in arView: ARView) {
             guard mesEngine.mode == .scan,
+                  !captureEngine.isFinalizationPending,
                   sessionManager.isAutomaticObjectCaptureSupported else {
                 return
             }
@@ -1510,12 +1640,7 @@ struct ARCameraView: UIViewRepresentable {
 
             if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 2 {
                 lastAutomaticPointCleanupTimestamp = frame.timestamp
-                if !captureEngine.isPointCleanupInProgress {
-                    removeVisiblePointsOutsideCurrentMask(
-                        in: arView,
-                        reportsFeedback: false
-                    )
-                }
+                removeVisiblePointsOutsideCurrentMask(in: arView)
             }
 
             let visibleHints = objectMaskAnchorHints(frame: frame, in: arView).filter {
@@ -1563,146 +1688,190 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
+            guard captureFitTask == nil,
+                  let hint = visibleHints.first else {
+                return
+            }
             createContentAnchorIfNeeded(in: arView)
-            for hint in visibleHints {
-                let id = hint.id
-                guard let maskTimestamp = newestMaskedPointTimestamp[id],
-                      maskTimestamp > fittedMaskedPointTimestamp[id, default: -.greatestFiniteMagnitude],
-                      let objectAccumulator = maskedAccumulators[id],
-                      let anchor = objectMaskAnchors[id] else {
-                    continue
-                }
-                let supportReference = liveResultsByObject[id]?.object.center
-                    ?? anchor.transform.translation
-                let planeSupportHeight = ObjectCapturePipeline.supportPlaneHeight(
-                    from: frame.anchors,
-                    beneath: supportReference
-                )
-                let supportPoints = supportAccumulators[id]?.points(
-                    minObservations: ObjectCapturePipeline.minObservations
-                ) ?? []
-                guard planeSupportHeight != nil || !supportPoints.isEmpty else {
-                    continue
-                }
-                let objectPoints = objectAccumulator.confirmedPoints(
-                    minObservations: ObjectCapturePipeline.minObservations
-                )
-                guard !objectPoints.isEmpty else {
-                    continue
-                }
+            let id = hint.id
+            guard let maskTimestamp = newestMaskedPointTimestamp[id],
+                  maskTimestamp > fittedMaskedPointTimestamp[
+                      id,
+                      default: -.greatestFiniteMagnitude
+                  ],
+                  let objectAccumulator = maskedAccumulators[id],
+                  let anchor = objectMaskAnchors[id] else {
+                return
+            }
+            let supportReference = liveResultsByObject[id]?.object.center
+                ?? anchor.transform.translation
+            let planeSupportHeight = ObjectCapturePipeline.supportPlaneHeight(
+                from: frame.anchors,
+                beneath: supportReference
+            )
+            let supportPoints = supportAccumulators[id]?.points(
+                minObservations: ObjectCapturePipeline.minObservations
+            ) ?? []
+            guard planeSupportHeight != nil || !supportPoints.isEmpty else {
+                return
+            }
+            let objectPoints = objectAccumulator.confirmedPoints(
+                minObservations: ObjectCapturePipeline.minObservations
+            )
+            guard !objectPoints.isEmpty else {
+                return
+            }
 
-                let outcome = ObjectCapturePipeline.capture(
+            let fitter = objectCaptureFitter
+            let seed = anchor.transform.translation
+            let wasAtCapacity = objectAccumulator.isAtCapacity
+            let cameraTransform = frame.camera.transform
+            let submittedResetRevision = captureEngine.resetRevision
+            let submittedFrameEpoch = sessionManager.frameEpoch
+            captureFitTaskGeneration &+= 1
+            let taskGeneration = captureFitTaskGeneration
+            captureFitTask = Task { [weak self] in
+                let outcome = await fitter.capture(
                     objectPoints: objectPoints,
                     supportPoints: supportPoints,
-                    seed: anchor.transform.translation,
-                    up: SIMD3<Float>(0, 1, 0),
+                    seed: seed,
                     supportHeight: planeSupportHeight
                 )
-                guard case .success(let result) = outcome else {
-                    continue
+                let wasCancelled = Task.isCancelled
+                guard let self,
+                      self.captureFitTaskGeneration == taskGeneration else {
+                    return
                 }
-
-                fittedMaskedPointTimestamp[id] = maskTimestamp
-                if let previous = liveResultsByObject[id],
-                   previous.selectionPoints == result.selectionPoints {
-                    continue
+                self.captureFitTask = nil
+                guard !wasCancelled,
+                      self.captureEngine.resetRevision == submittedResetRevision,
+                      self.sessionManager.frameEpoch == submittedFrameEpoch,
+                      !self.captureEngine.isFinalizationPending,
+                      self.captureEngine.activeObjectID == id,
+                      self.newestMaskedPointTimestamp[id, default: maskTimestamp]
+                          >= maskTimestamp else {
+                    return
                 }
-                var acceptedSurfaceExpansion = false
-                if let previous = liveResultsByObject[id] {
-                    let requiresExpansionEvidence =
-                        !isPlausibleBoxRefinement(result.object, from: previous.object)
-                        || objectAccumulator.isAtCapacity
-                    if requiresExpansionEvidence {
-                        acceptedSurfaceExpansion = hasConfirmedSurfaceExpansion(
-                            result,
-                            from: previous,
-                            for: id
-                        )
-                        if !acceptedSurfaceExpansion {
-                            let supportedPairs = zip(
-                                result.selectionPoints,
-                                result.surfacePoints
-                            ).filter { pair in
-                                previous.object.contains(
-                                    pair.0,
-                                    tolerance: ObjectCapturePipeline.selectionTolerance
-                                )
-                                    && previous.object.contains(
-                                        pair.1
-                                    )
-                            }
-                            let retainedResult = CaptureResult(
-                                object: previous.object,
-                                selectionPoints: mergedSelectionPoints(
-                                    previous.selectionPoints,
-                                    supportedPairs.map(\.0)
-                                ),
-                                surfacePoints: mergedSelectionPoints(
-                                    previous.surfacePoints,
-                                    supportedPairs.map(\.1)
-                                )
-                            )
-                            liveResultsByObject[id] = retainedResult
-                            selectionPointsByObject[id] =
-                                retainedResult.surfacePoints
-                            updateSelectionVisualization()
-                            continue
-                        }
-                    }
-                }
-                var acceptedResult = result
-                if objectAccumulator.isAtCapacity,
-                   let previous = liveResultsByObject[id] {
-                    let retainedSurfacePoints = mergedSelectionPoints(
-                        previous.surfacePoints,
-                        result.surfacePoints
-                    )
-                    acceptedResult = CaptureResult(
-                        object: ObjectBoundingBox.enclosing(
-                            retainedSurfacePoints,
-                            around: result.object
-                        ),
-                        selectionPoints: result.selectionPoints,
-                        surfacePoints: retainedSurfacePoints
-                    )
-                }
-                liveResultsByObject[id] = acceptedResult
-                selectionPointsByObject[id] = acceptedResult.surfacePoints
-                updateSelectionVisualization()
-                if acceptedSurfaceVoxelKeysByObject[id] == nil
-                    || acceptedSurfaceExpansion {
-                    acceptedSurfaceVoxelKeysByObject[id] = Set(
-                        acceptedResult.selectionPoints.filter {
-                            acceptedResult.object.contains(
-                                $0,
-                                tolerance: ObjectCapturePipeline.selectionTolerance
-                            )
-                        }.map(selectionVoxelKey(for:))
-                    )
-                } else {
-                    for point in acceptedResult.selectionPoints where acceptedResult.object.contains(
-                        point,
-                        tolerance: ObjectCapturePipeline.selectionTolerance
-                    ) {
-                        acceptedSurfaceVoxelKeysByObject[id, default: []].insert(
-                            selectionVoxelKey(for: point)
-                        )
-                    }
-                }
-                let displayBox = viewGatedBox(
-                    fitted: acceptedResult.object,
-                    id: id,
-                    base: planeSupportHeight,
-                    camera: frame.camera.transform,
-                    isActive: id == activeObjectID
+                self.fittedMaskedPointTimestamp[id] = max(
+                    self.fittedMaskedPointTimestamp[
+                        id,
+                        default: -.greatestFiniteMagnitude
+                    ],
+                    maskTimestamp
                 )
-                addCapturedBox(displayBox, for: id)
-                captureEngine.updateCapture(id: id, object: displayBox)
+                guard case .success(let result) = outcome else {
+                    return
+                }
+                self.applyCaptureResult(
+                    result,
+                    id: id,
+                    accumulatorWasAtCapacity: wasAtCapacity,
+                    supportHeight: planeSupportHeight,
+                    cameraTransform: cameraTransform
+                )
             }
+        }
 
-            if liveResultsByObject[activeObjectID] != nil {
-                captureEngine.focusCapture(id: activeObjectID)
+        private func applyCaptureResult(
+            _ result: CaptureResult,
+            id: UUID,
+            accumulatorWasAtCapacity: Bool,
+            supportHeight: Float?,
+            cameraTransform: simd_float4x4
+        ) {
+            if let previous = liveResultsByObject[id],
+               previous.selectionPoints == result.selectionPoints {
+                return
             }
+            var acceptedSurfaceExpansion = false
+            if let previous = liveResultsByObject[id] {
+                let requiresExpansionEvidence =
+                    !isPlausibleBoxRefinement(result.object, from: previous.object)
+                    || accumulatorWasAtCapacity
+                if requiresExpansionEvidence {
+                    acceptedSurfaceExpansion = hasConfirmedSurfaceExpansion(
+                        result,
+                        from: previous,
+                        for: id
+                    )
+                    if !acceptedSurfaceExpansion {
+                        let supportedPairs = zip(
+                            result.selectionPoints,
+                            result.surfacePoints
+                        ).filter { pair in
+                            previous.object.contains(
+                                pair.0,
+                                tolerance: ObjectCapturePipeline.selectionTolerance
+                            ) && previous.object.contains(pair.1)
+                        }
+                        let retainedResult = CaptureResult(
+                            object: previous.object,
+                            selectionPoints: mergedSelectionPoints(
+                                previous.selectionPoints,
+                                supportedPairs.map(\.0)
+                            ),
+                            surfacePoints: mergedSelectionPoints(
+                                previous.surfacePoints,
+                                supportedPairs.map(\.1)
+                            )
+                        )
+                        liveResultsByObject[id] = retainedResult
+                        selectionPointsByObject[id] = retainedResult.surfacePoints
+                        updateSelectionVisualization()
+                        return
+                    }
+                }
+            }
+            var acceptedResult = result
+            if accumulatorWasAtCapacity,
+               let previous = liveResultsByObject[id] {
+                let retainedSurfacePoints = mergedSelectionPoints(
+                    previous.surfacePoints,
+                    result.surfacePoints
+                )
+                acceptedResult = CaptureResult(
+                    object: ObjectBoundingBox.enclosing(
+                        retainedSurfacePoints,
+                        around: result.object
+                    ),
+                    selectionPoints: result.selectionPoints,
+                    surfacePoints: retainedSurfacePoints
+                )
+            }
+            liveResultsByObject[id] = acceptedResult
+            selectionPointsByObject[id] = acceptedResult.surfacePoints
+            updateSelectionVisualization()
+            if acceptedSurfaceVoxelKeysByObject[id] == nil
+                || acceptedSurfaceExpansion {
+                acceptedSurfaceVoxelKeysByObject[id] = Set(
+                    acceptedResult.selectionPoints.filter {
+                        acceptedResult.object.contains(
+                            $0,
+                            tolerance: ObjectCapturePipeline.selectionTolerance
+                        )
+                    }.map(selectionVoxelKey(for:))
+                )
+            } else {
+                for point in acceptedResult.selectionPoints
+                where acceptedResult.object.contains(
+                    point,
+                    tolerance: ObjectCapturePipeline.selectionTolerance
+                ) {
+                    acceptedSurfaceVoxelKeysByObject[id, default: []].insert(
+                        selectionVoxelKey(for: point)
+                    )
+                }
+            }
+            let displayBox = viewGatedBox(
+                fitted: acceptedResult.object,
+                id: id,
+                base: supportHeight,
+                camera: cameraTransform,
+                isActive: captureEngine.activeObjectID == id
+            )
+            addCapturedBox(displayBox, for: id)
+            captureEngine.updateCapture(id: id, object: displayBox)
+            captureEngine.focusCapture(id: id)
         }
 
         private func isPlausibleBoxRefinement(
@@ -1843,10 +2012,13 @@ struct ARCameraView: UIViewRepresentable {
             acceptedSurfaceVoxelKeysByObject.removeAll()
             manuallyRejectedVoxelKeysByObject.removeAll()
             scanTickCounter = 0
+            lastAutomaticPointCleanupTimestamp = -.greatestFiniteMagnitude
+            automaticPointCleanupCursorByObject.removeAll()
             resetObjectMaskTracking()
         }
 
         private func resetObjectMaskTracking() {
+            cancelCaptureFit()
             objectMaskTrackingGeneration &+= 1
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
@@ -1856,7 +2028,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
             objectMaskDisplaySeedsByID.removeAll()
-            removeAllObjectMaskSurfelOverlays()
             liveObjectMaskDisplayID = nil
             consecutiveLiveMaskMisses = 0
             objectMaskDisplayOrientation = nil
@@ -1868,6 +2039,8 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             pendingObjectMaskToggleRequest = nil
+            objectMaskToggleAttemptsRemaining = 0
+            objectMaskProcessingFailuresRemaining = 0
             consecutiveMaskMisses = 0
             consecutiveLiveMaskMisses = 0
             maskedAccumulators.removeAll()
@@ -1886,6 +2059,12 @@ struct ARCameraView: UIViewRepresentable {
             captureEngine.clearObjectMaskPreview()
         }
 
+        private func cancelCaptureFit() {
+            captureFitTask?.cancel()
+            captureFitTask = nil
+            captureFitTaskGeneration &+= 1
+        }
+
         private func removeAllObjectMaskAnchors() {
             guard let arView else {
                 objectMaskAnchors.removeAll()
@@ -1899,7 +2078,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskColorsByID.removeAll()
             maskedAccumulators.removeAll()
             supportAccumulators.removeAll()
-            removeAllObjectMaskSurfelOverlays()
         }
 
         private func placePointAtTarget(in arView: ARView) {
@@ -1917,10 +2095,10 @@ struct ARCameraView: UIViewRepresentable {
             let targetLocation = centerPoint(in: arView)
 
             let initialTransform: simd_float4x4
-            if let cached = lastAimerRaycastTransform {
-                initialTransform = cached
-            } else if let immediate = bestRaycastResult(from: targetLocation, in: arView) {
+            if let immediate = bestRaycastResult(from: targetLocation, in: arView) {
                 initialTransform = immediate.worldTransform
+            } else if let cached = lastAimerRaycastTransform {
+                initialTransform = cached
             } else {
                 mesEngine.reportPlacementFailure()
                 return
@@ -2025,9 +2203,13 @@ struct ARCameraView: UIViewRepresentable {
 
             updateTrackedRaycast(trackedRaycast, for: pointID)
 
-            Task { @MainActor in
+            refinementTasks[pointID]?.cancel()
+            refinementTasks[pointID] = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(1.5))
-                stopRefining(pointID: pointID)
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.stopRefining(pointID: pointID)
             }
         }
 
@@ -2048,13 +2230,16 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func stopRefining(pointID: UUID) {
+            refinementTasks.removeValue(forKey: pointID)?.cancel()
             guard let index = placedPoints.firstIndex(where: { $0.id == pointID }) else {
                 return
             }
 
             placedPoints[index].trackedRaycast?.stopTracking()
             placedPoints[index].trackedRaycast = nil
-            lockPointToARAnchor(at: index)
+            if sessionManager.isTrackingReady {
+                lockPointToARAnchor(at: index)
+            }
             mesEngine.finishRefiningPoint(id: pointID)
         }
 
@@ -2100,7 +2285,7 @@ struct ARCameraView: UIViewRepresentable {
                 name: "MesPoint-\(pointID.uuidString)",
                 transform: latestTransform
             )
-            let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))
+            let anchorEntity = AnchorEntity(anchor: arAnchor)
 
             arView.session.add(anchor: arAnchor)
             arView.scene.addAnchor(anchorEntity)
@@ -2229,7 +2414,9 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func syncAnchoredPositionIfNeeded(for placedPoint: PlacedPoint, worldPosition: SIMD3<Float>) {
-            guard placedPoint.anchorEntity != nil,
+            guard let frame = arView?.session.currentFrame,
+                  case .normal = frame.camera.trackingState,
+                  placedPoint.anchorEntity != nil,
                   let storedPosition = mesEngine.points.first(where: { $0.id == placedPoint.id })?.position,
                   simd_distance(storedPosition, worldPosition) > 0.001 else {
                 return
@@ -2317,11 +2504,17 @@ struct ARCameraView: UIViewRepresentable {
                         ?? captureEngine.capturedObjectsByID[objectID] else {
                     continue
                 }
-                renderCapturedBox(
-                    object,
-                    for: objectID,
+                let previousRearEdges = captureBoxRearEdgeStatesByObject[objectID]
+                let spans = captureBoxLineSpans(
+                    for: object,
+                    objectID: objectID,
                     cameraPosition: cameraPosition
                 )
+                guard captureBoxRearEdgeStatesByObject[objectID]
+                        != previousRearEdges else {
+                    continue
+                }
+                renderCapturedBoxSpans(spans, for: objectID)
             }
         }
 
@@ -2449,11 +2642,20 @@ struct ARCameraView: UIViewRepresentable {
                 let entityMaterial = material
                     ?? capturedBoxMaterial(for: objectID)
                 while entities.count < renderableSpans.count {
-                    let entity = ModelEntity(
-                        mesh: Self.unitCubeMesh,
-                        materials: [entityMaterial]
-                    )
-                    contentAnchor.addChild(entity)
+                    let entity: ModelEntity
+                    if let preparedEntity = captureBoxEntityPool.popLast() {
+                        entity = preparedEntity
+                        if var model = entity.model {
+                            model.materials = [entityMaterial]
+                            entity.model = model
+                        }
+                    } else {
+                        entity = ModelEntity(
+                            mesh: Self.unitCubeMesh,
+                            materials: [entityMaterial]
+                        )
+                        contentAnchor.addChild(entity)
+                    }
                     entities.append(entity)
                 }
             }
@@ -2586,6 +2788,7 @@ struct ARCameraView: UIViewRepresentable {
             heightFromSideObjects.removeAll()
             footprintStableTicks.removeAll()
             heightStableTicks.removeAll()
+            captureEngine.resetScanGuidance()
             hideAllSelectionMarkers()
             selectionPointsByObject.removeAll()
         }
@@ -2807,9 +3010,7 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func updateSelectionVisualization() {
-            let selectionPoints = selectionPointsByObject.keys
-                .sorted { $0.uuidString < $1.uuidString }
-                .flatMap { selectionPointsByObject[$0] ?? [] }
+            let selectionPoints = displayedSelectionPoints()
             guard captureEngine.showsSelectedPoints, !selectionPoints.isEmpty,
                   let contentAnchor else {
                 hideAllSelectionMarkers()
@@ -2844,6 +3045,69 @@ struct ARCameraView: UIViewRepresentable {
                 )
             ])
             selectionPointEntity?.isEnabled = true
+        }
+
+        private func prepareRenderersForFirstCapture() async {
+            guard let contentAnchor else {
+                return
+            }
+            _ = selectionPointMesh(
+                in: contentAnchor,
+                minimumCapacity: Self.maximumDisplayedSelectionPointCount
+            )
+            selectionPointEntity?.isEnabled = false
+
+            let material = capturedBoxMaterial(for: UUID())
+            while captureBoxEntityPool.count < Self.preparedCaptureBoxEntityCount {
+                guard !Task.isCancelled else {
+                    return
+                }
+                let batchEnd = min(
+                    captureBoxEntityPool.count + 6,
+                    Self.preparedCaptureBoxEntityCount
+                )
+                while captureBoxEntityPool.count < batchEnd {
+                    let entity = ModelEntity(
+                        mesh: Self.unitCubeMesh,
+                        materials: [material]
+                    )
+                    entity.isEnabled = false
+                    contentAnchor.addChild(entity)
+                    captureBoxEntityPool.append(entity)
+                }
+                if captureBoxEntityPool.count < Self.preparedCaptureBoxEntityCount {
+                    try? await Task.sleep(for: .milliseconds(25))
+                }
+            }
+        }
+
+        private func displayedSelectionPoints() -> [SIMD3<Float>] {
+            let pointGroups = selectionPointsByObject.keys
+                .sorted { $0.uuidString < $1.uuidString }
+                .compactMap { id -> [SIMD3<Float>]? in
+                    guard let points = selectionPointsByObject[id],
+                          !points.isEmpty else {
+                        return nil
+                    }
+                    return points
+                }
+            guard !pointGroups.isEmpty else {
+                return []
+            }
+
+            let limit = Self.maximumDisplayedSelectionPointCount
+            let baseQuota = limit / pointGroups.count
+            let extraQuota = limit % pointGroups.count
+            return pointGroups.enumerated().flatMap { index, points in
+                let quota = max(baseQuota + (index < extraQuota ? 1 : 0), 1)
+                guard points.count > quota else {
+                    return points
+                }
+                let stride = Double(points.count) / Double(quota)
+                return (0..<quota).map { sampleIndex in
+                    points[min(Int(Double(sampleIndex) * stride), points.count - 1)]
+                }
+            }
         }
 
         private func selectionPointMesh(
@@ -2909,354 +3173,6 @@ struct ARCameraView: UIViewRepresentable {
             return mesh
         }
 
-        // MARK: - World-anchored mask overlay
-        //
-        // The mask used to be a bitmap of an older camera frame that the overlay
-        // stretched to guess where the object had moved. A similarity transform
-        // cannot express perspective, so the silhouette always trailed the
-        // object and skewed as soon as two faces of a box were visible at once.
-        //
-        // Instead the mask-admitted LiDAR surface is uploaded as world-space
-        // geometry. RealityKit then draws it in the same pass as the camera
-        // background, from the same pose, so registration is exact and free:
-        // Vision only has to say *which* surface is masked, and it can take as
-        // long as it likes doing so.
-
-        private func updateObjectMaskSurfelOverlay(for id: UUID) {
-            guard let set = objectMaskSurfelSetsByID[id],
-                  !set.surfels.isEmpty,
-                  captureEngine.showsLockedMaskPreviews,
-                  let contentAnchor else {
-                objectMaskSurfelEntitiesByID[id]?.entity.isEnabled = false
-                refreshWorldSurfelMaskObjectIDs()
-                return
-            }
-
-            let (ordered, fillCount, fillRadiusScale, boundaryRadiusScale) =
-                objectMaskSurfelDrawOrder(set.surfels)
-            guard !ordered.isEmpty else {
-                objectMaskSurfelEntitiesByID[id]?.entity.isEnabled = false
-                refreshWorldSurfelMaskObjectIDs()
-                return
-            }
-
-            guard let overlay = objectMaskSurfelEntity(
-                for: id,
-                in: contentAnchor,
-                minimumCapacity: ordered.count,
-                color: set.color,
-                fillAlpha: set.fillAlpha
-            ) else {
-                return
-            }
-            let verticesPerSurfel = Self.maskSurfelOffsets.count
-            let indicesPerSurfel = Self.maskSurfelIndices.count
-
-            overlay.mesh.replaceUnsafeMutableBytes(bufferIndex: 0) { buffer in
-                let positions = buffer.bindMemory(to: SIMD3<Float>.self)
-                for (surfelIndex, surfel) in ordered.enumerated() {
-                    let vertexBase = surfelIndex * verticesPerSurfel
-                    let radius = surfel.isBoundary
-                        ? surfel.radius * Self.maskSurfelBoundaryRadiusScale
-                            * boundaryRadiusScale
-                        : surfel.radius * fillRadiusScale
-                    for offsetIndex in Self.maskSurfelOffsets.indices {
-                        positions[vertexBase + offsetIndex] = surfel.position
-                            + Self.maskSurfelOffsets[offsetIndex] * radius
-                    }
-                }
-            }
-
-            let bounds = objectMaskSurfelBounds(
-                ordered,
-                largestRadiusScale: max(
-                    fillRadiusScale,
-                    Self.maskSurfelBoundaryRadiusScale * boundaryRadiusScale
-                )
-            )
-            var parts: [LowLevelMesh.Part] = []
-            if fillCount > 0 {
-                parts.append(
-                    LowLevelMesh.Part(
-                        indexOffset: 0,
-                        indexCount: fillCount * indicesPerSurfel,
-                        topology: .triangle,
-                        materialIndex: 0,
-                        bounds: bounds
-                    )
-                )
-            }
-            let boundaryCount = ordered.count - fillCount
-            if boundaryCount > 0 {
-                parts.append(
-                    LowLevelMesh.Part(
-                        indexOffset: fillCount * indicesPerSurfel
-                            * MemoryLayout<UInt32>.stride,
-                        indexCount: boundaryCount * indicesPerSurfel,
-                        topology: .triangle,
-                        materialIndex: 1,
-                        bounds: bounds
-                    )
-                )
-            }
-            overlay.mesh.parts.replaceAll(parts)
-            overlay.entity.isEnabled = true
-            refreshWorldSurfelMaskObjectIDs()
-        }
-
-        /// Orders surfels so fill precedes silhouette, and thins the fill if the
-        /// object covers more of the frame than the mesh budget allows.
-        ///
-        /// Fill surfels occupy the low vertex blocks and silhouette surfels the
-        /// high ones, which lets the index buffer stay static: it is written once
-        /// per capacity, and a keyframe only rewrites positions before splitting
-        /// the fixed index range into a fill part and a rim part.
-        ///
-        /// The silhouette tier gets the budget first — the rim is one sample wide,
-        /// so thinning it is immediately visible, whereas thinned fill can be
-        /// compensated. Whichever tier is thinned has its splats grown by the
-        /// square root of the drop ratio, which preserves covered area and keeps
-        /// the overlay solid. The total is capped unconditionally, so the mesh
-        /// buffers can never grow past the budget however noisy the depth is.
-        private func objectMaskSurfelDrawOrder(
-            _ surfels: [ObjectMaskSurfel]
-        ) -> (
-            ordered: [ObjectMaskSurfel],
-            fillCount: Int,
-            fillRadiusScale: Float,
-            boundaryRadiusScale: Float
-        ) {
-            var fill: [ObjectMaskSurfel] = []
-            var boundary: [ObjectMaskSurfel] = []
-            fill.reserveCapacity(surfels.count)
-            for surfel in surfels {
-                if surfel.isBoundary {
-                    boundary.append(surfel)
-                } else {
-                    fill.append(surfel)
-                }
-            }
-
-            let budget = Self.maskSurfelDisplayLimit
-            var boundaryRadiusScale: Float = 1
-            if boundary.count > budget {
-                (boundary, boundaryRadiusScale) = Self.thinned(boundary, to: budget)
-            }
-            var fillRadiusScale: Float = 1
-            let fillBudget = max(budget - boundary.count, 0)
-            if fill.count > fillBudget {
-                (fill, fillRadiusScale) = Self.thinned(fill, to: fillBudget)
-            }
-
-            return (
-                fill + boundary,
-                fill.count,
-                fillRadiusScale,
-                boundaryRadiusScale
-            )
-        }
-
-        /// Uniformly strides `surfels` down to at most `limit`, returning the
-        /// radius scale that keeps the thinned set covering the same area.
-        private static func thinned(
-            _ surfels: [ObjectMaskSurfel],
-            to limit: Int
-        ) -> ([ObjectMaskSurfel], Float) {
-            guard limit > 0 else {
-                return ([], 1)
-            }
-            guard surfels.count > limit else {
-                return (surfels, 1)
-            }
-            let step = max(
-                Int((Double(surfels.count) / Double(limit)).rounded(.up)),
-                1
-            )
-            var kept: [ObjectMaskSurfel] = []
-            kept.reserveCapacity(limit)
-            for index in Swift.stride(from: 0, to: surfels.count, by: step) {
-                kept.append(surfels[index])
-            }
-            let scale = (Float(surfels.count) / Float(max(kept.count, 1)))
-                .squareRoot()
-            return (kept, scale)
-        }
-
-        private func objectMaskSurfelEntity(
-            for id: UUID,
-            in contentAnchor: AnchorEntity,
-            minimumCapacity: Int,
-            color: ObjectMaskDisplayColor,
-            fillAlpha: CGFloat
-        ) -> ObjectMaskSurfelEntity? {
-            if let existing = objectMaskSurfelEntitiesByID[id],
-               existing.capacity >= minimumCapacity {
-                existing.entity.model?.materials = objectMaskSurfelMaterials(
-                    color: color,
-                    fillAlpha: fillAlpha
-                )
-                return existing
-            }
-
-            var capacity = Self.maskSurfelMinimumCapacity
-            while capacity < minimumCapacity {
-                capacity *= 2
-            }
-            let verticesPerSurfel = Self.maskSurfelOffsets.count
-            let indicesPerSurfel = Self.maskSurfelIndices.count
-            let descriptor = LowLevelMesh.Descriptor(
-                vertexCapacity: capacity * verticesPerSurfel,
-                vertexAttributes: [
-                    LowLevelMesh.Attribute(
-                        semantic: .position,
-                        format: .float3,
-                        offset: 0
-                    )
-                ],
-                vertexLayouts: [
-                    LowLevelMesh.Layout(
-                        bufferIndex: 0,
-                        bufferStride: MemoryLayout<SIMD3<Float>>.stride
-                    )
-                ],
-                indexCapacity: capacity * indicesPerSurfel,
-                indexType: .uint32
-            )
-            guard let mesh = try? LowLevelMesh(descriptor: descriptor) else {
-                return nil
-            }
-            mesh.replaceUnsafeMutableIndices { buffer in
-                let indices = buffer.bindMemory(to: UInt32.self)
-                for surfelIndex in 0 ..< capacity {
-                    let vertexBase = UInt32(surfelIndex * verticesPerSurfel)
-                    let indexBase = surfelIndex * indicesPerSurfel
-                    for localIndex in Self.maskSurfelIndices.indices {
-                        indices[indexBase + localIndex] =
-                            vertexBase + Self.maskSurfelIndices[localIndex]
-                    }
-                }
-            }
-            guard let resource = try? MeshResource(from: mesh) else {
-                return nil
-            }
-
-            let entity = ModelEntity(
-                mesh: resource,
-                materials: objectMaskSurfelMaterials(
-                    color: color,
-                    fillAlpha: fillAlpha
-                )
-            )
-            objectMaskSurfelEntitiesByID[id]?.entity.removeFromParent()
-            contentAnchor.addChild(entity)
-            let overlay = ObjectMaskSurfelEntity(
-                mesh: mesh,
-                entity: entity,
-                capacity: capacity
-            )
-            objectMaskSurfelEntitiesByID[id] = overlay
-            return overlay
-        }
-
-        private func objectMaskSurfelMaterials(
-            color: ObjectMaskDisplayColor,
-            fillAlpha: CGFloat
-        ) -> [UnlitMaterial] {
-            [
-                UnlitMaterial(
-                    color: UIColor(
-                        red: CGFloat(color.red),
-                        green: CGFloat(color.green),
-                        blue: CGFloat(color.blue),
-                        alpha: fillAlpha
-                    ),
-                    applyPostProcessToneMap: false
-                ),
-                UnlitMaterial(
-                    color: UIColor(
-                        red: CGFloat(color.red),
-                        green: CGFloat(color.green),
-                        blue: CGFloat(color.blue),
-                        alpha: Self.maskSurfelBoundaryAlpha
-                    ),
-                    applyPostProcessToneMap: false
-                )
-            ]
-        }
-
-        private func objectMaskSurfelBounds(
-            _ surfels: [ObjectMaskSurfel],
-            largestRadiusScale: Float
-        ) -> BoundingBox {
-            var minimum = surfels[0].position
-            var maximum = surfels[0].position
-            var largestRadius = surfels[0].radius
-            for surfel in surfels.dropFirst() {
-                minimum = simd_min(minimum, surfel.position)
-                maximum = simd_max(maximum, surfel.position)
-                largestRadius = max(largestRadius, surfel.radius)
-            }
-            let padding = SIMD3<Float>(
-                repeating: largestRadius * largestRadiusScale
-            )
-            return BoundingBox(min: minimum - padding, max: maximum + padding)
-        }
-
-        private func removeObjectMaskSurfelOverlay(id: UUID) {
-            objectMaskSurfelSetsByID.removeValue(forKey: id)
-            objectMaskSurfelEntitiesByID.removeValue(forKey: id)?
-                .entity.removeFromParent()
-            refreshWorldSurfelMaskObjectIDs()
-        }
-
-        private func removeAllObjectMaskSurfelOverlays() {
-            objectMaskSurfelSetsByID.removeAll()
-            for overlay in objectMaskSurfelEntitiesByID.values {
-                overlay.entity.removeFromParent()
-            }
-            objectMaskSurfelEntitiesByID.removeAll()
-            refreshWorldSurfelMaskObjectIDs()
-        }
-
-        private func updateObjectMaskSurfelVisibility() {
-            for id in Array(objectMaskSurfelSetsByID.keys) {
-                updateObjectMaskSurfelOverlay(for: id)
-            }
-            refreshWorldSurfelMaskObjectIDs()
-        }
-
-        /// Drops overlays for objects that are no longer being measured or kept.
-        ///
-        /// A surfel overlay is world geometry, so a stale one keeps painting a
-        /// surface the app has stopped tracking. Objects that are merely lost
-        /// from view are deliberately left alone: their geometry is still correct
-        /// where it stands, and it reappears registered when the camera returns.
-        private func pruneObjectMaskSurfelOverlays() {
-            let retained = Set([captureEngine.activeObjectID].compactMap { $0 })
-                .union(captureEngine.finalizedObjectIDs)
-            for id in Array(objectMaskSurfelSetsByID.keys)
-            where !retained.contains(id) {
-                removeObjectMaskSurfelOverlay(id: id)
-            }
-            for id in Array(objectMaskSurfelEntitiesByID.keys)
-            where !retained.contains(id) {
-                removeObjectMaskSurfelOverlay(id: id)
-            }
-        }
-
-        /// Tells the 2D overlay which objects it must not draw. Only objects with
-        /// a live, enabled surfel overlay qualify, so if the geometry path ever
-        /// fails to build the bitmap path stays visible rather than the mask
-        /// disappearing.
-        private func refreshWorldSurfelMaskObjectIDs() {
-            let ids = Set(
-                objectMaskSurfelEntitiesByID
-                    .filter { $0.value.entity.isEnabled }
-                    .keys
-            )
-            captureEngine.updateWorldSurfelMaskObjectIDs(ids)
-        }
-
         private func selectionPointBounds(_ points: [SIMD3<Float>]) -> BoundingBox {
             var minimum = points[0]
             var maximum = points[0]
@@ -3320,9 +3236,22 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func stopTrackedRaycasts() {
+            cancelRefinementTasks(markPointsFinished: false)
             for index in placedPoints.indices {
                 placedPoints[index].trackedRaycast?.stopTracking()
                 placedPoints[index].trackedRaycast = nil
+            }
+        }
+
+        private func cancelRefinementTasks(markPointsFinished: Bool) {
+            for task in refinementTasks.values {
+                task.cancel()
+            }
+            refinementTasks.removeAll()
+            if markPointsFinished {
+                for point in placedPoints {
+                    mesEngine.finishRefiningPoint(id: point.id)
+                }
             }
         }
     }

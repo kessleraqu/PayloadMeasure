@@ -6,18 +6,18 @@ import Foundation
 import ImageIO
 import Vision
 
-struct EdgeTAMFrameFeatures: @unchecked Sendable {
+nonisolated struct EdgeTAMFrameFeatures: @unchecked Sendable {
     let visionFeatures: MLMultiArray
     let highResolutionFeature0: MLMultiArray
     let highResolutionFeature1: MLMultiArray
 }
 
-struct EdgeTAMMask: @unchecked Sendable {
+nonisolated struct EdgeTAMMask: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let predictedIoU: Float
 }
 
-enum EdgeTAMSegmenterError: LocalizedError {
+nonisolated enum EdgeTAMSegmenterError: LocalizedError {
     case modelsMissing
     case inputBufferCreationFailed
     case missingOutput(String)
@@ -37,7 +37,7 @@ enum EdgeTAMSegmenterError: LocalizedError {
     }
 }
 
-final class EdgeTAMSegmenter: @unchecked Sendable {
+nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {
     static let inputSize = 1024
     static let maskSize = 256
 

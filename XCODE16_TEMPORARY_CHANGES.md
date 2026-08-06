@@ -104,13 +104,21 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 - Generic iOS Simulator, Debug, iOS 18.2 SDK: succeeded for the complete generic simulator build after the RealityKit compatibility adjustment.
 - Remaining compiler errors: none.
 
-## Restoring the Xcode 26 syntax next week
+## Xcode 26.5 restoration completed
 
-1. In `objectmaskprocessor.swift`, restore `nonisolated ` immediately before each of the 12 type declarations listed above.
-2. In `PayloadMeasure/edgetamsegmenter.swift`, restore `nonisolated ` immediately before each of the four type declarations listed above.
-3. In `arcameraview.swift`, replace `let anchorEntity = AnchorEntity(.anchor(identifier: arAnchor.identifier))` with `let anchorEntity = AnchorEntity(anchor: arAnchor)`.
-4. Do not change the retained method-level `nonisolated` modifiers in `arsessionmanager.swift`.
-5. No project setting needs to be restored because none was changed.
-6. Rebuild with Xcode 26 and confirm all three Core ML models still compile and `objectmaskprocessor.swift` remains present once in Compile Sources.
+Date: 2026-08-06
 
-No Git command was used while making or verifying these temporary changes.
+- Restored declaration-level `nonisolated` annotations used by the cross-actor mask value types and
+  the retained experimental EdgeTAM adapter.
+- Restored `AnchorEntity(anchor:)` for anchors created from exact `ARAnchor` instances.
+- Raised the project deployment setting inherited by the app target to iOS 26.5.
+- Restored Xcode 26 concurrency settings: approachable concurrency, MainActor default isolation and
+  member-import visibility. Swift 5 language mode remains intentional.
+- Restored the HUD with native Liquid Glass effects and glass button styles.
+- Kept the EdgeTAM source and three Core ML packages as research material, but excluded them from
+  target membership because no active runtime path references them.
+- Removed development Markdown files from the application bundle while retaining them in the project.
+- Verified the active app with Xcode 26.5 using unsigned generic-device Debug and clean Release builds,
+  followed by Xcode static analysis.
+
+No Git command was used while restoring or verifying these changes.

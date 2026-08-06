@@ -10,7 +10,6 @@
 		AC99C67C2FF2B088006EBB3A /* arsessionmanager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */; };
 		AC99C67E2FF2B088006EBB3A /* arcameraview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67D2FF2B088006EBB3A /* arcameraview.swift */; };
 		AC99C6802FF2B08A006EBB3A /* mesoverlayview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */; };
-		AC99C6822FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md in Resources */ = {isa = PBXBuildFile; fileRef = AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */; };
 		AC99C6842FF2B226006EBB3A /* mespoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* mespoint.swift */; };
 		AC99C6862FF2B227006EBB3A /* mesengine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* mesengine.swift */; };
 		AC99C6882FF2BA02006EBB3A /* mesmode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* mesmode.swift */; };
@@ -33,9 +32,29 @@
 		ACDB56EE2FF2805400508C46 /* PayloadMeasure.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayloadMeasure.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				EdgeTAMSegmenter.swift,
+				Models/EdgeTAM/LICENSE,
+				Models/EdgeTAM/README.md,
+				Models/EdgeTAM/edgetam_image_encoder.mlpackage,
+				Models/EdgeTAM/edgetam_mask_decoder.mlpackage,
+				Models/EdgeTAM/edgetam_prompt_encoder.mlpackage,
+				Models/EdgeTAM/model_info.json,
+				PROJECT_CONTEXT.md,
+			);
+			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		ACDB56F02FF2805400508C46 /* PayloadMeasure */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */,
+			);
 			path = PayloadMeasure;
 			sourceTree = "<group>";
 		};
@@ -142,7 +161,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AC99C6822FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -220,7 +238,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
@@ -277,7 +295,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
@@ -311,7 +329,10 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.kessler.PayloadMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -341,7 +362,10 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.kessler.PayloadMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

@@ -4,7 +4,7 @@ import CoreVideo
 import simd
 import UIKit
 
-struct CapturedObject {
+nonisolated struct CapturedObject: Sendable {
     let dimensions: SIMD3<Float>
     let center: SIMD3<Float>
     let axes: (width: SIMD3<Float>, depth: SIMD3<Float>, height: SIMD3<Float>)
@@ -24,24 +24,24 @@ struct CapturedObject {
     }
 }
 
-struct CaptureResult {
+nonisolated struct CaptureResult: Sendable {
     let object: CapturedObject
     let selectionPoints: [SIMD3<Float>]
     let surfacePoints: [SIMD3<Float>]
 }
 
-struct AccumulatedDepthPoint {
+nonisolated struct AccumulatedDepthPoint: Sendable {
     let position: SIMD3<Float>
     let observedPosition: SIMD3<Float>
 }
 
-enum CaptureOutcome {
+nonisolated enum CaptureOutcome: Sendable {
     case success(CaptureResult)
     case noSupport
     case notEnoughMesh
 }
 
-enum ObjectCapturePipeline {
+nonisolated enum ObjectCapturePipeline {
     static let voxelSize: Float = 0.005
     static let supportVoxelSize: Float = 0.02
     static let accumulationRadius: Float = 0.4
@@ -219,6 +219,23 @@ enum ObjectCapturePipeline {
             previous = current
         }
         return isInside || minimumDistanceSquared <= tolerance * tolerance
+    }
+}
+
+actor ObjectCaptureFitter {
+    func capture(
+        objectPoints: [AccumulatedDepthPoint],
+        supportPoints: [SIMD3<Float>],
+        seed: SIMD3<Float>,
+        supportHeight: Float?
+    ) -> CaptureOutcome {
+        ObjectCapturePipeline.capture(
+            objectPoints: objectPoints,
+            supportPoints: supportPoints,
+            seed: seed,
+            up: SIMD3<Float>(0, 1, 0),
+            supportHeight: supportHeight
+        )
     }
 }
 
@@ -689,7 +706,7 @@ struct PointAccumulator {
 
 }
 
-enum VoxelCluster {
+nonisolated enum VoxelCluster {
     private struct Key: Hashable {
         let x: Int
         let y: Int
@@ -873,7 +890,7 @@ enum VoxelCluster {
     }
 }
 
-enum ObjectBoundingBox {
+nonisolated enum ObjectBoundingBox {
     static func make(
         from points: [SIMD3<Float>],
         enclosing enclosurePoints: [SIMD3<Float>] = [],

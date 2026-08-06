@@ -1,10 +1,16 @@
 
 import ARKit
+import AVFoundation
 import Observation
 
 @MainActor
 @Observable
 final class ARSessionManager: NSObject, ARSessionDelegate {
+    private weak var activeSession: ARSession?
+    private var activeConfiguration: ARWorldTrackingConfiguration?
+    private var sessionStartTask: Task<Void, Never>?
+    private var automaticRecoveryAttempts = 0
+
     enum EnvironmentReadiness: Equatable {
         case preparing(String)
         case ready(String)
@@ -87,6 +93,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var sceneDepthResolutionText = "Waiting for depth"
     private(set) var hasReconstructedMesh = false
     private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
+    private(set) var isCoachingActive = false
+    private(set) var frameEpoch = 0
     private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
         "Move the iPhone slowly across the object and its supporting surface."
     )
@@ -146,8 +154,29 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
     }
 
+    var worldMappingStatusText: String {
+        switch worldMappingStatus {
+        case .notAvailable:
+            "Not available"
+        case .limited:
+            "Limited — improving"
+        case .extending:
+            "Extending"
+        case .mapped:
+            "Mapped"
+        @unknown default:
+            "Unknown"
+        }
+    }
+
     func configure(_ session: ARSession) {
+        sessionStartTask?.cancel()
+        sessionStartTask = nil
+        automaticRecoveryAttempts = 0
+        activeSession = session
         session.delegate = self
+        isCoachingActive = false
+        frameEpoch &+= 1
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
@@ -156,7 +185,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         hasReconstructedMesh = false
         worldMappingStatus = .notAvailable
         environmentReadiness = .preparing(
-            isLiDARAvailable
+            isSceneDepthSupported
                 ? "LiDAR is starting. Move slowly across the object and table."
                 : "Move slowly across the object and table until a surface is detected."
         )
@@ -179,24 +208,147 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             isSceneReconstructionEnabled = false
         }
 
-        session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        activeConfiguration = configuration
+        startWhenCameraIsAuthorized(session, configuration: configuration)
+    }
+
+    func detach(_ session: ARSession) {
+        guard activeSession === session else {
+            return
+        }
+        sessionStartTask?.cancel()
+        sessionStartTask = nil
+        session.delegate = nil
+        activeSession = nil
+        activeConfiguration = nil
+        isCoachingActive = false
+    }
+
+    func updateCoachingState(isActive: Bool) {
+        if isCoachingActive != isActive {
+            isCoachingActive = isActive
+        }
+    }
+
+    func restartTracking(_ session: ARSession) {
+        guard activeSession === session,
+              let activeConfiguration else {
+            return
+        }
+        automaticRecoveryAttempts = 0
+        frameEpoch &+= 1
+        trackingStatus = .starting
+        hasDetectedHorizontalPlane = false
+        hasDetectedVerticalPlane = false
+        hasReceivedSceneDepth = false
+        sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
+        hasReconstructedMesh = false
+        worldMappingStatus = .notAvailable
+        environmentReadiness = .preparing(
+            "Restarting tracking. Move the iPhone slowly around the payload area."
+        )
+        session.run(
+            activeConfiguration,
+            options: [.resetTracking, .removeExistingAnchors]
+        )
+    }
+
+    private func startWhenCameraIsAuthorized(
+        _ session: ARSession,
+        configuration: ARWorldTrackingConfiguration
+    ) {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            startSession(session, configuration: configuration)
+        case .notDetermined:
+            environmentReadiness = .preparing(
+                "Allow camera access, then move slowly across the payload area."
+            )
+            sessionStartTask = Task { @MainActor [weak self, weak session] in
+                let isAuthorized = await AVCaptureDevice.requestAccess(for: .video)
+                guard !Task.isCancelled,
+                      let self,
+                      let session,
+                      self.activeSession === session else {
+                    return
+                }
+                self.sessionStartTask = nil
+                if isAuthorized {
+                    self.startSession(session, configuration: configuration)
+                } else {
+                    self.reportCameraPermissionFailure()
+                }
+            }
+        case .denied, .restricted:
+            reportCameraPermissionFailure()
+        @unknown default:
+            reportCameraPermissionFailure()
+        }
+    }
+
+    private func startSession(
+        _ session: ARSession,
+        configuration: ARWorldTrackingConfiguration
+    ) {
+        guard activeSession === session else {
+            return
+        }
+        trackingStatus = .starting
+        session.run(
+            configuration,
+            options: [.resetTracking, .removeExistingAnchors]
+        )
+    }
+
+    private func reportCameraPermissionFailure() {
+        trackingStatus = .failed(
+            "Camera access is required. Enable it for PayloadMeasure in Settings, then reopen the app."
+        )
+        refreshEnvironmentReadiness()
+    }
+
+    @discardableResult
+    func recoverFailedSessionIfPossible(_ session: ARSession) -> Bool {
+        guard activeSession === session,
+              case .failed = trackingStatus,
+              automaticRecoveryAttempts == 0,
+              AVCaptureDevice.authorizationStatus(for: .video) == .authorized,
+              let activeConfiguration else {
+            return false
+        }
+        automaticRecoveryAttempts += 1
+        frameEpoch &+= 1
+        trackingStatus = .starting
+        hasDetectedHorizontalPlane = false
+        hasDetectedVerticalPlane = false
+        hasReceivedSceneDepth = false
+        sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
+        hasReconstructedMesh = false
+        worldMappingStatus = .notAvailable
+        environmentReadiness = .preparing(
+            "Restarting AR tracking. Move slowly across the payload area."
+        )
+        session.run(
+            activeConfiguration,
+            options: [.resetTracking, .removeExistingAnchors]
+        )
+        return true
     }
 
     nonisolated func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
             updateTrackingStatus(from: camera.trackingState)
         }
     }
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         Task { @MainActor in
-            updateEnvironmentAnchors(from: anchors)
-            refreshEnvironmentReadiness()
-        }
-    }
-
-    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
             updateEnvironmentAnchors(from: anchors)
             refreshEnvironmentReadiness()
         }
@@ -225,6 +377,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func sessionWasInterrupted(_ session: ARSession) {
         Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
+            frameEpoch &+= 1
             trackingStatus = .interrupted
             refreshEnvironmentReadiness()
         }
@@ -232,13 +388,23 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func sessionInterruptionEnded(_ session: ARSession) {
         Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
             trackingStatus = .starting
+            if let activeConfiguration {
+                session.run(activeConfiguration)
+            }
             refreshEnvironmentReadiness()
         }
     }
 
     nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
         Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
+            frameEpoch &+= 1
             trackingStatus = .failed(error.localizedDescription)
             refreshEnvironmentReadiness()
         }
@@ -259,7 +425,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private func limitedTrackingMessage(for reason: ARCamera.TrackingState.Reason) -> String {
         switch reason {
         case .initializing:
-            "ARKit is initializing the world map."
+            "AR tracking is starting. Move the iPhone slowly in a small arc."
         case .excessiveMotion:
             "The iPhone is moving too quickly. Slow down for better tracking."
         case .insufficientFeatures:
@@ -296,17 +462,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             return
         }
 
-        if isLiDARAvailable {
+        if isSceneDepthSupported {
             guard hasReceivedSceneDepth else {
                 setEnvironmentReadiness(.preparing(
                     "LiDAR depth is starting. Keep the camera pointed at the payload area."
-                ))
-                return
-            }
-
-            guard hasReconstructedMesh || hasDetectedHorizontalPlane || hasDetectedVerticalPlane else {
-                setEnvironmentReadiness(.preparing(
-                    "Move slowly across the object and table while LiDAR builds the surface map."
                 ))
                 return
             }
@@ -317,26 +476,22 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             return
         }
 
-        switch worldMappingStatus {
-        case .notAvailable, .limited:
-            setEnvironmentReadiness(.preparing(
-                "Continue moving slowly from side to side so returning to locked objects is reliable."
-            ))
-        case .extending:
-            setEnvironmentReadiness(.ready(
-                isLiDARAvailable
-                    ? "LiDAR and world tracking are ready. You can lock objects now."
-                    : "A stable surface is available. You can lock objects while the visual map improves."
-            ))
-        case .mapped:
-            setEnvironmentReadiness(.ready(
-                "The environment map is stable. Locked objects can be recovered after leaving the view."
-            ))
-        @unknown default:
-            setEnvironmentReadiness(.preparing(
-                "Continue moving slowly while ARKit finishes understanding the environment."
-            ))
+        let detail: String
+        if isSceneDepthSupported {
+            detail = switch worldMappingStatus {
+            case .mapped:
+                "LiDAR depth, tracking and the environment map are ready."
+            case .extending:
+                "LiDAR depth and tracking are ready. The environment map is improving."
+            case .notAvailable, .limited:
+                "LiDAR depth and tracking are ready. Keep scanning to improve the wider map."
+            @unknown default:
+                "LiDAR depth and tracking are ready."
+            }
+        } else {
+            detail = "Tracking and a stable surface are ready."
         }
+        setEnvironmentReadiness(.ready(detail))
     }
 
     private func setEnvironmentReadiness(_ readiness: EnvironmentReadiness) {

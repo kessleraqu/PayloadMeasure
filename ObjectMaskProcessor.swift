@@ -6,7 +6,7 @@ import ImageIO
 import simd
 import Vision
 
-struct ObjectMaskPreviewLayer: @unchecked Sendable {
+nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let id: UUID
     let image: CGImage
     let trackedObjectID: UUID?
@@ -17,7 +17,7 @@ struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let trackingOrientation: CGImagePropertyOrientation
 }
 
-struct ObjectMaskPreview: @unchecked Sendable {
+nonisolated struct ObjectMaskPreview: @unchecked Sendable {
     let layers: [ObjectMaskPreviewLayer]
     let timestamp: TimeInterval
 
@@ -27,7 +27,7 @@ struct ObjectMaskPreview: @unchecked Sendable {
     }
 }
 
-struct ObjectMaskToggleRequest: @unchecked Sendable {
+nonisolated struct ObjectMaskToggleRequest: @unchecked Sendable {
     let normalizedViewportPoint: CGPoint
     let proposedLockID: UUID?
     let worldTransform: simd_float4x4?
@@ -46,20 +46,20 @@ struct ObjectMaskToggleRequest: @unchecked Sendable {
     }
 }
 
-struct ObjectMaskAnchorHint: @unchecked Sendable {
+nonisolated struct ObjectMaskAnchorHint: @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint?
     let cameraDistance: Float
     let worldPosition: SIMD3<Float>
 }
 
-struct ObjectMaskDisplayColor: Sendable, Hashable {
+nonisolated struct ObjectMaskDisplayColor: Sendable, Hashable {
     let red: Double
     let green: Double
     let blue: Double
 }
 
-struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
+nonisolated struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
     let id: UUID
     let normalizedViewportPoint: CGPoint
     let cameraDistance: Float
@@ -67,18 +67,18 @@ struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendable {
     let isMaskVisible: Bool
 }
 
-enum ObjectMaskLockChangeKind: Sendable {
+nonisolated enum ObjectMaskLockChangeKind: Sendable {
     case added
     case focused
 }
 
-struct ObjectMaskLockChange: @unchecked Sendable {
+nonisolated struct ObjectMaskLockChange: @unchecked Sendable {
     let id: UUID
     let kind: ObjectMaskLockChangeKind
     let worldTransform: simd_float4x4?
 }
 
-struct ObjectMaskFrame: @unchecked Sendable {
+nonisolated struct ObjectMaskFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let viewportSize: CGSize
@@ -89,10 +89,11 @@ struct ObjectMaskFrame: @unchecked Sendable {
     let finalizedObjectIDs: Set<UUID>
     let timestamp: TimeInterval
     let trackingGeneration: Int
+    let requiresDepthWarmup: Bool
     let depthSnapshot: ObjectMaskDepthSnapshot?
 }
 
-struct ObjectMaskDepthSnapshot: @unchecked Sendable {
+nonisolated struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let depthMap: CVPixelBuffer
     let confidenceMap: CVPixelBuffer?
     let cameraTransform: simd_float4x4
@@ -100,37 +101,13 @@ struct ObjectMaskDepthSnapshot: @unchecked Sendable {
     let cameraImageResolution: CGSize
 }
 
-/// One display-only splat of the masked LiDAR surface.
-///
-/// Surfels are handed to RealityKit as world-space geometry so the mask is drawn
-/// by the same render pass that draws the camera background. That makes the
-/// overlay pose-correct for free: it cannot lag behind the camera, and it
-/// follows perspective, parallax and rotation exactly, which a warped 2D
-/// bitmap of an older frame never can.
-///
-/// `radius` is chosen so the splat covers roughly one depth-map sample at its
-/// own distance, which keeps the on-screen footprint constant as the operator
-/// walks in and out. `isBoundary` marks samples on the screen-space silhouette
-/// so the renderer can outline the mask the same way the 2D path did.
-struct ObjectMaskSurfel: Sendable {
-    let position: SIMD3<Float>
-    let radius: Float
-    let isBoundary: Bool
-}
-
-struct ObjectMaskDepthPointCloud: @unchecked Sendable {
+nonisolated struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let id: UUID
-    /// Exact mask-admitted depth points. These feed measurement and must stay
-    /// untouched by any display concern.
     let points: [SIMD3<Float>]
-    /// Display splats, index-parallel to `points`.
-    let surfels: [ObjectMaskSurfel]
-    let color: ObjectMaskDisplayColor
-    let fillAlpha: CGFloat
     let timestamp: TimeInterval
 }
 
-struct ObjectMaskDisplaySeed: @unchecked Sendable {
+nonisolated struct ObjectMaskDisplaySeed: @unchecked Sendable {
     let id: UUID
     let boundingBox: NormalizedRect
     let orientation: CGImagePropertyOrientation
@@ -138,7 +115,7 @@ struct ObjectMaskDisplaySeed: @unchecked Sendable {
     let timestamp: TimeInterval
 }
 
-struct ObjectMaskDisplayFrame: @unchecked Sendable {
+nonisolated struct ObjectMaskDisplayFrame: @unchecked Sendable {
     let pixelBuffer: CVPixelBuffer
     let orientation: CGImagePropertyOrientation
     let imageToViewportTransform: CGAffineTransform
@@ -146,7 +123,13 @@ struct ObjectMaskDisplayFrame: @unchecked Sendable {
     let trackingGeneration: Int
 }
 
-struct ObjectMaskProcessingResult: @unchecked Sendable {
+nonisolated enum ObjectMaskProcessingStatus: Sendable {
+    case succeeded
+    case cancelled
+    case failed(String)
+}
+
+nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {
     let preview: ObjectMaskPreview?
     let lockedObjectCount: Int
     let visibleObjectCount: Int
@@ -155,6 +138,8 @@ struct ObjectMaskProcessingResult: @unchecked Sendable {
     let lockChange: ObjectMaskLockChange?
     let needsWorldSurface: Bool
     let maskedPointClouds: [ObjectMaskDepthPointCloud]
+    let status: ObjectMaskProcessingStatus
+    let isSelectionPipelineWarmed: Bool
 }
 
 actor ObjectMaskDisplayTracker {
@@ -484,7 +469,7 @@ actor ObjectMaskDisplayTracker {
     }
 }
 
-private func objectMaskViewportBoundingBox(
+nonisolated private func objectMaskViewportBoundingBox(
     _ boundingBox: NormalizedRect,
     orientation: CGImagePropertyOrientation,
     imageToViewportTransform: CGAffineTransform
@@ -523,7 +508,7 @@ private func objectMaskViewportBoundingBox(
     )
 }
 
-private func objectMaskRawTopLeftPoint(
+nonisolated private func objectMaskRawTopLeftPoint(
     fromUprightTopLeft point: CGPoint,
     orientation: CGImagePropertyOrientation
 ) -> CGPoint {
@@ -616,6 +601,9 @@ actor ObjectMaskProcessor {
     private let livePreviewID = UUID()
     private var trackedObjects: [TrackedObject] = []
     private var trackingGeneration: Int?
+    private var hasWarmedAppearanceSignature = false
+    private var hasWarmedScaledMask = false
+    private var hasWarmedLockCandidate = false
 
     func makePreview(from frame: ObjectMaskFrame) async -> ObjectMaskProcessingResult {
         if trackingGeneration != frame.trackingGeneration {
@@ -644,10 +632,14 @@ actor ObjectMaskProcessor {
         do {
             guard let observation = try await handler.perform(segmentationRequest) else {
                 ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
-                return result(preview: nil, frame: frame)
+                return result(
+                    preview: nil,
+                    frame: frame,
+                    status: .failed("Vision returned no foreground observation.")
+                )
             }
             guard !Task.isCancelled else {
-                return result(preview: nil, frame: frame)
+                return result(preview: nil, frame: frame, status: .cancelled)
             }
 
             await updateTrackedObjects(
@@ -657,7 +649,7 @@ actor ObjectMaskProcessor {
                 frame: frame
             )
             guard !Task.isCancelled else {
-                return result(preview: nil, frame: frame)
+                return result(preview: nil, frame: frame, status: .cancelled)
             }
 
             let toggleOutcome: ToggleOutcome
@@ -695,13 +687,43 @@ actor ObjectMaskProcessor {
                 frame: frame,
                 activeObjectID: effectiveActiveObjectID
             )
+            if let liveSelection = selections.first(where: { $0.lockID == nil }) {
+                if !hasWarmedAppearanceSignature,
+                   appearanceSignature(
+                       of: cameraImage,
+                       inside: liveSelection.boundingBox
+                   ) != nil {
+                    hasWarmedAppearanceSignature = true
+                }
+                if frame.requiresDepthWarmup,
+                   !hasWarmedScaledMask,
+                   frame.depthSnapshot != nil {
+                    _ = try observation.generateScaledMask(
+                        for: liveSelection.instances,
+                        scaledToImageFrom: handler
+                    )
+                    hasWarmedScaledMask = true
+                }
+                if !hasWarmedLockCandidate {
+                    let boundingBox = liveSelection.boundingBox.cgRect
+                    _ = try lockCandidate(
+                        near: NormalizedPoint(
+                            x: boundingBox.midX,
+                            y: boundingBox.midY
+                        ),
+                        preferredInstances: liveSelection.instances,
+                        in: observation
+                    )
+                    hasWarmedLockCandidate = true
+                }
+            }
             if Task.isCancelled {
                 if let addedTrackerID {
                     trackedObjects.removeAll {
                         $0.id == addedTrackerID
                     }
                 }
-                return result(preview: nil, frame: frame)
+                return result(preview: nil, frame: frame, status: .cancelled)
             }
             var previewLayers: [ObjectMaskPreviewLayer] = []
             var maskedPointClouds: [ObjectMaskDepthPointCloud] = []
@@ -715,7 +737,7 @@ actor ObjectMaskProcessor {
                             $0.id == addedTrackerID
                         }
                     }
-                    return result(preview: nil, frame: frame)
+                    return result(preview: nil, frame: frame, status: .cancelled)
                 }
                 let processed = try autoreleasepool {
                     let pixelBuffer = try observation.generateMask(
@@ -751,7 +773,10 @@ actor ObjectMaskProcessor {
                         )
                     }
                     let cloud: ObjectMaskDepthPointCloud?
-                    if selection.lockID == effectiveActiveObjectID,
+                    // Return a new selection immediately. The following frame is already active
+                    // and performs the identical depth back-projection without delaying the tap.
+                    if addedTrackerID == nil,
+                       selection.lockID == effectiveActiveObjectID,
                        frame.depthSnapshot != nil {
                         let sourceAlignedBuffer = try observation
                             .generateScaledMask(
@@ -791,7 +816,7 @@ actor ObjectMaskProcessor {
                         $0.id == addedTrackerID
                     }
                 }
-                return result(preview: nil, frame: frame)
+                return result(preview: nil, frame: frame, status: .cancelled)
             }
 
             switch toggleOutcome {
@@ -823,10 +848,14 @@ actor ObjectMaskProcessor {
                 }
             }
             if Task.isCancelled {
-                return result(preview: nil, frame: frame)
+                return result(preview: nil, frame: frame, status: .cancelled)
             }
             ageUnmatchedTracker(activeObjectID: frame.activeObjectID)
-            return result(preview: nil, frame: frame)
+            return result(
+                preview: nil,
+                frame: frame,
+                status: .failed(error.localizedDescription)
+            )
         }
     }
 
@@ -835,7 +864,8 @@ actor ObjectMaskProcessor {
         frame: ObjectMaskFrame,
         lockChange: ObjectMaskLockChange? = nil,
         needsWorldSurface: Bool = false,
-        maskedPointClouds: [ObjectMaskDepthPointCloud] = []
+        maskedPointClouds: [ObjectMaskDepthPointCloud] = [],
+        status: ObjectMaskProcessingStatus = .succeeded
     ) -> ObjectMaskProcessingResult {
         var markers = makeMarkers(from: frame.anchorHints)
         if let lockChange,
@@ -863,7 +893,11 @@ actor ObjectMaskProcessor {
             didToggleLock: lockChange != nil,
             lockChange: lockChange,
             needsWorldSurface: needsWorldSurface,
-            maskedPointClouds: maskedPointClouds
+            maskedPointClouds: maskedPointClouds,
+            status: status,
+            isSelectionPipelineWarmed: hasWarmedAppearanceSignature
+                && (!frame.requiresDepthWarmup || hasWarmedScaledMask)
+                && hasWarmedLockCandidate
         )
     }
 
@@ -1825,39 +1859,31 @@ actor ObjectMaskProcessor {
                   let hint = hintsByID[lockID] else {
                 return nil
             }
-            let surface = maskedWorldSurface(
+            let points = maskedWorldSurface(
                 mask: renderedMask.pixelBuffer,
                 anchor: hint,
                 frame: frame,
                 depth: depth
             )
-            guard !surface.points.isEmpty else {
+            guard !points.isEmpty else {
                 return nil
             }
             return ObjectMaskDepthPointCloud(
                 id: lockID,
-                points: surface.points,
-                surfels: surface.surfels,
-                color: renderedMask.color,
-                fillAlpha: renderedMask.fillAlpha,
+                points: points,
                 timestamp: frame.timestamp
             )
         }
     }
 
-    /// Mask-admitted LiDAR surface, in both measurement and display form.
-    ///
-    /// `points` is the untouched metric point set the box fitter consumes.
-    /// `surfels` is index-parallel to it and adds only presentation data: a
-    /// world radius that holds a constant on-screen footprint, and a silhouette
-    /// flag taken from the depth-grid neighbourhood of each admitted sample.
+    /// Returns the mask-admitted metric LiDAR points consumed by the box fitter.
     private func maskedWorldSurface(
         mask: CVPixelBuffer,
         anchor: ObjectMaskAnchorHint,
         frame: ObjectMaskFrame,
         depth: ObjectMaskDepthSnapshot
-    ) -> (points: [SIMD3<Float>], surfels: [ObjectMaskSurfel]) {
-        let empty: (points: [SIMD3<Float>], surfels: [ObjectMaskSurfel]) = ([], [])
+    ) -> [SIMD3<Float>] {
+        let empty: [SIMD3<Float>] = []
         guard CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float else {
             return empty
         }
@@ -1971,14 +1997,8 @@ actor ObjectMaskProcessor {
             return empty
         }
 
-        // A splat wide enough to close the gap to its grid neighbours keeps the
-        // overlay continuous; `spacingFactor` above 0.5 guarantees overlap on a
-        // fronto-parallel surface without visibly fattening the silhouette.
-        let spacingFactor: Float = 0.9
         var points: [SIMD3<Float>] = []
-        var surfels: [ObjectMaskSurfel] = []
         points.reserveCapacity(admittedCount)
-        surfels.reserveCapacity(admittedCount)
 
         // Light neighbour-based noise rejection. Most stray "outside the object"
         // points are isolated silhouette-ring samples (fuzzy mask edges) or LiDAR
@@ -2006,21 +2026,10 @@ actor ObjectMaskProcessor {
                 guard admittedNeighbours >= 3, !hasDepthEdge else {
                     continue
                 }
-                let sampleSpacing = depthHere / fx
                 points.append(worldPoints[index])
-                surfels.append(
-                    ObjectMaskSurfel(
-                        position: worldPoints[index],
-                        radius: min(
-                            max(sampleSpacing * spacingFactor, 0.0015),
-                            0.02
-                        ),
-                        isBoundary: false
-                    )
-                )
             }
         }
-        return (points, surfels)
+        return points
     }
 
 }

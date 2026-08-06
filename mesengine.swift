@@ -5,13 +5,7 @@ import simd
 @MainActor
 @Observable
 final class MesEngine {
-    var mode: MesMode = .scan {
-        didSet {
-            if mode != oldValue {
-                reset()
-            }
-        }
-    }
+    let mode: MesMode = .scan
 
     private(set) var points: [MesPoint] = []
     private(set) var lastMessage = "Aim at an object on a flat surface, then Capture."

@@ -2,16 +2,9 @@ import SwiftUI
 import UIKit
 
 struct MesOverlayView: View {
-    private enum WeightEntryContext {
+    private enum ObjectDetailsContext {
         case finalize(UUID)
         case edit(UUID)
-
-        var objectID: UUID {
-            switch self {
-            case .finalize(let id), .edit(let id):
-                id
-            }
-        }
     }
 
     let sessionManager: ARSessionManager
@@ -20,13 +13,11 @@ struct MesOverlayView: View {
 
     @State private var showsPanel = false
     @State private var showsLiDARLimitations = false
-    @State private var weightEntryContext: WeightEntryContext?
+    @State private var objectDetailsContext: ObjectDetailsContext?
+    @State private var objectNameText = ""
     @State private var weightText = ""
     @State private var pendingRemovalObjectID: UUID?
-
-    private var isScanning: Bool {
-        mesEngine.mode == .scan
-    }
+    @State private var showsResetConfirmation = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -34,120 +25,91 @@ struct MesOverlayView: View {
 
     var body: some View {
         ZStack {
-            objectMaskPreview
-            objectMaskMarkers
-            objectMaskInteractionLayer
-            aimer
-
-            VStack {
-                HStack(alignment: .top) {
-                    if isScanning {
-                        captureReadout
-                    } else {
-                        mesReadout
-                    }
-
-                    Spacer(minLength: 12)
-
-                    if showsPanel {
-                        infoPanel
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
-                    Button {
-                        showsPanel.toggle()
-                    } label: {
-                        Image(systemName: showsPanel ? "xmark" : "info")
-                            .font(.system(size: 17, weight: .semibold))
-                            .frame(width: 42, height: 42)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.primary)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .accessibilityLabel(showsPanel ? "Hide controls" : "Show controls")
-                }
-                .padding(.top, 16)
-                .padding(.horizontal, 16)
-
-                Spacer()
+            if !sessionManager.isCoachingActive {
+                objectMaskPreview
+                objectMaskMarkers
+                objectMaskInteractionLayer
+                aimer
             }
 
-            VStack {
-                Spacer()
-
-                HStack(alignment: .bottom) {
-                    if isScanning {
-                        scanQuickVisualControls
+            if !sessionManager.isCoachingActive {
+                VStack {
+                    GlassEffectContainer(spacing: 14) {
+                        topHUD
                     }
+                    .frame(maxWidth: .infinity, alignment: .top)
+                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
+
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 10) {
-                        if isScanning,
-                           !finalizedMeasuredObjectIDs.isEmpty {
-                            boxesMenu
-                        }
-                        if isScanning,
-                           isAutomaticCaptureSupported {
-                            if captureEngine.activeObjectID != nil
-                                || captureEngine.canReactivateFocusedObject {
-                                objectWorkflowButton
+                }
+            }
+
+            if !sessionManager.isCoachingActive {
+                VStack {
+                    Spacer()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        if !finalizedMeasuredObjectIDs.isEmpty
+                            || captureEngine.canReset {
+                            HStack(spacing: 10) {
+                                if !finalizedMeasuredObjectIDs.isEmpty {
+                                    boxesMenu
+                                }
+                                Spacer(minLength: 8)
+                                if isAutomaticCaptureSupported,
+                                   captureEngine.activeObjectID != nil
+                                    || captureEngine.canReactivateFocusedObject {
+                                    objectWorkflowButton
+                                }
+                                if captureEngine.canReset {
+                                    resetButton
+                                }
                             }
-                            pointCleanupButton
                         }
-                        modeMenu
+
+                        HStack {
+                            scanQuickVisualControls
+                            Spacer(minLength: 0)
+                        }
                     }
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 32)
-            }
-
-            VStack {
-                Spacer()
-                if !isScanning {
-                    addPointButton
-                        .padding(.bottom, 28)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 32)
                 }
             }
 
-            VStack {
-                if isScanning,
-                   sessionManager.isLiDARAvailable,
-                   !sessionManager.isObjectTrackingEnvironmentReady {
-                    environmentReadinessBanner
-                        .padding(.top, 86)
-                } else if isScanning,
-                          isAutomaticCaptureSupported,
-                          captureEngine.activeObjectID != nil {
-                    faceCaptureGuide
-                        .padding(.top, 86)
-                }
-                Spacer()
-            }
         }
         .animation(.snappy(duration: 0.22), value: showsPanel)
-        .animation(.snappy(duration: 0.18), value: mesEngine.mode)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
+        .animation(
+            .snappy(duration: 0.2),
+            value: captureEngine.hasCompletedObjectRecognitionWarmup
+        )
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
         .alert(
-            weightEntryTitle,
-            isPresented: weightEntryIsPresented
+            objectDetailsTitle,
+            isPresented: objectDetailsIsPresented
         ) {
+            TextField("Object name", text: $objectNameText)
+                .textInputAutocapitalization(.words)
             TextField("Weight in kg", text: $weightText)
                 .keyboardType(.decimalPad)
             Button("Cancel", role: .cancel) {
-                weightEntryContext = nil
-                weightText = ""
+                cancelObjectDetailsEntry()
             }
             Button("Save") {
-                saveWeightEntry()
+                saveObjectDetailsEntry()
             }
-            .disabled(parsedWeightInKilograms == nil)
+            .disabled(
+                trimmedObjectName.isEmpty
+                    || parsedWeightInKilograms == nil
+            )
         } message: {
-            Text("Enter a finite weight greater than zero in kilograms.")
+            Text("Give this object a name and enter a weight greater than zero in kilograms.")
         }
         .confirmationDialog(
             removalConfirmationTitle,
@@ -168,12 +130,64 @@ struct MesOverlayView: View {
                 Text("\(boxSummary(for: id)) and its saved measurement data will be removed.")
             }
         }
+        .confirmationDialog(
+            "Reset all measurements?",
+            isPresented: $showsResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset All", role: .destructive) {
+                captureEngine.reset()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This clears the active object and every saved box, name, weight, point cloud and measurement.")
+        }
+    }
+
+    @ViewBuilder
+    private var topHUD: some View {
+        if showsPanel {
+            infoPanel
+                .transition(.opacity.combined(with: .move(edge: .top)))
+        } else {
+            HStack(alignment: .top, spacing: 10) {
+                topStatusCard
+
+                Spacer(minLength: 8)
+
+                Button {
+                    showsPanel = true
+                } label: {
+                    Image(systemName: "info")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 38, height: 38)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .foregroundStyle(.primary)
+                .accessibilityLabel("Show information")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var topStatusCard: some View {
+        if !sessionManager.isObjectTrackingEnvironmentReady {
+            environmentReadinessBanner
+        } else if !captureEngine.hasCompletedObjectRecognitionWarmup {
+            objectRecognitionReadinessBanner
+        } else if isAutomaticCaptureSupported,
+                  captureEngine.activeObjectID != nil {
+            faceCaptureGuide
+        } else {
+            captureReadout
+        }
     }
 
     @ViewBuilder
     private var objectMaskMarkers: some View {
-        if isScanning,
-           captureEngine.showsObjectMaskMarkers,
+        if captureEngine.showsObjectMaskMarkers,
            !captureEngine.objectMaskMarkers.isEmpty {
             GeometryReader { proxy in
                 ForEach(captureEngine.objectMaskMarkers) { marker in
@@ -182,29 +196,35 @@ struct MesOverlayView: View {
                         green: marker.color.green,
                         blue: marker.color.blue
                     )
+                    let isPendingFinalization =
+                        captureEngine.pendingFinalizationObjectID == marker.id
                     let isActive = captureEngine.activeObjectID == marker.id
-                    let isFinalized = captureEngine.finalizedObjectIDs.contains(marker.id)
+                        && !isPendingFinalization
+                    let isLocked = isPendingFinalization
+                        || captureEngine.finalizedObjectIDs.contains(marker.id)
+                    let isMaskVisible = marker.isMaskVisible
+                        && !isPendingFinalization
                     ZStack {
                         Circle()
-                            .fill(color.opacity(marker.isMaskVisible ? 0.92 : 0.28))
+                            .fill(color.opacity(isMaskVisible ? 0.92 : 0.28))
                         Circle()
                             .stroke(color, style: StrokeStyle(
-                                lineWidth: marker.isMaskVisible ? 2 : 3,
-                                dash: marker.isMaskVisible ? [] : [4, 3]
+                                lineWidth: isMaskVisible ? 2 : 3,
+                                dash: isMaskVisible ? [] : [4, 3]
                             ))
                         Image(systemName: isActive
                             ? "viewfinder"
-                            : isFinalized ? "lock.fill" : "location.fill"
+                            : isLocked ? "lock.fill" : "location.fill"
                         )
                             .font(.system(
-                                size: isFinalized ? 8 : 11,
+                                size: isLocked ? 8 : 11,
                                 weight: .bold
                             ))
                             .foregroundStyle(.white)
                     }
                     .frame(
-                        width: marker.isMaskVisible ? 18 : 28,
-                        height: marker.isMaskVisible ? 18 : 28
+                        width: isMaskVisible ? 18 : 28,
+                        height: isMaskVisible ? 18 : 28
                     )
                     .position(
                         x: marker.normalizedViewportPoint.x * proxy.size.width,
@@ -220,12 +240,27 @@ struct MesOverlayView: View {
     }
 
     private var faceCaptureGuide: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(captureEngine.measurementSatisfied
-                ? "Measurement ready"
-                : "Show each face to measure it")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(captureEngine.measurementSatisfied ? .green : .secondary)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.circle.fill")
+                Text("Ready")
+                Text("·")
+                    .foregroundStyle(.secondary)
+                Text(captureEngine.measurementSatisfied
+                    ? "Measurement complete"
+                    : "Measuring selected object")
+                    .foregroundStyle(
+                        captureEngine.measurementSatisfied ? .green : .secondary
+                    )
+            }
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.green)
+            if captureEngine.primaryText != "--" {
+                Text(captureEngine.primaryText)
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
             faceGuideRow(
                 icon: "arrow.down.to.line",
                 label: "Top view",
@@ -250,9 +285,9 @@ struct MesOverlayView: View {
                 .padding(.top, 2)
             }
         }
-        .padding(12)
-        .frame(maxWidth: 240, alignment: .leading)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(10)
+        .frame(maxWidth: 220, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
         .accessibilityElement(children: .combine)
     }
 
@@ -263,7 +298,7 @@ struct MesOverlayView: View {
         isActive: Bool,
         isDone: Bool
     ) -> some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 7) {
             Image(systemName: isDone ? "checkmark.circle.fill" : icon)
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(isDone ? .green : (isActive ? .yellow : .secondary))
@@ -286,8 +321,8 @@ struct MesOverlayView: View {
                     .foregroundStyle(.green)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
         .background(
             isActive ? Color.yellow.opacity(0.14) : Color.clear,
             in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -295,75 +330,113 @@ struct MesOverlayView: View {
     }
 
     private var environmentReadinessBanner: some View {
-        HStack(spacing: 10) {
-            ProgressView()
-                .controlSize(.small)
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.red)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(sessionManager.environmentReadiness.title)
                     .font(.caption.weight(.semibold))
+                    .foregroundStyle(.red)
                 Text(sessionManager.environmentReadiness.detail)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: 310, alignment: .leading)
-        .background(.ultraThinMaterial, in: Capsule())
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 265, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 15))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var objectRecognitionReadinessBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.green)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Environment ready")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green)
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Preparing object recognition…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 265, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 15))
         .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
     private var objectMaskInteractionLayer: some View {
-        if isScanning {
-            GeometryReader { proxy in
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(
-                        SpatialTapGesture()
-                            .onEnded { value in
-                                guard captureEngine.activeObjectID == nil,
-                                      proxy.size.width > 0,
-                                      proxy.size.height > 0 else {
-                                    return
-                                }
-                                captureEngine.requestObjectMaskToggle(
-                                    at: CGPoint(
-                                        x: value.location.x / proxy.size.width,
-                                        y: value.location.y / proxy.size.height
-                                    )
-                                )
+        GeometryReader { proxy in
+            Color.clear
+                .contentShape(Rectangle())
+                .gesture(
+                    SpatialTapGesture()
+                        .onEnded { value in
+                            guard captureEngine.activeObjectID == nil,
+                                  !captureEngine.isObjectSelectionPending else {
+                                return
                             }
-                    )
-                    .accessibilityLabel(
-                        captureEngine.activeObjectID == nil
-                            ? "Tap an object to select it for measurement"
-                            : "Current object selected for measurement"
-                    )
-                    .accessibilityHint(
-                        captureEngine.activeObjectID == nil
-                            ? "Only one object can be measured at a time."
-                            : "Lock the current object before selecting another."
-                    )
-            }
-            .ignoresSafeArea()
+                            guard sessionManager.isTrackingReady,
+                                  sessionManager.isObjectTrackingEnvironmentReady else {
+                                captureEngine.reportObjectSelectionNotReady()
+                                return
+                            }
+                            guard captureEngine.hasCompletedObjectRecognitionWarmup else {
+                                captureEngine.reportObjectRecognitionPreparing()
+                                return
+                            }
+                            guard
+                                  proxy.size.width > 0,
+                                  proxy.size.height > 0 else {
+                                return
+                            }
+                            captureEngine.requestObjectMaskToggle(
+                                at: CGPoint(
+                                    x: value.location.x / proxy.size.width,
+                                    y: value.location.y / proxy.size.height
+                                )
+                            )
+                        }
+                )
+                .accessibilityLabel(
+                    captureEngine.activeObjectID == nil
+                        ? "Tap an object to select it for measurement"
+                        : "Current object selected for measurement"
+                )
+                .accessibilityHint(
+                    captureEngine.activeObjectID == nil
+                        ? "Only one object can be measured at a time."
+                        : "Lock the current object before selecting another."
+                )
         }
+        .ignoresSafeArea()
     }
 
     @ViewBuilder
     private var objectMaskPreview: some View {
-        if isScanning, let preview = captureEngine.objectMaskPreview {
+        if !captureEngine.isFinalizationPending,
+           let preview = captureEngine.objectMaskPreview {
             ZStack {
                 ForEach(preview.layers, id: \.id) { layer in
                     if let trackedObjectID = layer.trackedObjectID {
-                        // Objects with a world-anchored surfel overlay are drawn
-                        // by RealityKit instead; warping their older bitmap on
-                        // top would only reintroduce the lag it replaced.
-                        if captureEngine.showsLockedMaskPreviews,
-                           !captureEngine.worldSurfelMaskObjectIDs
-                               .contains(trackedObjectID),
+                        if captureEngine.showsSelectedObjectMaskPreview,
+                           captureEngine.activeObjectID == trackedObjectID,
+                           !captureEngine.finalizedObjectIDs.contains(trackedObjectID),
                            let marker = captureEngine.objectMaskMarkers.first(where: {
                                $0.id == trackedObjectID
                            }) {
@@ -467,20 +540,41 @@ struct MesOverlayView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Circle()
-                    .fill(statusColor)
+                    .fill(environmentStatusColor)
                     .frame(width: 9, height: 9)
-                    .shadow(color: statusColor.opacity(0.55), radius: 4)
+                    .shadow(color: environmentStatusColor.opacity(0.55), radius: 4)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Payload Measure")
                         .font(.headline)
-                    Text(sessionManager.trackingStatus.title)
+                    Text(sessionManager.environmentReadiness.title)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(environmentStatusColor)
                 }
+
+                Spacer(minLength: 12)
+
+                Button {
+                    showsPanel = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 32, height: 32)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close information")
             }
 
             VStack(alignment: .leading, spacing: 7) {
+                Text("Current step")
+                    .font(.caption.weight(.semibold))
+                Text(scanStatusText)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
                 Text(sessionManager.trackingStatus.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -493,71 +587,25 @@ struct MesOverlayView: View {
                 }
                 statusLine("Planes", sessionManager.planeStatusText)
                 statusLine("Tracking", sessionManager.trackingHardwareText)
-                statusLine("Map", sessionManager.environmentReadiness.title)
+                statusLine("Map", sessionManager.worldMappingStatusText)
             }
             .font(.caption)
 
         }
         .padding(14)
-        .frame(maxWidth: 275, alignment: .leading)
-        .background(
-            .ultraThinMaterial,
-            in: RoundedRectangle(cornerRadius: 24, style: .continuous)
-        )
-    }
-
-    private var mesReadout: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(mesEngine.mesStatusText)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Text(mesEngine.primaryMeasurementText)
-                    .font(primaryValueFont)
-                    .monospacedDigit()
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.72)
-
-                if let secondaryMeasurementText = mesEngine.secondaryMeasurementText {
-                    Text(secondaryMeasurementText)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-            }
-
-            if mesEngine.canReset {
-                Button {
-                    mesEngine.reset()
-                } label: {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(width: 32, height: 32)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.primary)
-                .background(.ultraThinMaterial, in: Circle())
-                .accessibilityLabel("Reset measurement")
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 220, alignment: .leading)
-        .background(
-            .ultraThinMaterial,
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
     private var captureReadout: some View {
         HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
                     Text(scanStatusHeadline)
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.green)
 
                     if !sessionManager.isLiDARAvailable {
                         Button {
@@ -578,46 +626,15 @@ struct MesOverlayView: View {
                 Text(scanPrimaryText)
                     .font(.system(.caption, design: .rounded).weight(.semibold))
                     .monospacedDigit()
-                    .lineLimit(2)
+                    .lineLimit(1)
                     .minimumScaleFactor(0.72)
-
-                if isAutomaticCaptureSupported, let secondaryText = captureEngine.secondaryText {
-                    Text(secondaryText)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-
-                Text(
-                    scanStatusText
-                )
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
-            if captureEngine.canReset {
-                Button {
-                    captureEngine.reset()
-                } label: {
-                    Image(systemName: "arrow.counterclockwise")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(width: 32, height: 32)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.primary)
-                .background(.ultraThinMaterial, in: Circle())
-                .accessibilityLabel("Clear all selected and locked objects, points, and boxes")
-            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 270, alignment: .leading)
-        .background(
-            .ultraThinMaterial,
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous)
-        )
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(maxWidth: 225, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 15))
     }
 
     private var scanStatusHeadline: String {
@@ -655,10 +672,6 @@ struct MesOverlayView: View {
     }
 
     private var scanStatusText: String {
-        if let cleanupFeedback = captureEngine.pointCleanupFeedbackText {
-            return cleanupFeedback
-        }
-
         if let feedback = captureEngine.objectMaskFeedbackText {
             return feedback
         }
@@ -686,23 +699,25 @@ struct MesOverlayView: View {
 
     @ViewBuilder
     private var objectWorkflowButton: some View {
-        if captureEngine.activeObjectID != nil {
+        if captureEngine.activeObjectID != nil,
+           !captureEngine.isFinalizationPending {
             Button {
-                presentFinalizationWeightEntry()
+                presentFinalizationDetailsEntry()
             } label: {
-                Label("Lock", systemImage: "lock.fill")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 12)
-                    .frame(minWidth: 44, minHeight: 44)
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(.orange)
+                    Text("Lock")
+                        .foregroundStyle(.primary)
+                        .minimumScaleFactor(0.8)
+                }
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .frame(width: 96, height: 44)
                     .contentShape(Capsule())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(
-                captureEngine.canFinalizeActiveObject
-                    ? Color.orange
-                    : Color.secondary
-            )
-            .background(.ultraThinMaterial, in: Capsule())
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
             .disabled(!captureEngine.canFinalizeActiveObject)
             .accessibilityLabel("Finish and lock current object")
             .accessibilityHint(
@@ -714,18 +729,45 @@ struct MesOverlayView: View {
             Button {
                 captureEngine.reactivateFocusedObject()
             } label: {
-                Label("Unlock", systemImage: "lock.open.fill")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 12)
-                    .frame(minWidth: 44, minHeight: 44)
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.open.fill")
+                        .foregroundStyle(.orange)
+                    Text("Unlock")
+                        .foregroundStyle(.primary)
+                        .minimumScaleFactor(0.8)
+                }
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .frame(width: 96, height: 44)
                     .contentShape(Capsule())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.orange)
-            .background(.ultraThinMaterial, in: Capsule())
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
             .accessibilityLabel("Unlock focused object for measurement")
             .accessibilityHint("Only one object can be unlocked at a time.")
         }
+    }
+
+    private var resetButton: some View {
+        Button {
+            showsResetConfirmation = true
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.counterclockwise")
+                    .foregroundStyle(.red)
+                Text("Reset")
+                    .foregroundStyle(.primary)
+                    .minimumScaleFactor(0.8)
+            }
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .frame(width: 96, height: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.capsule)
+        .accessibilityLabel("Reset all measurements")
+        .accessibilityHint("Asks for confirmation before clearing every object and measurement.")
     }
 
     private var finalizedMeasuredObjectIDs: [UUID] {
@@ -749,9 +791,9 @@ struct MesOverlayView: View {
                     )
 
                     Button {
-                        presentWeightEditor(for: id)
+                        presentDetailsEditor(for: id)
                     } label: {
-                        Label("Edit weight", systemImage: "pencil")
+                        Label("Edit name and weight", systemImage: "pencil")
                     }
 
                     Button(role: .destructive) {
@@ -778,23 +820,22 @@ struct MesOverlayView: View {
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.glass)
+        .buttonBorderShape(.capsule)
         .foregroundStyle(.primary)
-        .background(.ultraThinMaterial, in: Capsule())
         .accessibilityLabel(
             "\(finalizedMeasuredObjectIDs.count) saved box\(finalizedMeasuredObjectIDs.count == 1 ? "" : "es")"
         )
     }
 
-    private var weightEntryIsPresented: Binding<Bool> {
+    private var objectDetailsIsPresented: Binding<Bool> {
         Binding(
             get: {
-                weightEntryContext != nil
+                objectDetailsContext != nil
             },
             set: { isPresented in
                 if !isPresented {
-                    weightEntryContext = nil
-                    weightText = ""
+                    cancelObjectDetailsEntry()
                 }
             }
         )
@@ -825,16 +866,19 @@ struct MesOverlayView: View {
         return weight
     }
 
-    private var weightEntryTitle: String {
-        guard let weightEntryContext else {
-            return "Object weight"
+    private var trimmedObjectName: String {
+        objectNameText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var objectDetailsTitle: String {
+        guard let objectDetailsContext else {
+            return "Object details"
         }
-        let number = boxNumber(for: weightEntryContext.objectID)
-        switch weightEntryContext {
+        switch objectDetailsContext {
         case .finalize:
-            return "Lock Box \(number)"
+            return "Lock object"
         case .edit:
-            return "Edit Box \(number)"
+            return "Edit object"
         }
     }
 
@@ -845,37 +889,56 @@ struct MesOverlayView: View {
         return "Remove Box \(boxNumber(for: id))?"
     }
 
-    private func presentFinalizationWeightEntry() {
-        guard let id = captureEngine.activeObjectID,
-              captureEngine.canFinalizeActiveObject else {
+    private func presentFinalizationDetailsEntry() {
+        guard let id = captureEngine.beginFinalization() else {
             return
         }
+        objectNameText = captureEngine.name(for: id) ?? ""
         weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
-        weightEntryContext = .finalize(id)
+        objectDetailsContext = .finalize(id)
     }
 
-    private func presentWeightEditor(for id: UUID) {
+    private func presentDetailsEditor(for id: UUID) {
+        objectNameText = captureEngine.name(for: id) ?? ""
         weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
-        weightEntryContext = .edit(id)
+        objectDetailsContext = .edit(id)
     }
 
-    private func saveWeightEntry() {
-        guard let weightEntryContext,
+    private func saveObjectDetailsEntry() {
+        guard let objectDetailsContext,
+              !trimmedObjectName.isEmpty,
               let weight = parsedWeightInKilograms else {
             return
         }
-        switch weightEntryContext {
+        switch objectDetailsContext {
         case .finalize(let id):
-            guard captureEngine.activeObjectID == id else {
-                self.weightEntryContext = nil
-                weightText = ""
+            guard captureEngine.activeObjectID == id,
+                  captureEngine.pendingFinalizationObjectID == id else {
+                cancelObjectDetailsEntry()
                 return
             }
-            captureEngine.finalizeActiveObject(weightInKilograms: weight)
+            captureEngine.finalizeActiveObject(
+                name: trimmedObjectName,
+                weightInKilograms: weight
+            )
         case .edit(let id):
-            captureEngine.updateWeight(id: id, weightInKilograms: weight)
+            captureEngine.updateDetails(
+                id: id,
+                name: trimmedObjectName,
+                weightInKilograms: weight
+            )
         }
-        self.weightEntryContext = nil
+        self.objectDetailsContext = nil
+        objectNameText = ""
+        weightText = ""
+    }
+
+    private func cancelObjectDetailsEntry() {
+        if case .finalize? = objectDetailsContext {
+            captureEngine.cancelPendingFinalization()
+        }
+        objectDetailsContext = nil
+        objectNameText = ""
         weightText = ""
     }
 
@@ -884,10 +947,11 @@ struct MesOverlayView: View {
     }
 
     private func boxSummary(for id: UUID) -> String {
+        let name = captureEngine.name(for: id) ?? "Box \(boxNumber(for: id))"
         let weightText = captureEngine.weightInKilograms(for: id)
             .map { "\(formattedWeight($0)) kg" }
             ?? "No weight"
-        return "Box \(boxNumber(for: id)) · \(weightText)"
+        return "\(name) · \(weightText)"
     }
 
     private func removalButtonTitle(for id: UUID) -> String {
@@ -916,33 +980,6 @@ struct MesOverlayView: View {
                 .grouping(.never)
                 .precision(.fractionLength(0...3))
         )
-    }
-
-    private var pointCleanupButton: some View {
-        Button {
-            captureEngine.requestVisiblePointCleanup()
-        } label: {
-            HStack(spacing: 6) {
-                if captureEngine.isPointCleanupInProgress {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.cyan)
-                } else {
-                    Image(systemName: "eraser.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                Text("Enhance")
-                    .font(.caption.weight(.semibold))
-            }
-            .padding(.horizontal, 12)
-            .frame(minWidth: 44, minHeight: 44)
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.cyan)
-        .background(.ultraThinMaterial, in: Capsule())
-        .disabled(captureEngine.isPointCleanupInProgress)
-        .accessibilityLabel("Enhance cyan points using the object mask")
     }
 
     private var nonLiDARLimitationsSheet: some View {
@@ -1046,7 +1083,7 @@ struct MesOverlayView: View {
         }
         .padding(.horizontal, 4)
         .frame(height: 48)
-        .background(.ultraThinMaterial, in: Capsule())
+        .glassEffect(.regular.interactive(), in: Capsule())
         .accessibilityElement(children: .contain)
     }
 
@@ -1089,10 +1126,10 @@ struct MesOverlayView: View {
                     action: captureEngine.toggleLiveMaskPreview
                 )
                 visualToggleButton(
-                    title: "Locked masks",
+                    title: "Selected object",
                     systemImage: "paintpalette",
-                    isVisible: captureEngine.showsLockedMaskPreviews,
-                    action: captureEngine.toggleLockedMaskPreviews
+                    isVisible: captureEngine.showsSelectedObjectMaskPreview,
+                    action: captureEngine.toggleSelectedObjectMaskPreview
                 )
             }
 
@@ -1154,50 +1191,6 @@ struct MesOverlayView: View {
         }
     }
 
-    private var modeMenu: some View {
-        Menu {
-            ForEach(MesMode.allCases) { mode in
-                Button {
-                    mesEngine.mode = mode
-                } label: {
-                    HStack {
-                        Label(mode.title, systemImage: mode.systemImageName)
-                        Spacer()
-
-                        if mesEngine.mode == mode {
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: mesEngine.mode.systemImageName)
-                    .font(.system(size: 14, weight: .semibold))
-
-                Text("Mode")
-                    .font(.caption.weight(.semibold))
-
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 42)
-            .contentShape(Capsule())
-            .background {
-                if mesEngine.mode == .scan {
-                    Capsule()
-                        .fill(.white.opacity(0.08))
-                }
-            }
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .background(.ultraThinMaterial, in: Capsule())
-        .accessibilityLabel("Measurement mode, \(mesEngine.mode.title)")
-    }
-
     private var aimer: some View {
         ZStack {
             Ellipse()
@@ -1224,32 +1217,6 @@ struct MesOverlayView: View {
         .accessibilityHidden(true)
     }
 
-    private var addPointButton: some View {
-        Button {
-            mesEngine.requestPointPlacement()
-        } label: {
-            Label("Add Point", systemImage: "plus")
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(sessionManager.isTrackingReady ? .primary : .secondary)
-                .padding(.horizontal, 22)
-                .frame(height: 52)
-        }
-        .buttonStyle(.plain)
-        .background(.ultraThinMaterial, in: Capsule())
-        .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 6)
-        .disabled(!sessionManager.isTrackingReady)
-        .accessibilityLabel("Add measurement point")
-    }
-
-    private var primaryValueFont: Font {
-        switch mesEngine.mode {
-        case .line:
-            .system(.callout, design: .rounded).weight(.semibold)
-        case .boundingBox, .scan:
-            .system(.caption, design: .rounded).weight(.semibold)
-        }
-    }
-
     private func statusLine(_ label: String, _ value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(label + ":")
@@ -1259,15 +1226,8 @@ struct MesOverlayView: View {
         }
     }
 
-    private var statusColor: Color {
-        switch sessionManager.trackingStatus {
-        case .normal:
-            .green
-        case .starting, .limited:
-            .yellow
-        case .unavailable, .interrupted, .failed:
-            .red
-        }
+    private var environmentStatusColor: Color {
+        sessionManager.isObjectTrackingEnvironmentReady ? .green : .red
     }
 }
 
