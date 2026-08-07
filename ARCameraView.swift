@@ -11,12 +11,14 @@ struct ARCameraView: UIViewRepresentable {
     let sessionManager: ARSessionManager
     let mesEngine: MesEngine
     let captureEngine: ObjectCaptureEngine
+    let workflowMode: MeasurementWorkflowMode
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             sessionManager: sessionManager,
             mesEngine: mesEngine,
-            captureEngine: captureEngine
+            captureEngine: captureEngine,
+            workflowMode: workflowMode
         )
     }
 
@@ -33,6 +35,7 @@ struct ARCameraView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {
+        context.coordinator.setWorkflowMode(workflowMode)
     }
 
     static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
@@ -59,6 +62,17 @@ struct ARCameraView: UIViewRepresentable {
             var width: Float
             var depth: Float
             var centerXZ: SIMD2<Float>
+        }
+
+        private enum SupportHeightSource: Equatable, Sendable {
+            case plane(UUID)
+            case depth
+        }
+
+        private struct SupportHeightState {
+            var recentCandidates: [Float] = []
+            var value: Float?
+            var source: SupportHeightSource?
         }
 
         private struct ObjectMaskMarkerState {
@@ -137,7 +151,9 @@ struct ARCameraView: UIViewRepresentable {
         fileprivate static let captureBoxDashTargetPeriod: Float = 0.018
         fileprivate static let captureBoxMaximumDashCount = 24
         fileprivate static let preparedCaptureBoxEntityCount = 48
-        fileprivate static let automaticPointCleanupBatchSize = 4_096
+        // Keep mask cleanup time-sliced so a Lock tap never waits behind a
+        // multi-thousand-point projection pass on the main actor.
+        fileprivate static let automaticPointCleanupBatchSize = 512
         fileprivate static let captureBoxEdges = [
             (0, 1), (1, 3), (2, 3), (0, 2),
             (4, 5), (5, 7), (6, 7), (4, 6),
@@ -165,6 +181,7 @@ struct ARCameraView: UIViewRepresentable {
         private let sessionManager: ARSessionManager
         private let mesEngine: MesEngine
         private let captureEngine: ObjectCaptureEngine
+        private var workflowMode: MeasurementWorkflowMode
         private weak var arView: ARView?
         private var coachingOverlayView: ARCoachingOverlayView?
         private var contentAnchor: AnchorEntity?
@@ -173,6 +190,23 @@ struct ARCameraView: UIViewRepresentable {
         private var mesEntities: [ModelEntity] = []
         private var previewMeasurementEntities: [ModelEntity] = []
         private var captureEntitiesByObject: [UUID: [ModelEntity]] = [:]
+        private var captureAnchorEntitiesByObject: [UUID: AnchorEntity] = [:]
+        /// A box normally follows its object anchor while evidence is acquired. Once ARKit has a
+        /// definitive supporting plane, presentation is rebound to that exact plane identifier so
+        /// later plane refinements keep the bottom face on the physical surface.
+        private var capturePresentationPlaneIDsByObject: [UUID: UUID] = [:]
+        private var renderAnchorTransformByObject: [UUID: simd_float4x4] = [:]
+        /// Last transform from each stored plane snapshot into the plane's latest world pose. It
+        /// preserves visual continuity if ARKit removes that identifier while merging planes.
+        private var latestPresentationRebaseByObject: [UUID: simd_float4x4] = [:]
+        private var objectsAwaitingSupportPlane: Set<UUID> = []
+        /// Anchor pose used when the current canonical box was published. It
+        /// lets an unlocked box be rebased after ARKit refines that anchor.
+        private var publishedAnchorTransformByObject: [UUID: simd_float4x4] = [:]
+        /// World frame in which the active voxel evidence was accumulated.
+        /// Kept separate from presentation so small anchor refinements can be
+        /// rendered coherently and larger ones trigger a clean reacquisition.
+        private var evidenceAnchorTransformByObject: [UUID: simd_float4x4] = [:]
         private var captureBoxActiveSpanCountsByObject: [UUID: Int] = [:]
         private var captureBoxRearEdgeStatesByObject: [UUID: [Bool]] = [:]
         private var selectionPointMesh: LowLevelMesh?
@@ -191,6 +225,9 @@ struct ARCameraView: UIViewRepresentable {
         // viewpoint cannot disturb it (this also stops side-view background points widening W/L).
         private var capturedFootprintByObject: [UUID: ObjectFootprint] = [:]
         private var capturedHeightByObject: [UUID: Float] = [:]
+        private var supportHeightStateByObject: [UUID: SupportHeightState] = [:]
+        private var supportPlaneAnchorIDsByObject: [UUID: UUID] = [:]
+        private var fittedSupportHeightByObject: [UUID: Float] = [:]
         // "Satisfied" sets: a dimension is added once it has held steady for several fits in its
         // ideal view (the convergence heuristic that tells the operator a face is done).
         private var footprintFromTopObjects: Set<UUID> = []
@@ -200,7 +237,16 @@ struct ARCameraView: UIViewRepresentable {
         private static let dimensionDeadband: Float = 0.004
         private static let dimensionRelativeDeadband: Float = 0.03
         private static let dimensionBlend: Float = 0.35
+        private static let positionDeadband: Float = 0.004
+        private static let orientationDeadbandDegrees: Float = 1.5
+        private static let depthSupportDeadband: Float = 0.001
+        private static let depthSupportMaximumStep: Float = 0.002
+        private static let supportHistoryCount = 7
+        private static let minimumSupportSamples = 3
         private static let satisfiedTickCount = 6
+        private static let topAlignmentEnterDegrees: Float = 12
+        private static let topAlignmentExitDegrees: Float = 18
+        private var topAlignmentAccepted = false
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private let objectCaptureFitter = ObjectCaptureFitter()
@@ -209,6 +255,8 @@ struct ARCameraView: UIViewRepresentable {
         private let objectMaskProcessor = ObjectMaskProcessor()
         private let objectMaskDisplayTracker = ObjectMaskDisplayTracker()
         private var scanTickCounter = 0
+        private var lastSupportBindingRefreshTimestamp: TimeInterval =
+            -.greatestFiniteMagnitude
         private var lastAutomaticPointCleanupTimestamp: TimeInterval = -.greatestFiniteMagnitude
         private var automaticPointCleanupCursorByObject: [UUID: Int] = [:]
         private var consecutiveMaskMisses = 0
@@ -248,11 +296,13 @@ struct ARCameraView: UIViewRepresentable {
         init(
             sessionManager: ARSessionManager,
             mesEngine: MesEngine,
-            captureEngine: ObjectCaptureEngine
+            captureEngine: ObjectCaptureEngine,
+            workflowMode: MeasurementWorkflowMode
         ) {
             self.sessionManager = sessionManager
             self.mesEngine = mesEngine
             self.captureEngine = captureEngine
+            self.workflowMode = workflowMode
         }
 
         func prepareForNewWorld() {
@@ -262,6 +312,7 @@ struct ARCameraView: UIViewRepresentable {
 
         func attach(to arView: ARView) {
             self.arView = arView
+            captureEngine.setMeasurementMode(workflowMode)
             installCoachingOverlay(in: arView)
             observedResetRevision = mesEngine.resetRevision
             observedPlacementRequestRevision = mesEngine.placementRequestRevision
@@ -296,7 +347,9 @@ struct ARCameraView: UIViewRepresentable {
                     self.updateSessionFrameStatus(in: arView)
                     self.updateAimerSurface(in: arView)
                     self.updatePlacedPointBillboards(in: arView)
+                    self.updateFastObjectMaskMarkers(in: arView)
                     self.updateScanLive(in: arView)
+                    self.refreshSupportPlaneBindings(in: arView)
                     self.updateCaptureBoxLineStyles(in: arView)
                 }
             }
@@ -326,11 +379,20 @@ struct ARCameraView: UIViewRepresentable {
             observeEngineRevisions()
         }
 
+        func setWorkflowMode(_ mode: MeasurementWorkflowMode) {
+            guard workflowMode != mode else {
+                return
+            }
+            workflowMode = mode
+            captureEngine.setMeasurementMode(mode)
+            resetScanState()
+            updateTopViewAlignment(from: arView?.session.currentFrame)
+        }
+
         @objc private func updateMaskDisplay() {
             guard let arView else {
                 return
             }
-            updateFastObjectMaskMarkers(in: arView)
             updateFastObjectMaskPreview(in: arView)
             updateObjectMaskPreview(in: arView)
         }
@@ -399,7 +461,9 @@ struct ARCameraView: UIViewRepresentable {
             let coachingOverlay = ARCoachingOverlayView()
             coachingOverlay.translatesAutoresizingMaskIntoConstraints = false
             coachingOverlay.delegate = self
-            coachingOverlay.goal = .tracking
+            // A reliable horizontal support is a prerequisite for height. Apple keeps this goal
+            // active until movement has produced a detected floor/table plane.
+            coachingOverlay.goal = .horizontalPlane
             coachingOverlay.activatesAutomatically = true
             coachingOverlay.session = arView.session
             arView.addSubview(coachingOverlay)
@@ -593,6 +657,11 @@ struct ARCameraView: UIViewRepresentable {
 
             switch request.kind {
             case .pauseFinalization:
+                guard snapCaptureToCurrentSupportPlane(for: request.id) else {
+                    captureEngine.rejectPendingFinalizationWithoutSupportPlane()
+                    return
+                }
+                selectionPointsByObject.removeValue(forKey: request.id)
                 objectMaskDisplayTask?.cancel()
                 objectMaskDisplayTaskGeneration &+= 1
                 objectMaskDisplayTask = nil
@@ -607,13 +676,14 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
             case .resumeFinalization:
+                if let points = liveResultsByObject[request.id]?.surfacePoints {
+                    selectionPointsByObject[request.id] = points
+                }
                 objectMaskDisplaySeedsByID.removeValue(forKey: request.id)
                 removeLiveObjectMaskDisplaySeed()
                 captureEngine.clearTransientObjectMaskPreviews()
             case .finalize:
-                if let points = liveResultsByObject[request.id]?.surfacePoints {
-                    selectionPointsByObject[request.id] = points
-                }
+                selectionPointsByObject.removeValue(forKey: request.id)
                 objectMaskDisplayTask?.cancel()
                 objectMaskDisplayTaskGeneration &+= 1
                 objectMaskDisplayTask = nil
@@ -626,8 +696,7 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
             case .reactivate:
-                fittedMaskedPointTimestamp[request.id] =
-                    -.greatestFiniteMagnitude
+                rebaseAndRestartMeasurement(for: request.id)
                 removeLiveObjectMaskDisplaySeed()
                 captureEngine.clearLiveObjectMaskPreview()
             case .remove:
@@ -658,9 +727,393 @@ struct ARCameraView: UIViewRepresentable {
                     forKey: request.id
                 )
                 selectionPointsByObject.removeValue(forKey: request.id)
+                publishedAnchorTransformByObject.removeValue(forKey: request.id)
+                evidenceAnchorTransformByObject.removeValue(forKey: request.id)
                 clearCaptureContent(for: request.id)
             }
             updateSelectionVisualization()
+        }
+
+        /// Lock is the commit boundary: resolve the latest geometry for the retained support plane,
+        /// put the box bottom exactly on it, and preserve the already-observed top face.
+        @discardableResult
+        private func snapCaptureToCurrentSupportPlane(for id: UUID) -> Bool {
+            guard let arView,
+                  let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState,
+                  let storedObject = captureEngine.capturedObjectsByID[id],
+                  let objectAnchor = currentObjectAnchor(
+                      id: id,
+                      frame: frame,
+                      fallback: objectMaskAnchors[id]
+                  ) else {
+                return false
+            }
+
+            // Bring the canonical box into its *visible* current world frame. Once presentation is
+            // plane-bound, that frame comes from the plane anchor rather than the mask/object anchor;
+            // using the latter would turn different local refinements into a false height change.
+            let presentationRebase: simd_float4x4
+            if let planeID = capturePresentationPlaneIDsByObject[id],
+               let currentPlane = frame.anchors.first(where: {
+                   $0.identifier == planeID
+               }) as? ARPlaneAnchor,
+               let renderReference = renderAnchorTransformByObject[id] {
+                presentationRebase = currentPlane.transform * renderReference.inverse
+                latestPresentationRebaseByObject[id] = presentationRebase
+            } else if capturePresentationPlaneIDsByObject[id] != nil,
+                      let latestPresentationRebase =
+                        latestPresentationRebaseByObject[id] {
+                presentationRebase = latestPresentationRebase
+            } else {
+                let publishedObjectAnchorTransform = publishedAnchorTransformByObject[id]
+                    ?? objectMaskAnchors[id]?.transform
+                    ?? objectAnchor.transform
+                presentationRebase = objectAnchor.transform
+                    * publishedObjectAnchorTransform.inverse
+            }
+            let object = transformedCapturedObject(
+                storedObject,
+                by: presentationRebase
+            )
+
+            let reference = objectAnchor.transform.translation
+            let currentFootprint = ObjectFootprint(
+                widthAxis: object.axes.width,
+                width: object.dimensions.x,
+                depth: object.dimensions.y,
+                centerXZ: SIMD2<Float>(object.center.x, object.center.z)
+            )
+            guard let match = ObjectCapturePipeline.supportPlaneMatch(
+                from: frame.anchors,
+                beneath: reference,
+                validating: supportPlaneValidationPoints(
+                    for: currentFootprint,
+                    reference: reference
+                ),
+                preferredAnchorIdentifier: supportPlaneAnchorIDsByObject[id]
+            ) else {
+                return false
+            }
+
+            let snappedObject: CapturedObject
+            let snappedHeight: Float
+            if captureEngine.finalizedObjectIDs.contains(id) {
+                // A lock freezes dimensions. If ARKit merges/replaces its plane, translate the
+                // fixed box onto the replacement instead of measuring it again.
+                snappedHeight = object.dimensions.z
+                var translation = matrix_identity_float4x4
+                translation.columns.3 = SIMD4<Float>(
+                    0,
+                    match.height - (object.center.y - snappedHeight / 2),
+                    0,
+                    1
+                )
+                snappedObject = transformedCapturedObject(object, by: translation)
+            } else {
+                let observedTop = object.center.y + object.dimensions.z / 2
+                snappedHeight = observedTop - match.height
+                guard snappedHeight >= 0.005,
+                      snappedHeight <= ObjectCapturePipeline.maxHeight else {
+                    return false
+                }
+                snappedObject = makeViewBox(
+                    footprint: currentFootprint,
+                    height: snappedHeight,
+                    base: match.height,
+                    up: SIMD3<Float>(0, 1, 0),
+                    sampleCount: object.sampleCount
+                )
+            }
+
+            publishedAnchorTransformByObject[id] = objectAnchor.transform
+            supportPlaneAnchorIDsByObject[id] = match.anchorIdentifier
+            _ = stabilizedSupportHeight(
+                candidate: match.height,
+                source: .plane(match.anchorIdentifier),
+                for: id
+            )
+            capturedHeightByObject[id] = snappedHeight
+            supportHeightStateByObject[id]?.value = match.height
+            fittedSupportHeightByObject[id] = match.height
+            configureCapturePresentationAnchor(
+                for: id,
+                supportPlaneMatch: match
+            )
+            latestPresentationRebaseByObject[id] = matrix_identity_float4x4
+            objectsAwaitingSupportPlane.remove(id)
+            captureEngine.updateAnchoredCapture(id: id, object: snappedObject)
+            addCapturedBox(snappedObject, for: id)
+            return true
+        }
+
+        /// ARKit can merge plane anchors and remove the older identifier. Plane-bound boxes normally
+        /// follow refinements automatically; this reacquires or safely falls back when that exact
+        /// identifier disappears, for both active and finalized objects.
+        private func refreshSupportPlaneBindings(in arView: ARView) {
+            guard !capturePresentationPlaneIDsByObject.isEmpty
+                    || !objectsAwaitingSupportPlane.isEmpty,
+                  let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState else {
+                return
+            }
+            let currentPlanes = Dictionary(uniqueKeysWithValues: frame.anchors.compactMap {
+                anchor -> (UUID, ARPlaneAnchor)? in
+                guard let plane = anchor as? ARPlaneAnchor,
+                      plane.alignment == .horizontal,
+                      plane.classification != .ceiling else {
+                    return nil
+                }
+                return (plane.identifier, plane)
+            })
+
+            // Retain the most recent visible pose before ARKit replaces an anchor during a merge.
+            for (objectID, planeID) in capturePresentationPlaneIDsByObject {
+                if let plane = currentPlanes[planeID],
+                   let renderReference = renderAnchorTransformByObject[objectID] {
+                    latestPresentationRebaseByObject[objectID] =
+                        plane.transform * renderReference.inverse
+                }
+            }
+            let missingSupportIDs = capturePresentationPlaneIDsByObject.compactMap {
+                objectID, planeID -> UUID? in
+                captureEngine.capturedObjectsByID[objectID] != nil
+                    && currentPlanes[planeID] == nil
+                    ? objectID
+                    : nil
+            }
+            // Do not let the retry throttle keep a stale Lock sheet alive after its exact plane
+            // disappears. Presentation recovery may wait a few frames; the invalid commit may not.
+            if let pendingID = captureEngine.pendingFinalizationObjectID,
+               missingSupportIDs.contains(pendingID) {
+                captureEngine.rejectPendingFinalizationWithoutSupportPlane()
+            }
+            let objectsNeedingSupport = Set(missingSupportIDs).union(
+                objectsAwaitingSupportPlane.filter {
+                    captureEngine.capturedObjectsByID[$0] != nil
+                }
+            )
+            guard !objectsNeedingSupport.isEmpty,
+                  frame.timestamp - lastSupportBindingRefreshTimestamp >= 0.5 else {
+                return
+            }
+            lastSupportBindingRefreshTimestamp = frame.timestamp
+            for id in objectsNeedingSupport {
+                let wasBoundToRemovedPlane =
+                    capturePresentationPlaneIDsByObject[id] != nil
+                supportPlaneAnchorIDsByObject.removeValue(forKey: id)
+                objectsAwaitingSupportPlane.insert(id)
+                let didReacquireSupport =
+                    snapCaptureToCurrentSupportPlane(for: id)
+                if !didReacquireSupport {
+                    moveCaptureFromRemovedPlaneToObjectAnchor(
+                        id: id,
+                        frame: frame
+                    )
+                }
+                if wasBoundToRemovedPlane,
+                   captureEngine.activeObjectID == id {
+                    // Whether support was replaced immediately or temporarily fell back, the
+                    // presentation changed coordinate frames. Never mix old depth evidence into it.
+                    rebaseAndRestartMeasurement(for: id)
+                    if !didReacquireSupport {
+                        objectsAwaitingSupportPlane.insert(id)
+                    }
+                }
+                if !didReacquireSupport,
+                   captureEngine.pendingFinalizationObjectID == id {
+                    captureEngine.rejectPendingFinalizationWithoutSupportPlane()
+                }
+            }
+        }
+
+        /// Never leave content parented to an ARPlaneAnchor that ARKit has removed. Keep the last
+        /// visible world pose on the object's retained anchor and continue looking for a replacement.
+        private func moveCaptureFromRemovedPlaneToObjectAnchor(
+            id: UUID,
+            frame: ARFrame
+        ) {
+            guard let storedObject = captureEngine.capturedObjectsByID[id],
+                  let objectAnchor = currentObjectAnchor(
+                      id: id,
+                      frame: frame,
+                      fallback: objectMaskAnchors[id]
+                  ) else {
+                configureCapturePresentationAnchor(
+                    for: id,
+                    supportPlaneMatch: nil
+                )
+                return
+            }
+
+            let worldRebase: simd_float4x4
+            if capturePresentationPlaneIDsByObject[id] != nil {
+                worldRebase = latestPresentationRebaseByObject[id]
+                    ?? matrix_identity_float4x4
+            } else {
+                let publishedTransform = publishedAnchorTransformByObject[id]
+                    ?? objectAnchor.transform
+                worldRebase = objectAnchor.transform * publishedTransform.inverse
+            }
+            let rebasedObject = transformedCapturedObject(
+                storedObject,
+                by: worldRebase
+            )
+            publishedAnchorTransformByObject[id] = objectAnchor.transform
+            configureCapturePresentationAnchor(
+                for: id,
+                supportPlaneMatch: nil
+            )
+            renderAnchorTransformByObject[id] = objectAnchor.transform
+            latestPresentationRebaseByObject[id] = matrix_identity_float4x4
+            captureEngine.updateAnchoredCapture(id: id, object: rebasedObject)
+            addCapturedBox(rebasedObject, for: id)
+        }
+
+        /// ARKit can refine an anchor while an object is locked. Its rendered
+        /// box follows automatically, but the old depth voxels remain expressed
+        /// in the earlier world frame. Rebase the canonical box, then reacquire
+        /// evidence so an unlock never combines those two coordinate frames.
+        private func rebaseAndRestartMeasurement(for id: UUID) {
+            objectsAwaitingSupportPlane.remove(id)
+            let frame = arView?.session.currentFrame
+            let currentAnchor = currentObjectAnchor(
+                id: id,
+                frame: frame,
+                fallback: objectMaskAnchors[id]
+            )
+            if let object = captureEngine.capturedObjectsByID[id],
+               let currentAnchor {
+                let worldRebase: simd_float4x4
+                let usesCurrentPlanePresentation: Bool
+                if let planeID = capturePresentationPlaneIDsByObject[id],
+                   let currentPlane = frame?.anchors.first(where: {
+                       $0.identifier == planeID
+                   }) as? ARPlaneAnchor,
+                   let renderReference = renderAnchorTransformByObject[id] {
+                    worldRebase = currentPlane.transform * renderReference.inverse
+                    renderAnchorTransformByObject[id] = currentPlane.transform
+                    usesCurrentPlanePresentation = true
+                } else {
+                    let publishedTransform = publishedAnchorTransformByObject[id]
+                        ?? objectMaskAnchors[id]?.transform
+                        ?? currentAnchor.transform
+                    worldRebase = currentAnchor.transform * publishedTransform.inverse
+                    usesCurrentPlanePresentation = false
+                }
+                let rebasedObject = transformedCapturedObject(
+                    object,
+                    by: worldRebase
+                )
+                publishedAnchorTransformByObject[id] = currentAnchor.transform
+                evidenceAnchorTransformByObject[id] = currentAnchor.transform
+                if !usesCurrentPlanePresentation {
+                    // A removed/merged plane cannot remain the presentation target while evidence
+                    // restarts. Return to the current object anchor until support is reacquired.
+                    configureCapturePresentationAnchor(
+                        for: id,
+                        supportPlaneMatch: nil
+                    )
+                    renderAnchorTransformByObject[id] = currentAnchor.transform
+                }
+                captureEngine.updateCapture(id: id, object: rebasedObject)
+                addCapturedBox(rebasedObject, for: id)
+            }
+            if let currentAnchor {
+                publishedAnchorTransformByObject[id] = currentAnchor.transform
+                evidenceAnchorTransformByObject[id] = currentAnchor.transform
+            }
+
+            supportAccumulators.removeValue(forKey: id)
+            maskedAccumulators.removeValue(forKey: id)
+            newestMaskedPointTimestamp.removeValue(forKey: id)
+            fittedMaskedPointTimestamp.removeValue(forKey: id)
+            liveResultsByObject.removeValue(forKey: id)
+            acceptedSurfaceVoxelKeysByObject.removeValue(forKey: id)
+            manuallyRejectedVoxelKeysByObject.removeValue(forKey: id)
+            automaticPointCleanupCursorByObject.removeValue(forKey: id)
+            selectionPointsByObject.removeValue(forKey: id)
+            capturedFootprintByObject.removeValue(forKey: id)
+            capturedHeightByObject.removeValue(forKey: id)
+            supportHeightStateByObject.removeValue(forKey: id)
+            fittedSupportHeightByObject.removeValue(forKey: id)
+            footprintFromTopObjects.remove(id)
+            heightFromSideObjects.remove(id)
+            footprintStableTicks.removeValue(forKey: id)
+            heightStableTicks.removeValue(forKey: id)
+            captureBoxRearEdgeStatesByObject.removeValue(forKey: id)
+            captureEngine.resetScanGuidance()
+        }
+
+        /// Preserve the anchored box but discard world-space evidence after a
+        /// material map correction, preventing old and corrected coordinates
+        /// from entering the same fit.
+        @discardableResult
+        private func restartActiveMeasurementAfterAnchorCorrectionIfNeeded(
+            frame: ARFrame,
+            cancelMaskTask: Bool
+        ) -> Bool {
+            guard let id = captureEngine.activeObjectID,
+                  let previous = evidenceAnchorTransformByObject[id],
+                  let current = currentObjectAnchor(
+                      id: id,
+                      frame: frame,
+                      fallback: objectMaskAnchors[id]
+                  )?.transform else {
+                return false
+            }
+            let translationDelta = current.translation - previous.translation
+            let horizontalTranslationShift = hypot(
+                translationDelta.x,
+                translationDelta.z
+            )
+            let verticalTranslationShift = abs(translationDelta.y)
+            let previousRotation = simd_quatf(rotationMatrix(of: previous))
+            let currentRotation = simd_quatf(rotationMatrix(of: current))
+            let quaternionDot = min(
+                max(abs(simd_dot(previousRotation.vector, currentRotation.vector)), 0),
+                1
+            )
+            let rotationShift = 2 * acos(quaternionDot)
+            // Vertical support errors are conspicuous at only a few millimetres. Reacquire before
+            // old world-space evidence can be combined with a vertically corrected anchor frame;
+            // retain the wider horizontal threshold to avoid needless restarts from lateral noise.
+            guard horizontalTranslationShift > 0.008
+                    || verticalTranslationShift > 0.0015
+                    || rotationShift > (Float.pi / 180) else {
+                return false
+            }
+
+            if cancelMaskTask {
+                objectMaskTask?.cancel()
+                objectMaskTaskGeneration &+= 1
+                objectMaskTask = nil
+            }
+            cancelCaptureFit()
+            rebaseAndRestartMeasurement(for: id)
+            return true
+        }
+
+        private func rotationMatrix(
+            of transform: simd_float4x4
+        ) -> simd_float3x3 {
+            simd_float3x3(columns: (
+                SIMD3<Float>(
+                    transform.columns.0.x,
+                    transform.columns.0.y,
+                    transform.columns.0.z
+                ),
+                SIMD3<Float>(
+                    transform.columns.1.x,
+                    transform.columns.1.y,
+                    transform.columns.1.z
+                ),
+                SIMD3<Float>(
+                    transform.columns.2.x,
+                    transform.columns.2.y,
+                    transform.columns.2.z
+                )
+            ))
         }
 
         private func updateMeshVisibility() {
@@ -746,6 +1199,9 @@ struct ARCameraView: UIViewRepresentable {
                 pendingObjectMaskToggleRequest = nil
             }
             let processor = objectMaskProcessor
+            updateTopViewAlignment(from: frame)
+            let submittedWorkflowMode = workflowMode
+            let submittedTopAlignmentAccepted = topAlignmentAccepted
             let submittedResetRevision = captureEngine.resetRevision
             let submittedFrameEpoch = sessionManager.frameEpoch
             lastObjectMaskSubmittedFrameTimestamp = frame.timestamp
@@ -767,6 +1223,7 @@ struct ARCameraView: UIViewRepresentable {
                 }
                 guard self.sessionManager.frameEpoch == submittedFrameEpoch,
                       !wasCancelled,
+                      self.workflowMode == submittedWorkflowMode,
                       self.mesEngine.mode == .scan,
                       !self.captureEngine.isFinalizationPending,
                       self.sessionManager.isTrackingReady,
@@ -816,7 +1273,19 @@ struct ARCameraView: UIViewRepresentable {
                         self.captureEngine.focusFinalizedObject(id: lockChange.id)
                     }
                 }
+                let restartedForAnchorCorrection =
+                    self.restartActiveMeasurementAfterAnchorCorrectionIfNeeded(
+                        frame: currentFrame,
+                        cancelMaskTask: false
+                    )
                 for cloud in result.maskedPointClouds {
+                    if restartedForAnchorCorrection {
+                        continue
+                    }
+                    if submittedWorkflowMode == .top,
+                       !submittedTopAlignmentAccepted {
+                        continue
+                    }
                     guard cloud.id == self.captureEngine.activeObjectID else {
                         continue
                     }
@@ -942,7 +1411,9 @@ struct ARCameraView: UIViewRepresentable {
         private func updateFastObjectMaskPreview(in arView: ARView) {
             guard mesEngine.mode == .scan,
                   !captureEngine.isFinalizationPending,
-                  let frame = arView.session.currentFrame else {
+                  sessionManager.isTrackingReady,
+                  let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState else {
                 return
             }
             let orientation = cameraImageOrientation(in: arView)
@@ -1058,7 +1529,10 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func updateFastObjectMaskMarkers(in arView: ARView) {
-            guard mesEngine.mode == .scan else {
+            guard mesEngine.mode == .scan,
+                  sessionManager.isTrackingReady,
+                  let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState else {
                 captureEngine.updateObjectMaskMarkers([])
                 return
             }
@@ -1092,12 +1566,15 @@ struct ARCameraView: UIViewRepresentable {
                   sessionManager.isAutomaticObjectCaptureSupported,
                   sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState,
                   let objectID = captureEngine.activeObjectID,
                   var accumulator = maskedAccumulators[objectID],
                   let result = liveResultsByObject[objectID],
                   result.selectionPoints.count == result.surfacePoints.count,
                   !result.surfacePoints.isEmpty,
-                  let layer = captureEngine.objectMaskPreview?.layers.first(where: {
+                  let preview = captureEngine.objectMaskPreview,
+                  abs(frame.timestamp - preview.timestamp) <= 0.2,
+                  let layer = preview.layers.first(where: {
                       $0.trackedObjectID == objectID
                   }),
                   layer.trackingOrientation == cameraImageOrientation(in: arView),
@@ -1359,6 +1836,10 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
+            // The point set is the fit's input. Invalidate any result that was
+            // computed from the pre-cleanup snapshot before changing it.
+            cancelCaptureFit()
+
             let removedPairs = removedIndices.map {
                 (
                     selection: result.selectionPoints[$0],
@@ -1424,14 +1905,48 @@ struct ARCameraView: UIViewRepresentable {
             fittedMaskedPointTimestamp[objectID] = -.greatestFiniteMagnitude
             selectionPointsByObject[objectID] = retainedSurfacePoints
             updateSelectionVisualization()
-            captureEngine.updateCapture(id: objectID, object: cleanedObject)
         }
 
         private func updateSessionFrameStatus(in arView: ARView) {
             guard let frame = arView.session.currentFrame else {
+                updateTopViewAlignment(from: nil)
                 return
             }
             sessionManager.updateFrameStatus(from: frame)
+            updateTopViewAlignment(from: frame)
+        }
+
+        private func updateTopViewAlignment(from frame: ARFrame?) {
+            guard workflowMode == .top,
+                  let frame,
+                  case .normal = frame.camera.trackingState else {
+                topAlignmentAccepted = false
+                captureEngine.updateTopViewAlignment(
+                    deviationDegrees: nil,
+                    isAligned: false
+                )
+                return
+            }
+
+            let cameraForward = simd_normalize(
+                -SIMD3<Float>(
+                    frame.camera.transform.columns.2.x,
+                    frame.camera.transform.columns.2.y,
+                    frame.camera.transform.columns.2.z
+                )
+            )
+            let worldDown = SIMD3<Float>(0, -1, 0)
+            let cosine = min(max(simd_dot(cameraForward, worldDown), -1), 1)
+            let deviation = acos(cosine) * 180 / .pi
+            if topAlignmentAccepted {
+                topAlignmentAccepted = deviation <= Self.topAlignmentExitDegrees
+            } else {
+                topAlignmentAccepted = deviation <= Self.topAlignmentEnterDegrees
+            }
+            captureEngine.updateTopViewAlignment(
+                deviationDegrees: Int(deviation.rounded()),
+                isAligned: topAlignmentAccepted
+            )
         }
 
         private func preparedObjectMaskToggleRequest(
@@ -1527,7 +2042,14 @@ struct ARCameraView: UIViewRepresentable {
             let worldToCamera = frame.camera.transform.inverse
             let cameraPosition = frame.camera.transform.translation
 
-            return objectMaskAnchors.map { lockID, anchor in
+            return objectMaskAnchors.compactMap { lockID, storedAnchor in
+                guard let anchor = currentObjectAnchor(
+                    id: lockID,
+                    frame: frame,
+                    fallback: storedAnchor
+                ) else {
+                    return nil
+                }
                 let worldPosition = anchor.transform.translation
                 let pointInCamera = worldToCamera * SIMD4<Float>(worldPosition, 1)
                 let isInFrontOfCamera = pointInCamera.z < -0.02
@@ -1550,6 +2072,19 @@ struct ARCameraView: UIViewRepresentable {
                     worldPosition: worldPosition
                 )
             }
+        }
+
+        private func currentObjectAnchor(
+            id: UUID,
+            frame: ARFrame?,
+            fallback: ARAnchor? = nil
+        ) -> ARAnchor? {
+            guard let stored = fallback ?? objectMaskAnchors[id] else {
+                return nil
+            }
+            return frame?.anchors.first(where: {
+                $0.identifier == stored.identifier
+            }) ?? stored
         }
 
         private func objectMaskDepthSnapshot(from frame: ARFrame) -> ObjectMaskDepthSnapshot? {
@@ -1589,6 +2124,9 @@ struct ARCameraView: UIViewRepresentable {
                 liveResultsByObject.removeValue(forKey: change.id)
                 capturedFootprintByObject.removeValue(forKey: change.id)
                 capturedHeightByObject.removeValue(forKey: change.id)
+                supportHeightStateByObject.removeValue(forKey: change.id)
+                supportPlaneAnchorIDsByObject.removeValue(forKey: change.id)
+                fittedSupportHeightByObject.removeValue(forKey: change.id)
                 footprintFromTopObjects.remove(change.id)
                 heightFromSideObjects.remove(change.id)
                 footprintStableTicks.removeValue(forKey: change.id)
@@ -1596,8 +2134,19 @@ struct ARCameraView: UIViewRepresentable {
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
                 manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
+                captureAnchorEntitiesByObject.removeValue(forKey: change.id)?
+                    .removeFromParent()
+                capturePresentationPlaneIDsByObject.removeValue(forKey: change.id)
+                latestPresentationRebaseByObject.removeValue(forKey: change.id)
+                objectsAwaitingSupportPlane.remove(change.id)
+                let captureAnchor = AnchorEntity(anchor: anchor)
                 arView.session.add(anchor: anchor)
+                arView.scene.addAnchor(captureAnchor)
                 objectMaskAnchors[change.id] = anchor
+                captureAnchorEntitiesByObject[change.id] = captureAnchor
+                renderAnchorTransformByObject[change.id] = anchor.transform
+                publishedAnchorTransformByObject[change.id] = anchor.transform
+                evidenceAnchorTransformByObject[change.id] = anchor.transform
             case .focused:
                 break
             }
@@ -1633,12 +2182,66 @@ struct ARCameraView: UIViewRepresentable {
 
             guard sessionManager.isTrackingReady,
                   let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState,
                   let activeObjectID = captureEngine.activeObjectID,
                   objectMaskAnchors[activeObjectID] != nil else {
+                if let activeObjectID = captureEngine.activeObjectID {
+                    captureEngine.updateActiveSupportPlaneAvailability(
+                        id: activeObjectID,
+                        isAvailable: false
+                    )
+                }
                 return
             }
 
-            if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 2 {
+            _ = restartActiveMeasurementAfterAnchorCorrectionIfNeeded(
+                frame: frame,
+                cancelMaskTask: true
+            )
+
+            guard let activeAnchor = currentObjectAnchor(
+                id: activeObjectID,
+                frame: frame,
+                fallback: objectMaskAnchors[activeObjectID]
+            ) else {
+                captureEngine.updateActiveSupportPlaneAvailability(
+                    id: activeObjectID,
+                    isAvailable: false
+                )
+                return
+            }
+            let supportReference = activeAnchor.transform.translation
+            let supportValidationPoints = supportPlaneValidationPoints(
+                for: activeObjectID,
+                reference: supportReference
+            )
+            let planeSupportMatch = ObjectCapturePipeline.supportPlaneMatch(
+                from: frame.anchors,
+                beneath: supportReference,
+                validating: supportValidationPoints,
+                preferredAnchorIdentifier: supportPlaneAnchorIDsByObject[
+                    activeObjectID
+                ]
+            )
+            if let planeSupportMatch {
+                supportPlaneAnchorIDsByObject[activeObjectID] =
+                    planeSupportMatch.anchorIdentifier
+            } else {
+                supportPlaneAnchorIDsByObject.removeValue(
+                    forKey: activeObjectID
+                )
+            }
+            captureEngine.updateActiveSupportPlaneAvailability(
+                id: activeObjectID,
+                isAvailable: planeSupportMatch != nil
+            )
+
+            updateTopViewAlignment(from: frame)
+            guard workflowMode != .top || topAlignmentAccepted else {
+                return
+            }
+
+            if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 0.5 {
                 lastAutomaticPointCleanupTimestamp = frame.timestamp
                 removeVisiblePointsOutsideCurrentMask(in: arView)
             }
@@ -1646,8 +2249,8 @@ struct ARCameraView: UIViewRepresentable {
             let visibleHints = objectMaskAnchorHints(frame: frame, in: arView).filter {
                 $0.id == activeObjectID && $0.normalizedViewportPoint != nil
             }
-            let seeds = Dictionary(uniqueKeysWithValues: visibleHints.compactMap { hint in
-                objectMaskAnchors[hint.id].map { (hint.id, $0.transform.translation) }
+            let seeds = Dictionary(uniqueKeysWithValues: visibleHints.map { hint in
+                (hint.id, hint.worldPosition)
             })
             guard !seeds.isEmpty else {
                 return
@@ -1695,37 +2298,65 @@ struct ARCameraView: UIViewRepresentable {
             createContentAnchorIfNeeded(in: arView)
             let id = hint.id
             guard let maskTimestamp = newestMaskedPointTimestamp[id],
-                  maskTimestamp > fittedMaskedPointTimestamp[
-                      id,
-                      default: -.greatestFiniteMagnitude
-                  ],
-                  let objectAccumulator = maskedAccumulators[id],
-                  let anchor = objectMaskAnchors[id] else {
+                  let objectAccumulator = maskedAccumulators[id] else {
                 return
             }
-            let supportReference = liveResultsByObject[id]?.object.center
-                ?? anchor.transform.translation
-            let planeSupportHeight = ObjectCapturePipeline.supportPlaneHeight(
-                from: frame.anchors,
-                beneath: supportReference
-            )
+            let anchor = activeAnchor
+            // The ARAnchor is the tracked spatial reference; a previously
+            // published world-space center can lag behind an anchor correction.
             let supportPoints = supportAccumulators[id]?.points(
                 minObservations: ObjectCapturePipeline.minObservations
             ) ?? []
-            guard planeSupportHeight != nil || !supportPoints.isEmpty else {
+            let seed = anchor.transform.translation
+            guard let supportCandidate = ObjectCapturePipeline.resolvedSupportHeight(
+                planeHeight: planeSupportMatch?.height,
+                supportPoints: supportPoints,
+                seed: seed
+            ) else {
                 return
             }
-            let objectPoints = objectAccumulator.confirmedPoints(
-                minObservations: ObjectCapturePipeline.minObservations
-            )
+            let supportSource: SupportHeightSource = planeSupportMatch.map {
+                .plane($0.anchorIdentifier)
+            } ?? .depth
+            guard let resolvedSupportHeight = stabilizedSupportHeight(
+                candidate: supportCandidate,
+                source: supportSource,
+                for: id
+            ) else {
+                return
+            }
+            let requiresPointFit = maskTimestamp > fittedMaskedPointTimestamp[
+                id,
+                default: -.greatestFiniteMagnitude
+            ]
+            let requiresSupportFit = fittedSupportHeightByObject[id].map {
+                abs($0 - resolvedSupportHeight) > 0.0005
+            } ?? true
+            let isSupportOnlyFit = requiresSupportFit && !requiresPointFit
+            guard requiresPointFit || requiresSupportFit else {
+                if workflowMode == .top,
+                   !captureEngine.topMeasurementStable,
+                   let previous = liveResultsByObject[id] {
+                    let displayBox = topViewBox(
+                        fitted: previous.object,
+                        id: id,
+                        base: resolvedSupportHeight,
+                        isActive: true
+                    )
+                    addCapturedBox(displayBox, for: id)
+                    captureEngine.updateCapture(id: id, object: displayBox)
+                }
+                return
+            }
+            let objectPoints = objectAccumulator.stablePointsSnapshot()
             guard !objectPoints.isEmpty else {
                 return
             }
 
             let fitter = objectCaptureFitter
-            let seed = anchor.transform.translation
             let wasAtCapacity = objectAccumulator.isAtCapacity
             let cameraTransform = frame.camera.transform
+            let submittedWorkflowMode = workflowMode
             let submittedResetRevision = captureEngine.resetRevision
             let submittedFrameEpoch = sessionManager.frameEpoch
             captureFitTaskGeneration &+= 1
@@ -1735,7 +2366,8 @@ struct ARCameraView: UIViewRepresentable {
                     objectPoints: objectPoints,
                     supportPoints: supportPoints,
                     seed: seed,
-                    supportHeight: planeSupportHeight
+                    supportHeight: resolvedSupportHeight,
+                    mode: submittedWorkflowMode
                 )
                 let wasCancelled = Task.isCancelled
                 guard let self,
@@ -1746,29 +2378,34 @@ struct ARCameraView: UIViewRepresentable {
                 guard !wasCancelled,
                       self.captureEngine.resetRevision == submittedResetRevision,
                       self.sessionManager.frameEpoch == submittedFrameEpoch,
+                      self.workflowMode == submittedWorkflowMode,
                       !self.captureEngine.isFinalizationPending,
                       self.captureEngine.activeObjectID == id,
-                      self.newestMaskedPointTimestamp[id, default: maskTimestamp]
-                          >= maskTimestamp else {
+                      self.supportHeightStateByObject[id]?.value.map({
+                          abs($0 - resolvedSupportHeight) <= 0.0005
+                      }) == true,
+                      self.supportHeightStateByObject[id]?.source == supportSource else {
                     return
                 }
-                self.fittedMaskedPointTimestamp[id] = max(
-                    self.fittedMaskedPointTimestamp[
-                        id,
-                        default: -.greatestFiniteMagnitude
-                    ],
-                    maskTimestamp
-                )
                 guard case .success(let result) = outcome else {
+                    if case .notEnoughMesh = outcome {
+                        self.fittedMaskedPointTimestamp[id] = maskTimestamp
+                        self.fittedSupportHeightByObject[id] = resolvedSupportHeight
+                    }
                     return
                 }
-                self.applyCaptureResult(
+                let didPublish = self.applyCaptureResult(
                     result,
                     id: id,
-                    accumulatorWasAtCapacity: wasAtCapacity,
-                    supportHeight: planeSupportHeight,
+                    accumulatorWasAtCapacity: wasAtCapacity && !isSupportOnlyFit,
+                    supportHeight: resolvedSupportHeight,
+                    supportPlaneMatch: planeSupportMatch,
                     cameraTransform: cameraTransform
                 )
+                self.fittedMaskedPointTimestamp[id] = maskTimestamp
+                if didPublish {
+                    self.fittedSupportHeightByObject[id] = resolvedSupportHeight
+                }
             }
         }
 
@@ -1777,12 +2414,9 @@ struct ARCameraView: UIViewRepresentable {
             id: UUID,
             accumulatorWasAtCapacity: Bool,
             supportHeight: Float?,
+            supportPlaneMatch: SupportPlaneMatch?,
             cameraTransform: simd_float4x4
-        ) {
-            if let previous = liveResultsByObject[id],
-               previous.selectionPoints == result.selectionPoints {
-                return
-            }
+        ) -> Bool {
             var acceptedSurfaceExpansion = false
             if let previous = liveResultsByObject[id] {
                 let requiresExpansionEvidence =
@@ -1818,12 +2452,13 @@ struct ARCameraView: UIViewRepresentable {
                         liveResultsByObject[id] = retainedResult
                         selectionPointsByObject[id] = retainedResult.surfacePoints
                         updateSelectionVisualization()
-                        return
+                        return false
                     }
                 }
             }
             var acceptedResult = result
-            if accumulatorWasAtCapacity,
+            if workflowMode == .spatial3D,
+               accumulatorWasAtCapacity,
                let previous = liveResultsByObject[id] {
                 let retainedSurfacePoints = mergedSelectionPoints(
                     previous.surfacePoints,
@@ -1862,16 +2497,35 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
             }
-            let displayBox = viewGatedBox(
-                fitted: acceptedResult.object,
-                id: id,
-                base: supportHeight,
-                camera: cameraTransform,
-                isActive: captureEngine.activeObjectID == id
+            let displayBox: CapturedObject
+            switch workflowMode {
+            case .spatial3D:
+                displayBox = viewGatedBox(
+                    fitted: acceptedResult.object,
+                    id: id,
+                    base: supportHeight,
+                    camera: cameraTransform,
+                    isActive: captureEngine.activeObjectID == id
+                )
+            case .top:
+                displayBox = topViewBox(
+                    fitted: acceptedResult.object,
+                    id: id,
+                    base: supportHeight,
+                    isActive: captureEngine.activeObjectID == id
+                )
+            }
+            if let evidenceTransform = evidenceAnchorTransformByObject[id] {
+                publishedAnchorTransformByObject[id] = evidenceTransform
+            }
+            configureCapturePresentationAnchor(
+                for: id,
+                supportPlaneMatch: supportPlaneMatch
             )
             addCapturedBox(displayBox, for: id)
             captureEngine.updateCapture(id: id, object: displayBox)
             captureEngine.focusCapture(id: id)
+            return true
         }
 
         private func isPlausibleBoxRefinement(
@@ -2003,6 +2657,7 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func resetScanState() {
+            topAlignmentAccepted = false
             clearAllCaptureContent()
             supportAccumulators.removeAll()
             maskedAccumulators.removeAll()
@@ -2012,6 +2667,7 @@ struct ARCameraView: UIViewRepresentable {
             acceptedSurfaceVoxelKeysByObject.removeAll()
             manuallyRejectedVoxelKeysByObject.removeAll()
             scanTickCounter = 0
+            lastSupportBindingRefreshTimestamp = -.greatestFiniteMagnitude
             lastAutomaticPointCleanupTimestamp = -.greatestFiniteMagnitude
             automaticPointCleanupCursorByObject.removeAll()
             resetObjectMaskTracking()
@@ -2495,20 +3151,43 @@ struct ARCameraView: UIViewRepresentable {
 
         private func updateCaptureBoxLineStyles(in arView: ARView) {
             let objectIDs = Array(captureEntitiesByObject.keys)
-            guard captureEngine.showsBoundingBoxes, !objectIDs.isEmpty else {
+            guard captureEngine.showsBoundingBoxes,
+                  !objectIDs.isEmpty,
+                  observedObjectWorkflowRequestRevision
+                    == captureEngine.objectWorkflowRequestRevision,
+                  sessionManager.isTrackingReady,
+                  let frame = arView.session.currentFrame,
+                  case .normal = frame.camera.trackingState else {
                 return
             }
-            let cameraPosition = arView.cameraTransform.translation
+            let cameraPosition = frame.camera.transform.translation
             for objectID in objectIDs {
-                guard let object = liveResultsByObject[objectID]?.object
-                        ?? captureEngine.capturedObjectsByID[objectID] else {
+                guard !captureEngine.finalizedObjectIDs.contains(objectID),
+                      captureEngine.pendingFinalizationObjectID != objectID else {
                     continue
+                }
+                guard let object = captureEngine.capturedObjectsByID[objectID] else {
+                    continue
+                }
+                let cameraPositionInPublishedFrame: SIMD3<Float>
+                if let publishedTransform = publishedAnchorTransformByObject[objectID],
+                   let currentAnchor = currentObjectAnchor(
+                       id: objectID,
+                       frame: frame,
+                       fallback: objectMaskAnchors[objectID]
+                   ) {
+                    cameraPositionInPublishedFrame = transformedPoint(
+                        cameraPosition,
+                        by: publishedTransform * currentAnchor.transform.inverse
+                    )
+                } else {
+                    cameraPositionInPublishedFrame = cameraPosition
                 }
                 let previousRearEdges = captureBoxRearEdgeStatesByObject[objectID]
                 let spans = captureBoxLineSpans(
                     for: object,
                     objectID: objectID,
-                    cameraPosition: cameraPosition
+                    cameraPosition: cameraPositionInPublishedFrame
                 )
                 guard captureBoxRearEdgeStatesByObject[objectID]
                         != previousRearEdges else {
@@ -2631,9 +3310,23 @@ struct ARCameraView: UIViewRepresentable {
             for objectID: UUID,
             material: UnlitMaterial? = nil
         ) {
-            guard let contentAnchor else {
+            guard let renderAnchor = captureAnchorEntitiesByObject[objectID]
+                    ?? contentAnchor else {
                 return
             }
+            // Box coordinates belong to the world frame captured alongside
+            // `publishedAnchorTransform`. Keeping that exact inverse as the
+            // child transform lets RealityKit apply later anchor corrections
+            // without repainting the box back into stale world coordinates.
+            let worldToRenderAnchor = renderAnchorTransformByObject[objectID]?
+                .inverse
+                ?? publishedAnchorTransformByObject[objectID]?.inverse
+                ?? currentObjectAnchor(
+                    id: objectID,
+                    frame: arView?.session.currentFrame,
+                    fallback: objectMaskAnchors[objectID]
+                )?.transform.inverse
+                ?? matrix_identity_float4x4
             let renderableSpans = spans.filter {
                 simd_length($0.end - $0.start) > 0.001
             }
@@ -2645,6 +3338,8 @@ struct ARCameraView: UIViewRepresentable {
                     let entity: ModelEntity
                     if let preparedEntity = captureBoxEntityPool.popLast() {
                         entity = preparedEntity
+                        entity.removeFromParent()
+                        renderAnchor.addChild(entity)
                         if var model = entity.model {
                             model.materials = [entityMaterial]
                             entity.model = model
@@ -2654,7 +3349,7 @@ struct ARCameraView: UIViewRepresentable {
                             mesh: Self.unitCubeMesh,
                             materials: [entityMaterial]
                         )
-                        contentAnchor.addChild(entity)
+                        renderAnchor.addChild(entity)
                     }
                     entities.append(entity)
                 }
@@ -2662,8 +3357,14 @@ struct ARCameraView: UIViewRepresentable {
             for (index, span) in renderableSpans.enumerated() {
                 updateCapturedBoxEdge(
                     entities[index],
-                    from: span.start,
-                    to: span.end,
+                    from: transformedPoint(
+                        span.start,
+                        by: worldToRenderAnchor
+                    ),
+                    to: transformedPoint(
+                        span.end,
+                        by: worldToRenderAnchor
+                    ),
                     material: material
                 )
             }
@@ -2674,6 +3375,49 @@ struct ARCameraView: UIViewRepresentable {
             }
             captureEntitiesByObject[objectID] = entities
             captureBoxActiveSpanCountsByObject[objectID] = renderableSpans.count
+        }
+
+        private func transformedPoint(
+            _ point: SIMD3<Float>,
+            by transform: simd_float4x4
+        ) -> SIMD3<Float> {
+            let transformed = transform * SIMD4<Float>(point, 1)
+            return SIMD3<Float>(transformed.x, transformed.y, transformed.z)
+        }
+
+        private func transformedDirection(
+            _ direction: SIMD3<Float>,
+            by transform: simd_float4x4
+        ) -> SIMD3<Float> {
+            let transformed = transform * SIMD4<Float>(direction, 0)
+            let vector = SIMD3<Float>(
+                transformed.x,
+                transformed.y,
+                transformed.z
+            )
+            return simd_length(vector) > 0.000_001
+                ? simd_normalize(vector)
+                : direction
+        }
+
+        private func transformedCapturedObject(
+            _ object: CapturedObject,
+            by transform: simd_float4x4
+        ) -> CapturedObject {
+            CapturedObject(
+                dimensions: object.dimensions,
+                center: transformedPoint(object.center, by: transform),
+                axes: (
+                    transformedDirection(object.axes.width, by: transform),
+                    transformedDirection(object.axes.depth, by: transform),
+                    transformedDirection(object.axes.height, by: transform)
+                ),
+                corners: object.corners.map {
+                    transformedPoint($0, by: transform)
+                },
+                volume: object.volume,
+                sampleCount: object.sampleCount
+            )
         }
 
         private func renderCapturedBox(
@@ -2743,15 +3487,14 @@ struct ARCameraView: UIViewRepresentable {
 
         private func updateCaptureBoxVisibility() {
             if captureEngine.showsBoundingBoxes {
+                for (objectID, entities) in captureEntitiesByObject {
+                    let activeCount = captureBoxActiveSpanCountsByObject[objectID] ?? 0
+                    for (index, entity) in entities.enumerated() {
+                        entity.isEnabled = index < activeCount
+                    }
+                }
                 if let arView {
                     updateCaptureBoxLineStyles(in: arView)
-                } else {
-                    for (objectID, entities) in captureEntitiesByObject {
-                        let activeCount = captureBoxActiveSpanCountsByObject[objectID] ?? 0
-                        for (index, entity) in entities.enumerated() {
-                            entity.isEnabled = index < activeCount
-                        }
-                    }
                 }
             } else {
                 for entities in captureEntitiesByObject.values {
@@ -2779,11 +3522,24 @@ struct ARCameraView: UIViewRepresentable {
                     entity.removeFromParent()
                 }
             }
+            for anchor in captureAnchorEntitiesByObject.values {
+                anchor.removeFromParent()
+            }
             captureEntitiesByObject.removeAll()
+            captureAnchorEntitiesByObject.removeAll()
+            capturePresentationPlaneIDsByObject.removeAll()
+            renderAnchorTransformByObject.removeAll()
+            latestPresentationRebaseByObject.removeAll()
+            objectsAwaitingSupportPlane.removeAll()
+            publishedAnchorTransformByObject.removeAll()
+            evidenceAnchorTransformByObject.removeAll()
             captureBoxActiveSpanCountsByObject.removeAll()
             captureBoxRearEdgeStatesByObject.removeAll()
             capturedFootprintByObject.removeAll()
             capturedHeightByObject.removeAll()
+            supportHeightStateByObject.removeAll()
+            supportPlaneAnchorIDsByObject.removeAll()
+            fittedSupportHeightByObject.removeAll()
             footprintFromTopObjects.removeAll()
             heightFromSideObjects.removeAll()
             footprintStableTicks.removeAll()
@@ -2797,10 +3553,21 @@ struct ARCameraView: UIViewRepresentable {
             for entity in captureEntitiesByObject.removeValue(forKey: id) ?? [] {
                 entity.removeFromParent()
             }
+            captureAnchorEntitiesByObject.removeValue(forKey: id)?
+                .removeFromParent()
+            capturePresentationPlaneIDsByObject.removeValue(forKey: id)
+            renderAnchorTransformByObject.removeValue(forKey: id)
+            latestPresentationRebaseByObject.removeValue(forKey: id)
+            objectsAwaitingSupportPlane.remove(id)
+            publishedAnchorTransformByObject.removeValue(forKey: id)
+            evidenceAnchorTransformByObject.removeValue(forKey: id)
             captureBoxActiveSpanCountsByObject.removeValue(forKey: id)
             captureBoxRearEdgeStatesByObject.removeValue(forKey: id)
             capturedFootprintByObject.removeValue(forKey: id)
             capturedHeightByObject.removeValue(forKey: id)
+            supportHeightStateByObject.removeValue(forKey: id)
+            supportPlaneAnchorIDsByObject.removeValue(forKey: id)
+            fittedSupportHeightByObject.removeValue(forKey: id)
             footprintFromTopObjects.remove(id)
             heightFromSideObjects.remove(id)
             footprintStableTicks.removeValue(forKey: id)
@@ -2865,12 +3632,17 @@ struct ARCameraView: UIViewRepresentable {
                 if var stored = capturedFootprintByObject[id] {
                     let width = stabilize(stored.width, aligned.width)
                     let depth = stabilize(stored.depth, aligned.depth)
+                    let center = stabilizePosition(stored.centerXZ, aligned.centerXZ)
+                    let axis = stabilizeOrientation(stored.widthAxis, aligned.widthAxis)
                     stored.width = width.value
                     stored.depth = depth.value
-                    stored.widthAxis = aligned.widthAxis
-                    stored.centerXZ = aligned.centerXZ
+                    stored.widthAxis = axis.value
+                    stored.centerXZ = center.value
                     capturedFootprintByObject[id] = stored
-                    footprintStableTicks[id] = (width.stable && depth.stable)
+                    footprintStableTicks[id] = (
+                        width.stable && depth.stable
+                            && center.stable && axis.stable
+                    )
                         ? (footprintStableTicks[id, default: 0] + 1)
                         : 0
                 } else {
@@ -2917,6 +3689,89 @@ struct ARCameraView: UIViewRepresentable {
             )
         }
 
+        /// Stabilizes repeated applications of the paper's bird's-eye fit. The fit itself remains
+        /// entirely world-space; this only adds a small temporal deadband so depth noise does not
+        /// make an otherwise unchanged result breathe while the user is holding the phone still.
+        private func topViewBox(
+            fitted: CapturedObject,
+            id: UUID,
+            base: Float?,
+            isActive: Bool
+        ) -> CapturedObject {
+            let up = SIMD3<Float>(0, 1, 0)
+            var candidateAxis = SIMD3<Float>(
+                fitted.axes.width.x,
+                0,
+                fitted.axes.width.z
+            )
+            if simd_length(candidateAxis) < 1e-4 {
+                candidateAxis = SIMD3<Float>(1, 0, 0)
+            }
+            candidateAxis = simd_normalize(candidateAxis)
+            let candidateFootprint = ObjectFootprint(
+                widthAxis: candidateAxis,
+                width: fitted.dimensions.x,
+                depth: fitted.dimensions.y,
+                centerXZ: SIMD2<Float>(fitted.center.x, fitted.center.z)
+            )
+            let candidateHeight = fitted.dimensions.z
+            let baseY = base ?? (fitted.center.y - candidateHeight / 2)
+
+            guard let previousFootprint = capturedFootprintByObject[id],
+                  let previousHeight = capturedHeightByObject[id] else {
+                capturedFootprintByObject[id] = candidateFootprint
+                capturedHeightByObject[id] = candidateHeight
+                footprintStableTicks[id] = 0
+                if isActive {
+                    captureEngine.updateTopMeasurementGuidance(isStable: false)
+                }
+                return makeViewBox(
+                    footprint: candidateFootprint,
+                    height: candidateHeight,
+                    base: baseY,
+                    up: up,
+                    sampleCount: fitted.sampleCount
+                )
+            }
+
+            let aligned = alignFootprint(candidateFootprint, to: previousFootprint)
+            let width = stabilize(previousFootprint.width, aligned.width)
+            let depth = stabilize(previousFootprint.depth, aligned.depth)
+            let height = stabilize(previousHeight, candidateHeight)
+            let center = stabilizePosition(previousFootprint.centerXZ, aligned.centerXZ)
+            let axis = stabilizeOrientation(previousFootprint.widthAxis, aligned.widthAxis)
+            capturedFootprintByObject[id] = ObjectFootprint(
+                widthAxis: axis.value,
+                width: width.value,
+                depth: depth.value,
+                centerXZ: center.value
+            )
+            capturedHeightByObject[id] = height.value
+
+            if width.stable && depth.stable && height.stable
+                && center.stable && axis.stable {
+                footprintStableTicks[id, default: 0] += 1
+            } else {
+                footprintStableTicks[id] = 0
+            }
+            if footprintStableTicks[id, default: 0] >= Self.satisfiedTickCount {
+                footprintFromTopObjects.insert(id)
+            }
+            if isActive {
+                captureEngine.updateTopMeasurementGuidance(
+                    isStable: footprintFromTopObjects.contains(id)
+                )
+            }
+
+            return makeViewBox(
+                footprint: capturedFootprintByObject[id] ?? aligned,
+                height: capturedHeightByObject[id] ?? candidateHeight,
+                base: baseY,
+                up: up,
+                sampleCount: fitted.sampleCount
+            )
+        }
+
         /// Deadband + light smoothing for a remembered dimension: within tolerance the stored value
         /// is held (so the box does not "breathe" on per-frame fit noise, and the tick counts as
         /// stable for convergence); beyond it, the value eases toward the new measurement.
@@ -2929,6 +3784,241 @@ struct ARCameraView: UIViewRepresentable {
                 return (stored, true)
             }
             return (stored + (candidate - stored) * Self.dimensionBlend, false)
+        }
+
+        private func stabilizePosition(
+            _ stored: SIMD2<Float>,
+            _ candidate: SIMD2<Float>
+        ) -> (value: SIMD2<Float>, stable: Bool) {
+            let delta = candidate - stored
+            if simd_length(delta) <= Self.positionDeadband {
+                return (stored, true)
+            }
+            return (stored + delta * Self.dimensionBlend, false)
+        }
+
+        private func stabilizeOrientation(
+            _ stored: SIMD3<Float>,
+            _ candidate: SIMD3<Float>
+        ) -> (value: SIMD3<Float>, stable: Bool) {
+            let cosine = min(max(simd_dot(stored, candidate), -1), 1)
+            let degrees = acos(cosine) * 180 / .pi
+            if degrees <= Self.orientationDeadbandDegrees {
+                return (stored, true)
+            }
+            // `alignFootprint` has already selected the equivalent paper-fit axis closest to the
+            // remembered direction. Preserve that exact candidate instead of inventing a blended
+            // rectangle orientation when the change is real.
+            return (candidate, false)
+        }
+
+        /// Tests ARKit's detailed plane boundary around the outside of the object's footprint, not
+        /// only beneath its center. This rejects small horizontal patches on the object itself while
+        /// allowing the actual floor/table plane that surrounds it.
+        private func supportPlaneValidationPoints(
+            for id: UUID,
+            reference: SIMD3<Float>
+        ) -> [SIMD3<Float>] {
+            supportPlaneValidationPoints(
+                for: capturedFootprintByObject[id],
+                reference: reference
+            )
+        }
+
+        private func supportPlaneValidationPoints(
+            for footprint: ObjectFootprint?,
+            reference: SIMD3<Float>
+        ) -> [SIMD3<Float>] {
+            guard let footprint else {
+                let radius: Float = 0.055
+                return [
+                    reference + SIMD3<Float>(radius, 0, 0),
+                    reference + SIMD3<Float>(-radius, 0, 0),
+                    reference + SIMD3<Float>(0, 0, radius),
+                    reference + SIMD3<Float>(0, 0, -radius)
+                ]
+            }
+
+            var widthAxis = SIMD3<Float>(
+                footprint.widthAxis.x,
+                0,
+                footprint.widthAxis.z
+            )
+            if simd_length(widthAxis) < 0.0001 {
+                widthAxis = SIMD3<Float>(1, 0, 0)
+            }
+            widthAxis = simd_normalize(widthAxis)
+            let depthAxis = simd_normalize(
+                simd_cross(SIMD3<Float>(0, 1, 0), widthAxis)
+            )
+            let center = SIMD3<Float>(
+                footprint.centerXZ.x,
+                reference.y,
+                footprint.centerXZ.y
+            )
+            let widthDistance = max(footprint.width / 2 + 0.015, 0.04)
+            let depthDistance = max(footprint.depth / 2 + 0.015, 0.04)
+            let widthOffset = widthAxis * widthDistance
+            let depthOffset = depthAxis * depthDistance
+            return [
+                center + widthOffset,
+                center - widthOffset,
+                center + depthOffset,
+                center - depthOffset,
+                center + widthOffset + depthOffset,
+                center + widthOffset - depthOffset,
+                center - widthOffset + depthOffset,
+                center - widthOffset - depthOffset
+            ]
+        }
+
+        /// Reparents only the box presentation to the chosen support plane. Object masking and
+        /// evidence continue to use their dedicated nearby ARAnchor.
+        private func configureCapturePresentationAnchor(
+            for id: UUID,
+            supportPlaneMatch: SupportPlaneMatch?
+        ) {
+            guard let arView else {
+                return
+            }
+
+            let latestPlaneAnchor = supportPlaneMatch.flatMap { match in
+                arView.session.currentFrame?.anchors.first(where: {
+                    $0.identifier == match.anchorIdentifier
+                }) as? ARPlaneAnchor
+            }
+
+            if let supportPlaneMatch, let latestPlaneAnchor {
+                if capturePresentationPlaneIDsByObject[id]
+                    != supportPlaneMatch.anchorIdentifier {
+                    replaceCapturePresentationAnchor(
+                        for: id,
+                        with: AnchorEntity(anchor: latestPlaneAnchor),
+                        in: arView
+                    )
+                    capturePresentationPlaneIDsByObject[id] =
+                        supportPlaneMatch.anchorIdentifier
+                }
+                // Geometry was computed in this exact plane snapshot. RealityKit then applies any
+                // later update to the same plane identifier to the local child coordinates.
+                renderAnchorTransformByObject[id] = supportPlaneMatch.anchorTransform
+                latestPresentationRebaseByObject[id] = matrix_identity_float4x4
+                return
+            }
+
+            if capturePresentationPlaneIDsByObject.removeValue(forKey: id) != nil,
+               let objectAnchor = currentObjectAnchor(
+                   id: id,
+                   frame: arView.session.currentFrame,
+                   fallback: objectMaskAnchors[id]
+               ) {
+                replaceCapturePresentationAnchor(
+                    for: id,
+                    with: AnchorEntity(anchor: objectAnchor),
+                    in: arView
+                )
+            }
+            renderAnchorTransformByObject[id] = publishedAnchorTransformByObject[id]
+                ?? evidenceAnchorTransformByObject[id]
+                ?? objectMaskAnchors[id]?.transform
+        }
+
+        private func replaceCapturePresentationAnchor(
+            for id: UUID,
+            with replacement: AnchorEntity,
+            in arView: ARView
+        ) {
+            arView.scene.addAnchor(replacement)
+            for entity in captureEntitiesByObject[id] ?? [] {
+                entity.removeFromParent()
+                replacement.addChild(entity)
+            }
+            captureAnchorEntitiesByObject.removeValue(forKey: id)?
+                .removeFromParent()
+            captureAnchorEntitiesByObject[id] = replacement
+        }
+
+        private func stabilizedSupportHeight(
+            candidate: Float,
+            source: SupportHeightSource,
+            for id: UUID
+        ) -> Float? {
+            guard candidate.isFinite else {
+                return nil
+            }
+            var state = supportHeightStateByObject[id] ?? SupportHeightState()
+            if state.source != source {
+                state.source = source
+                state.recentCandidates.removeAll(keepingCapacity: true)
+            }
+
+            // ARPlaneAnchor geometry is already ARKit's tracked, definitive support. Applying a
+            // display deadband here was the direct cause of a visible 1–3 mm hover, so plane-backed
+            // bases follow the latest anchor exactly. Filtering remains only for noisy depth fallback.
+            if case .plane = source {
+                let previous = state.value
+                state.value = candidate
+                state.recentCandidates = [candidate]
+                supportHeightStateByObject[id] = state
+                preserveCapturedTop(
+                    whenSupportMovesFrom: previous,
+                    to: candidate,
+                    for: id
+                )
+                return candidate
+            }
+
+            state.recentCandidates.append(candidate)
+            if state.recentCandidates.count > Self.supportHistoryCount {
+                state.recentCandidates.removeFirst(
+                    state.recentCandidates.count - Self.supportHistoryCount
+                )
+            }
+            guard state.recentCandidates.count >= Self.minimumSupportSamples else {
+                supportHeightStateByObject[id] = state
+                return nil
+            }
+
+            let ordered = state.recentCandidates.sorted()
+            let median = ordered[ordered.count / 2]
+            let previous = state.value
+            if let stored = state.value {
+                let delta = median - stored
+                if abs(delta) > Self.depthSupportDeadband {
+                    state.value = stored + min(
+                        max(delta, -Self.depthSupportMaximumStep),
+                        Self.depthSupportMaximumStep
+                    )
+                }
+            } else {
+                state.value = median
+            }
+            supportHeightStateByObject[id] = state
+            preserveCapturedTop(
+                whenSupportMovesFrom: previous,
+                to: state.value ?? median,
+                for: id
+            )
+            return state.value
+        }
+
+        /// When ARKit refines a support plane, keep the already-observed top face fixed while the
+        /// base snaps to the new plane. This turns a base correction into the corresponding height
+        /// correction instead of translating the whole box vertically.
+        private func preserveCapturedTop(
+            whenSupportMovesFrom previous: Float?,
+            to current: Float,
+            for id: UUID
+        ) {
+            guard let previous,
+                  abs(current - previous) > 0.000_001,
+                  let storedHeight = capturedHeightByObject[id] else {
+                return
+            }
+            capturedHeightByObject[id] = max(
+                storedHeight + previous - current,
+                0.001
+            )
         }
 
         /// Re-expresses a fresh footprint in the orientation closest to the remembered one, so the

@@ -89,12 +89,14 @@ Current milestone:
 
 ✅ Camera permission (`NSCameraUsageDescription`) configured via build settings (`INFOPLIST_KEY_NSCameraUsageDescription`).
 
-✅ The operator-facing app is scan-only. The former Line/Box mode picker and manual controls are no
-longer exposed, and the measurement mode is fixed to Scan.
+✅ The operator-facing app is scan-only. The former Line/Box picker and manual controls are not
+exposed. Information contains the only selector for two automatic measurement methods: Full 3D and
+Top.
 
 ✅ LiDAR depth-based automatic Scan workflow implemented with live multi-frame accumulation.
 
-✅ Scan is the sole workflow and reports unsupported hardware explicitly on non-LiDAR devices.
+✅ Scan is the sole operator workflow and reports unsupported hardware explicitly on non-LiDAR
+devices; its Full 3D and Top measurement methods share selection, naming, weight and saved objects.
 
 ✅ Live RGB foreground-instance mask preview runs in Scan mode on both LiDAR and non-LiDAR devices.
 
@@ -118,9 +120,10 @@ Finalized masks are purged and late asynchronous frames cannot restore them.
 ✅ A display-only Visuals menu independently controls the live/selected mask, lock markers, LiDAR
 object points, reconstructed mesh and 3D boxes.
 
-✅ Mask-gated LiDAR uses direct registered-image coordinates, a conservative two-depth-pixel mask
-interior and depth-edge rejection. One-centimetre object voxels, temporal voxel expiry, dominant
-support-plane estimation and bounded box refinements reduce table leakage and box growth.
+✅ Mask-gated LiDAR uses direct registered-image coordinates and admits a depth sample only when at
+least three of its four immediate depth-grid neighbours are also admitted and depth-continuous.
+Five-millimetre object voxels, temporal transient rejection, dominant support-plane estimation and
+bounded box refinements reduce table leakage and box growth.
 
 ✅ Cyan points are final-box inliers only. Direct bottom controls toggle masks, points and boxes,
 and the diagnostics panel reports the device's actual ARKit depth-map resolution at runtime.
@@ -135,8 +138,16 @@ mask points, support/table samples and an oriented 3D box retained after finaliz
 ✅ Non-LiDAR Scan mode is explicitly marked with a tappable limitations badge. RGB masking remains
 available, while the sheet explains the absence of metric depth, automatic boxes and 3D table removal.
 
-✅ Environment readiness is reported at runtime: LiDAR devices wait for depth/mesh data, while
-non-LiDAR devices guide the operator until camera-based plane mapping is stable.
+✅ Environment readiness is reported at runtime: all devices require normal tracking and a current
+horizontal floor/table support plane; LiDAR workflows additionally wait for scene depth.
+
+✅ Height baselines retain the selected horizontal `ARPlaneAnchor` identifier, validate its detailed
+geometry around the object's footprint, and attach box presentation to that exact support. Plane
+updates therefore keep the bottom face flush; Lock performs a final exact support snap, and a merged
+or removed plane is reacquired for active and finalized boxes. Lock is enabled only when plane
+geometry covers the active object's own footprint, and removed anchors fall back coherently to the
+retained object anchor while the app waits for ARKit's replacement plane. Active measurement
+evidence is restarted after that frame change.
 
 ✅ The functional app targets iOS 26.5. Native Liquid Glass styling and the Xcode 26 concurrency
 configuration are restored without changing the segmentation, tracking, LiDAR measurement or box-fitting algorithms.
@@ -150,8 +161,33 @@ automatic recovery attempt before any measurement exists.
 ✅ Object selection waits for a real-frame recognition warmup. Transient Vision failures no longer
 consume valid no-match retries, and a new selection is acknowledged before depth back-projection.
 
-✅ Box fitting runs away from the main UI actor with the same inputs and algorithm. Optional cyan
-debug rendering is capped at 600 displayed samples, and 3D box edges use a 3 mm thickness.
+✅ Box fitting runs away from the main UI actor. Full 3D retains the established PCA/view-gated
+algorithm; Top uses its separate convex-hull orientation algorithm. Optional cyan debug rendering is
+capped at 600 displayed samples, and 3D box edges use a 3 mm thickness.
+
+✅ Top follows the supplied Liu–Liu–Zhang IV 2020 method: uniform downsampling to `Nmax = 100`,
+Graham-scan hull with approximate-collinearity `τ = 0.01`, every hull-point pair as a candidate yaw,
+and the cited Zhang points-to-edges closeness score. The score is maximized as defined by the cited
+primary paper; its `d0` floor is the app's 5 mm voxel size because neither paper specifies a value.
+
+✅ Top measurements are built from gravity-aligned AR world points rather than the perspective camera
+image. Collection enters at 12° from straight down and exits at 18° to avoid threshold flicker. The
+2D paper fit supplies length/width; height is the maximum selected 3D point above the stable support.
+
+✅ First-run tracking is hardened: failed support warmup is not marked as a completed fit, invalid
+fit work is rejected by lifecycle/support guards, newer point snapshots follow immediately,
+support-height candidates are median/deadband stabilized, and center/yaw presentation has bounded
+temporal stabilization.
+
+✅ Each measured box is rendered under its own exact AR anchor in anchor-local coordinates. Once
+Lock is pressed, its last canonical local geometry remains attached to that anchor and cannot be
+repainted from newer raw fit data. Published geometry keeps its matching anchor pose; Unlock and
+material active-anchor corrections rebase the box and reacquire evidence rather than mixing world
+frames. Lock is unavailable while camera tracking is not normal.
+
+✅ The persisted Full 3D/Top selector exists only inside Information. Switching while measurement
+state exists requires destructive confirmation and clears the incompatible scan state. Top has one
+compact red/green overhead-alignment card instead of sharing space with the Full 3D face guide.
 
 ✅ The top HUD shows exactly one compact contextual card at a time. Opening Information replaces the
 other top cards instead of squeezing or stacking beside them.

@@ -19,6 +19,7 @@ struct ObjectWorkflowRequest: Sendable {
 @MainActor
 @Observable
 final class ObjectCaptureEngine {
+    private(set) var measurementMode: MeasurementWorkflowMode = .spatial3D
     private(set) var capturedObjectsByID: [UUID: CapturedObject] = [:]
     private(set) var activeObjectID: UUID?
     private(set) var pendingFinalizationObjectID: UUID?
@@ -67,13 +68,54 @@ final class ObjectCaptureEngine {
     /// side view) have converged — held steady for several fits. Guidance only, not measurement.
     private(set) var footprintSatisfied = false
     private(set) var heightSatisfied = false
+    private(set) var topViewDeviationDegrees: Int?
+    private(set) var isTopViewAligned = false
+    private(set) var topMeasurementStable = false
+    /// A definitive ARKit plane currently covers the active object's footprint. A global plane
+    /// elsewhere in the scene is not sufficient for committing a height measurement.
+    private(set) var hasDefinitiveSupportPlaneForActiveObject = false
 
     /// True once both the footprint and height have converged — the object is fully measured.
     var measurementSatisfied: Bool {
-        footprintSatisfied && heightSatisfied
+        switch measurementMode {
+        case .spatial3D:
+            footprintSatisfied && heightSatisfied
+        case .top:
+            topMeasurementStable
+        }
     }
 
     private static let defaultPrompt = "Center or tap a highlighted object to select it for measurement."
+
+    private var activeMeasurementPrompt: String {
+        switch measurementMode {
+        case .spatial3D:
+            "Move around the selected object to measure all visible surfaces."
+        case .top:
+            "Move above the selected object and point the camera straight down."
+        }
+    }
+
+    private var idleMeasurementPrompt: String {
+        measurementMode == .top
+            ? "Top mode ready. Point down and select an object."
+            : Self.defaultPrompt
+    }
+
+    private var activeMaskFeedback: String {
+        measurementMode == .top
+            ? "Measuring one object from above. Hold the phone pointed down, then lock it."
+            : "Measuring one object. Lock it before selecting another."
+    }
+
+    func setMeasurementMode(_ mode: MeasurementWorkflowMode) {
+        guard measurementMode != mode else {
+            return
+        }
+        measurementMode = mode
+        reset()
+        statusText = idleMeasurementPrompt
+    }
 
     private var displayObject: CapturedObject? {
         if let focusedCaptureID, let focused = capturedObjectsByID[focusedCaptureID] {
@@ -110,6 +152,7 @@ final class ObjectCaptureEngine {
     var canFinalizeActiveObject: Bool {
         pendingFinalizationObjectID == nil
             && activeObjectID.flatMap { capturedObjectsByID[$0] } != nil
+            && hasDefinitiveSupportPlaneForActiveObject
     }
 
     var isFinalizationPending: Bool {
@@ -313,7 +356,7 @@ final class ObjectCaptureEngine {
         } else if activeObjectID != nil {
             objectMaskFeedbackText = lostCount > 0
                 ? "The object being measured is currently outside the view. Its anchor is retained."
-                : "Measuring one object. Lock it before selecting another."
+                : activeMaskFeedback
         } else if lostCount > 0 {
             objectMaskFeedbackText = "\(finalizedObjectIDs.count) locked · \(lostCount) currently outside the view. Their results are retained."
         } else if finalizedObjectIDs.count >= 15 {
@@ -401,11 +444,12 @@ final class ObjectCaptureEngine {
             return
         }
         resetScanGuidance()
+        hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
         focusedCaptureID = id
         isObjectSelectionPending = false
-        statusText = "Move around the selected object to measure all visible surfaces."
-        objectMaskFeedbackText = "Measuring one object. Lock it before selecting another."
+        statusText = activeMeasurementPrompt
+        objectMaskFeedbackText = activeMaskFeedback
     }
 
     func focusFinalizedObject(id: UUID) {
@@ -429,6 +473,10 @@ final class ObjectCaptureEngine {
             objectMaskFeedbackText = "Keep measuring until the object has a LiDAR box, then lock it."
             return nil
         }
+        guard hasDefinitiveSupportPlaneForActiveObject else {
+            objectMaskFeedbackText = "Scan the floor or table directly beneath this object before locking it."
+            return nil
+        }
 
         pendingFinalizationObjectID = id
         isObjectSelectionPending = false
@@ -441,6 +489,26 @@ final class ObjectCaptureEngine {
         statusText = "Measurement paused at the current dimensions."
         objectMaskFeedbackText = "Save to lock it, or Cancel to continue measuring."
         return id
+    }
+
+    /// Cancels a Lock that raced with an ARKit plane removal between the button tap and commit.
+    func rejectPendingFinalizationWithoutSupportPlane() {
+        guard let id = pendingFinalizationObjectID else {
+            return
+        }
+        pendingFinalizationObjectID = nil
+        hasDefinitiveSupportPlaneForActiveObject = false
+        guard activeObjectID == id,
+              capturedObjectsByID[id] != nil else {
+            return
+        }
+        objectWorkflowRequest = ObjectWorkflowRequest(
+            id: id,
+            kind: .resumeFinalization
+        )
+        objectWorkflowRequestRevision += 1
+        statusText = activeMeasurementPrompt
+        objectMaskFeedbackText = "Support moved. Scan the floor or table beneath the object, then lock again."
     }
 
     func cancelPendingFinalization() {
@@ -457,7 +525,7 @@ final class ObjectCaptureEngine {
             kind: .resumeFinalization
         )
         objectWorkflowRequestRevision += 1
-        statusText = "Continue moving around the selected object."
+        statusText = activeMeasurementPrompt
         objectMaskFeedbackText = "Measurement resumed. Lock it when the box is ready."
     }
 
@@ -475,6 +543,10 @@ final class ObjectCaptureEngine {
             objectMaskFeedbackText = "Enter a valid weight greater than zero before locking this object."
             return
         }
+        guard hasDefinitiveSupportPlaneForActiveObject else {
+            rejectPendingFinalizationWithoutSupportPlane()
+            return
+        }
         guard let id = activeObjectID,
               pendingFinalizationObjectID == id else {
             objectMaskFeedbackText = "Select an object to measure before locking it."
@@ -486,7 +558,9 @@ final class ObjectCaptureEngine {
         }
         pendingFinalizationObjectID = nil
         activeObjectID = nil
+        hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.insert(id)
+        resetScanGuidance()
         hideObjectMask(id: id)
         objectNamesByID[id] = trimmedName
         objectWeightsInKilogramsByID[id] = weightInKilograms
@@ -553,7 +627,7 @@ final class ObjectCaptureEngine {
             statusText = "Measuring object."
             objectMaskFeedbackText = "Locked object removed. The active measurement was not changed."
         } else if finalizedObjectIDs.isEmpty {
-            statusText = Self.defaultPrompt
+            statusText = idleMeasurementPrompt
             objectMaskFeedbackText = "Locked object removed."
         } else {
             statusText = finalizedObjectIDs.count == 1
@@ -581,12 +655,15 @@ final class ObjectCaptureEngine {
         }
         finalizedObjectIDs.remove(id)
         resetScanGuidance()
+        hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
         isObjectSelectionPending = false
         objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .reactivate)
         objectWorkflowRequestRevision += 1
-        statusText = "Object unlocked. Continue measuring it."
-        objectMaskFeedbackText = "Measuring one object. Lock it before selecting another."
+        statusText = measurementMode == .top
+            ? "Object unlocked. Continue measuring it from above."
+            : "Object unlocked. Continue measuring it."
+        objectMaskFeedbackText = activeMaskFeedback
     }
 
     /// Publishes the current viewpoint and per-dimension capture status for the face guide.
@@ -602,10 +679,47 @@ final class ObjectCaptureEngine {
         }
     }
 
+    func updateTopViewAlignment(
+        deviationDegrees: Int?,
+        isAligned: Bool
+    ) {
+        if topViewDeviationDegrees != deviationDegrees {
+            topViewDeviationDegrees = deviationDegrees
+        }
+        if isTopViewAligned != isAligned {
+            isTopViewAligned = isAligned
+        }
+    }
+
+    func updateTopMeasurementGuidance(isStable: Bool) {
+        if topMeasurementStable != isStable {
+            topMeasurementStable = isStable
+        }
+        updateScanGuidance(
+            view: .topDown,
+            footprintSatisfied: isStable,
+            heightSatisfied: isStable
+        )
+    }
+
+    func updateActiveSupportPlaneAvailability(
+        id: UUID,
+        isAvailable: Bool
+    ) {
+        guard activeObjectID == id,
+              pendingFinalizationObjectID == nil else {
+            return
+        }
+        if hasDefinitiveSupportPlaneForActiveObject != isAvailable {
+            hasDefinitiveSupportPlaneForActiveObject = isAvailable
+        }
+    }
+
     func resetScanGuidance() {
         scanViewHint = .other
         footprintSatisfied = false
         heightSatisfied = false
+        topMeasurementStable = false
     }
 
     func clearObjectMaskPreview() {
@@ -713,7 +827,19 @@ final class ObjectCaptureEngine {
         }
         capturedObjectsByID[id] = object
         focusedCaptureID = id
-        statusText = "LiDAR box ready. Continue scanning or lock this object."
+        statusText = measurementMode == .top
+            ? "Overhead LiDAR fit ready. Hold steady or lock this object."
+            : "LiDAR box ready. Continue scanning or lock this object."
+    }
+
+    /// Updates geometry while the coordinator changes only its ARKit support-anchor frame. Unlike
+    /// a live fit, this is also valid during the Lock sheet and for an already locked object.
+    func updateAnchoredCapture(id: UUID, object: CapturedObject) {
+        guard capturedObjectsByID[id] != nil,
+              activeObjectID == id || finalizedObjectIDs.contains(id) else {
+            return
+        }
+        capturedObjectsByID[id] = object
     }
 
     func focusCapture(id: UUID) {
@@ -725,6 +851,7 @@ final class ObjectCaptureEngine {
         capturedObjectsByID.removeAll()
         activeObjectID = nil
         pendingFinalizationObjectID = nil
+        hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.removeAll()
         captureOrder.removeAll()
         objectColorsByID.removeAll()
@@ -745,9 +872,11 @@ final class ObjectCaptureEngine {
         objectMaskMarkerMissCounts.removeAll()
         objectMaskFeedbackText = nil
         objectMaskToggleRequest = nil
-        statusText = Self.defaultPrompt
+        statusText = idleMeasurementPrompt
         hasCompletedObjectRecognitionWarmup = false
         resetScanGuidance()
+        topViewDeviationDegrees = nil
+        isTopViewAligned = false
         resetRevision += 1
     }
 }

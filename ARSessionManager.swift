@@ -10,6 +10,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private var activeConfiguration: ARWorldTrackingConfiguration?
     private var sessionStartTask: Task<Void, Never>?
     private var automaticRecoveryAttempts = 0
+    private var horizontalPlaneAnchorIDs: Set<UUID> = []
+    private var verticalPlaneAnchorIDs: Set<UUID> = []
 
     enum EnvironmentReadiness: Equatable {
         case preparing(String)
@@ -180,6 +182,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
+        horizontalPlaneAnchorIDs.removeAll()
+        verticalPlaneAnchorIDs.removeAll()
         hasReceivedSceneDepth = false
         sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
         hasReconstructedMesh = false
@@ -191,6 +195,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         )
 
         let configuration = ARWorldTrackingConfiguration()
+        configuration.worldAlignment = .gravity
         configuration.planeDetection = [.horizontal, .vertical]
         configuration.environmentTexturing = .none
 
@@ -240,6 +245,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
+        horizontalPlaneAnchorIDs.removeAll()
+        verticalPlaneAnchorIDs.removeAll()
         hasReceivedSceneDepth = false
         sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
         hasReconstructedMesh = false
@@ -321,6 +328,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false
         hasDetectedVerticalPlane = false
+        horizontalPlaneAnchorIDs.removeAll()
+        verticalPlaneAnchorIDs.removeAll()
         hasReceivedSceneDepth = false
         sceneDepthResolutionText = isSceneDepthSupported ? "Waiting for depth" : "Unavailable"
         hasReconstructedMesh = false
@@ -350,6 +359,33 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
                 return
             }
             updateEnvironmentAnchors(from: anchors)
+            refreshEnvironmentReadiness()
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
+            // Plane transforms and detailed boundaries improve as ARKit observes more of the
+            // surface. Keep readiness tied to the current anchor set, not only the first add event.
+            updateEnvironmentAnchors(from: anchors)
+            refreshEnvironmentReadiness()
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        Task { @MainActor in
+            guard activeSession === session else {
+                return
+            }
+            for anchor in anchors {
+                horizontalPlaneAnchorIDs.remove(anchor.identifier)
+                verticalPlaneAnchorIDs.remove(anchor.identifier)
+            }
+            hasDetectedHorizontalPlane = !horizontalPlaneAnchorIDs.isEmpty
+            hasDetectedVerticalPlane = !verticalPlaneAnchorIDs.isEmpty
             refreshEnvironmentReadiness()
         }
     }
@@ -384,6 +420,12 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             trackingStatus = .interrupted
             refreshEnvironmentReadiness()
         }
+    }
+
+    nonisolated func sessionShouldAttemptRelocalization(
+        _ session: ARSession
+    ) -> Bool {
+        true
     }
 
     nonisolated func sessionInterruptionEnded(_ session: ARSession) {
@@ -446,14 +488,20 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             if let planeAnchor = anchor as? ARPlaneAnchor {
                 switch planeAnchor.alignment {
                 case .horizontal:
-                    hasDetectedHorizontalPlane = true
+                    if planeAnchor.classification == .ceiling {
+                        horizontalPlaneAnchorIDs.remove(planeAnchor.identifier)
+                    } else {
+                        horizontalPlaneAnchorIDs.insert(planeAnchor.identifier)
+                    }
                 case .vertical:
-                    hasDetectedVerticalPlane = true
+                    verticalPlaneAnchorIDs.insert(planeAnchor.identifier)
                 @unknown default:
                     continue
                 }
             }
         }
+        hasDetectedHorizontalPlane = !horizontalPlaneAnchorIDs.isEmpty
+        hasDetectedVerticalPlane = !verticalPlaneAnchorIDs.isEmpty
     }
 
     private func refreshEnvironmentReadiness() {
@@ -469,9 +517,11 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
                 ))
                 return
             }
-        } else if !hasDetectedHorizontalPlane && !hasDetectedVerticalPlane {
+        }
+
+        guard hasDetectedHorizontalPlane else {
             setEnvironmentReadiness(.preparing(
-                "This iPhone has no LiDAR. Move slowly across the table until a stable surface is detected."
+                "Move slowly across the floor or table until its horizontal support plane is detected."
             ))
             return
         }
@@ -480,13 +530,13 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         if isSceneDepthSupported {
             detail = switch worldMappingStatus {
             case .mapped:
-                "LiDAR depth, tracking and the environment map are ready."
+                "LiDAR depth, tracking and the supporting plane are ready."
             case .extending:
-                "LiDAR depth and tracking are ready. The environment map is improving."
+                "The supporting plane is ready. The wider environment map is improving."
             case .notAvailable, .limited:
-                "LiDAR depth and tracking are ready. Keep scanning to improve the wider map."
+                "The supporting plane is ready. Keep scanning to improve the wider map."
             @unknown default:
-                "LiDAR depth and tracking are ready."
+                "LiDAR depth, tracking and the supporting plane are ready."
             }
         } else {
             detail = "Tracking and a stable surface are ready."

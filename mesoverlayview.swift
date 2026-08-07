@@ -10,6 +10,7 @@ struct MesOverlayView: View {
     let sessionManager: ARSessionManager
     let mesEngine: MesEngine
     let captureEngine: ObjectCaptureEngine
+    @Binding var workflowMode: MeasurementWorkflowMode
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showsPanel = false
@@ -20,6 +21,9 @@ struct MesOverlayView: View {
     @State private var pendingRemovalObjectID: UUID?
     @State private var showsResetConfirmation = false
     @State private var showsSavedObjects = false
+    @State private var pendingWorkflowMode: MeasurementWorkflowMode?
+    @State private var showsModeChangeConfirmation = false
+    @State private var showsTrackingDetails = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -30,8 +34,10 @@ struct MesOverlayView: View {
             if !sessionManager.isCoachingActive {
                 objectMaskPreview
                 objectMaskMarkers
-                objectMaskInteractionLayer
-                aimer
+                if !showsPanel {
+                    objectMaskInteractionLayer
+                    aimer
+                }
             }
 
             if !sessionManager.isCoachingActive {
@@ -47,7 +53,7 @@ struct MesOverlayView: View {
                 }
             }
 
-            if !sessionManager.isCoachingActive {
+            if !sessionManager.isCoachingActive, !showsPanel {
                 VStack {
                     Spacer()
 
@@ -97,6 +103,28 @@ struct MesOverlayView: View {
         .onChange(of: sessionManager.isCoachingActive) { _, isActive in
             if isActive {
                 showsSavedObjects = false
+            }
+        }
+        .onChange(of: captureEngine.pendingFinalizationObjectID) {
+            _, pendingObjectID in
+            guard let context = objectDetailsContext else {
+                return
+            }
+            if case .finalize(let id) = context,
+               pendingObjectID != id {
+                objectDetailsContext = nil
+                objectNameText = ""
+                weightText = ""
+            }
+        }
+        .onChange(of: showsModeChangeConfirmation) { _, isPresented in
+            if !isPresented {
+                pendingWorkflowMode = nil
+            }
+        }
+        .onAppear {
+            if !isAutomaticCaptureSupported, workflowMode == .top {
+                workflowMode = .spatial3D
             }
         }
         .sheet(isPresented: $showsLiDARLimitations) {
@@ -161,6 +189,27 @@ struct MesOverlayView: View {
         } message: {
             Text("This clears the active object and every saved box, name, weight, point cloud and measurement.")
         }
+        .confirmationDialog(
+            "Switch measurement mode?",
+            isPresented: $showsModeChangeConfirmation,
+            titleVisibility: .visible
+        ) {
+            if let pendingWorkflowMode {
+                Button(
+                    "Switch to \(pendingWorkflowMode.title)",
+                    role: .destructive
+                ) {
+                    showsSavedObjects = false
+                    workflowMode = pendingWorkflowMode
+                    self.pendingWorkflowMode = nil
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingWorkflowMode = nil
+            }
+        } message: {
+            Text("Changing the measurement method clears the current scan and all saved objects.")
+        }
     }
 
     @ViewBuilder
@@ -175,6 +224,7 @@ struct MesOverlayView: View {
                 Spacer(minLength: 8)
 
                 Button {
+                    showsSavedObjects = false
                     showsPanel = true
                 } label: {
                     Image(systemName: "info")
@@ -196,6 +246,8 @@ struct MesOverlayView: View {
             environmentReadinessBanner
         } else if !captureEngine.hasCompletedObjectRecognitionWarmup {
             objectRecognitionReadinessBanner
+        } else if workflowMode == .top {
+            topCaptureGuide
         } else if isAutomaticCaptureSupported,
                   captureEngine.activeObjectID != nil {
             faceCaptureGuide
@@ -308,6 +360,77 @@ struct MesOverlayView: View {
         .frame(maxWidth: 220, alignment: .leading)
         .glassEffect(.regular, in: .rect(cornerRadius: 16))
         .accessibilityElement(children: .combine)
+    }
+
+    private var topCaptureGuide: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: topGuideSystemImage)
+                    .foregroundStyle(topGuideColor)
+                Text(topGuideHeadline)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(topGuideColor)
+            }
+
+            if captureEngine.activeObjectID != nil,
+               captureEngine.primaryText != "--" {
+                Text(captureEngine.primaryText)
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+
+            Text(topGuideDetail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: 230, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var topGuideColor: Color {
+        captureEngine.topMeasurementStable || captureEngine.isTopViewAligned
+            ? .green
+            : .red
+    }
+
+    private var topGuideSystemImage: String {
+        if captureEngine.topMeasurementStable {
+            return "checkmark.seal.fill"
+        }
+        return captureEngine.isTopViewAligned
+            ? "checkmark.circle.fill"
+            : "iphone.gen3.radiowaves.left.and.right"
+    }
+
+    private var topGuideHeadline: String {
+        if captureEngine.topMeasurementStable {
+            return "Top fit ready"
+        }
+        if captureEngine.isTopViewAligned {
+            return "Top view aligned"
+        }
+        if let degrees = captureEngine.topViewDeviationDegrees {
+            return "Point straight down · \(degrees)° off"
+        }
+        return "Point straight down"
+    }
+
+    private var topGuideDetail: String {
+        if captureEngine.activeObjectID == nil {
+            return captureEngine.isTopViewAligned
+                ? "Hold this angle and tap the object."
+                : "Hold the phone above the object with the camera facing the floor."
+        }
+        if captureEngine.topMeasurementStable {
+            return "The overhead fit is stable. You can lock this object."
+        }
+        return captureEngine.isTopViewAligned
+            ? "Hold still while the overhead points converge."
+            : "Tilt toward vertical. Collection pauses until the angle is correct."
     }
 
     private func faceGuideRow(
@@ -556,7 +679,8 @@ struct MesOverlayView: View {
     }
 
     private var infoPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Circle()
                     .fill(environmentStatusColor)
@@ -586,6 +710,29 @@ struct MesOverlayView: View {
             }
 
             VStack(alignment: .leading, spacing: 7) {
+                Text("Measurement method")
+                    .font(.caption.weight(.semibold))
+                Picker("Measurement method", selection: workflowModeSelection) {
+                    ForEach(MeasurementWorkflowMode.allCases) { mode in
+                        Text(mode.shortTitle).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityLabel("Measurement method")
+
+                if !isAutomaticCaptureSupported {
+                    Text("Top Fit requires LiDAR and is unavailable on this device.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+
+                Text(workflowMode.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
                 Text("Current step")
                     .font(.caption.weight(.semibold))
                 Text(scanStatusText)
@@ -598,21 +745,32 @@ struct MesOverlayView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if isAutomaticCaptureSupported {
-                    statusLine("Depth", sessionManager.depthStatusText)
-                    statusLine("Depth map", sessionManager.sceneDepthResolutionText)
-                    statusLine("Object cloud", "1 cm confirmed voxels")
-                    statusLine("Mesh", sessionManager.sceneReconstructionStatusText)
+                DisclosureGroup(
+                    "Tracking details",
+                    isExpanded: $showsTrackingDetails
+                ) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        if isAutomaticCaptureSupported {
+                            statusLine("Depth", sessionManager.depthStatusText)
+                            statusLine("Depth map", sessionManager.sceneDepthResolutionText)
+                            statusLine("Object cloud", "5 mm confirmed voxels")
+                            statusLine("Mesh", sessionManager.sceneReconstructionStatusText)
+                        }
+                        statusLine("Planes", sessionManager.planeStatusText)
+                        statusLine("Tracking", sessionManager.trackingHardwareText)
+                        statusLine("Map", sessionManager.worldMappingStatusText)
+                    }
+                    .padding(.top, 5)
                 }
-                statusLine("Planes", sessionManager.planeStatusText)
-                statusLine("Tracking", sessionManager.trackingHardwareText)
-                statusLine("Map", sessionManager.worldMappingStatusText)
             }
             .font(.caption)
 
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .scrollIndicators(.visible)
+        .frame(maxWidth: .infinity, maxHeight: 430, alignment: .topLeading)
         .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 
@@ -697,6 +855,9 @@ struct MesOverlayView: View {
 
         if isAutomaticCaptureSupported {
             if captureEngine.activeObjectID != nil {
+                if workflowMode == .top {
+                    return "\(captureEngine.statusText) Hold the phone above it and point straight down; the fit uses world-space points, not the tilted camera image."
+                }
                 return "\(captureEngine.statusText) Only this object is being measured. Move around all sides, then tap Lock."
             }
             if !captureEngine.finalizedObjectIDs.isEmpty {
@@ -714,6 +875,29 @@ struct MesOverlayView: View {
         }
 
         return "Center an object to preview its color, then tap it to start measuring."
+    }
+
+    private var workflowModeSelection: Binding<MeasurementWorkflowMode> {
+        Binding(
+            get: { workflowMode },
+            set: requestWorkflowModeChange(to:)
+        )
+    }
+
+    private func requestWorkflowModeChange(to mode: MeasurementWorkflowMode) {
+        guard mode != workflowMode else {
+            return
+        }
+        guard mode != .top || isAutomaticCaptureSupported else {
+            showsLiDARLimitations = true
+            return
+        }
+        guard captureEngine.canReset else {
+            workflowMode = mode
+            return
+        }
+        pendingWorkflowMode = mode
+        showsModeChangeConfirmation = true
     }
 
     @ViewBuilder
@@ -760,6 +944,10 @@ struct MesOverlayView: View {
         if captureEngine.activeObjectID != nil,
            !captureEngine.isFinalizationPending {
             Button {
+                guard sessionManager.isTrackingReady,
+                      sessionManager.isObjectTrackingEnvironmentReady else {
+                    return
+                }
                 showsSavedObjects = false
                 presentFinalizationDetailsEntry()
             } label: {
@@ -779,12 +967,22 @@ struct MesOverlayView: View {
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
-            .disabled(!captureEngine.canFinalizeActiveObject)
+            .disabled(
+                !captureEngine.canFinalizeActiveObject
+                    || !sessionManager.isTrackingReady
+                    || !sessionManager.isObjectTrackingEnvironmentReady
+            )
             .accessibilityLabel("Finish and lock current object")
             .accessibilityHint(
-                captureEngine.canFinalizeActiveObject
-                    ? "Stops measurement updates so you can select another object."
-                    : "Keep scanning until a LiDAR box is ready."
+                !sessionManager.isTrackingReady
+                    ? "Wait for normal camera tracking before locking."
+                    : !sessionManager.isObjectTrackingEnvironmentReady
+                        ? "Scan the floor or table until its supporting plane is ready."
+                    : !captureEngine.hasDefinitiveSupportPlaneForActiveObject
+                        ? "Scan the floor or table directly beneath this object before locking."
+                    : captureEngine.canFinalizeActiveObject
+                        ? "Stops measurement updates so you can select another object."
+                        : "Keep scanning until a LiDAR box is ready."
             )
         } else if captureEngine.canReactivateFocusedObject {
             Button {
@@ -1039,7 +1237,15 @@ struct MesOverlayView: View {
     private var objectDetailsIsPresented: Binding<Bool> {
         Binding(
             get: {
-                objectDetailsContext != nil
+                guard let context = objectDetailsContext else {
+                    return false
+                }
+                switch context {
+                case .finalize(let id):
+                    return captureEngine.pendingFinalizationObjectID == id
+                case .edit:
+                    return true
+                }
             },
             set: { isPresented in
                 if !isPresented {
@@ -1443,6 +1649,7 @@ struct MesOverlayView: View {
     MesOverlayView(
         sessionManager: ARSessionManager(),
         mesEngine: MesEngine(),
-        captureEngine: ObjectCaptureEngine()
+        captureEngine: ObjectCaptureEngine(),
+        workflowMode: .constant(.spatial3D)
     )
 }

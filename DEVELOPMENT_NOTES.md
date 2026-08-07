@@ -41,6 +41,35 @@ These instructions should guide every future implementation step.
 
 ---
 
+## 2026-08-06 - Definitive Support-Plane Anchoring
+
+- Height measurement now retains the identifier of the horizontal `ARPlaneAnchor` supporting each
+  object and consumes its latest detailed `ARPlaneGeometry` as ARKit refines the surface.
+- Plane validation samples the surface around the object's footprint rather than accepting a plane
+  only beneath its center. Floor/table classification breaks close ties but is not required because
+  Apple reports classification asynchronously.
+- A plane-backed baseline is applied exactly. The former 3 mm support deadband was removed; a 1 mm
+  filter remains only for temporary scene-depth fallback.
+- Box presentation is parented to the selected support plane while mask/evidence tracking keeps its
+  nearby object anchor. If ARKit merges and removes that plane, active and finalized boxes reacquire
+  the replacement support. Until a replacement qualifies, the box is moved coherently to its
+  retained object anchor instead of remaining attached to a removed plane identifier; active depth
+  evidence is restarted so coordinate frames are never mixed.
+- Pressing Lock performs one final current-frame plane snap while preserving the measured top face.
+  Small vertical object-anchor corrections now trigger evidence reacquisition at 1.5 mm instead of
+  being mixed into a later fit.
+- Environment readiness and coaching now require a detected horizontal support plane. Lock remains
+  unavailable until both normal tracking and environment readiness are present. It additionally
+  requires detailed plane geometry beneath the active object's own footprint; a floor or table
+  elsewhere in the scene does not enable Lock. A last-frame plane removal cancels the commit safely.
+
+Validation: the main support-plane implementation passed an Xcode 26.5 generic iOS device Debug
+build with code signing disabled. The final per-object Lock/lifecycle guards still need the next
+local build and physical run. Plane accuracy and anchor refinement cannot be evaluated in the
+simulator.
+
+---
+
 ## 2026-06-29 - AR Foundation Status Layer
 
 ### Goal
@@ -2109,10 +2138,10 @@ state and naturally resumes the same active object on the next frame. Finalized 
 be edited together and the saved Boxes menu displays the name.
 
 The manual Enhance button and its one-shot request, progress and feedback state were removed. Its
-mask-based cyan-point rejection remains in the active scan loop and runs automatically every two
-seconds, so cleanup is now a continuous workflow rather than an operator decision. Each pass checks
-at most 4,096 points and advances a per-object cursor, preserving the same rejection rules while
-preventing a maximum-size point cloud from monopolizing the main actor in a single timer tick.
+mask-based cyan-point rejection remains in the active scan loop and runs automatically every half
+second, so cleanup is now a continuous workflow rather than an operator decision. Each pass checks
+at most 512 points and advances a per-object cursor, preserving the same rejection rules while
+keeping each main-actor slice short enough for Lock and other controls to remain responsive.
 
 The compact top status now uses red for Understanding environment and green after readiness. Ready
 cards carry a green check and Information reflects the same environment state. Reset is a labeled
@@ -2198,3 +2227,106 @@ AR coaching activation and external engine resets.
 - Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
 - Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
 - Physical iPhone 13 Pro validation is still required for final appearance over the live camera.
+
+---
+
+## 2026-08-06 - Anchored tracking and separate paper-based Top measurement
+
+### Tracking problem and cause
+
+The Lock transaction already stopped new measurement publication, but two downstream paths could
+still make a saved result appear to move. The 15 Hz edge-style renderer could rebuild a stabilized
+box from the fitter's raw geometry, and every captured box was drawn under one world-origin entity
+instead of the exact AR anchor that represents that object. Early measurements could also change
+support source abruptly when a horizontal plane became available after the depth-cloud estimate.
+
+A separate first-start defect advanced the “fitted” timestamp before checking whether the fit had
+succeeded. If the first attempt returned no support while ARKit was warming up, support arriving by
+itself did not schedule another attempt. Reopening the app indirectly hid this race because planes
+and depth were then warm.
+
+### Tracking changes
+
+- Only the canonical object in `ObjectCaptureEngine` may redraw a box; raw live results are retained
+  only for point refinement and rejection checks.
+- Every object box is now a child of `AnchorEntity(anchor:)` for that exact `ARAnchor`. Incoming
+  world-space corners are converted to anchor-local coordinates. Finalized geometry is no longer
+  rebuilt by the changing front/rear-edge style pass, so later ARKit anchor corrections move the
+  saved box coherently with the tracked object.
+- The current frame's copy of an anchor is resolved by identifier rather than repeatedly reading the
+  original instance created by the app.
+- Support candidates use the horizontal plane when available and otherwise the local depth cloud.
+  A seven-sample median, 3 mm deadband and 2 mm maximum correction step prevent a late plane from
+  translating the first box by centimetres in one update. The same canonical support is passed to
+  both fitting and rendering.
+- A fit is marked processed only after success (or a genuine insufficient-object-points result).
+  New support values can independently request a refit. A valid immutable point snapshot may publish
+  while newer voxels arrive; its submitted timestamp is recorded so the newer snapshot is scheduled
+  immediately afterward. Lifecycle, mode, anchor-correction and support guards still reject stale
+  work.
+- The accumulator now maintains a compact list of points at the moment their voxels become stable.
+  The fitter snapshots that contiguous list instead of retaining the full as-many-as-64,000-entry
+  voxel dictionary, avoiding large dictionary copy-on-write work when the next frame arrives.
+  Automatic mask cleanup is split into 512-point slices and invalidates any in-flight pre-cleanup
+  fit before mutating its accumulator.
+- An anchor pose is retained with both published geometry and active evidence. Rendering uses that
+  exact box-to-anchor transform, so even active rear-edge restyling cannot undo a later ARKit anchor
+  correction. On Unlock—or a material correction while measuring—the canonical box is rebased and
+  old voxel/support evidence is reacquired rather than mixed with the corrected world frame.
+- Center position has a 4 mm deadband; equivalent yaw candidates have a 1.5° deadband; dimensions
+  retain the existing 4 mm/3% stabilization. These are temporal presentation guards and do not
+  replace either geometry algorithm.
+- Depth/vision submission, Lock and rear-edge restyling require normal AR camera tracking. Marker
+  projection moved from 60 Hz to 15 Hz, and canceled clustering/paper loops now check cooperative
+  task cancellation to avoid a first-Lock CPU tail.
+
+### Two measurement methods
+
+The app remains one Scan workflow, but it now has two mutually exclusive automatic methods. Their
+selector is persisted and appears only inside Information. Switching with active or saved state
+requires destructive confirmation because their convergence histories are incompatible.
+
+`Full 3D` preserves the established behavior: footprint is remembered from a top view and height
+from a side view. `Top` accepts depth points only while the AR camera optical axis is close to world
+down. It enters alignment at 12° and remains aligned until 18°, giving the operator a stable red or
+green overhead guide. Because the computation uses ARKit world points in the gravity-aligned frame,
+small perspective/hand-angle errors do not become 2D image distortion.
+
+The Top footprint follows *Estimation of 2D Bounding Box Orientation with Convex-Hull Points – A
+Quantitative Evaluation on Accuracy and Efficiency* (Liu, Liu and Zhang, IV 2020):
+
+1. Uniformly downsample `P` to `Nmax = 100` with deterministic reservoir sampling.
+2. Compute a Graham-scan convex hull using approximate-collinearity threshold `τ = 0.01`.
+3. Evaluate the direction formed by every unordered hull-point pair.
+4. Apply the points-to-edges closeness criterion cited from Zhang et al.; choose the maximum score,
+   as defined by that primary criterion. The supplied paper's prose saying “minimum” conflicts with
+   its cited equation/algorithm.
+5. Derive length and width from the same downsampled `P` and chosen direction.
+
+The cited closeness criterion defines a positive distance floor `d0` but neither publication gives a
+numeric value. The implementation explicitly uses the existing 5 mm object-voxel resolution rather
+than hiding another tuning constant. Height is intentionally the user's requested extension to the
+2D paper: the maximum selected 3D point above the stabilized support plane. The paper evaluates
+orientation rather than claiming validated object-size accuracy, so physical calibration remains
+necessary.
+
+Approximate ray-collinearity is evaluated against the first ray in each polar group (and requires
+the same direction), rather than chaining adjacent small angle differences; this preserves the
+paper's threshold instead of accidentally merging a much wider angular span.
+
+### UI and validation
+
+Top uses one compact status card: red while the phone must point farther down, green when aligned,
+and a stable-fit message when the overhead result converges. Full 3D keeps its existing top/side
+guide. Tracking diagnostics in Information are collapsed by default so the new selector does not
+recreate the previous crowded HUD.
+
+- Xcode 26.5 generic iOS Simulator Debug build with signing disabled: succeeded.
+- Both simulator architectures compiled, including Observation/Preview macros and RealityKit anchor
+  APIs.
+- Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded after the final
+  anchor-frame, support-refit and compact stable-point changes.
+- Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
+- The simulator cannot validate LiDAR, world-anchor correction, physical angle guidance or
+  measurement error. Repeat cold-launch, first-object, Lock/Cancel and multi-object drift trials on
+  the iPhone 13 Pro before treating the behavior as experimentally verified.

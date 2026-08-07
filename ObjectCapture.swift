@@ -1,6 +1,7 @@
 
 import ARKit
 import CoreVideo
+import Foundation
 import simd
 import UIKit
 
@@ -41,6 +42,15 @@ nonisolated enum CaptureOutcome: Sendable {
     case notEnoughMesh
 }
 
+/// A definitive horizontal support selected from ARKit's current plane geometry.
+/// The identifier lets callers keep using the same physical surface as ARKit
+/// refines its transform and boundary over time.
+nonisolated struct SupportPlaneMatch: Sendable {
+    let anchorIdentifier: UUID
+    let height: Float
+    let anchorTransform: simd_float4x4
+}
+
 nonisolated enum ObjectCapturePipeline {
     static let voxelSize: Float = 0.005
     static let supportVoxelSize: Float = 0.02
@@ -63,7 +73,8 @@ nonisolated enum ObjectCapturePipeline {
         up: SIMD3<Float>,
         supportHeight: Float? = nil
     ) -> CaptureOutcome {
-        guard objectPoints.count >= minimumClusterPoints else {
+        guard !Task.isCancelled,
+              objectPoints.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
@@ -77,7 +88,8 @@ nonisolated enum ObjectCapturePipeline {
             return heightAboveSupport > 0 && heightAboveSupport < maxHeight
         }
 
-        guard candidates.count >= minimumClusterPoints else {
+        guard !Task.isCancelled,
+              candidates.count >= minimumClusterPoints else {
             return .notEnoughMesh
         }
 
@@ -93,6 +105,9 @@ nonisolated enum ObjectCapturePipeline {
             return .notEnoughMesh
         }
 
+        guard !Task.isCancelled else {
+            return .notEnoughMesh
+        }
         let selectedPoints = cluster.pointIndices.map { candidates[$0].position }
         let surfacePoints = cluster.pointIndices.map { candidates[$0].observedPosition }
         guard let object = ObjectBoundingBox.make(
@@ -111,34 +126,176 @@ nonisolated enum ObjectCapturePipeline {
         ))
     }
 
-    static func supportPlaneHeight(
+    static func captureTopView(
+        objectPoints: [AccumulatedDepthPoint],
+        supportPoints: [SIMD3<Float>],
+        seed: SIMD3<Float>,
+        up: SIMD3<Float>,
+        supportHeight: Float? = nil
+    ) -> CaptureOutcome {
+        guard !Task.isCancelled,
+              objectPoints.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard let resolvedSupportHeight = supportHeight
+            ?? estimateSupportHeight(points: supportPoints, seed: seed) else {
+            return .noSupport
+        }
+
+        let candidates = objectPoints.filter { point in
+            let heightAboveSupport = point.position.y - resolvedSupportHeight
+            return heightAboveSupport > 0 && heightAboveSupport < maxHeight
+        }
+
+        guard !Task.isCancelled,
+              candidates.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard let cluster = VoxelCluster.connectedComponent(
+            points: candidates.map(\.position),
+            seed: seed,
+            voxelSize: voxelSize,
+            neighborRadius: connectivityRadiusInVoxels,
+            bridgeRadius: surfaceBridgeRadiusInVoxels,
+            minimumBridgedPointCount: minimumBridgedSurfacePoints,
+            minimumBridgeContactCount: minimumSurfaceBridgeContacts
+        ), cluster.points.count >= minimumClusterPoints else {
+            return .notEnoughMesh
+        }
+
+        guard !Task.isCancelled else {
+            return .notEnoughMesh
+        }
+        let selectedPoints = cluster.pointIndices.map { candidates[$0].position }
+        let surfacePoints = cluster.pointIndices.map { candidates[$0].observedPosition }
+        guard let object = PaperTopBoundingBox.make(
+            from: cluster.points,
+            enclosing: surfacePoints,
+            up: up,
+            groundHeight: resolvedSupportHeight,
+            minimumEdgeDistance: voxelSize
+        ) else {
+            return .notEnoughMesh
+        }
+
+        return .success(CaptureResult(
+            object: object,
+            selectionPoints: selectedPoints,
+            surfacePoints: surfacePoints
+        ))
+    }
+
+    static func supportPlaneMatch(
         from anchors: [ARAnchor],
-        beneath referencePoint: SIMD3<Float>
-    ) -> Float? {
-        var bestHeight: Float?
+        beneath referencePoint: SIMD3<Float>,
+        validating samplePoints: [SIMD3<Float>],
+        preferredAnchorIdentifier: UUID?
+    ) -> SupportPlaneMatch? {
+        struct Candidate {
+            let match: SupportPlaneMatch
+            let coveredSampleCount: Int
+            let classificationPriority: Int
+        }
+
+        let validationPoints = samplePoints.isEmpty ? [referencePoint] : samplePoints
+        let minimumCoveredSamples = min(3, max(1, validationPoints.count / 2))
+        var candidates: [Candidate] = []
+
         for case let anchor as ARPlaneAnchor in anchors where anchor.alignment == .horizontal {
+            // A ceiling can be horizontal and below a seed on another storey, but it is never a
+            // valid surface on which the selected object is resting.
+            if anchor.classification == .ceiling {
+                continue
+            }
             let local = anchor.transform.inverse * SIMD4<Float>(referencePoint, 1)
             let boundary = anchor.geometry.boundaryVertices
-            guard boundaryContains(
-                SIMD2<Float>(local.x, local.z),
-                vertices: boundary,
-                tolerance: 0.03
-            ) else {
+            let coveredSampleCount = validationPoints.count { point in
+                let localPoint = anchor.transform.inverse * SIMD4<Float>(point, 1)
+                return boundaryContains(
+                    SIMD2<Float>(localPoint.x, localPoint.z),
+                    vertices: boundary,
+                    tolerance: 0.012
+                )
+            }
+            guard coveredSampleCount >= minimumCoveredSamples else {
                 continue
             }
 
             let worldPlanePoint = anchor.transform * SIMD4<Float>(local.x, 0, local.z, 1)
             let height = worldPlanePoint.y
             let distanceBelowReference = referencePoint.y - height
-            guard distanceBelowReference >= 0.008,
-                  distanceBelowReference <= 0.5 else {
+            guard distanceBelowReference >= 0.005,
+                  distanceBelowReference <= maxHeight + 0.1 else {
                 continue
             }
-            if bestHeight == nil || height > bestHeight! {
-                bestHeight = height
-            }
+            candidates.append(Candidate(
+                match: SupportPlaneMatch(
+                    anchorIdentifier: anchor.identifier,
+                    height: height,
+                    anchorTransform: anchor.transform
+                ),
+                coveredSampleCount: coveredSampleCount,
+                classificationPriority: supportClassificationPriority(anchor.classification)
+            ))
         }
-        return bestHeight
+
+        let bestCandidate = candidates.max { first, second in
+            // The closest qualifying surface below the object is its support. Classification and
+            // geometry coverage only break near-height ties because classification can be pending.
+            if abs(first.match.height - second.match.height) > 0.01 {
+                return first.match.height < second.match.height
+            }
+            if first.classificationPriority != second.classificationPriority {
+                return first.classificationPriority < second.classificationPriority
+            }
+            if first.coveredSampleCount != second.coveredSampleCount {
+                return first.coveredSampleCount < second.coveredSampleCount
+            }
+            return first.match.height < second.match.height
+        }
+
+        // Retain a valid physical plane across ordinary geometry refinements, but allow a newly
+        // discovered surface that is materially closer to replace an early floor/depth choice (for
+        // example, when ARKit detects the table only after it had already detected the floor).
+        if let preferredAnchorIdentifier,
+           let preferred = candidates.first(where: {
+               $0.match.anchorIdentifier == preferredAnchorIdentifier
+           }), let bestCandidate,
+           bestCandidate.match.height - preferred.match.height <= 0.015 {
+            return preferred.match
+        }
+
+        return bestCandidate?.match
+    }
+
+    /// Resolves one support candidate before fitting so the fitter and renderer use the same base.
+    /// ARKit's horizontal plane is preferred once available; the depth-cloud estimate keeps the
+    /// first measurement usable while plane detection is still warming up.
+    static func resolvedSupportHeight(
+        planeHeight: Float?,
+        supportPoints: [SIMD3<Float>],
+        seed: SIMD3<Float>
+    ) -> Float? {
+        planeHeight ?? estimateSupportHeight(points: supportPoints, seed: seed)
+    }
+
+    private static func supportClassificationPriority(
+        _ classification: ARPlaneAnchor.Classification
+    ) -> Int {
+        switch classification {
+        case .floor, .table:
+            3
+        case .seat:
+            2
+        case .none:
+            1
+        case .ceiling, .wall, .door, .window:
+            0
+        @unknown default:
+            1
+        }
     }
 
     private static func estimateSupportHeight(points: [SIMD3<Float>], seed: SIMD3<Float>) -> Float? {
@@ -157,7 +314,9 @@ nonisolated enum ObjectCapturePipeline {
             return nil
         }
 
-        let binSize: Float = 0.01
+        // This is only a temporary fallback until a definitive ARPlaneAnchor is available. Keep
+        // its grouping fine enough that it cannot itself introduce a centimetre-scale baseline.
+        let binSize: Float = 0.004
         var histogram: [Int: Int] = [:]
         for height in nearbyHeights {
             histogram[Int((height / binSize).rounded()), default: 0] += 1
@@ -227,15 +386,27 @@ actor ObjectCaptureFitter {
         objectPoints: [AccumulatedDepthPoint],
         supportPoints: [SIMD3<Float>],
         seed: SIMD3<Float>,
-        supportHeight: Float?
+        supportHeight: Float?,
+        mode: MeasurementWorkflowMode
     ) -> CaptureOutcome {
-        ObjectCapturePipeline.capture(
-            objectPoints: objectPoints,
-            supportPoints: supportPoints,
-            seed: seed,
-            up: SIMD3<Float>(0, 1, 0),
-            supportHeight: supportHeight
-        )
+        switch mode {
+        case .spatial3D:
+            return ObjectCapturePipeline.capture(
+                objectPoints: objectPoints,
+                supportPoints: supportPoints,
+                seed: seed,
+                up: SIMD3<Float>(0, 1, 0),
+                supportHeight: supportHeight
+            )
+        case .top:
+            return ObjectCapturePipeline.captureTopView(
+                objectPoints: objectPoints,
+                supportPoints: supportPoints,
+                seed: seed,
+                up: SIMD3<Float>(0, 1, 0),
+                supportHeight: supportHeight
+            )
+        }
     }
 }
 
@@ -415,20 +586,20 @@ enum DepthPointCloud {
     }
 }
 
-struct PointAccumulator {
-    private struct Key: Hashable {
+nonisolated struct PointAccumulator: Sendable {
+    private struct Key: Hashable, Sendable {
         let x: Int32
         let y: Int32
         let z: Int32
     }
 
-    private struct FrameSample {
+    private struct FrameSample: Sendable {
         var sum: SIMD3<Float>
         var count: Int32
         var observedPoint: SIMD3<Float>
     }
 
-    private struct Sample {
+    private struct Sample: Sendable {
         var sum: SIMD3<Float>
         var observationCount: Int32
         var lastSeenGeneration: Int32
@@ -438,6 +609,12 @@ struct PointAccumulator {
     }
 
     private var samples: [Key: Sample] = [:]
+    /// Compact immutable fit input. Object samples become stable once and
+    /// retain that position, so the fitter can snapshot this array without
+    /// retaining/copying the much larger voxel dictionary.
+    private var stableKeys: [Key] = []
+    private var stablePoints: [AccumulatedDepthPoint] = []
+    private var stablePointIndices: [Key: Int] = [:]
     private var generation: Int32 = 0
     private var lastAddedTimestamp: TimeInterval?
     private let voxelSize: Float
@@ -548,6 +725,9 @@ struct PointAccumulator {
                 newlyStabilizedCount += 1
             }
             samples[key] = sample
+            if sample.stablePoint != nil {
+                recordStablePointIfNeeded(for: key, sample: sample)
+            }
         }
 
         let unsortedNewKeys = frameKeyOrder.filter { samples[$0] == nil }
@@ -634,6 +814,9 @@ struct PointAccumulator {
             )
             if stablePoint != nil {
                 newlyStabilizedCount += 1
+                if let sample = samples[key] {
+                    recordStablePointIfNeeded(for: key, sample: sample)
+                }
             }
         }
         return newlyStabilizedCount
@@ -669,6 +852,10 @@ struct PointAccumulator {
         return result
     }
 
+    func stablePointsSnapshot() -> [AccumulatedDepthPoint] {
+        stablePoints
+    }
+
     mutating func pruneTransient(below minCount: Int, olderThan minimumAge: Int = 0) {
         let oldestRecentGeneration = generation - Int32(max(minimumAge, 0))
         let stale: [Key] = samples.compactMap { entry in
@@ -700,8 +887,43 @@ struct PointAccumulator {
 
     private mutating func remove(_ keys: [Key]) {
         for key in keys {
+            removeStablePoint(for: key)
             samples[key] = nil
         }
+    }
+
+    private mutating func recordStablePointIfNeeded(
+        for key: Key,
+        sample: Sample
+    ) {
+        guard stablePointIndices[key] == nil,
+              let position = sample.stablePoint else {
+            return
+        }
+        stablePointIndices[key] = stablePoints.count
+        stableKeys.append(key)
+        stablePoints.append(
+            AccumulatedDepthPoint(
+                position: position,
+                observedPosition: sample.stableObservedPoint
+                    ?? sample.observedPoint
+            )
+        )
+    }
+
+    private mutating func removeStablePoint(for key: Key) {
+        guard let index = stablePointIndices.removeValue(forKey: key) else {
+            return
+        }
+        let lastIndex = stablePoints.count - 1
+        if index != lastIndex {
+            stablePoints[index] = stablePoints[lastIndex]
+            let movedKey = stableKeys[lastIndex]
+            stableKeys[index] = movedKey
+            stablePointIndices[movedKey] = index
+        }
+        stablePoints.removeLast()
+        stableKeys.removeLast()
     }
 
 }
@@ -736,6 +958,9 @@ nonisolated enum VoxelCluster {
 
         var voxelToPoints: [Key: [Int]] = [:]
         for (index, point) in points.enumerated() {
+            if index.isMultiple(of: 1_024), Task.isCancelled {
+                return nil
+            }
             voxelToPoints[key(point), default: []].append(index)
         }
 
@@ -763,6 +988,10 @@ nonisolated enum VoxelCluster {
             var head = 0
             remaining.remove(start)
             while head < component.count {
+                if head.isMultiple(of: 512), Task.isCancelled {
+                    remaining.removeAll()
+                    return []
+                }
                 let voxel = component[head]
                 head += 1
                 for offset in neighborOffsets {
@@ -781,8 +1010,14 @@ nonisolated enum VoxelCluster {
 
         var remaining = occupied
         var selected = Set(takeComponent(start: seedKey, from: &remaining))
+        guard !Task.isCancelled, !selected.isEmpty else {
+            return nil
+        }
         var secondaryComponents: [[Key]] = []
         while let start = remaining.first {
+            guard !Task.isCancelled else {
+                return nil
+            }
             let component = takeComponent(start: start, from: &remaining)
             let pointCount = component.reduce(into: 0) { count, voxel in
                 count += voxelToPoints[voxel]?.count ?? 0
@@ -812,6 +1047,9 @@ nonisolated enum VoxelCluster {
             var pendingComponents = secondaryComponents
             var addedComponent = true
             while addedComponent, !pendingComponents.isEmpty {
+                guard !Task.isCancelled else {
+                    return nil
+                }
                 addedComponent = false
                 var remainingComponents: [[Key]] = []
                 for component in pendingComponents {
@@ -854,7 +1092,10 @@ nonisolated enum VoxelCluster {
             if left.y != right.y { return left.y < right.y }
             return left.z < right.z
         }
-        for voxel in orderedVoxels {
+        for (voxelIndex, voxel) in orderedVoxels.enumerated() {
+            if voxelIndex.isMultiple(of: 512), Task.isCancelled {
+                return nil
+            }
             guard let indices = voxelToPoints[voxel] else {
                 continue
             }
@@ -1081,5 +1322,413 @@ nonisolated enum ObjectBoundingBox {
             highest = max(highest, projection)
         }
         return (highest - lowest, (lowest + highest) / 2)
+    }
+}
+
+/// Bird's-eye rectangle fitting from Liu, Liu and Zhang (IV 2020):
+/// deterministic uniform downsampling, Graham-scan convex hull with approximate
+/// collinearity, every pair of hull points as a candidate direction, and the
+/// points-to-edges closeness criterion used by the paper's Algorithm 2.
+nonisolated enum PaperTopBoundingBox {
+    private static let maximumOrientationPointCount = 100
+    private static let approximateCollinearitySine: Float = 0.01
+    private static let geometricEpsilon: Float = 1e-6
+
+    private struct RectangleFit {
+        let widthAxis: SIMD2<Float>
+        let depthAxis: SIMD2<Float>
+        let widthMinimum: Float
+        let widthMaximum: Float
+        let depthMinimum: Float
+        let depthMaximum: Float
+    }
+
+    static func make(
+        from points: [SIMD3<Float>],
+        enclosing enclosurePoints: [SIMD3<Float>],
+        up: SIMD3<Float>,
+        groundHeight: Float,
+        minimumEdgeDistance: Float
+    ) -> CapturedObject? {
+        guard points.count >= 3 else {
+            return nil
+        }
+
+        let upAxis = simd_length(up) > 0
+            ? simd_normalize(up)
+            : SIMD3<Float>(0, 1, 0)
+        guard let basis = horizontalBasis(up: upAxis) else {
+            return nil
+        }
+
+        let stablePoints2D = points.map {
+            SIMD2<Float>(simd_dot($0, basis.first), simd_dot($0, basis.second))
+        }
+        let orientationPoints = uniformDownsample(
+            stablePoints2D,
+            maximumCount: maximumOrientationPointCount
+        )
+        let hull = convexHull(
+            orientationPoints,
+            collinearitySine: approximateCollinearitySine
+        )
+        guard hull.count >= 3,
+              let direction = bestDirection(
+                hull: hull,
+                points: orientationPoints,
+                minimumEdgeDistance: max(minimumEdgeDistance, geometricEpsilon)
+              ) else {
+            return nil
+        }
+
+        // Algorithm 2 derives l and w from the same (possibly downsampled) P used by closeness.
+        // The full 3D set is retained only for the separately requested max-height calculation.
+        guard var fit = rectangleFit(points: orientationPoints, axis: direction) else {
+            return nil
+        }
+
+        // The paper treats orientations 90 degrees apart as equivalent. Keep
+        // the longer rectangle edge first so length/width do not swap randomly.
+        let firstSpan = fit.widthMaximum - fit.widthMinimum
+        let secondSpan = fit.depthMaximum - fit.depthMinimum
+        if secondSpan > firstSpan {
+            fit = RectangleFit(
+                widthAxis: fit.depthAxis,
+                depthAxis: -fit.widthAxis,
+                widthMinimum: fit.depthMinimum,
+                widthMaximum: fit.depthMaximum,
+                depthMinimum: -fit.widthMaximum,
+                depthMaximum: -fit.widthMinimum
+            )
+        }
+
+        let width = fit.widthMaximum - fit.widthMinimum
+        let depth = fit.depthMaximum - fit.depthMinimum
+        var highestProjection = groundHeight
+        for point in points {
+            highestProjection = max(highestProjection, simd_dot(point, upAxis))
+        }
+        for point in enclosurePoints {
+            highestProjection = max(highestProjection, simd_dot(point, upAxis))
+        }
+        let height = min(
+            highestProjection - groundHeight,
+            ObjectCapturePipeline.maxHeight
+        )
+        guard width > 0.005, depth > 0.005, height > 0.005 else {
+            return nil
+        }
+
+        let widthAxis = simd_normalize(
+            basis.first * fit.widthAxis.x + basis.second * fit.widthAxis.y
+        )
+        let depthAxis = simd_normalize(simd_cross(upAxis, widthAxis))
+        let widthMidpoint = (fit.widthMinimum + fit.widthMaximum) / 2
+        let depthMidpoint = (fit.depthMinimum + fit.depthMaximum) / 2
+        let horizontalCenter = widthAxis * widthMidpoint
+            + depthAxis * depthMidpoint
+        let center = horizontalCenter
+            + upAxis * (groundHeight + height / 2)
+        let dimensions = SIMD3<Float>(width, depth, height)
+        let corners = makeCorners(
+            center: center,
+            dimensions: dimensions,
+            widthAxis: widthAxis,
+            depthAxis: depthAxis,
+            upAxis: upAxis
+        )
+
+        return CapturedObject(
+            dimensions: dimensions,
+            center: center,
+            axes: (widthAxis, depthAxis, upAxis),
+            corners: corners,
+            volume: width * depth * height,
+            sampleCount: points.count
+        )
+    }
+
+    private static func horizontalBasis(
+        up: SIMD3<Float>
+    ) -> (first: SIMD3<Float>, second: SIMD3<Float>)? {
+        var first = SIMD3<Float>(1, 0, 0) - up * simd_dot(SIMD3<Float>(1, 0, 0), up)
+        if simd_length(first) < 1e-4 {
+            first = SIMD3<Float>(0, 0, 1) - up * simd_dot(SIMD3<Float>(0, 0, 1), up)
+        }
+        guard simd_length(first) >= 1e-4 else {
+            return nil
+        }
+        first = simd_normalize(first)
+        return (first, simd_normalize(simd_cross(up, first)))
+    }
+
+    private static func uniformDownsample(
+        _ points: [SIMD2<Float>],
+        maximumCount: Int
+    ) -> [SIMD2<Float>] {
+        guard maximumCount > 0, points.count > maximumCount else {
+            return points
+        }
+
+        // Reservoir sampling gives every input point the same selection probability, matching the
+        // paper's uniform downsampling while remaining O(n). A fixed generator makes repeated fits
+        // of the same ordered voxel set deterministic instead of visibly changing at random.
+        var sample = Array(points.prefix(maximumCount))
+        var randomState: UInt64 = 0x9E37_79B9_7F4A_7C15
+        for index in maximumCount..<points.count {
+            if index.isMultiple(of: 1_024), Task.isCancelled {
+                return []
+            }
+            randomState = randomState &* 6_364_136_223_846_793_005 &+ 1
+            let selectedIndex = Int(randomState % UInt64(index + 1))
+            if selectedIndex < maximumCount {
+                sample[selectedIndex] = points[index]
+            }
+        }
+        return sample
+    }
+
+    /// Graham scan matching Algorithm 1, with the paper's optional sine
+    /// threshold replacing exact collinearity tests.
+    private static func convexHull(
+        _ points: [SIMD2<Float>],
+        collinearitySine: Float
+    ) -> [SIMD2<Float>] {
+        guard points.count >= 3,
+              let pivot = points.min(by: {
+                if abs($0.y - $1.y) > geometricEpsilon {
+                    return $0.y < $1.y
+                }
+                return $0.x < $1.x
+              }) else {
+            return []
+        }
+
+        let sorted = points.filter { $0 != pivot }.sorted { lhs, rhs in
+            let left = lhs - pivot
+            let right = rhs - pivot
+            let leftAngle = atan2(left.y, left.x)
+            let rightAngle = atan2(right.y, right.x)
+            if leftAngle == rightAngle {
+                return simd_length_squared(left) < simd_length_squared(right)
+            }
+            return leftAngle < rightAngle
+        }
+
+        var polarPoints: [SIMD2<Float>] = []
+        var index = 0
+        while index < sorted.count {
+            var farthest = sorted[index]
+            let referenceRayPoint = sorted[index]
+            var next = index + 1
+            while next < sorted.count,
+                  raysAreApproximatelyCollinear(
+                    from: pivot,
+                    through: referenceRayPoint,
+                    and: sorted[next],
+                    tolerance: collinearitySine
+                  ) {
+                if simd_distance_squared(pivot, sorted[next])
+                    >= simd_distance_squared(pivot, farthest) {
+                    farthest = sorted[next]
+                }
+                next += 1
+            }
+            polarPoints.append(farthest)
+            index = next
+        }
+        guard polarPoints.count >= 2 else {
+            return []
+        }
+
+        var stack = [pivot, polarPoints[0], polarPoints[1]]
+        for point in polarPoints.dropFirst(2) {
+            while stack.count >= 2,
+                  turnSine(stack[stack.count - 2], stack[stack.count - 1], point)
+                    <= collinearitySine {
+                stack.removeLast()
+            }
+            stack.append(point)
+        }
+        return stack.count >= 3 ? stack : []
+    }
+
+    /// Algorithm 2: evaluate every pair of hull points as a candidate yaw.
+    private static func bestDirection(
+        hull: [SIMD2<Float>],
+        points: [SIMD2<Float>],
+        minimumEdgeDistance: Float
+    ) -> SIMD2<Float>? {
+        var bestAxis: SIMD2<Float>?
+        var bestScore = -Float.greatestFiniteMagnitude
+        for firstIndex in 0..<(hull.count - 1) {
+            if Task.isCancelled {
+                return nil
+            }
+            for secondIndex in (firstIndex + 1)..<hull.count {
+                let delta = hull[secondIndex] - hull[firstIndex]
+                guard simd_length_squared(delta) > geometricEpsilon else {
+                    continue
+                }
+                let axis = simd_normalize(delta)
+                let score = closenessScore(
+                    points: points,
+                    axis: axis,
+                    minimumEdgeDistance: minimumEdgeDistance
+                )
+                if score > bestScore {
+                    bestScore = score
+                    bestAxis = axis
+                }
+            }
+        }
+        return bestAxis
+    }
+
+    /// Points-to-edges closeness from Zhang et al. Algorithm 4, the criterion
+    /// referenced by the supplied paper: choose the nearer boundary on each
+    /// axis by L2 norm, then sum the reciprocal nearest-edge distance.
+    private static func closenessScore(
+        points: [SIMD2<Float>],
+        axis: SIMD2<Float>,
+        minimumEdgeDistance: Float
+    ) -> Float {
+        let perpendicular = SIMD2<Float>(-axis.y, axis.x)
+        guard let firstPoint = points.first else {
+            return -Float.greatestFiniteMagnitude
+        }
+
+        var firstMinimum = simd_dot(firstPoint, axis)
+        var firstMaximum = firstMinimum
+        var secondMinimum = simd_dot(firstPoint, perpendicular)
+        var secondMaximum = secondMinimum
+        for point in points.dropFirst() {
+            let first = simd_dot(point, axis)
+            let second = simd_dot(point, perpendicular)
+            firstMinimum = min(firstMinimum, first)
+            firstMaximum = max(firstMaximum, first)
+            secondMinimum = min(secondMinimum, second)
+            secondMaximum = max(secondMaximum, second)
+        }
+
+        var firstMinimumNorm: Float = 0
+        var firstMaximumNorm: Float = 0
+        var secondMinimumNorm: Float = 0
+        var secondMaximumNorm: Float = 0
+        for point in points {
+            let first = simd_dot(point, axis)
+            let second = simd_dot(point, perpendicular)
+            firstMinimumNorm += (first - firstMinimum) * (first - firstMinimum)
+            firstMaximumNorm += (firstMaximum - first) * (firstMaximum - first)
+            secondMinimumNorm += (second - secondMinimum) * (second - secondMinimum)
+            secondMaximumNorm += (secondMaximum - second) * (secondMaximum - second)
+        }
+        let useFirstMaximum = firstMaximumNorm <= firstMinimumNorm
+        let useSecondMaximum = secondMaximumNorm <= secondMinimumNorm
+
+        var score: Float = 0
+        for point in points {
+            let first = simd_dot(point, axis)
+            let second = simd_dot(point, perpendicular)
+            let firstDistance = useFirstMaximum
+                ? firstMaximum - first
+                : first - firstMinimum
+            let secondDistance = useSecondMaximum
+                ? secondMaximum - second
+                : second - secondMinimum
+            score += 1 / max(
+                min(firstDistance, secondDistance),
+                minimumEdgeDistance
+            )
+        }
+        return score
+    }
+
+    private static func rectangleFit(
+        points: [SIMD2<Float>],
+        axis: SIMD2<Float>
+    ) -> RectangleFit? {
+        let perpendicular = SIMD2<Float>(-axis.y, axis.x)
+        let first = points.map { simd_dot($0, axis) }
+        let second = points.map { simd_dot($0, perpendicular) }
+        guard let firstMinimum = first.min(),
+              let firstMaximum = first.max(),
+              let secondMinimum = second.min(),
+              let secondMaximum = second.max() else {
+            return nil
+        }
+        return RectangleFit(
+            widthAxis: axis,
+            depthAxis: perpendicular,
+            widthMinimum: firstMinimum,
+            widthMaximum: firstMaximum,
+            depthMinimum: secondMinimum,
+            depthMaximum: secondMaximum
+        )
+    }
+
+    private static func turnSine(
+        _ first: SIMD2<Float>,
+        _ second: SIMD2<Float>,
+        _ third: SIMD2<Float>
+    ) -> Float {
+        let incoming = second - first
+        let outgoing = third - second
+        let denominator = simd_length(incoming) * simd_length(outgoing)
+        guard denominator > geometricEpsilon else {
+            return 0
+        }
+        return cross2D(incoming, outgoing) / denominator
+    }
+
+    private static func raysAreApproximatelyCollinear(
+        from pivot: SIMD2<Float>,
+        through first: SIMD2<Float>,
+        and second: SIMD2<Float>,
+        tolerance: Float
+    ) -> Bool {
+        let firstRay = first - pivot
+        let secondRay = second - pivot
+        let denominator = simd_length(firstRay) * simd_length(secondRay)
+        guard denominator > geometricEpsilon else {
+            return true
+        }
+        return simd_dot(firstRay, secondRay) > 0
+            && abs(cross2D(firstRay, secondRay) / denominator) <= tolerance
+    }
+
+    private static func cross2D(
+        _ first: SIMD2<Float>,
+        _ second: SIMD2<Float>
+    ) -> Float {
+        first.x * second.y - first.y * second.x
+    }
+
+    private static func makeCorners(
+        center: SIMD3<Float>,
+        dimensions: SIMD3<Float>,
+        widthAxis: SIMD3<Float>,
+        depthAxis: SIMD3<Float>,
+        upAxis: SIMD3<Float>
+    ) -> [SIMD3<Float>] {
+        let half = dimensions / 2
+        var corners: [SIMD3<Float>] = []
+        corners.reserveCapacity(8)
+        for heightIndex in 0...1 {
+            for depthIndex in 0...1 {
+                for widthIndex in 0...1 {
+                    let widthSign = Float(widthIndex) * 2 - 1
+                    let depthSign = Float(depthIndex) * 2 - 1
+                    let heightSign = Float(heightIndex) * 2 - 1
+                    corners.append(
+                        center
+                            + widthAxis * (widthSign * half.x)
+                            + depthAxis * (depthSign * half.y)
+                            + upAxis * (heightSign * half.z)
+                    )
+                }
+            }
+        }
+        return corners
     }
 }
