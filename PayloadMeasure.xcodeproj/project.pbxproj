@@ -37,12 +37,12 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				EdgeTAMSegmenter.swift,
-				Models/EdgeTAM/LICENSE,
-				Models/EdgeTAM/README.md,
 				Models/EdgeTAM/edgetam_image_encoder.mlpackage,
 				Models/EdgeTAM/edgetam_mask_decoder.mlpackage,
 				Models/EdgeTAM/edgetam_prompt_encoder.mlpackage,
+				Models/EdgeTAM/LICENSE,
 				Models/EdgeTAM/model_info.json,
+				Models/EdgeTAM/README.md,
 				PROJECT_CONTEXT.md,
 			);
 			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;

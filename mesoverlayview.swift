@@ -24,14 +24,25 @@ struct MesOverlayView: View {
     @State private var pendingWorkflowMode: MeasurementWorkflowMode?
     @State private var showsModeChangeConfirmation = false
     @State private var showsTrackingDetails = false
+    @State private var pendingDetailsObjectID: UUID?
+    @State private var lockFeedback = UINotificationFeedbackGenerator()
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
     }
 
+    /// Deliberately *not* keyed on the details sheet. Tearing the overlay down when the sheet
+    /// opens meant a full teardown and rebuild of this hierarchy — glass containers, mask layers,
+    /// aimer, every card — in the same frame that presents an alert and cold-starts the keyboard.
+    /// Measurement has already stopped by then, so the overlay costs almost nothing to leave up,
+    /// and leaving it up keeps that frame free.
+    private var showsLiveOverlay: Bool {
+        !sessionManager.isCoachingActive
+    }
+
     var body: some View {
         ZStack {
-            if !sessionManager.isCoachingActive {
+            if showsLiveOverlay {
                 objectMaskPreview
                 objectMaskMarkers
                 if !showsPanel {
@@ -40,7 +51,7 @@ struct MesOverlayView: View {
                 }
             }
 
-            if !sessionManager.isCoachingActive {
+            if showsLiveOverlay {
                 VStack {
                     GlassEffectContainer(spacing: 14) {
                         topHUD
@@ -53,11 +64,18 @@ struct MesOverlayView: View {
                 }
             }
 
-            if !sessionManager.isCoachingActive, !showsPanel {
+            if showsLiveOverlay, !showsPanel {
                 VStack {
                     Spacer()
 
                     VStack(alignment: .leading, spacing: 10) {
+                        bottomStatusCard
+                            .transition(
+                                .opacity.combined(
+                                    with: .move(edge: .bottom)
+                                )
+                            )
+
                         if showsSavedObjects,
                            !finalizedMeasuredObjectIDs.isEmpty {
                             savedObjectsPanel
@@ -92,6 +110,10 @@ struct MesOverlayView: View {
             .snappy(duration: 0.2),
             value: captureEngine.hasCompletedObjectRecognitionWarmup
         )
+        .animation(
+            .snappy(duration: 0.25),
+            value: sessionManager.isObjectTrackingEnvironmentReady
+        )
         .onChange(of: captureEngine.resetRevision) { _, _ in
             showsSavedObjects = false
         }
@@ -105,21 +127,22 @@ struct MesOverlayView: View {
                 showsSavedObjects = false
             }
         }
-        .onChange(of: captureEngine.pendingFinalizationObjectID) {
-            _, pendingObjectID in
-            guard let context = objectDetailsContext else {
-                return
-            }
-            if case .finalize(let id) = context,
-               pendingObjectID != id {
-                objectDetailsContext = nil
-                objectNameText = ""
-                weightText = ""
-            }
-        }
         .onChange(of: showsModeChangeConfirmation) { _, isPresented in
             if !isPresented {
                 pendingWorkflowMode = nil
+            }
+        }
+        .onChange(of: captureEngine.automaticLockRequestRevision) { _, _ in
+            presentAutomaticLockIfRequested()
+        }
+        .task(id: pendingDetailsObjectID) {
+            await presentPendingDetailsSheet()
+        }
+        .onChange(of: captureEngine.canFinalizeActiveObject) { _, canLock in
+            // Warm the Taptic Engine while a lock is merely possible, so the lock itself does not
+            // pay for it. Apple's guidance for the feedback generators is exactly this.
+            if canLock {
+                lockFeedback.prepare()
             }
         }
         .onAppear {
@@ -151,7 +174,7 @@ struct MesOverlayView: View {
                     || parsedWeightInKilograms == nil
             )
         } message: {
-            Text("Give this object a name and enter a weight greater than zero in kilograms.")
+            Text(objectDetailsMessage)
         }
         .confirmationDialog(
             removalConfirmationTitle,
@@ -219,8 +242,6 @@ struct MesOverlayView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
         } else {
             HStack(alignment: .top, spacing: 10) {
-                topStatusCard
-
                 Spacer(minLength: 8)
 
                 Button {
@@ -240,12 +261,18 @@ struct MesOverlayView: View {
         }
     }
 
+    private var isPreparingToMeasure: Bool {
+        !sessionManager.isObjectTrackingEnvironmentReady
+            || !captureEngine.hasCompletedObjectRecognitionWarmup
+    }
+
+    /// Every status card lives at the bottom, directly above the controls, at one size and in one
+    /// place. It used to sit top-left in a narrow chip while the buttons it refers to were at the
+    /// opposite corner, which made the operator's eye cross the screen on every glance.
     @ViewBuilder
-    private var topStatusCard: some View {
-        if !sessionManager.isObjectTrackingEnvironmentReady {
-            environmentReadinessBanner
-        } else if !captureEngine.hasCompletedObjectRecognitionWarmup {
-            objectRecognitionReadinessBanner
+    private var bottomStatusCard: some View {
+        if isPreparingToMeasure {
+            startupStatusBanner
         } else if workflowMode == .top {
             topCaptureGuide
         } else if isAutomaticCaptureSupported,
@@ -267,14 +294,9 @@ struct MesOverlayView: View {
                         green: marker.color.green,
                         blue: marker.color.blue
                     )
-                    let isPendingFinalization =
-                        captureEngine.pendingFinalizationObjectID == marker.id
                     let isActive = captureEngine.activeObjectID == marker.id
-                        && !isPendingFinalization
-                    let isLocked = isPendingFinalization
-                        || captureEngine.finalizedObjectIDs.contains(marker.id)
+                    let isLocked = captureEngine.finalizedObjectIDs.contains(marker.id)
                     let isMaskVisible = marker.isMaskVisible
-                        && !isPendingFinalization
                     ZStack {
                         Circle()
                             .fill(color.opacity(isMaskVisible ? 0.92 : 0.28))
@@ -310,85 +332,170 @@ struct MesOverlayView: View {
         }
     }
 
+    /// Three lines: the live dimensions with a view-coverage chip per face, the auto-lock bar,
+    /// and one line of guidance. This card sits over the camera the operator is aiming, so the
+    /// two face rows it used to spell out are folded into the header as chips — the check mark is
+    /// the whole message, and the words around it were costing four lines of the view.
     private var faceCaptureGuide: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 5) {
-                Image(systemName: "checkmark.circle.fill")
-                Text("Ready")
-                Text("·")
-                    .foregroundStyle(.secondary)
-                Text(captureEngine.measurementSatisfied
-                    ? "Measurement complete"
-                    : "Measuring selected object")
-                    .foregroundStyle(
-                        captureEngine.measurementSatisfied ? .green : .secondary
-                    )
-            }
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.green)
-            if captureEngine.primaryText != "--" {
-                Text(captureEngine.primaryText)
-                    .font(.system(.caption, design: .rounded).weight(.semibold))
+            HStack(spacing: 8) {
+                Text(captureEngine.primaryText == "--"
+                    ? "Measuring"
+                    : captureEngine.primaryText)
+                    .font(.system(.subheadline, design: .rounded).weight(.semibold))
                     .monospacedDigit()
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+
+                Spacer(minLength: 4)
+
+                faceCoverageChip(
+                    "arrow.down.to.line",
+                    isActive: captureEngine.scanViewHint == .topDown,
+                    isDone: captureEngine.footprintSatisfied
+                )
+                faceCoverageChip(
+                    "arrow.right.to.line",
+                    isActive: captureEngine.scanViewHint == .side,
+                    isDone: captureEngine.heightSatisfied
+                )
             }
-            faceGuideRow(
-                icon: "arrow.down.to.line",
-                label: "Top view",
-                detail: "width × length",
-                isActive: captureEngine.scanViewHint == .topDown,
-                isDone: captureEngine.footprintSatisfied
-            )
-            faceGuideRow(
-                icon: "arrow.right.to.line",
-                label: "Side view",
-                detail: "height",
-                isActive: captureEngine.scanViewHint == .side,
-                isDone: captureEngine.heightSatisfied
-            )
-            if captureEngine.measurementSatisfied {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.seal.fill")
-                        .foregroundStyle(.green)
-                    Text("All faces captured — lock it in")
-                        .font(.caption2.weight(.semibold))
-                }
-                .padding(.top, 2)
-            }
+
+            autoLockProgress
         }
-        .padding(10)
-        .frame(maxWidth: 220, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(faceCoverageAccessibilityLabel)
+    }
+
+    private func faceCoverageChip(
+        _ icon: String,
+        isActive: Bool,
+        isDone: Bool
+    ) -> some View {
+        Image(systemName: isDone ? "checkmark" : icon)
+            .font(.system(size: 12, weight: .bold))
+            .foregroundStyle(isDone ? .green : (isActive ? .yellow : .secondary))
+            .frame(width: 24, height: 20)
+            .background(
+                isDone
+                    ? Color.green.opacity(0.16)
+                    : (isActive ? Color.yellow.opacity(0.18) : Color.primary.opacity(0.06)),
+                in: Capsule()
+            )
+    }
+
+    private var faceCoverageAccessibilityLabel: String {
+        let top = captureEngine.footprintSatisfied ? "captured" : "still needed"
+        let side = captureEngine.heightSatisfied ? "captured" : "still needed"
+        return "\(captureEngine.primaryText). Top view \(top). Side view \(side)."
     }
 
     private var topCaptureGuide: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 Image(systemName: topGuideSystemImage)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(topGuideColor)
                 Text(topGuideHeadline)
-                    .font(.caption.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(topGuideColor)
-            }
-
-            if captureEngine.activeObjectID != nil,
-               captureEngine.primaryText != "--" {
-                Text(captureEngine.primaryText)
-                    .font(.system(.caption, design: .rounded).weight(.semibold))
-                    .monospacedDigit()
                     .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                if captureEngine.activeObjectID != nil,
+                   captureEngine.primaryText != "--" {
+                    Text(captureEngine.primaryText)
+                        .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
             }
 
-            Text(topGuideDetail)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if captureEngine.activeObjectID == nil {
+                Text(topGuideDetail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            autoLockProgress
         }
-        .padding(10)
-        .frame(maxWidth: 230, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
-        .accessibilityElement(children: .combine)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+    }
+
+    /// Progress toward the automatic lock. The value is the fraction of the stopping rule that is
+    /// satisfied, taken over its limiting condition, so it only reaches full when the measurement
+    /// really is about to lock — and the caption always names what is still holding it back.
+    /// The bar carries the state; the percentage rides on the caption line rather than taking a
+    /// header row of its own, and the icon and tint replace the words that used to label it.
+    @ViewBuilder
+    private var autoLockProgress: some View {
+        let convergence = captureEngine.convergence
+        if convergence.isActive {
+            let progress = min(max(convergence.progress, 0), 1)
+            let percent = Int((progress * 100).rounded())
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .tint(autoLockTint)
+
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: autoLockSystemImage)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(autoLockTint)
+                    Text(convergence.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Text("\(percent)%")
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(autoLockTint)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(autoLockHeadline). \(percent) percent.")
+            .accessibilityValue(convergence.detail)
+        }
+    }
+
+    private var autoLockHeadline: String {
+        if !captureEngine.isAutomaticLockEnabled {
+            return "Measurement quality"
+        }
+        if captureEngine.isAutomaticLockDisarmedForActiveObject {
+            return "Auto-lock dismissed"
+        }
+        return captureEngine.convergence.headline
+    }
+
+    private var autoLockSystemImage: String {
+        if !captureEngine.isAutomaticLockEnabled
+            || captureEngine.isAutomaticLockDisarmedForActiveObject {
+            return "lock.slash.fill"
+        }
+        return captureEngine.convergence.isConverged ? "lock.fill" : "hourglass"
+    }
+
+    private var autoLockTint: Color {
+        switch captureEngine.convergence.limitingFactor {
+        case .converged:
+            .green
+        case .waitingForSupportPlane, .needsTopView, .needsSideView:
+            .orange
+        default:
+            .yellow
+        }
     }
 
     private var topGuideColor: Color {
@@ -442,24 +549,24 @@ struct MesOverlayView: View {
     ) -> some View {
         HStack(spacing: 7) {
             Image(systemName: isDone ? "checkmark.circle.fill" : icon)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(isDone ? .green : (isActive ? .yellow : .secondary))
-                .frame(width: 20)
+                .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text(label)
-                    .font(.caption.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                 Text(detail)
-                    .font(.caption2)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 6)
             if isActive {
                 Text("capturing")
-                    .font(.caption2.weight(.bold))
+                    .font(.footnote.weight(.bold))
                     .foregroundStyle(.yellow)
             } else if isDone {
                 Text("saved")
-                    .font(.caption2.weight(.semibold))
+                    .font(.footnote.weight(.semibold))
                     .foregroundStyle(.green)
             }
         }
@@ -471,54 +578,62 @@ struct MesOverlayView: View {
         )
     }
 
-    private var environmentReadinessBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.red)
+    /// Startup state, shown at the bottom of the screen above the visibility controls. Two steps —
+    /// ARKit understanding the room, then object recognition warming up — so the wait reads as
+    /// progress rather than as one indefinite spinner.
+    private var startupStatusBanner: some View {
+        let isEnvironmentReady = sessionManager.isObjectTrackingEnvironmentReady
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(isEnvironmentReady
+                    ? "Preparing object recognition"
+                    : sessionManager.environmentReadiness.title)
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 0)
+            }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(sessionManager.environmentReadiness.title)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.red)
-                Text(sessionManager.environmentReadiness.detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Text(isEnvironmentReady
+                ? "Almost ready. Keep the payload area in view."
+                : sessionManager.environmentReadiness.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                startupStep(
+                    "Reading the room",
+                    isDone: isEnvironmentReady
+                )
+                startupStep(
+                    "Object recognition",
+                    isDone: captureEngine.hasCompletedObjectRecognitionWarmup
+                )
             }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 265, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 15))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
         .accessibilityElement(children: .combine)
     }
 
-    private var objectRecognitionReadinessBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.green)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Environment ready")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.green)
-                HStack(spacing: 5) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text("Preparing object recognition…")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
+    private func startupStep(_ title: String, isDone: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: isDone ? "checkmark.circle.fill" : "circle.dotted")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isDone ? .green : .secondary)
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(isDone ? .primary : .secondary)
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 8)
-        .frame(maxWidth: 265, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 15))
-        .accessibilityElement(children: .combine)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            isDone ? Color.green.opacity(0.14) : Color.primary.opacity(0.06),
+            in: Capsule()
+        )
     }
 
     @ViewBuilder
@@ -571,8 +686,7 @@ struct MesOverlayView: View {
 
     @ViewBuilder
     private var objectMaskPreview: some View {
-        if !captureEngine.isFinalizationPending,
-           let preview = captureEngine.objectMaskPreview {
+        if            let preview = captureEngine.objectMaskPreview {
             ZStack {
                 ForEach(preview.layers, id: \.id) { layer in
                     if let trackedObjectID = layer.trackedObjectID {
@@ -733,6 +847,20 @@ struct MesOverlayView: View {
 
                 Divider()
 
+                Toggle(isOn: automaticLockBinding) {
+                    Text("Lock automatically")
+                        .font(.caption.weight(.semibold))
+                }
+                .toggleStyle(.switch)
+                .accessibilityHint("Opens the name and weight sheet as soon as the measurement reaches its precision target.")
+
+                Text("Locks once every dimension holds to ±5 mm or 1% over its last 24 fits — a 95% confidence interval that tight, and no remaining drift. Each dimension must also have been seen from a viewpoint that can measure it, over a surface ARKit has confirmed.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
                 Text("Current step")
                     .font(.caption.weight(.semibold))
                 Text(scanStatusText)
@@ -781,7 +909,7 @@ struct MesOverlayView: View {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                     Text(scanStatusHeadline)
-                        .font(.caption2.weight(.semibold))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(.green)
 
                     if !sessionManager.isLiDARAvailable {
@@ -805,13 +933,14 @@ struct MesOverlayView: View {
                     .monospacedDigit()
                     .lineLimit(1)
                     .minimumScaleFactor(0.72)
+                    .foregroundStyle(.secondary)
             }
 
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .frame(maxWidth: 225, alignment: .leading)
-        .glassEffect(.regular, in: .rect(cornerRadius: 15))
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 
     private var scanStatusHeadline: String {
@@ -942,14 +1071,14 @@ struct MesOverlayView: View {
     @ViewBuilder
     private var objectWorkflowButton: some View {
         if captureEngine.activeObjectID != nil,
-           !captureEngine.isFinalizationPending {
+           true {
             Button {
                 guard sessionManager.isTrackingReady,
                       sessionManager.isObjectTrackingEnvironmentReady else {
                     return
                 }
                 showsSavedObjects = false
-                presentFinalizationDetailsEntry()
+                lockAndPresentDetails()
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.fill")
@@ -1242,7 +1371,7 @@ struct MesOverlayView: View {
                 }
                 switch context {
                 case .finalize(let id):
-                    return captureEngine.pendingFinalizationObjectID == id
+                    return captureEngine.finalizedObjectIDs.contains(id)
                 case .edit:
                     return true
                 }
@@ -1252,6 +1381,13 @@ struct MesOverlayView: View {
                     cancelObjectDetailsEntry()
                 }
             }
+        )
+    }
+
+    private var automaticLockBinding: Binding<Bool> {
+        Binding(
+            get: { captureEngine.isAutomaticLockEnabled },
+            set: { captureEngine.setAutomaticLockEnabled($0) }
         )
     }
 
@@ -1284,13 +1420,22 @@ struct MesOverlayView: View {
         objectNameText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// After a lock the measurement is already stored, so the sheet says so — dismissing it is a
+    /// choice to name the object later, not to lose it.
+    private var objectDetailsMessage: String {
+        guard case .finalize = objectDetailsContext else {
+            return "Give this object a name and a weight greater than zero in kilograms."
+        }
+        return "Measurement saved. Add a name and weight, or add them later from the saved list."
+    }
+
     private var objectDetailsTitle: String {
         guard let objectDetailsContext else {
             return "Object details"
         }
         switch objectDetailsContext {
         case .finalize:
-            return "Lock object"
+            return "Object locked"
         case .edit:
             return "Edit object"
         }
@@ -1303,13 +1448,51 @@ struct MesOverlayView: View {
         return "Remove Box \(boxNumber(for: id))?"
     }
 
-    private func presentFinalizationDetailsEntry() {
-        guard let id = captureEngine.beginFinalization() else {
+    /// The stopping rule fired. Takes exactly the path the Lock button takes.
+    private func presentAutomaticLockIfRequested() {
+        guard let id = captureEngine.automaticLockRequest,
+              captureEngine.activeObjectID == id,
+              objectDetailsContext == nil,
+              sessionManager.isTrackingReady,
+              sessionManager.isObjectTrackingEnvironmentReady else {
+            return
+        }
+        showsSavedObjects = false
+        showsPanel = false
+        lockAndPresentDetails()
+    }
+
+    /// Locks first, asks second. The measurement is committed the moment the operator taps Lock;
+    /// the sheet that follows only fills in the name and weight, so dismissing it — or taking a
+    /// minute over it — cannot cost the dimensions.
+    ///
+    /// The sheet is deliberately *not* presented in this same turn. Committing already runs the
+    /// plane snap, a RealityKit anchor rebind and the mask teardown; stacking an alert
+    /// presentation and a cold keyboard on top of that is what made the first lock stall long
+    /// enough for tracking to suffer. The lock is safe by the time this returns, so the sheet can
+    /// wait for a couple of frames.
+    private func lockAndPresentDetails() {
+        guard let id = captureEngine.lockActiveObject() else {
+            return
+        }
+        lockFeedback.notificationOccurred(.success)
+        pendingDetailsObjectID = id
+    }
+
+    private func presentPendingDetailsSheet() async {
+        guard let id = pendingDetailsObjectID else {
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(180))
+        guard !Task.isCancelled,
+              captureEngine.finalizedObjectIDs.contains(id) else {
+            pendingDetailsObjectID = nil
             return
         }
         objectNameText = captureEngine.name(for: id) ?? ""
         weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
         objectDetailsContext = .finalize(id)
+        pendingDetailsObjectID = nil
     }
 
     private func presentDetailsEditor(for id: UUID) {
@@ -1325,17 +1508,7 @@ struct MesOverlayView: View {
             return
         }
         switch objectDetailsContext {
-        case .finalize(let id):
-            guard captureEngine.activeObjectID == id,
-                  captureEngine.pendingFinalizationObjectID == id else {
-                cancelObjectDetailsEntry()
-                return
-            }
-            captureEngine.finalizeActiveObject(
-                name: trimmedObjectName,
-                weightInKilograms: weight
-            )
-        case .edit(let id):
+        case .finalize(let id), .edit(let id):
             captureEngine.updateDetails(
                 id: id,
                 name: trimmedObjectName,
@@ -1347,10 +1520,10 @@ struct MesOverlayView: View {
         weightText = ""
     }
 
+    /// Dismissing the sheet leaves the object locked under its default name with no weight yet.
+    /// The measurement was never at stake here — only its label — and the saved-objects list can
+    /// supply the rest later.
     private func cancelObjectDetailsEntry() {
-        if case .finalize? = objectDetailsContext {
-            captureEngine.cancelPendingFinalization()
-        }
         objectDetailsContext = nil
         objectNameText = ""
         weightText = ""

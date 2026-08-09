@@ -4,8 +4,6 @@ import Observation
 import simd
 
 enum ObjectWorkflowRequestKind: Sendable {
-    case pauseFinalization
-    case resumeFinalization
     case finalize
     case reactivate
     case remove
@@ -22,7 +20,6 @@ final class ObjectCaptureEngine {
     private(set) var measurementMode: MeasurementWorkflowMode = .spatial3D
     private(set) var capturedObjectsByID: [UUID: CapturedObject] = [:]
     private(set) var activeObjectID: UUID?
-    private(set) var pendingFinalizationObjectID: UUID?
     private(set) var finalizedObjectIDs: Set<UUID> = []
     private(set) var objectMaskPreview: ObjectMaskPreview?
     private(set) var lockedObjectMaskCount = 0
@@ -36,8 +33,10 @@ final class ObjectCaptureEngine {
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
     private(set) var showsSelectedPoints = true
-    private(set) var showsLiveMaskPreview = true
-    private(set) var showsSelectedObjectMaskPreview = true
+    // The segmentation overlay is diagnostic, not part of the measurement, and it covers the very
+    // surface the operator is judging. Off until the Mask control asks for it.
+    private(set) var showsLiveMaskPreview = false
+    private(set) var showsSelectedObjectMaskPreview = false
     private(set) var showsBoundingBoxes = true
     private(set) var showsObjectMaskMarkers = true
     private(set) var hasCompletedObjectRecognitionWarmup = false
@@ -74,6 +73,92 @@ final class ObjectCaptureEngine {
     /// A definitive ARKit plane currently covers the active object's footprint. A global plane
     /// elsewhere in the scene is not sufficient for committing a height measurement.
     private(set) var hasDefinitiveSupportPlaneForActiveObject = false
+
+    // MARK: - Automatic lock
+
+    /// Live state of the sequential stopping rule, for the on-screen progress bar.
+    private(set) var convergence: MeasurementConvergence = .idle
+    private(set) var isAutomaticLockEnabled = true
+    /// Set when the rule fires. The overlay watches the revision and opens the name/weight sheet,
+    /// so an automatic lock takes exactly the same path as tapping Lock by hand.
+    private(set) var automaticLockRequest: UUID?
+    private(set) var automaticLockRequestRevision = 0
+    private var convergenceMonitor = MeasurementConvergenceMonitor()
+    /// Objects the rule has already fired for. Auto-lock offers itself once per measurement, so
+    /// cancelling the sheet returns control to the operator instead of reopening it every fit.
+    private var automaticLockOfferedObjectIDs: Set<UUID> = []
+
+    var isAutomaticLockDisarmedForActiveObject: Bool {
+        guard isAutomaticLockEnabled, let activeObjectID else {
+            return false
+        }
+        return automaticLockOfferedObjectIDs.contains(activeObjectID)
+    }
+
+    func setAutomaticLockEnabled(_ isEnabled: Bool) {
+        guard isAutomaticLockEnabled != isEnabled else {
+            return
+        }
+        isAutomaticLockEnabled = isEnabled
+        if isEnabled, let activeObjectID {
+            automaticLockOfferedObjectIDs.remove(activeObjectID)
+        }
+        refreshConvergence()
+    }
+
+    private func resetConvergence() {
+        convergenceMonitor.reset()
+        if convergence != .idle {
+            convergence = .idle
+        }
+        automaticLockRequest = nil
+    }
+
+    /// One raw observation of one dimension, taken from a viewpoint that can actually measure it.
+    /// The coordinator reports these before its display deadband, so the stopping rule sees the
+    /// estimator's real fit-to-fit spread rather than the smoothed value shown on screen.
+    /// Recording does not re-evaluate. A fit reports two or three axes in a row, and the scan tick
+    /// refreshes afterwards anyway, so evaluating per axis was doing the same work three times.
+    func recordDimensionObservation(_ axis: MeasurementAxis, value: Float) {
+        guard activeObjectID != nil else {
+            return
+        }
+        convergenceMonitor.record(
+            axis,
+            value: value,
+            at: ProcessInfo.processInfo.systemUptime
+        )
+    }
+
+    func refreshConvergence() {
+        let isMeasuring = activeObjectID != nil
+        let coverage = MeasurementConvergenceMonitor.Coverage(
+            isMeasuring: isMeasuring,
+            hasSupportPlane: hasDefinitiveSupportPlaneForActiveObject,
+            reportsSideViewSeparately: measurementMode == .spatial3D
+        )
+        let updated = convergenceMonitor.evaluate(
+            coverage: coverage,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        if convergence != updated {
+            convergence = updated
+        }
+        requestAutomaticLockIfConverged()
+    }
+
+    private func requestAutomaticLockIfConverged() {
+        guard isAutomaticLockEnabled,
+              convergence.isConverged,
+              canFinalizeActiveObject,
+              let id = activeObjectID,
+              !automaticLockOfferedObjectIDs.contains(id) else {
+            return
+        }
+        automaticLockOfferedObjectIDs.insert(id)
+        automaticLockRequest = id
+        automaticLockRequestRevision += 1
+    }
 
     /// True once both the footprint and height have converged — the object is fully measured.
     var measurementSatisfied: Bool {
@@ -143,20 +228,14 @@ final class ObjectCaptureEngine {
     var canReset: Bool {
         !capturedObjectsByID.isEmpty
             || activeObjectID != nil
-            || pendingFinalizationObjectID != nil
             || !finalizedObjectIDs.isEmpty
             || isObjectSelectionPending
             || lockedObjectMaskCount > 0
     }
 
     var canFinalizeActiveObject: Bool {
-        pendingFinalizationObjectID == nil
-            && activeObjectID.flatMap { capturedObjectsByID[$0] } != nil
+        activeObjectID.flatMap { capturedObjectsByID[$0] } != nil
             && hasDefinitiveSupportPlaneForActiveObject
-    }
-
-    var isFinalizationPending: Bool {
-        pendingFinalizationObjectID != nil
     }
 
     var canReactivateFocusedObject: Bool {
@@ -197,9 +276,6 @@ final class ObjectCaptureEngine {
     }
 
     var statusHeadline: String {
-        if isFinalizationPending {
-            return "Measurement paused"
-        }
         if activeObjectID != nil {
             return "Measuring object"
         }
@@ -291,9 +367,6 @@ final class ObjectCaptureEngine {
     }
 
     func showObjectMaskPreview(_ preview: ObjectMaskPreview) {
-        guard pendingFinalizationObjectID == nil else {
-            return
-        }
         guard preview.timestamp >= latestObjectMaskPreviewTimestamp else {
             return
         }
@@ -349,9 +422,7 @@ final class ObjectCaptureEngine {
         cacheObjectMaskColors(from: retainedMarkers)
         objectMaskMarkers = stabilizedObjectMaskMarkers(retainedMarkers)
         let lostCount = lostObjectMaskCount
-        if isFinalizationPending {
-            objectMaskFeedbackText = "Measurement paused. Save to lock it, or Cancel to continue."
-        } else if isObjectSelectionPending {
+        if isObjectSelectionPending {
             objectMaskFeedbackText = "Selecting object…"
         } else if activeObjectID != nil {
             objectMaskFeedbackText = lostCount > 0
@@ -438,12 +509,12 @@ final class ObjectCaptureEngine {
 
     func beginObjectMeasurement(id: UUID) {
         guard isObjectSelectionPending,
-              pendingFinalizationObjectID == nil,
               !finalizedObjectIDs.contains(id),
               activeObjectID == nil || activeObjectID == id else {
             return
         }
         resetScanGuidance()
+        automaticLockOfferedObjectIDs.remove(id)
         hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
         focusedCaptureID = id
@@ -463,10 +534,19 @@ final class ObjectCaptureEngine {
         objectMaskFeedbackText = "This object is locked. Unlock it to continue measuring it."
     }
 
+    /// Commits the current measurement immediately and returns the locked object.
+    ///
+    /// Locking used to pause the measurement, open the name/weight sheet, and only commit when
+    /// the operator pressed Save. That left the transaction open for as long as someone took to
+    /// type: measurement was suspended while ARKit carried on refining, merging and re-cutting the
+    /// plane anchors the half-committed box was still bound to, and the geometry drifted out from
+    /// under it. The dimensions are what the lock is for, so they are frozen here, at the instant
+    /// the operator asked for it. Naming is metadata and happens afterwards, against an object
+    /// that is already safely stored.
     @discardableResult
-    func beginFinalization() -> UUID? {
-        guard pendingFinalizationObjectID == nil,
-              let id = activeObjectID else {
+    func lockActiveObject() -> UUID? {
+        guard let id = activeObjectID else {
+            objectMaskFeedbackText = "Select an object to measure before locking it."
             return nil
         }
         guard capturedObjectsByID[id] != nil else {
@@ -478,100 +558,28 @@ final class ObjectCaptureEngine {
             return nil
         }
 
-        pendingFinalizationObjectID = id
-        isObjectSelectionPending = false
-        clearTransientObjectMaskPreviews()
-        objectWorkflowRequest = ObjectWorkflowRequest(
-            id: id,
-            kind: .pauseFinalization
-        )
-        objectWorkflowRequestRevision += 1
-        statusText = "Measurement paused at the current dimensions."
-        objectMaskFeedbackText = "Save to lock it, or Cancel to continue measuring."
-        return id
-    }
-
-    /// Cancels a Lock that raced with an ARKit plane removal between the button tap and commit.
-    func rejectPendingFinalizationWithoutSupportPlane() {
-        guard let id = pendingFinalizationObjectID else {
-            return
-        }
-        pendingFinalizationObjectID = nil
-        hasDefinitiveSupportPlaneForActiveObject = false
-        guard activeObjectID == id,
-              capturedObjectsByID[id] != nil else {
-            return
-        }
-        objectWorkflowRequest = ObjectWorkflowRequest(
-            id: id,
-            kind: .resumeFinalization
-        )
-        objectWorkflowRequestRevision += 1
-        statusText = activeMeasurementPrompt
-        objectMaskFeedbackText = "Support moved. Scan the floor or table beneath the object, then lock again."
-    }
-
-    func cancelPendingFinalization() {
-        guard let id = pendingFinalizationObjectID else {
-            return
-        }
-        pendingFinalizationObjectID = nil
-        guard activeObjectID == id,
-              capturedObjectsByID[id] != nil else {
-            return
-        }
-        objectWorkflowRequest = ObjectWorkflowRequest(
-            id: id,
-            kind: .resumeFinalization
-        )
-        objectWorkflowRequestRevision += 1
-        statusText = activeMeasurementPrompt
-        objectMaskFeedbackText = "Measurement resumed. Lock it when the box is ready."
-    }
-
-    func finalizeActiveObject(
-        name: String,
-        weightInKilograms: Double
-    ) {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty else {
-            objectMaskFeedbackText = "Enter a name before locking this object."
-            return
-        }
-        guard weightInKilograms.isFinite,
-              weightInKilograms > 0 else {
-            objectMaskFeedbackText = "Enter a valid weight greater than zero before locking this object."
-            return
-        }
-        guard hasDefinitiveSupportPlaneForActiveObject else {
-            rejectPendingFinalizationWithoutSupportPlane()
-            return
-        }
-        guard let id = activeObjectID,
-              pendingFinalizationObjectID == id else {
-            objectMaskFeedbackText = "Select an object to measure before locking it."
-            return
-        }
-        guard capturedObjectsByID[id] != nil else {
-            objectMaskFeedbackText = "Keep measuring until the object has a LiDAR box, then lock it."
-            return
-        }
-        pendingFinalizationObjectID = nil
         activeObjectID = nil
         hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.insert(id)
         resetScanGuidance()
         hideObjectMask(id: id)
-        objectNamesByID[id] = trimmedName
-        objectWeightsInKilogramsByID[id] = weightInKilograms
+        clearTransientObjectMaskPreviews()
+        if objectNamesByID[id] == nil {
+            objectNamesByID[id] = defaultName(for: id)
+        }
         focusedCaptureID = id
         isObjectSelectionPending = false
         objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .finalize)
         objectWorkflowRequestRevision += 1
         statusText = finalizedObjectIDs.count == 1
-            ? "1 object locked. Select another object to measure."
-            : "\(finalizedObjectIDs.count) objects locked. Select another object to measure."
+            ? "1 object locked. Add its name and weight, or select another object."
+            : "\(finalizedObjectIDs.count) objects locked. Add details, or select another object."
         objectMaskFeedbackText = statusText
+        return id
+    }
+
+    private func defaultName(for id: UUID) -> String {
+        "Box \(objectNumber(for: id) ?? finalizedObjectIDs.count)"
     }
 
     func updateDetails(
@@ -617,6 +625,7 @@ final class ObjectCaptureEngine {
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
         objectMaskMarkers.removeAll(where: { $0.id == id })
         objectMaskMarkerMissCounts.removeValue(forKey: id)
+        automaticLockOfferedObjectIDs.remove(id)
         if focusedCaptureID == id {
             focusedCaptureID = activeObjectID ?? measuredObjectIDs.last
         }
@@ -638,8 +647,7 @@ final class ObjectCaptureEngine {
     }
 
     func reactivateFocusedObject() {
-        guard activeObjectID == nil,
-              pendingFinalizationObjectID == nil else {
+        guard activeObjectID == nil else {
             objectMaskFeedbackText = "Lock the object being measured before unlocking another."
             return
         }
@@ -655,6 +663,7 @@ final class ObjectCaptureEngine {
         }
         finalizedObjectIDs.remove(id)
         resetScanGuidance()
+        automaticLockOfferedObjectIDs.remove(id)
         hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
         isObjectSelectionPending = false
@@ -677,6 +686,7 @@ final class ObjectCaptureEngine {
         if self.heightSatisfied != heightSatisfied {
             self.heightSatisfied = heightSatisfied
         }
+        refreshConvergence()
     }
 
     func updateTopViewAlignment(
@@ -706,13 +716,15 @@ final class ObjectCaptureEngine {
         id: UUID,
         isAvailable: Bool
     ) {
-        guard activeObjectID == id,
-              pendingFinalizationObjectID == nil else {
+        guard activeObjectID == id else {
             return
         }
         if hasDefinitiveSupportPlaneForActiveObject != isAvailable {
             hasDefinitiveSupportPlaneForActiveObject = isAvailable
         }
+        // Called once per scan tick, which is also what drives the rule's evidence timeout.
+        // `refreshConvergence` diffs before publishing, so an unchanged state costs nothing.
+        refreshConvergence()
     }
 
     func resetScanGuidance() {
@@ -720,6 +732,7 @@ final class ObjectCaptureEngine {
         footprintSatisfied = false
         heightSatisfied = false
         topMeasurementStable = false
+        resetConvergence()
     }
 
     func clearObjectMaskPreview() {
@@ -818,8 +831,7 @@ final class ObjectCaptureEngine {
     }
 
     func updateCapture(id: UUID, object: CapturedObject) {
-        guard activeObjectID == id,
-              pendingFinalizationObjectID != id else {
+        guard activeObjectID == id else {
             return
         }
         if capturedObjectsByID[id] == nil {
@@ -850,7 +862,6 @@ final class ObjectCaptureEngine {
     func reset() {
         capturedObjectsByID.removeAll()
         activeObjectID = nil
-        pendingFinalizationObjectID = nil
         hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.removeAll()
         captureOrder.removeAll()
@@ -874,6 +885,7 @@ final class ObjectCaptureEngine {
         objectMaskToggleRequest = nil
         statusText = idleMeasurementPrompt
         hasCompletedObjectRecognitionWarmup = false
+        automaticLockOfferedObjectIDs.removeAll()
         resetScanGuidance()
         topViewDeviationDegrees = nil
         isTopViewAligned = false

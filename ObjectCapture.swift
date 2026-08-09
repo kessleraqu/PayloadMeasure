@@ -51,6 +51,69 @@ nonisolated struct SupportPlaneMatch: Sendable {
     let anchorTransform: simd_float4x4
 }
 
+/// The object's horizontal footprint in world space.
+///
+/// ARKit's depth cloud does not distinguish the payload from the surface it rests on, so every
+/// support estimate has to be told which part of the scene is the object. Without this, a
+/// top-down view mistakes the object's own top face — the densest, flattest horizontal cluster
+/// right under the seed — for its support.
+nonisolated struct SupportFootprint: Sendable {
+    let widthAxis: SIMD3<Float>
+    let depthAxis: SIMD3<Float>
+    let halfWidth: Float
+    let halfDepth: Float
+    let centerXZ: SIMD2<Float>
+
+    init(widthAxis: SIMD3<Float>, width: Float, depth: Float, centerXZ: SIMD2<Float>) {
+        var axis = SIMD3<Float>(widthAxis.x, 0, widthAxis.z)
+        if simd_length(axis) < 1e-4 {
+            axis = SIMD3<Float>(1, 0, 0)
+        }
+        axis = simd_normalize(axis)
+        self.widthAxis = axis
+        depthAxis = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), axis))
+        halfWidth = max(width, 0) / 2
+        halfDepth = max(depth, 0) / 2
+        self.centerXZ = centerXZ
+    }
+
+    /// Radius of the circle that always encloses the footprint, corners included.
+    var circumscribedRadius: Float {
+        (halfWidth * halfWidth + halfDepth * halfDepth).squareRoot()
+    }
+
+    func contains(x: Float, z: Float, margin: Float) -> Bool {
+        let relative = SIMD3<Float>(x - centerXZ.x, 0, z - centerXZ.y)
+        return abs(simd_dot(relative, widthAxis)) <= halfWidth + margin
+            && abs(simd_dot(relative, depthAxis)) <= halfDepth + margin
+    }
+
+    /// Points on the surrounding surface, just outside the object, ordered ring-first.
+    /// Used both to validate an `ARPlaneAnchor` and as raycast origins.
+    ///
+    /// `minimumDistance` keeps the ring clear of a small object whose own footprint is narrower
+    /// than the margin, without pushing it so far out that it leaves the supporting surface.
+    func perimeterPoints(
+        y: Float,
+        margin: Float,
+        minimumDistance: Float = 0.04
+    ) -> [SIMD3<Float>] {
+        let widthOffset = widthAxis * max(halfWidth + margin, minimumDistance)
+        let depthOffset = depthAxis * max(halfDepth + margin, minimumDistance)
+        let center = SIMD3<Float>(centerXZ.x, y, centerXZ.y)
+        return [
+            center + widthOffset,
+            center - widthOffset,
+            center + depthOffset,
+            center - depthOffset,
+            center + widthOffset + depthOffset,
+            center + widthOffset - depthOffset,
+            center - widthOffset + depthOffset,
+            center - widthOffset - depthOffset
+        ]
+    }
+}
+
 nonisolated enum ObjectCapturePipeline {
     static let voxelSize: Float = 0.005
     static let supportVoxelSize: Float = 0.02
@@ -65,13 +128,19 @@ nonisolated enum ObjectCapturePipeline {
     static let selectionTolerance: Float = voxelSize * 0.5
     static let maxObjectVoxels = 64_000
     private static let supportRadius: Float = 0.24
+    /// How far outside the object's footprint the surrounding surface starts, and how wide a
+    /// band of it to sample. The band has to clear the object even when its footprint fills the
+    /// old fixed 0.24 m disc, which is why the outer radius grows with the footprint.
+    static let supportExclusionMargin: Float = 0.025
+    private static let supportRingWidth: Float = 0.22
 
     static func capture(
         objectPoints: [AccumulatedDepthPoint],
         supportPoints: [SIMD3<Float>],
         seed: SIMD3<Float>,
         up: SIMD3<Float>,
-        supportHeight: Float? = nil
+        supportHeight: Float? = nil,
+        footprint: SupportFootprint? = nil
     ) -> CaptureOutcome {
         guard !Task.isCancelled,
               objectPoints.count >= minimumClusterPoints else {
@@ -79,7 +148,11 @@ nonisolated enum ObjectCapturePipeline {
         }
 
         guard let resolvedSupportHeight = supportHeight
-            ?? estimateSupportHeight(points: supportPoints, seed: seed) else {
+            ?? estimateSupportHeight(
+                points: supportPoints,
+                seed: seed,
+                footprint: footprint
+            ) else {
             return .noSupport
         }
 
@@ -131,7 +204,8 @@ nonisolated enum ObjectCapturePipeline {
         supportPoints: [SIMD3<Float>],
         seed: SIMD3<Float>,
         up: SIMD3<Float>,
-        supportHeight: Float? = nil
+        supportHeight: Float? = nil,
+        footprint: SupportFootprint? = nil
     ) -> CaptureOutcome {
         guard !Task.isCancelled,
               objectPoints.count >= minimumClusterPoints else {
@@ -139,7 +213,11 @@ nonisolated enum ObjectCapturePipeline {
         }
 
         guard let resolvedSupportHeight = supportHeight
-            ?? estimateSupportHeight(points: supportPoints, seed: seed) else {
+            ?? estimateSupportHeight(
+                points: supportPoints,
+                seed: seed,
+                footprint: footprint
+            ) else {
             return .noSupport
         }
 
@@ -271,14 +349,26 @@ nonisolated enum ObjectCapturePipeline {
     }
 
     /// Resolves one support candidate before fitting so the fitter and renderer use the same base.
-    /// ARKit's horizontal plane is preferred once available; the depth-cloud estimate keeps the
-    /// first measurement usable while plane detection is still warming up.
+    ///
+    /// Preference order matches how much ARKit itself vouches for each source:
+    /// 1. a validated `ARPlaneAnchor` — ARKit's tracked, definitive surface;
+    /// 2. a downward raycast, which Apple documents as intersecting the LiDAR scene mesh and
+    ///    estimated planes, so it produces a surface before any plane anchor is classified;
+    /// 3. the depth-cloud histogram, which only keeps the very first frames usable.
     static func resolvedSupportHeight(
         planeHeight: Float?,
+        raycastHeight: Float?,
         supportPoints: [SIMD3<Float>],
-        seed: SIMD3<Float>
+        seed: SIMD3<Float>,
+        footprint: SupportFootprint?
     ) -> Float? {
-        planeHeight ?? estimateSupportHeight(points: supportPoints, seed: seed)
+        planeHeight
+            ?? raycastHeight
+            ?? estimateSupportHeight(
+                points: supportPoints,
+                seed: seed,
+                footprint: footprint
+            )
     }
 
     private static func supportClassificationPriority(
@@ -298,16 +388,40 @@ nonisolated enum ObjectCapturePipeline {
         }
     }
 
-    private static func estimateSupportHeight(points: [SIMD3<Float>], seed: SIMD3<Float>) -> Float? {
-        let radiusSquared = supportRadius * supportRadius
+    private static func estimateSupportHeight(
+        points: [SIMD3<Float>],
+        seed: SIMD3<Float>,
+        footprint: SupportFootprint?
+    ) -> Float? {
+        // Sample a band that starts just outside the object and reaches far enough onto the
+        // surrounding surface to stay populated for a large payload. The support accumulator is
+        // fed by raw scene depth, so without this the object's own top face is in the sample.
+        let innerRadius = (footprint?.circumscribedRadius ?? 0) + supportExclusionMargin
+        let outerRadius = max(supportRadius, innerRadius + supportRingWidth)
+        let outerRadiusSquared = outerRadius * outerRadius
+        let innerRadiusSquared = innerRadius * innerRadius
+
         var nearbyHeights: [Float] = []
         for point in points {
             let deltaX = point.x - seed.x
             let deltaZ = point.z - seed.z
-            if deltaX * deltaX + deltaZ * deltaZ < radiusSquared,
-               point.y <= seed.y + 0.04 {
-                nearbyHeights.append(point.y)
+            let distanceSquared = deltaX * deltaX + deltaZ * deltaZ
+            guard distanceSquared < outerRadiusSquared,
+                  point.y <= seed.y + 0.04 else {
+                continue
             }
+            if let footprint {
+                if footprint.contains(
+                    x: point.x,
+                    z: point.z,
+                    margin: supportExclusionMargin
+                ) {
+                    continue
+                }
+            } else if distanceSquared < innerRadiusSquared {
+                continue
+            }
+            nearbyHeights.append(point.y)
         }
 
         guard nearbyHeights.count >= 20 else {
@@ -321,16 +435,22 @@ nonisolated enum ObjectCapturePipeline {
         for height in nearbyHeights {
             histogram[Int((height / binSize).rounded()), default: 0] += 1
         }
-        guard let strongestBin = histogram.max(by: { lhs, rhs in
-            if lhs.value == rhs.value {
-                return lhs.key < rhs.key
-            }
-            return lhs.value < rhs.value
-        })?.key else {
+        guard let strongestCount = histogram.values.max() else {
             return nil
         }
 
-        let centerHeight = Float(strongestBin) * binSize
+        // With the object excluded, the surface it rests on is the *closest* well-populated
+        // level below it — the table rather than the floor beyond the table edge. This matches
+        // how `supportPlaneMatch` breaks the same tie, so the plane and depth sources agree
+        // instead of the base jumping when ARKit finally publishes the plane anchor.
+        let minimumBinCount = max(12, Int(Float(strongestCount) * 0.35))
+        guard let supportBin = histogram.keys.filter({ key in
+            histogram[key, default: 0] >= minimumBinCount
+        }).max() else {
+            return nil
+        }
+
+        let centerHeight = Float(supportBin) * binSize
         var inliers = nearbyHeights.filter { abs($0 - centerHeight) <= binSize * 1.5 }
         guard inliers.count >= 12 else {
             return nil
@@ -387,6 +507,7 @@ actor ObjectCaptureFitter {
         supportPoints: [SIMD3<Float>],
         seed: SIMD3<Float>,
         supportHeight: Float?,
+        footprint: SupportFootprint?,
         mode: MeasurementWorkflowMode
     ) -> CaptureOutcome {
         switch mode {
@@ -396,7 +517,8 @@ actor ObjectCaptureFitter {
                 supportPoints: supportPoints,
                 seed: seed,
                 up: SIMD3<Float>(0, 1, 0),
-                supportHeight: supportHeight
+                supportHeight: supportHeight,
+                footprint: footprint
             )
         case .top:
             return ObjectCapturePipeline.captureTopView(
@@ -404,7 +526,8 @@ actor ObjectCaptureFitter {
                 supportPoints: supportPoints,
                 seed: seed,
                 up: SIMD3<Float>(0, 1, 0),
-                supportHeight: supportHeight
+                supportHeight: supportHeight,
+                footprint: footprint
             )
         }
     }
