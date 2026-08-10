@@ -225,6 +225,26 @@ batches before the first fit, avoiding a burst of first-box renderer allocation 
 ✅ The retained experimental EdgeTAM adapter and model packages are excluded from the app target so
 they remain available for future research without being compiled or shipped in the production app.
 
+✅ Payload arrangement is implemented in `Packing/`. After measuring, the operator opens Arrange
+payload from the saved-objects panel and gets a load-balanced placement for every measured package
+inside the 20 × 80 × 10 cm payload module: a to-scale plan and side elevation, the resulting centre
+of mass against its target, and a numbered loading order. See `Packing/PACKING_NOTES.md`.
+
+✅ The arrangement follows Kaluzny & Shaw (2009) with the project chapter's adaptations: axis-aligned
+three-dimensional orientations selected by the optimiser, the module height limit, a weighted
+three-axis centre-of-mass objective and envelope, and the empty module and airframe masses folded
+into the centre of mass of the complete connected aircraft. Position, orientation and every pairwise
+relative placement are decided simultaneously as one mixed-integer linear program; nothing is placed
+sequentially and nothing is repositioned afterwards. Two modules, the choice of module connection
+and stacking with load-bearing constraints remain outside the model.
+
+✅ The mixed-integer program is solved on the device by a self-contained exact solver — a
+bounded-variable primal and dual simplex with refactorisation and a Harris ratio test, driven by a
+warm-started depth-first branch and bound. No third-party solver is linked. A result is only called
+optimal when the search proved it; otherwise the arrangement is reported with its true optimality
+gap, and an independent geometric check re-derives containment, clearances and the centre of mass
+from the reported placement alone.
+
 ---
 
 # Long-Term Roadmap

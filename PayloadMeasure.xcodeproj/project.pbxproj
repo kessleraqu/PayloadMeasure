@@ -43,6 +43,7 @@
 				Models/EdgeTAM/LICENSE,
 				Models/EdgeTAM/model_info.json,
 				Models/EdgeTAM/README.md,
+				Packing/PACKING_NOTES.md,
 				PROJECT_CONTEXT.md,
 			);
 			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;

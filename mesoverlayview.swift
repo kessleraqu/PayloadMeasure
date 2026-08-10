@@ -26,6 +26,8 @@ struct MesOverlayView: View {
     @State private var showsTrackingDetails = false
     @State private var pendingDetailsObjectID: UUID?
     @State private var lockFeedback = UINotificationFeedbackGenerator()
+    @State private var packingStore = PackingStore()
+    @State private var showsArrangement = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -116,6 +118,7 @@ struct MesOverlayView: View {
         )
         .onChange(of: captureEngine.resetRevision) { _, _ in
             showsSavedObjects = false
+            packingStore.clear()
         }
         .onChange(of: finalizedMeasuredObjectIDs.count) { _, count in
             if count == 0 {
@@ -154,6 +157,12 @@ struct MesOverlayView: View {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showsArrangement) {
+            PackingArrangementView(
+                captureEngine: captureEngine,
+                store: packingStore
+            )
         }
         .alert(
             objectDetailsTitle,
@@ -1247,11 +1256,55 @@ struct MesOverlayView: View {
                     : .hidden
             )
             .frame(height: savedObjectsListHeight)
+
+            arrangePayloadButton
         }
         .padding(10)
         .frame(maxWidth: .infinity)
         .glassEffect(.regular, in: .rect(cornerRadius: 20))
         .accessibilityElement(children: .contain)
+    }
+
+    /// Entry point to the load-balanced arrangement. It lives in the saved-objects panel because
+    /// that is where the operator already is once every package has a name and a weight, and
+    /// keeping it out of the bottom action row leaves the live HUD uncluttered.
+    private var arrangePayloadButton: some View {
+        let missingWeights = packingStore.packagesMissingWeight(from: captureEngine).count
+        let isMeasuring = captureEngine.activeObjectID != nil
+
+        return VStack(alignment: .leading, spacing: 4) {
+            Button {
+                showsSavedObjects = false
+                showsArrangement = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.grid.3x3.square")
+                        .foregroundStyle(.cyan)
+                    Text("Arrange payload")
+                        .foregroundStyle(.primary)
+                }
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
+            .disabled(isMeasuring)
+            .opacity(isMeasuring ? 0.5 : 1)
+            .accessibilityLabel("Arrange the payload inside the module")
+            .accessibilityHint(
+                isMeasuring
+                    ? "Lock the object being measured first."
+                    : "Computes and shows where to place every measured package."
+            )
+
+            if missingWeights > 0 {
+                Text("\(missingWeights) object\(missingWeights == 1 ? " still needs" : "s still need") a weight before the load can be balanced.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
     }
 
     private func savedObjectRow(for id: UUID) -> some View {
