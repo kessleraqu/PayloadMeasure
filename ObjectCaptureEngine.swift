@@ -1,7 +1,14 @@
 
+import CoreGraphics
 import Foundation
 import Observation
 import simd
+
+nonisolated enum ObjectFramingGuidance: String, Sendable, Equatable, CaseIterable {
+    case moveCloser
+    case moveFarther
+    case okay
+}
 
 enum ObjectWorkflowRequestKind: Sendable {
     case finalize
@@ -9,14 +16,34 @@ enum ObjectWorkflowRequestKind: Sendable {
     case remove
 }
 
-struct ObjectWorkflowRequest: Sendable {
+struct ObjectWorkflowRequest: @unchecked Sendable {
     let id: UUID
     let kind: ObjectWorkflowRequestKind
+    /// Last known object box in normalized viewport coordinates. A finalize request carries this
+    /// value because locking intentionally clears all live mask state before the renderer reacts.
+    let snapshotViewportBoundingBox: CGRect?
+
+    init(
+        id: UUID,
+        kind: ObjectWorkflowRequestKind,
+        snapshotViewportBoundingBox: CGRect? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.snapshotViewportBoundingBox = snapshotViewportBoundingBox
+    }
 }
 
 @MainActor
 @Observable
 final class ObjectCaptureEngine {
+    private enum MeasurementDetailStatus {
+        case unknown
+        case needsCloser
+        case sufficient
+    }
+
+    private static let maximumSnapshotJPEGByteCount = 512_000
     private(set) var measurementMode: MeasurementWorkflowMode = .spatial3D
     private(set) var capturedObjectsByID: [UUID: CapturedObject] = [:]
     private(set) var activeObjectID: UUID?
@@ -48,6 +75,8 @@ final class ObjectCaptureEngine {
     private var objectColorsByID: [UUID: ObjectMaskDisplayColor] = [:]
     private var objectNamesByID: [UUID: String] = [:]
     private var objectWeightsInKilogramsByID: [UUID: Double] = [:]
+    /// Finalize thumbnails are session-only metadata. They are never written to Photos or disk.
+    private var snapshotJPEGDataByObjectID: [UUID: Data] = [:]
     private(set) var focusedCaptureID: UUID?
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
@@ -73,14 +102,18 @@ final class ObjectCaptureEngine {
     /// A definitive ARKit plane currently covers the active object's footprint. A global plane
     /// elsewhere in the scene is not sufficient for committing a height measurement.
     private(set) var hasDefinitiveSupportPlaneForActiveObject = false
+    /// Nil means there is no current, trustworthy viewport box for the active object.
+    private(set) var framingGuidance: ObjectFramingGuidance?
+    private var measurementDetailStatus: MeasurementDetailStatus = .unknown
+    private var didEncounterInsufficientFit = false
 
     // MARK: - Automatic lock
 
     /// Live state of the sequential stopping rule, for the on-screen progress bar.
     private(set) var convergence: MeasurementConvergence = .idle
     private(set) var isAutomaticLockEnabled = true
-    /// Set when the rule fires. The overlay watches the revision and opens the name/weight sheet,
-    /// so an automatic lock takes exactly the same path as tapping Lock by hand.
+    /// Set when the rule fires. The overlay watches the revision and takes the same finalize path
+    /// as a manual Lock.
     private(set) var automaticLockRequest: UUID?
     private(set) var automaticLockRequestRevision = 0
     private var convergenceMonitor = MeasurementConvergenceMonitor()
@@ -271,8 +304,38 @@ final class ObjectCaptureEngine {
         return objectWeightsInKilogramsByID[id]
     }
 
+    func weightInGrams(for id: UUID) -> Double? {
+        guard let kilograms = objectWeightsInKilogramsByID[id] else {
+            return nil
+        }
+        let grams = kilograms * 1_000
+        return grams.isFinite ? grams : nil
+    }
+
     func name(for id: UUID) -> String? {
         objectNamesByID[id]
+    }
+
+    func snapshotJPEGData(for id: UUID) -> Data? {
+        snapshotJPEGDataByObjectID[id]
+    }
+
+    func setSnapshotJPEGData(_ data: Data, for id: UUID) {
+        guard finalizedObjectIDs.contains(id),
+              capturedObjectsByID[id] != nil,
+              !data.isEmpty,
+              data.count <= Self.maximumSnapshotJPEGByteCount else {
+            return
+        }
+        snapshotJPEGDataByObjectID[id] = data
+    }
+
+    func clearSnapshotJPEGData(for id: UUID) {
+        snapshotJPEGDataByObjectID.removeValue(forKey: id)
+    }
+
+    func clearAllSnapshotJPEGData() {
+        snapshotJPEGDataByObjectID.removeAll()
     }
 
     var statusHeadline: String {
@@ -395,6 +458,7 @@ final class ObjectCaptureEngine {
             }
         }
         rebuildObjectMaskPreview(timestamp: preview.timestamp)
+        refreshFramingGuidance()
     }
 
     func updateObjectMaskDisplayBoundingBoxes(_ boundingBoxes: [UUID: CGRect]) {
@@ -403,6 +467,51 @@ final class ObjectCaptureEngine {
         }
         if objectMaskDisplayBoundingBoxes != activeBoundingBoxes {
             objectMaskDisplayBoundingBoxes = activeBoundingBoxes
+        }
+        refreshFramingGuidance()
+    }
+
+    /// Reports the actual stable LiDAR evidence available to the cuboid fitter. A screen-space
+    /// box alone can look large enough while a small object still covers too few depth voxels.
+    func updateActiveMeasurementDetail(
+        id: UUID,
+        stablePointCount: Int
+    ) {
+        guard activeObjectID == id else {
+            return
+        }
+        let hasPublishedMeasurement = capturedObjectsByID[id] != nil
+        let updated: MeasurementDetailStatus
+        if hasPublishedMeasurement {
+            updated = .sufficient
+        } else if didEncounterInsufficientFit {
+            // A raw point count cannot prove that those samples form the connected surface the
+            // fitter needs. After a real fit failure, keep the instruction honest until a fit
+            // actually succeeds; `updateCapture` clears this state.
+            updated = .needsCloser
+        } else {
+            updated = stablePointCount >= ObjectCapturePipeline.minimumClusterPoints
+                ? .sufficient
+                : .needsCloser
+        }
+        guard measurementDetailStatus != updated else {
+            return
+        }
+        measurementDetailStatus = updated
+        refreshFramingGuidance()
+    }
+
+    /// The fitter could not form its required connected surface. Keep asking for a closer view
+    /// until a real fit works; a raw point count alone cannot prove that the object is measurable.
+    func reportActiveMeasurementNeedsMoreDetail(id: UUID) {
+        guard activeObjectID == id,
+              capturedObjectsByID[id] == nil else {
+            return
+        }
+        didEncounterInsufficientFit = true
+        if measurementDetailStatus != .needsCloser {
+            measurementDetailStatus = .needsCloser
+            refreshFramingGuidance()
         }
     }
 
@@ -516,7 +625,10 @@ final class ObjectCaptureEngine {
         resetScanGuidance()
         automaticLockOfferedObjectIDs.remove(id)
         hasDefinitiveSupportPlaneForActiveObject = false
+        measurementDetailStatus = .unknown
+        didEncounterInsufficientFit = false
         activeObjectID = id
+        refreshFramingGuidance()
         focusedCaptureID = id
         isObjectSelectionPending = false
         statusText = activeMeasurementPrompt
@@ -558,28 +670,57 @@ final class ObjectCaptureEngine {
             return nil
         }
 
+        let snapshotViewportBoundingBox = objectMaskDisplayBoundingBoxes[id]
         activeObjectID = nil
         hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.insert(id)
         resetScanGuidance()
         hideObjectMask(id: id)
         clearTransientObjectMaskPreviews()
-        if objectNamesByID[id] == nil {
-            objectNamesByID[id] = defaultName(for: id)
-        }
         focusedCaptureID = id
         isObjectSelectionPending = false
-        objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .finalize)
+        objectWorkflowRequest = ObjectWorkflowRequest(
+            id: id,
+            kind: .finalize,
+            snapshotViewportBoundingBox: snapshotViewportBoundingBox
+        )
         objectWorkflowRequestRevision += 1
-        statusText = finalizedObjectIDs.count == 1
-            ? "1 object locked. Add its name and weight, or select another object."
-            : "\(finalizedObjectIDs.count) objects locked. Add details, or select another object."
+        statusText = "Measurement saved. Select the next object."
         objectMaskFeedbackText = statusText
         return id
     }
 
-    private func defaultName(for id: UUID) -> String {
-        "Box \(objectNumber(for: id) ?? finalizedObjectIDs.count)"
+    func updateName(id: UUID, name: String) {
+        guard finalizedObjectIDs.contains(id) else {
+            objectMaskFeedbackText = "Only a locked object can have its name updated."
+            return
+        }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            objectMaskFeedbackText = "Enter a name for this object."
+            return
+        }
+        objectNamesByID[id] = trimmedName
+        objectMaskFeedbackText = "Object name updated."
+    }
+
+    func updatePackedWeight(id: UUID, weightInGrams: Double) {
+        guard finalizedObjectIDs.contains(id) else {
+            objectMaskFeedbackText = "Only a locked object can have its weight updated."
+            return
+        }
+        guard weightInGrams.isFinite,
+              weightInGrams > 0 else {
+            objectMaskFeedbackText = "Enter a valid weight greater than zero."
+            return
+        }
+        let kilograms = weightInGrams / 1_000
+        guard kilograms.isFinite, kilograms > 0 else {
+            objectMaskFeedbackText = "Enter a valid weight greater than zero."
+            return
+        }
+        objectWeightsInKilogramsByID[id] = kilograms
+        objectMaskFeedbackText = "Packed weight updated."
     }
 
     func updateDetails(
@@ -619,6 +760,7 @@ final class ObjectCaptureEngine {
         captureOrder.removeAll(where: { $0 == id })
         objectNamesByID.removeValue(forKey: id)
         objectWeightsInKilogramsByID.removeValue(forKey: id)
+        clearSnapshotJPEGData(for: id)
         objectColorsByID.removeValue(forKey: id)
         lockedMaskLayersByID.removeValue(forKey: id)
         lockedMaskLayerOrder.removeAll(where: { $0 == id })
@@ -662,6 +804,7 @@ final class ObjectCaptureEngine {
             return
         }
         finalizedObjectIDs.remove(id)
+        clearSnapshotJPEGData(for: id)
         resetScanGuidance()
         automaticLockOfferedObjectIDs.remove(id)
         hasDefinitiveSupportPlaneForActiveObject = false
@@ -732,6 +875,9 @@ final class ObjectCaptureEngine {
         footprintSatisfied = false
         heightSatisfied = false
         topMeasurementStable = false
+        framingGuidance = nil
+        measurementDetailStatus = .unknown
+        didEncounterInsufficientFit = false
         resetConvergence()
     }
 
@@ -741,6 +887,7 @@ final class ObjectCaptureEngine {
         lockedMaskLayerOrder.removeAll()
         liveMaskLayer = nil
         objectMaskDisplayBoundingBoxes.removeAll()
+        framingGuidance = nil
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
 
@@ -750,6 +897,7 @@ final class ObjectCaptureEngine {
         }
         liveMaskLayer = nil
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
+        refreshFramingGuidance()
     }
 
     func clearTransientObjectMaskPreviews() {
@@ -763,10 +911,12 @@ final class ObjectCaptureEngine {
             objectMaskDisplayBoundingBoxes.removeValue(forKey: activeObjectID)
         }
         rebuildObjectMaskPreview(timestamp: latestObjectMaskPreviewTimestamp)
+        refreshFramingGuidance()
     }
 
     func clearObjectMaskDisplayTracking(id: UUID) {
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
+        refreshFramingGuidance()
     }
 
     private func hideObjectMask(
@@ -776,6 +926,7 @@ final class ObjectCaptureEngine {
         lockedMaskLayersByID.removeValue(forKey: id)
         lockedMaskLayerOrder.removeAll(where: { $0 == id })
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
+        refreshFramingGuidance()
         rebuildObjectMaskPreview(
             timestamp: timestamp ?? latestObjectMaskPreviewTimestamp
         )
@@ -789,6 +940,57 @@ final class ObjectCaptureEngine {
         objectMaskPreview = layers.isEmpty
             ? nil
             : ObjectMaskPreview(layers: layers, timestamp: timestamp)
+    }
+
+    static func framingGuidance(
+        forNormalizedViewportBoundingBox boundingBox: CGRect,
+        hasSufficientMeasurementDetail: Bool = true
+    ) -> ObjectFramingGuidance? {
+        guard boundingBox.origin.x.isFinite,
+              boundingBox.origin.y.isFinite,
+              boundingBox.width.isFinite,
+              boundingBox.height.isFinite,
+              boundingBox.width > 0,
+              boundingBox.height > 0 else {
+            return nil
+        }
+
+        let viewport = CGRect(x: 0, y: 0, width: 1, height: 1)
+        guard boundingBox.intersects(viewport) else {
+            return nil
+        }
+
+        let edgeMargin: CGFloat = 0.03
+        let isEdgeClipped = boundingBox.minX <= edgeMargin
+            || boundingBox.minY <= edgeMargin
+            || boundingBox.maxX >= 1 - edgeMargin
+            || boundingBox.maxY >= 1 - edgeMargin
+        let isTooLarge = boundingBox.width >= 0.85
+            || boundingBox.height >= 0.85
+        if isEdgeClipped || isTooLarge {
+            return .moveFarther
+        }
+
+        if max(boundingBox.width, boundingBox.height) < 0.28
+            || !hasSufficientMeasurementDetail {
+            return .moveCloser
+        }
+        return .okay
+    }
+
+    private func refreshFramingGuidance() {
+        let updatedGuidance = activeObjectID
+            .flatMap { objectMaskDisplayBoundingBoxes[$0] }
+            .flatMap {
+                Self.framingGuidance(
+                    forNormalizedViewportBoundingBox: $0,
+                    hasSufficientMeasurementDetail:
+                        measurementDetailStatus == .sufficient
+                )
+            }
+        if framingGuidance != updatedGuidance {
+            framingGuidance = updatedGuidance
+        }
     }
 
     private func stabilizedObjectMaskMarkers(
@@ -838,6 +1040,9 @@ final class ObjectCaptureEngine {
             captureOrder.append(id)
         }
         capturedObjectsByID[id] = object
+        measurementDetailStatus = .sufficient
+        didEncounterInsufficientFit = false
+        refreshFramingGuidance()
         focusedCaptureID = id
         statusText = measurementMode == .top
             ? "Overhead LiDAR fit ready. Hold steady or lock this object."
@@ -868,6 +1073,7 @@ final class ObjectCaptureEngine {
         objectColorsByID.removeAll()
         objectNamesByID.removeAll()
         objectWeightsInKilogramsByID.removeAll()
+        clearAllSnapshotJPEGData()
         focusedCaptureID = nil
         isObjectSelectionPending = false
         objectWorkflowRequest = nil

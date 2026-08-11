@@ -150,12 +150,15 @@ struct ARCameraView: UIViewRepresentable {
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
         fileprivate static let captureBoxEdgeThickness: Float = 0.003
         fileprivate static let captureBoxDashTargetPeriod: Float = 0.018
-        fileprivate static let captureBoxMaximumDashCount = 24
+        nonisolated fileprivate static let captureBoxMaximumDashCount = 24
         /// Total dash segments a single box may draw, shared across its dashed edges. Keeps the
         /// entity count near the prepared pool so a box never has to build a few hundred entities
         /// in one main-thread pass.
         fileprivate static let captureBoxDashBudget = 60
         fileprivate static let preparedCaptureBoxEntityCount = 48
+        private static let finalizeThumbnailMaximumDimension: CGFloat = 512
+        private static let finalizeThumbnailFallbackMaximumDimension: CGFloat = 320
+        private static let finalizeThumbnailMaximumByteCount = 512_000
         // Keep mask cleanup time-sliced so a Lock tap never waits behind a
         // multi-thousand-point projection pass on the main actor.
         fileprivate static let automaticPointCleanupBatchSize = 512
@@ -757,6 +760,14 @@ struct ARCameraView: UIViewRepresentable {
 
             switch request.kind {
             case .finalize:
+                if let arView {
+                    captureFinalizeThumbnail(
+                        for: request.id,
+                        normalizedViewportBoundingBox:
+                            request.snapshotViewportBoundingBox,
+                        in: arView
+                    )
+                }
                 // The commit that used to happen when the operator pressed Save. Best effort now:
                 // the engine has already locked the dimensions, so a plane that slipped away in
                 // the same frame leaves the box on its last good geometry rather than throwing
@@ -819,6 +830,152 @@ struct ARCameraView: UIViewRepresentable {
                 clearCaptureContent(for: request.id)
             }
             updateSelectionVisualization()
+        }
+
+        /// Captures RealityKit's current camera view in memory. The normalized mask box is in the
+        /// same viewport coordinate system as the snapshot; if it is missing or invalid, the full
+        /// view is retained rather than attempting an unsafe crop.
+        private func captureFinalizeThumbnail(
+            for id: UUID,
+            normalizedViewportBoundingBox: CGRect?,
+            in arView: ARView
+        ) {
+            arView.snapshot(saveToHDR: false) { [weak self, weak arView] image in
+                guard let self, let arView, let image else {
+                    return
+                }
+                Task { @MainActor [weak self, weak arView] in
+                    guard let self,
+                          let arView,
+                          self.arView === arView,
+                          self.captureEngine.finalizedObjectIDs.contains(id),
+                          let data = Self.thumbnailJPEGData(
+                              from: image,
+                              normalizedViewportBoundingBox:
+                                  normalizedViewportBoundingBox
+                          ) else {
+                        return
+                    }
+                    self.captureEngine.setSnapshotJPEGData(data, for: id)
+                }
+            }
+        }
+
+        private static func thumbnailJPEGData(
+            from image: UIImage,
+            normalizedViewportBoundingBox: CGRect?
+        ) -> Data? {
+            guard image.size.width.isFinite,
+                  image.size.height.isFinite,
+                  image.size.width > 0,
+                  image.size.height > 0 else {
+                return nil
+            }
+
+            let normalizedCrop = safeNormalizedThumbnailCrop(
+                normalizedViewportBoundingBox
+            )
+            guard let primary = renderedThumbnail(
+                from: image,
+                normalizedCrop: normalizedCrop,
+                maximumDimension: finalizeThumbnailMaximumDimension
+            ) else {
+                return nil
+            }
+            for quality in [0.72, 0.58, 0.44] {
+                if let data = primary.jpegData(compressionQuality: quality),
+                   data.count <= finalizeThumbnailMaximumByteCount {
+                    return data
+                }
+            }
+
+            // Camera noise can make a small JPEG unexpectedly large. A second, smaller render
+            // provides a deterministic memory ceiling without truncating or corrupting the JPEG.
+            guard let fallback = renderedThumbnail(
+                from: image,
+                normalizedCrop: normalizedCrop,
+                maximumDimension: finalizeThumbnailFallbackMaximumDimension
+            ),
+            let data = fallback.jpegData(compressionQuality: 0.4),
+            data.count <= finalizeThumbnailMaximumByteCount else {
+                return nil
+            }
+            return data
+        }
+
+        private static func safeNormalizedThumbnailCrop(
+            _ boundingBox: CGRect?
+        ) -> CGRect {
+            let fullViewport = CGRect(x: 0, y: 0, width: 1, height: 1)
+            guard let boundingBox,
+                  boundingBox.origin.x.isFinite,
+                  boundingBox.origin.y.isFinite,
+                  boundingBox.width.isFinite,
+                  boundingBox.height.isFinite,
+                  boundingBox.width >= 0.01,
+                  boundingBox.height >= 0.01,
+                  boundingBox.intersects(fullViewport) else {
+                return fullViewport
+            }
+
+            // Keep enough surroundings for the operator to recognise the object later. The old
+            // 12% crop filled the card with a fragment of small objects and felt over-zoomed.
+            let horizontalPadding = max(boundingBox.width * 0.4, 0.06)
+            let verticalPadding = max(boundingBox.height * 0.4, 0.06)
+            let padded = boundingBox.insetBy(
+                dx: -horizontalPadding,
+                dy: -verticalPadding
+            ).intersection(fullViewport)
+            guard !padded.isNull,
+                  padded.width >= 0.01,
+                  padded.height >= 0.01 else {
+                return fullViewport
+            }
+            return padded
+        }
+
+        private static func renderedThumbnail(
+            from image: UIImage,
+            normalizedCrop: CGRect,
+            maximumDimension: CGFloat
+        ) -> UIImage? {
+            let sourceCrop = CGRect(
+                x: normalizedCrop.minX * image.size.width,
+                y: normalizedCrop.minY * image.size.height,
+                width: normalizedCrop.width * image.size.width,
+                height: normalizedCrop.height * image.size.height
+            )
+            guard sourceCrop.width.isFinite,
+                  sourceCrop.height.isFinite,
+                  sourceCrop.width > 0,
+                  sourceCrop.height > 0 else {
+                return nil
+            }
+
+            let scale = min(
+                maximumDimension / max(sourceCrop.width, sourceCrop.height),
+                1
+            )
+            let outputSize = CGSize(
+                width: max(floor(sourceCrop.width * scale), 1),
+                height: max(floor(sourceCrop.height * scale), 1)
+            )
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(size: outputSize, format: format)
+            return renderer.image { context in
+                UIColor.black.setFill()
+                context.fill(CGRect(origin: .zero, size: outputSize))
+                image.draw(
+                    in: CGRect(
+                        x: -sourceCrop.minX * scale,
+                        y: -sourceCrop.minY * scale,
+                        width: image.size.width * scale,
+                        height: image.size.height * scale
+                    )
+                )
+            }
         }
 
         /// Lock is the commit boundary: resolve the latest geometry for the retained support plane,
@@ -1405,6 +1562,11 @@ struct ARCameraView: UIViewRepresentable {
                             cloud.timestamp
                         )
                     }
+                    self.captureEngine.updateActiveMeasurementDetail(
+                        id: cloud.id,
+                        stablePointCount: self.maskedAccumulators[cloud.id]?
+                            .stablePointCount ?? 0
+                    )
                 }
                 for marker in result.markers {
                     self.objectMaskColorsByID[marker.id] = marker.color
@@ -2475,6 +2637,10 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
             let objectPoints = objectAccumulator.stablePointsSnapshot()
+            captureEngine.updateActiveMeasurementDetail(
+                id: id,
+                stablePointCount: objectPoints.count
+            )
             guard !objectPoints.isEmpty else {
                 return
             }
@@ -2515,6 +2681,7 @@ struct ARCameraView: UIViewRepresentable {
                 }
                 guard case .success(let result) = outcome else {
                     if case .notEnoughMesh = outcome {
+                        self.captureEngine.reportActiveMeasurementNeedsMoreDetail(id: id)
                         self.fittedMaskedPointTimestamp[id] = maskTimestamp
                         self.fittedSupportHeightByObject[id] = resolvedSupportHeight
                     }

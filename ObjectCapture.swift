@@ -780,6 +780,12 @@ nonisolated struct PointAccumulator: Sendable {
         return samples.count >= maxVoxels
     }
 
+    /// Stable 5 mm voxels currently available to the object fitter. Exposing the count avoids
+    /// copying the complete point array merely to decide whether the camera needs to move closer.
+    var stablePointCount: Int {
+        stablePoints.count
+    }
+
     @discardableResult
     mutating func add(
         _ points: [SIMD3<Float>],

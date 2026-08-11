@@ -15,6 +15,12 @@ struct PackingArrangementView: View {
     private var packages: [PackingItem] { store.packages(from: captureEngine) }
     private var baldiProblem: BaldiProblem { store.baldiProblem(from: captureEngine) }
     private var missingWeightIDs: [UUID] { store.packagesMissingWeight(from: captureEngine) }
+    private var excludedBecauseNoStockedBoxFitsIDs: [UUID] {
+        store.objectIDsExcludedBecauseNoStockedBoxFits(in: captureEngine)
+    }
+    private var missingPreparationIDs: [UUID] {
+        store.packagesMissingPreparation(from: captureEngine)
+    }
 
     var body: some View {
         NavigationStack {
@@ -22,11 +28,18 @@ struct PackingArrangementView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     approachPicker
 
-                    if packages.isEmpty {
+                    if captureEngine.measuredObjectIDs.isEmpty {
                         emptyCard
+                    } else if !missingPreparationIDs.isEmpty {
+                        preparationRequiredCard
+                    } else if packages.isEmpty {
+                        allPackagesExcludedCard
                     } else if store.isSolving {
                         solvingCard
                     } else {
+                        if !excludedBecauseNoStockedBoxFitsIDs.isEmpty {
+                            physicalExclusionCard
+                        }
                         switch store.approach {
                         case .loadBalanced:
                             if let result = store.result {
@@ -70,6 +83,15 @@ struct PackingArrangementView: View {
                 PackingSettingsView(store: store, packages: packages)
             }
             .task(id: solveTrigger) {
+                store.reconcilePreparationState(with: captureEngine)
+                guard missingPreparationIDs.isEmpty else {
+                    store.cancel()
+                    return
+                }
+                guard !packages.isEmpty else {
+                    store.cancel()
+                    return
+                }
                 switch store.approach {
                 case .loadBalanced:
                     if store.result == nil || store.isStale(for: packages) {
@@ -88,9 +110,17 @@ struct PackingArrangementView: View {
     /// Re-solves whenever the measured load, the chosen method, or any setting it depends on
     /// changes.
     private var solveTrigger: String {
+        guard missingPreparationIDs.isEmpty else {
+            return "preparation-required|" + missingPreparationIDs
+                .map(\.uuidString)
+                .sorted()
+                .joined(separator: ",")
+        }
         switch store.approach {
-        case .loadBalanced: "balance|" + store.signature(for: packages)
-        case .knapsack3D: "knapsack|" + store.baldiSignature(for: baldiProblem)
+        case .loadBalanced:
+            return "balance|" + store.signature(for: packages)
+        case .knapsack3D:
+            return "knapsack|" + store.baldiSignature(for: baldiProblem)
         }
     }
 
@@ -145,11 +175,57 @@ struct PackingArrangementView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label("Nothing to arrange yet", systemImage: "shippingbox")
                     .font(.headline)
-                Text("Measure and lock at least one object, then give it a weight.")
+                Text("Measure and lock at least one object first.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var preparationRequiredCard: some View {
+        card {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Finish preparing the packages", systemImage: "shippingbox")
+                    .font(.headline)
+                Text("Return to package preparation. Prepare each fitting object, or continue past an object that does not fit an available box.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var allPackagesExcludedCard: some View {
+        card {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Nothing submitted for loading", systemImage: "shippingbox.and.arrow.backward")
+                    .font(.headline)
+                Text("None of the measured objects fits an available outer box, so there is no loading plan to follow.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var physicalExclusionCard: some View {
+        card {
+            VStack(alignment: .leading, spacing: 6) {
+                Label("Left out — no fitting box", systemImage: "shippingbox.and.arrow.backward")
+                    .font(.headline)
+                Text("Not in this plan: \(physicalExclusionNames). These objects do not fit any available outer box.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var physicalExclusionNames: String {
+        excludedBecauseNoStockedBoxFitsIDs.map { id in
+            captureEngine.name(for: id)
+                ?? "Object \(captureEngine.objectNumber(for: id) ?? 0)"
+        }
+        .joined(separator: ", ")
     }
 
     @ViewBuilder

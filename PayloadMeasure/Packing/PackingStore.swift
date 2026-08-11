@@ -40,6 +40,14 @@ final class PackingStore {
     /// Which method to run. Both are kept so they can be compared on the same measurements.
     var approach: PackingApproach = .knapsack3D
     var baldiOptions = Baldi3BKPOptions()
+    /// The physical outer box selected for each measured object during preparation.
+    private(set) var selectedBoxPresetIDsByObjectID: [UUID: String] = [:]
+    /// Explicit operator decisions to exclude an object because no stocked outer box fits.
+    /// The recorded dimensions bind the decision to that measurement; remeasurement cannot
+    /// silently inherit an old exclusion.
+    private var noStockedBoxFitExclusionSizesByObjectID: [UUID: SIMD3<Double>] = [:]
+    /// Central stocked-box catalogue used by the preparation screen and both optimisers.
+    let boxPresets: [PackingBoxPreset] = PackingBoxPreset.standardCatalog
     /// The Paper-mode placement and the optional centre-refined placement for the same input.
     /// Publishing them together prevents the result screen from mixing generations.
     private(set) var baldiComparison: Baldi3BKPComparison?
@@ -87,19 +95,21 @@ final class PackingStore {
 
     // MARK: - Inputs
 
-    /// Builds the optimiser's package list from every locked measurement.
+    /// Builds optimiser input only from fully prepared packages. Raw measured geometry and a
+    /// placeholder mass are never submitted as a physical package.
     func packages(from engine: ObjectCaptureEngine) -> [PackingItem] {
         engine.measuredObjectIDs.compactMap { id in
-            guard let captured = engine.capturedObjectsByID[id] else { return nil }
+            guard preparationState(for: id, in: engine).isSubmittedToOptimizer,
+                  let preset = validSelectedBoxPreset(for: id, in: engine),
+                  let name = trimmedName(for: id, in: engine),
+                  let mass = validPackedMass(for: id, in: engine) else {
+                return nil
+            }
             return PackingItem(
                 id: id,
-                name: engine.name(for: id) ?? "Object \(engine.objectNumber(for: id) ?? 0)",
-                size: SIMD3(
-                    Double(captured.widthInMeters) * 1000,
-                    Double(captured.depthInMeters) * 1000,
-                    Double(captured.heightInMeters) * 1000
-                ),
-                massKilograms: engine.weightInKilograms(for: id) ?? 0,
+                name: name,
+                size: preset.outerSizeMillimetres,
+                massKilograms: mass,
                 horizontalClearance: defaultPackageClearance,
                 keepsUpright: uprightPackageIDs.contains(id)
             )
@@ -108,9 +118,9 @@ final class PackingStore {
 
     // MARK: - 3BKP inputs
 
-    /// Builds the 3BKP instance. The paper assumes integral knapsack and item sizes, so measured
-    /// millimetres are rounded: item sizes up and the knapsack down, so the discretisation can only
-    /// make the packing more conservative, never claim a fit that does not exist.
+    /// Builds the 3BKP instance. The paper assumes integral knapsack and item sizes, so physical
+    /// package millimetres are rounded: item sizes up and the knapsack down. The discretisation can
+    /// therefore only make packing more conservative, never claim a fit that does not exist.
     func knapsack() -> BaldiKnapsack {
         let size = SIMD3<Int>(
             Int(module.lengthMillimetres.rounded(.down)),
@@ -140,17 +150,23 @@ final class PackingStore {
 
     func baldiItems(from engine: ObjectCaptureEngine) -> [BaldiItem] {
         engine.measuredObjectIDs.compactMap { id in
-            guard let captured = engine.capturedObjectsByID[id] else { return nil }
+            guard preparationState(for: id, in: engine).isSubmittedToOptimizer,
+                  let preset = validSelectedBoxPreset(for: id, in: engine),
+                  let name = trimmedName(for: id, in: engine),
+                  let mass = validPackedMass(for: id, in: engine) else {
+                return nil
+            }
+            let packageSize = preset.outerSizeMillimetres
             let size = SIMD3<Int>(
-                Int((Double(captured.widthInMeters) * 1000).rounded(.up)),
-                Int((Double(captured.depthInMeters) * 1000).rounded(.up)),
-                Int((Double(captured.heightInMeters) * 1000).rounded(.up))
+                Int(packageSize.x.rounded(.up)),
+                Int(packageSize.y.rounded(.up)),
+                Int(packageSize.z.rounded(.up))
             )
             return BaldiItem(
                 id: id,
-                name: engine.name(for: id) ?? "Object \(engine.objectNumber(for: id) ?? 0)",
+                name: name,
                 size: size,
-                mass: engine.weightInKilograms(for: id) ?? 0
+                mass: mass
             )
         }
     }
@@ -161,7 +177,243 @@ final class PackingStore {
 
     /// Locked measurements that cannot be arranged yet because no weight has been entered.
     func packagesMissingWeight(from engine: ObjectCaptureEngine) -> [UUID] {
-        engine.measuredObjectIDs.filter { engine.weightInKilograms(for: $0) == nil }
+        engine.measuredObjectIDs.filter { id in
+            guard !isExcludedBecauseNoStockedBoxFits(id, in: engine) else {
+                return false
+            }
+            return validPackedMass(for: id, in: engine) == nil
+        }
+    }
+
+    /// Locked objects that have not either completed physical preparation or been explicitly
+    /// excluded because no stocked box fits.
+    func packagesMissingPreparation(from engine: ObjectCaptureEngine) -> [UUID] {
+        engine.measuredObjectIDs.filter {
+            !preparationState(for: $0, in: engine).isComplete
+        }
+    }
+
+    /// Central preparation decision used by the workflow, guards and optimiser bridges.
+    func preparationState(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> PackagePreparationState {
+        guard engine.measuredObjectIDs.contains(objectID),
+              engine.capturedObjectsByID[objectID] != nil else {
+            return .unavailable
+        }
+
+        let fittingPresets = fittingBoxPresets(for: objectID, in: engine)
+        if fittingPresets.isEmpty {
+            return isExcludedBecauseNoStockedBoxFits(objectID, in: engine)
+                ? .excludedBecauseNoStockedBoxFits
+                : .noStockedBoxFits
+        }
+        guard validSelectedBoxPreset(for: objectID, in: engine) != nil else {
+            return .needsFittingBox
+        }
+        guard trimmedName(for: objectID, in: engine) != nil else {
+            return .needsName
+        }
+        guard validPackedMass(for: objectID, in: engine) != nil else {
+            return .needsPackedWeight
+        }
+        return .ready
+    }
+
+    /// Marks a locked object as excluded from loading only when no stocked box fits its current
+    /// measurement. This happens before either optimiser sees the package.
+    @discardableResult
+    func markExcludedBecauseNoStockedBoxFits(
+        _ objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> Bool {
+        guard engine.measuredObjectIDs.contains(objectID),
+              let captured = engine.capturedObjectsByID[objectID],
+              fittingBoxPresets(for: objectID, in: engine).isEmpty else {
+            return false
+        }
+
+        selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+        noStockedBoxFitExclusionSizesByObjectID[objectID] = measuredSizeMillimetres(captured)
+        invalidateResults()
+        return true
+    }
+
+    func clearNoStockedBoxFitExclusion(for objectID: UUID) {
+        guard noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID) != nil else {
+            return
+        }
+        invalidateResults()
+    }
+
+    func isExcludedBecauseNoStockedBoxFits(
+        _ objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> Bool {
+        guard let excludedSize = noStockedBoxFitExclusionSizesByObjectID[objectID],
+              engine.measuredObjectIDs.contains(objectID),
+              let captured = engine.capturedObjectsByID[objectID],
+              measuredSizeMillimetres(captured) == excludedSize else {
+            return false
+        }
+        return fittingBoxPresets(for: objectID, in: engine).isEmpty
+    }
+
+    /// Valid no-fit exclusions, in the same stable order as the captured measurements.
+    func objectIDsExcludedBecauseNoStockedBoxFits(
+        in engine: ObjectCaptureEngine
+    ) -> [UUID] {
+        engine.measuredObjectIDs.filter {
+            isExcludedBecauseNoStockedBoxFits($0, in: engine)
+        }
+    }
+
+    func selectedBoxPreset(for objectID: UUID) -> PackingBoxPreset? {
+        guard let presetID = selectedBoxPresetIDsByObjectID[objectID] else {
+            return nil
+        }
+        return boxPresets.first(where: { $0.id == presetID })
+    }
+
+    func fittingBoxPresets(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> [PackingBoxPreset] {
+        guard let captured = engine.capturedObjectsByID[objectID] else {
+            return []
+        }
+        return PackingBoxCatalog.fittingPresets(
+            for: measuredSizeMillimetres(captured),
+            in: boxPresets
+        )
+    }
+
+    func recommendedBoxPreset(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> PackingBoxPreset? {
+        fittingBoxPresets(for: objectID, in: engine).first
+    }
+
+    private func validSelectedBoxPreset(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> PackingBoxPreset? {
+        guard let selected = selectedBoxPreset(for: objectID),
+              fittingBoxPresets(for: objectID, in: engine).contains(where: {
+                  $0.id == selected.id
+              }) else {
+            return nil
+        }
+        return selected
+    }
+
+    /// Records a stocked box only if that box exists and the measured object can fit inside it.
+    @discardableResult
+    func selectBoxPreset(
+        id presetID: String,
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> Bool {
+        guard let preset = boxPresets.first(where: { $0.id == presetID }),
+              engine.measuredObjectIDs.contains(objectID),
+              fittingBoxPresets(for: objectID, in: engine).contains(where: {
+                  $0.id == preset.id
+              }) else {
+            return false
+        }
+        noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID)
+        selectedBoxPresetIDsByObjectID[objectID] = preset.id
+        invalidateResults()
+        return true
+    }
+
+    func clearBoxPreset(for objectID: UUID) {
+        guard selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID) != nil else {
+            return
+        }
+        invalidateResults()
+    }
+
+    /// Clears every package-specific store value when a measured object is removed.
+    func clearPreparation(for objectID: UUID) {
+        let removedPreset = selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID) != nil
+        let removedExclusion = noStockedBoxFitExclusionSizesByObjectID
+            .removeValue(forKey: objectID) != nil
+        let removedUprightPreference = uprightPackageIDs.remove(objectID) != nil
+        guard removedPreset || removedExclusion || removedUprightPreference else {
+            return
+        }
+        invalidateResults()
+    }
+
+    /// Removes stale package-specific state after deletion or remeasurement. In particular, a
+    /// no-fit exclusion never survives a changed measurement, even if the object is still large.
+    func reconcilePreparationState(with engine: ObjectCaptureEngine) {
+        let measuredIDs = Set(engine.measuredObjectIDs)
+        var changed = false
+
+        for objectID in Array(noStockedBoxFitExclusionSizesByObjectID.keys) {
+            guard let captured = engine.capturedObjectsByID[objectID],
+                  measuredIDs.contains(objectID),
+                  noStockedBoxFitExclusionSizesByObjectID[objectID]
+                    == measuredSizeMillimetres(captured),
+                  fittingBoxPresets(for: objectID, in: engine).isEmpty else {
+                noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID)
+                changed = true
+                continue
+            }
+        }
+
+        for objectID in Array(selectedBoxPresetIDsByObjectID.keys)
+        where !measuredIDs.contains(objectID)
+            || validSelectedBoxPreset(for: objectID, in: engine) == nil {
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+            changed = true
+        }
+
+        let staleUprightIDs = uprightPackageIDs.subtracting(measuredIDs)
+        if !staleUprightIDs.isEmpty {
+            uprightPackageIDs.subtract(staleUprightIDs)
+            changed = true
+        }
+
+        if changed {
+            invalidateResults()
+        }
+    }
+
+    private func measuredSizeMillimetres(_ captured: CapturedObject) -> SIMD3<Double> {
+        SIMD3(
+            Double(captured.widthInMeters) * 1000,
+            Double(captured.depthInMeters) * 1000,
+            Double(captured.heightInMeters) * 1000
+        )
+    }
+
+    private func trimmedName(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> String? {
+        guard let name = engine.name(for: objectID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            return nil
+        }
+        return name
+    }
+
+    private func validPackedMass(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> Double? {
+        guard let mass = engine.weightInKilograms(for: objectID),
+              mass.isFinite,
+              mass > 0 else {
+            return nil
+        }
+        return mass
     }
 
     func colour(for id: UUID, in engine: ObjectCaptureEngine) -> Color {
@@ -283,6 +535,16 @@ final class PackingStore {
     }
 
     func clear() {
+        cancel()
+        result = nil
+        baldiComparison = nil
+        solvedSignature = nil
+        selectedBoxPresetIDsByObjectID.removeAll()
+        noStockedBoxFitExclusionSizesByObjectID.removeAll()
+        uprightPackageIDs.removeAll()
+    }
+
+    private func invalidateResults() {
         cancel()
         result = nil
         baldiComparison = nil

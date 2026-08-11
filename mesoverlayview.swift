@@ -18,7 +18,6 @@ struct MesOverlayView: View {
     @State private var showsLiDARLimitations = false
     @State private var objectDetailsContext: ObjectDetailsContext?
     @State private var objectNameText = ""
-    @State private var weightText = ""
     @State private var pendingRemovalObjectID: UUID?
     @State private var showsResetConfirmation = false
     @State private var showsSavedObjects = false
@@ -28,7 +27,7 @@ struct MesOverlayView: View {
     @State private var pendingDetailsObjectID: UUID?
     @State private var lockFeedback = UINotificationFeedbackGenerator()
     @State private var packingStore = PackingStore()
-    @State private var showsArrangement = false
+    @State private var showsPackingWorkflow = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -153,16 +152,19 @@ struct MesOverlayView: View {
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
         }
-        .onChange(of: showsArrangement) { _, isPresented in
-            handleArrangementPresentationChange(isPresented)
+        .onChange(of: showsPackingWorkflow) { _, isPresented in
+            handlePackingWorkflowPresentationChange(isPresented)
         }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(isPresented: $showsArrangement) {
-            PackingArrangementView(
+        .fullScreenCover(
+            isPresented: $showsPackingWorkflow,
+            onDismiss: captureEngine.clearAllSnapshotJPEGData
+        ) {
+            PackingPreparationWorkflowView(
                 captureEngine: captureEngine,
                 store: packingStore
             )
@@ -173,18 +175,13 @@ struct MesOverlayView: View {
         ) {
             TextField("Object name", text: $objectNameText)
                 .textInputAutocapitalization(.words)
-            TextField("Weight in kg", text: $weightText)
-                .keyboardType(.decimalPad)
             Button("Cancel", role: .cancel) {
                 cancelObjectDetailsEntry()
             }
             Button("Save") {
                 saveObjectDetailsEntry()
             }
-            .disabled(
-                trimmedObjectName.isEmpty
-                    || parsedWeightInKilograms == nil
-            )
+            .disabled(trimmedObjectName.isEmpty)
         } message: {
             Text(objectDetailsMessage)
         }
@@ -195,6 +192,7 @@ struct MesOverlayView: View {
         ) {
             if let id = pendingRemovalObjectID {
                 Button(removalButtonTitle(for: id), role: .destructive) {
+                    packingStore.clearPreparation(for: id)
                     captureEngine.removeFinalizedObject(id: id)
                     if finalizedMeasuredObjectIDs.isEmpty {
                         showsSavedObjects = false
@@ -222,7 +220,7 @@ struct MesOverlayView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This clears the active object and every saved box, name, weight, point cloud and measurement.")
+            Text("This clears the active object and every saved name, outer-box choice, packed weight, point cloud and measurement.")
         }
         .confirmationDialog(
             "Switch measurement mode?",
@@ -258,7 +256,7 @@ struct MesOverlayView: View {
         sessionManager.setApplicationActive(phase == .active)
     }
 
-    private func handleArrangementPresentationChange(_ isPresented: Bool) {
+    private func handlePackingWorkflowPresentationChange(_ isPresented: Bool) {
         sessionManager.setPackingArrangementPresented(isPresented)
     }
 
@@ -321,36 +319,26 @@ struct MesOverlayView: View {
                         green: marker.color.green,
                         blue: marker.color.blue
                     )
-                    let isActive = captureEngine.activeObjectID == marker.id
-                    let isLocked = captureEngine.finalizedObjectIDs.contains(marker.id)
-                    let isMaskVisible = marker.isMaskVisible
                     ZStack {
                         Circle()
-                            .fill(color.opacity(isMaskVisible ? 0.92 : 0.28))
+                            .fill(color.opacity(0.9))
                         Circle()
-                            .stroke(color, style: StrokeStyle(
-                                lineWidth: isMaskVisible ? 2 : 3,
-                                dash: isMaskVisible ? [] : [4, 3]
-                            ))
-                        Image(systemName: isActive
-                            ? "viewfinder"
-                            : isLocked ? "lock.fill" : "location.fill"
-                        )
-                            .font(.system(
-                                size: isLocked ? 8 : 11,
-                                weight: .bold
-                            ))
-                            .foregroundStyle(.white)
+                            .stroke(.white.opacity(0.9), lineWidth: 2)
+                        Circle()
+                            .fill(.white)
+                            .frame(width: 6, height: 6)
                     }
-                    .frame(
-                        width: isMaskVisible ? 18 : 28,
-                        height: isMaskVisible ? 18 : 28
-                    )
+                    .frame(width: 24, height: 24)
                     .position(
                         x: marker.normalizedViewportPoint.x * proxy.size.width,
                         y: marker.normalizedViewportPoint.y * proxy.size.height
                     )
                     .shadow(color: color.opacity(0.65), radius: 5)
+                    // The marker is a fixed anchor, not a distance gauge. Project it to the tapped
+                    // world point without interpolating between camera frames.
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
                 }
             }
             .ignoresSafeArea()
@@ -388,6 +376,7 @@ struct MesOverlayView: View {
                 )
             }
 
+            framingGuidanceLine
             autoLockProgress
         }
         .padding(.horizontal, 13)
@@ -418,7 +407,10 @@ struct MesOverlayView: View {
     private var faceCoverageAccessibilityLabel: String {
         let top = captureEngine.footprintSatisfied ? "captured" : "still needed"
         let side = captureEngine.heightSatisfied ? "captured" : "still needed"
-        return "\(captureEngine.primaryText). Top view \(top). Side view \(side)."
+        let framing = captureEngine.framingGuidance.map {
+            " \(framingGuidanceText(for: $0))."
+        } ?? ""
+        return "\(captureEngine.primaryText). Top view \(top). Side view \(side).\(framing)"
     }
 
     private var topCaptureGuide: some View {
@@ -451,12 +443,59 @@ struct MesOverlayView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            framingGuidanceLine
             autoLockProgress
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
+    }
+
+    @ViewBuilder
+    private var framingGuidanceLine: some View {
+        if captureEngine.activeObjectID != nil,
+           let guidance = captureEngine.framingGuidance {
+            Label(
+                framingGuidanceText(for: guidance),
+                systemImage: framingGuidanceSystemImage(for: guidance)
+            )
+            .font(.footnote.weight(.bold))
+            .foregroundStyle(framingGuidanceColor(for: guidance))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                framingGuidanceColor(for: guidance).opacity(0.16),
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+        }
+    }
+
+    private func framingGuidanceText(for guidance: ObjectFramingGuidance) -> String {
+        switch guidance {
+        case .moveCloser:
+            "Move the phone closer"
+        case .moveFarther:
+            "Move the phone farther away"
+        case .okay:
+            "Distance looks good"
+        }
+    }
+
+    private func framingGuidanceSystemImage(for guidance: ObjectFramingGuidance) -> String {
+        switch guidance {
+        case .moveCloser:
+            "arrow.down.right.and.arrow.up.left"
+        case .moveFarther:
+            "arrow.up.left.and.arrow.down.right"
+        case .okay:
+            "checkmark.circle.fill"
+        }
+    }
+
+    private func framingGuidanceColor(for guidance: ObjectFramingGuidance) -> Color {
+        guidance == .okay ? .green : .orange
     }
 
     /// Progress toward the automatic lock. The value is the fraction of the stopping rule that is
@@ -751,19 +790,7 @@ struct MesOverlayView: View {
         GeometryReader { proxy in
             let referencePoint = layer.referenceAnchorPoint ?? CGPoint(x: 0.5, y: 0.5)
             let currentPoint = marker?.normalizedViewportPoint ?? referencePoint
-            let distanceScale: CGFloat = {
-                guard let referenceDistance = layer.referenceCameraDistance,
-                      let currentDistance = marker?.cameraDistance,
-                      referenceDistance > 0.05,
-                      currentDistance > 0.05 else {
-                    return 1
-                }
-                return min(max(CGFloat(referenceDistance / currentDistance), 0.4), 2.5)
-            }()
             let trackedTransform: (
-                anchor: UnitPoint,
-                xScale: CGFloat,
-                yScale: CGFloat,
                 xOffset: CGFloat,
                 yOffset: CGFloat
             )? = {
@@ -776,22 +803,10 @@ struct MesOverlayView: View {
                     return nil
                 }
                 return (
-                    UnitPoint(x: reference.midX, y: reference.midY),
-                    min(max(current.width / reference.width, 0.4), 2.5),
-                    min(max(current.height / reference.height, 0.4), 2.5),
                     (current.midX - reference.midX) * proxy.size.width,
                     (current.midY - reference.midY) * proxy.size.height
                 )
             }()
-            let fallbackScale = marker == nil ? 1 : distanceScale
-            // Scale by camera distance only. The tracked bounding-box ratio
-            // (current/reference) jitters between Vision frames and made the
-            // highlight visibly "breathe" a couple times a second; use it for
-            // position (offset) but not for size.
-            let xScale = fallbackScale
-            let yScale = fallbackScale
-            let anchor = trackedTransform?.anchor
-                ?? UnitPoint(x: referencePoint.x, y: referencePoint.y)
             let xOffset = trackedTransform?.xOffset
                 ?? (currentPoint.x - referencePoint.x) * proxy.size.width
             let yOffset = trackedTransform?.yOffset
@@ -801,11 +816,6 @@ struct MesOverlayView: View {
                 Image(decorative: layer.image, scale: 1, orientation: .up)
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
-                    .scaleEffect(
-                        x: xScale,
-                        y: yScale,
-                        anchor: anchor
-                    )
                     .offset(
                         x: xOffset,
                         y: yOffset
@@ -879,7 +889,7 @@ struct MesOverlayView: View {
                         .font(.caption.weight(.semibold))
                 }
                 .toggleStyle(.switch)
-                .accessibilityHint("Opens the name and weight sheet as soon as the measurement reaches its precision target.")
+                .accessibilityHint("Locks the measurement and asks for a name as soon as it reaches its precision target.")
 
                 Text("Locks once every dimension holds to ±5 mm or 1% over its last 24 fits — a 95% confidence interval that tight, and no remaining drift. Each dimension must also have been seen from a viewpoint that can measure it, over a surface ARKit has confirmed.")
                     .font(.caption2)
@@ -1224,7 +1234,7 @@ struct MesOverlayView: View {
             "\(finalizedMeasuredObjectIDs.count) saved object\(finalizedMeasuredObjectIDs.count == 1 ? "" : "s")"
         )
         .accessibilityValue(showsSavedObjects ? "Expanded" : "Collapsed")
-        .accessibilityHint("Shows names, weights and actions for locked objects.")
+        .accessibilityHint("Shows names, outer-box choices, packed weights and actions for locked objects.")
     }
 
     private var savedObjectsPanel: some View {
@@ -1283,22 +1293,26 @@ struct MesOverlayView: View {
         .accessibilityElement(children: .contain)
     }
 
-    /// Entry point to the load-balanced arrangement. It lives in the saved-objects panel because
-    /// that is where the operator already is once every package has a name and a weight, and
-    /// keeping it out of the bottom action row leaves the live HUD uncluttered.
+    /// Entry point to physical preparation and then arrangement. It lives with the saved objects
+    /// because this is where the operator can verify every name before handling the packages.
     private var arrangePayloadButton: some View {
-        let missingWeights = packingStore.packagesMissingWeight(from: captureEngine).count
         let isMeasuring = captureEngine.activeObjectID != nil
+        let needsPreparation = packingStore
+            .packagesMissingPreparation(from: captureEngine)
+            .count
+        let noFittingBoxCount = finalizedMeasuredObjectIDs.count(where: { id in
+            packingStore.fittingBoxPresets(for: id, in: captureEngine).isEmpty
+        })
 
         return VStack(alignment: .leading, spacing: 4) {
             Button {
                 showsSavedObjects = false
-                showsArrangement = true
+                showsPackingWorkflow = true
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "square.grid.3x3.square")
+                    Image(systemName: "shippingbox.and.arrow.backward")
                         .foregroundStyle(.cyan)
-                    Text("Arrange payload")
+                    Text("Prepare & arrange")
                         .foregroundStyle(.primary)
                 }
                 .font(.subheadline.weight(.semibold))
@@ -1309,17 +1323,27 @@ struct MesOverlayView: View {
             .buttonBorderShape(.capsule)
             .disabled(isMeasuring)
             .opacity(isMeasuring ? 0.5 : 1)
-            .accessibilityLabel("Arrange the payload inside the module")
+            .accessibilityLabel("Prepare packages and arrange the payload")
             .accessibilityHint(
                 isMeasuring
                     ? "Lock the object being measured first."
-                    : "Searches for a supported, balanced arrangement of the measured packages."
+                    : "Guides you through naming, choosing an outer box and weighing each package before creating the loading plan."
             )
 
-            if missingWeights > 0 {
-                Text("\(missingWeights) object\(missingWeights == 1 ? " still needs" : "s still need") a weight before the load can be balanced.")
+            if noFittingBoxCount > 0 {
+                Text("\(noFittingBoxCount) object\(noFittingBoxCount == 1 ? " does" : "s do") not fit available boxes and will be left out during preparation.")
                     .font(.caption2)
                     .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if needsPreparation > 0 {
+                Text("You will choose a fitting outer box and enter the packed weight in grams for each object.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text("Review every prepared package before rebuilding the loading plan.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -1330,6 +1354,9 @@ struct MesOverlayView: View {
         let canSelect = captureEngine.activeObjectID == nil
             && !captureEngine.isObjectSelectionPending
         let objectName = captureEngine.name(for: id) ?? "Unnamed object"
+        let doesNotFitAvailableBoxes = packingStore
+            .fittingBoxPresets(for: id, in: captureEngine)
+            .isEmpty
 
         return HStack(spacing: 4) {
             Button {
@@ -1347,10 +1374,12 @@ struct MesOverlayView: View {
                             .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                             .truncationMode(.tail)
 
-                        Text(objectWeightSummary(for: id))
+                        Text(objectPreparationSummary(for: id))
                             .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .foregroundStyle(
+                                doesNotFitAvailableBoxes ? Color.orange : Color.secondary
+                            )
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                     }
 
                     Spacer(minLength: 4)
@@ -1369,7 +1398,7 @@ struct MesOverlayView: View {
             .disabled(!canSelect)
             .opacity(canSelect ? 1 : 0.55)
             .accessibilityLabel(
-                "\(objectName), \(objectWeightSummary(for: id))"
+                "\(objectName), \(objectPreparationSummary(for: id))"
             )
             .accessibilityValue(isFocused ? "Selected" : "Not selected")
             .accessibilityHint(
@@ -1388,8 +1417,8 @@ struct MesOverlayView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.primary)
-            .accessibilityLabel("Edit \(objectName)")
-            .accessibilityHint("Changes this object's name and weight.")
+            .accessibilityLabel("Rename \(objectName)")
+            .accessibilityHint("Changes this object's name.")
 
             Button(role: .destructive) {
                 pendingRemovalObjectID = id
@@ -1428,10 +1457,19 @@ struct MesOverlayView: View {
         dynamicTypeSize.isAccessibilitySize ? 116 : 52
     }
 
-    private func objectWeightSummary(for id: UUID) -> String {
-        captureEngine.weightInKilograms(for: id)
-            .map { "\(formattedWeight($0)) kg" }
-            ?? "No weight"
+    private func objectPreparationSummary(for id: UUID) -> String {
+        if packingStore.fittingBoxPresets(for: id, in: captureEngine).isEmpty {
+            return packingStore.isExcludedBecauseNoStockedBoxFits(id, in: captureEngine)
+                ? "Excluded — does not fit available boxes"
+                : "Does not fit available boxes"
+        }
+        let boxName = packingStore.selectedBoxPreset(for: id)?.name
+            ?? "Choose outer box"
+        let weight = captureEngine.weightInGrams(for: id)
+            .flatMap { PositiveDecimalText.format($0, maximumFractionDigits: 3) }
+            .map { "\($0) g" }
+            ?? "Enter packed weight"
+        return "\(boxName) · \(weight)"
     }
 
     private var objectDetailsIsPresented: Binding<Bool> {
@@ -1475,29 +1513,17 @@ struct MesOverlayView: View {
         )
     }
 
-    private var parsedWeightInKilograms: Double? {
-        let normalized = weightText
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: ",", with: ".")
-        guard let weight = Double(normalized),
-              weight.isFinite,
-              weight > 0 else {
-            return nil
-        }
-        return weight
-    }
-
     private var trimmedObjectName: String {
         objectNameText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// After a lock the measurement is already stored, so the sheet says so — dismissing it is a
-    /// choice to name the object later, not to lose it.
+    /// After a lock the measurement is already stored. This quick prompt labels it; physical box
+    /// selection and packed weighing deliberately happen later in the preparation workflow.
     private var objectDetailsMessage: String {
         guard case .finalize = objectDetailsContext else {
-            return "Give this object a name and a weight greater than zero in kilograms."
+            return "Enter the name the operator should see during packing."
         }
-        return "Measurement saved. Add a name and weight, or add them later from the saved list."
+        return "Measurement saved. Add a short name you will recognise during packing."
     }
 
     private var objectDetailsTitle: String {
@@ -1514,9 +1540,13 @@ struct MesOverlayView: View {
 
     private var removalConfirmationTitle: String {
         guard let id = pendingRemovalObjectID else {
-            return "Remove box?"
+            return "Remove object?"
         }
-        return "Remove Box \(boxNumber(for: id))?"
+        guard let name = captureEngine.name(for: id),
+              !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Remove unnamed object?"
+        }
+        return "Remove \(name)?"
     }
 
     /// The stopping rule fired. Takes exactly the path the Lock button takes.
@@ -1534,7 +1564,7 @@ struct MesOverlayView: View {
     }
 
     /// Locks first, asks second. The measurement is committed the moment the operator taps Lock;
-    /// the sheet that follows only fills in the name and weight, so dismissing it — or taking a
+    /// the sheet that follows only fills in the name, so dismissing it — or taking a
     /// minute over it — cannot cost the dimensions.
     ///
     /// The sheet is deliberately *not* presented in this same turn. Committing already runs the
@@ -1560,60 +1590,46 @@ struct MesOverlayView: View {
             pendingDetailsObjectID = nil
             return
         }
-        objectNameText = captureEngine.name(for: id) ?? ""
-        weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
+        // Start blank so a new object receives the operator's meaningful name rather than a
+        // generated label.
+        objectNameText = ""
         objectDetailsContext = .finalize(id)
         pendingDetailsObjectID = nil
     }
 
     private func presentDetailsEditor(for id: UUID) {
         objectNameText = captureEngine.name(for: id) ?? ""
-        weightText = captureEngine.weightInKilograms(for: id).map(formattedWeight) ?? ""
         objectDetailsContext = .edit(id)
     }
 
     private func saveObjectDetailsEntry() {
         guard let objectDetailsContext,
-              !trimmedObjectName.isEmpty,
-              let weight = parsedWeightInKilograms else {
+              !trimmedObjectName.isEmpty else {
             return
         }
         switch objectDetailsContext {
         case .finalize(let id), .edit(let id):
-            captureEngine.updateDetails(
-                id: id,
-                name: trimmedObjectName,
-                weightInKilograms: weight
-            )
+            captureEngine.updateName(id: id, name: trimmedObjectName)
         }
         self.objectDetailsContext = nil
         objectNameText = ""
-        weightText = ""
     }
 
-    /// Dismissing the sheet leaves the object locked under its default name with no weight yet.
-    /// The measurement was never at stake here — only its label — and the saved-objects list can
-    /// supply the rest later.
+    /// The measurement was never at stake here — only its label. An unnamed object remains in the
+    /// saved list and can be named there or during physical preparation.
     private func cancelObjectDetailsEntry() {
         objectDetailsContext = nil
         objectNameText = ""
-        weightText = ""
-    }
-
-    private func boxNumber(for id: UUID) -> String {
-        captureEngine.objectNumber(for: id).map { String($0) } ?? "?"
     }
 
     private func boxSummary(for id: UUID) -> String {
-        let name = captureEngine.name(for: id) ?? "Box \(boxNumber(for: id))"
-        let weightText = captureEngine.weightInKilograms(for: id)
-            .map { "\(formattedWeight($0)) kg" }
-            ?? "No weight"
-        return "\(name) · \(weightText)"
+        let name = captureEngine.name(for: id) ?? "Unnamed object"
+        return "\(name) · \(objectPreparationSummary(for: id))"
     }
 
     private func removalButtonTitle(for id: UUID) -> String {
-        "Remove Box \(boxNumber(for: id))"
+        captureEngine.name(for: id).map { "Remove \($0)" }
+            ?? "Remove object"
     }
 
     private func boxColorImage(for id: UUID) -> Image {
@@ -1630,14 +1646,6 @@ struct MesOverlayView: View {
         )
         return image.map(Image.init(uiImage:))
             ?? Image(systemName: "circle.fill")
-    }
-
-    private func formattedWeight(_ weight: Double) -> String {
-        weight.formatted(
-            .number
-                .grouping(.never)
-                .precision(.fractionLength(0...3))
-        )
     }
 
     private var nonLiDARLimitationsSheet: some View {
@@ -1868,7 +1876,6 @@ struct MesOverlayView: View {
             y: CGFloat(mesEngine.aimerSurfaceScaleY),
             anchor: .center
         )
-        .scaleEffect(CGFloat(mesEngine.aimerDistanceScale), anchor: .center)
         .rotationEffect(.degrees(mesEngine.aimerSurfaceRotationDegrees))
         .shadow(color: .white.opacity(0.55), radius: 5)
         .allowsHitTesting(false)
