@@ -23,12 +23,24 @@ import simd
 /// item moves there; `r'_i ∉ D_i` and the item moves to the point of `D_i` that better approximates
 /// `r'_i` on each axis.
 ///
+/// Paper mode approximates `D_i` locally from blockers around the old position and stops when the
+/// CoM first enters `[L,U]`. Centred mode samples a bounded set of static placements across the
+/// container and continues toward the domain centre. The latter is a rearrangement, not a claim of
+/// a collision-free physical motion path.
+///
 /// Baldi finally applies gravity because its construction may leave packages floating. This hybrid
 /// never admits such a package: Junqueira's full-support rule is enforced during construction and
 /// after every tentative movement. Consequently there is no separate gravity repair that could
 /// turn a partial contact into an invalid "resting" position.
+///
+/// Both modes recheck containment, non-overlap and full support on the complete proposed packing,
+/// and commit only a strict CoM-distance improvement. Centred mode additionally requires every
+/// post-feasibility refinement to remain inside `[L,U]`.
 nonisolated enum BaldiCentreOfMassOptimisation {
     nonisolated struct Options: Sendable, Equatable {
+        /// `.paper` is the academically conservative default. `.centred` is an explicit
+        /// post-feasibility quality refinement and is reported separately from paper mode.
+        var mode: BaldiPackingMode = .paper
         /// The paper states a maximum number of iterations as a stopping condition but does not
         /// give its value.
         var maximumIterations = 50
@@ -50,7 +62,8 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         let target = knapsack.idealCentreOfMass
 
         for _ in 0..<options.maximumIterations {
-            if knapsack.containsCentreOfMass(centreOfMass(of: current)) { break }
+            if options.mode == .paper,
+               knapsack.containsCentreOfMass(centreOfMass(of: current)) { break }
             var movedAnything = false
 
             // The paper does not fix the order in which items are considered. Eq. (28) shows that
@@ -61,7 +74,11 @@ nonisolated enum BaldiCentreOfMassOptimisation {
 
             for index in order {
                 let centre = centreOfMass(of: current)
-                if knapsack.containsCentreOfMass(centre) { break }
+                if options.mode == .paper,
+                   knapsack.containsCentreOfMass(centre) { break }
+                let currentQuality = simd_distance_squared(centre, target)
+                guard currentQuality.isFinite, currentQuality > 0 else { continue }
+                let mustRemainBalanced = knapsack.containsCentreOfMass(centre)
                 let totalMass = current.reduce(0) { $0 + $1.mass }
                 let item = current[index]
                 guard item.mass.isFinite, item.mass > 0,
@@ -77,26 +94,49 @@ nonisolated enum BaldiCentreOfMassOptimisation {
                 )
                 let desiredOrigin = desiredItemCentre - halfSize
 
-                guard let domain = candidateDomain(for: index, in: current, knapsack: knapsack) else {
-                    continue
-                }
-                let clamped = simd_clamp(desiredOrigin, domain.lower, domain.upper)
-                let candidates = candidateOrigins(
-                    for: index,
-                    desired: clamped,
-                    in: current,
-                    domain: domain
-                )
-                guard let accepted = candidates.first(where: {
-                    isAcceptableMove(
-                        of: index,
-                        to: $0,
+                let domain: CandidateDomain?
+                switch options.mode {
+                case .paper:
+                    domain = localCandidateDomain(
+                        for: index,
                         in: current,
                         knapsack: knapsack
                     )
-                }) else { continue }
+                case .centred:
+                    domain = containerDomain(for: item, knapsack: knapsack)
+                }
+                guard let domain else {
+                    continue
+                }
+                let clamped = simd_clamp(desiredOrigin, domain.lower, domain.upper)
+                let candidates: [SIMD3<Double>]
+                switch options.mode {
+                case .paper:
+                    candidates = localCandidateOrigins(
+                        for: index,
+                        desired: clamped,
+                        in: current,
+                        domain: domain
+                    )
+                case .centred:
+                    candidates = centredCandidateOrigins(
+                        for: index,
+                        desired: clamped,
+                        in: current,
+                        domain: domain
+                    )
+                }
+                guard let improvement = bestImprovingMove(
+                    of: index,
+                    toOneOf: candidates,
+                    in: current,
+                    knapsack: knapsack,
+                    target: target,
+                    currentQuality: currentQuality,
+                    mustRemainBalanced: mustRemainBalanced
+                ) else { continue }
 
-                current[index].origin = accepted
+                current = improvement
                 movedAnything = true
             }
 
@@ -132,15 +172,16 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         var upper: SIMD3<Double>
     }
 
-    /// Axis-wise movement bounds inspired by Baldi's `D_i`. This box is only a source of candidate
-    /// positions: every candidate is still checked for collision and full support before use.
-    private static func candidateDomain(
+    /// Baldi's local `D_i` approximation: packages intersecting the moving package's current
+    /// projection bound each axis. This intentionally models a local collision-free-ish move and
+    /// can exclude a valid static relocation elsewhere; centred mode exists for that separate use.
+    private static func localCandidateDomain(
         for index: Int,
         in placements: [BaldiPlacement],
         knapsack: BaldiKnapsack
     ) -> CandidateDomain? {
         let item = placements[index]
-        let tolerance = 1e-6
+        let tolerance = BaldiVerticalSupport.contactTolerance
         var lower = SIMD3<Double>.zero
         var upper = SIMD3<Double>(
             Double(knapsack.size.x), Double(knapsack.size.y), Double(knapsack.size.z)
@@ -150,7 +191,6 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         for axis in 0..<3 {
             let (first, second) = otherAxes(of: axis)
             for (other, placed) in placements.enumerated() where other != index {
-                // Only items that overlap on the other two axes can block this slide.
                 let overlapsFirst = item.origin[first] < placed.maximum[first] - tolerance
                     && placed.origin[first] < item.maximum[first] - tolerance
                 let overlapsSecond = item.origin[second] < placed.maximum[second] - tolerance
@@ -168,10 +208,107 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         return CandidateDomain(lower: lower, upper: upper)
     }
 
-    /// Tries the desired point, the same horizontal point on every available support plane, and
-    /// safe one-axis moves. Ordering by distance keeps the accepted move as close as possible to
-    /// Baldi equation (29).
-    private static func candidateOrigins(
+    /// The complete container bounds for a package origin. Blockers around the package's old
+    /// position are deliberately not folded into these bounds: the optimisation computes a new
+    /// static arrangement, not a collision-free motion path. Every proposed final arrangement is
+    /// checked independently for overlap, containment and whole-packing support before commitment.
+    private static func containerDomain(
+        for item: BaldiPlacement,
+        knapsack: BaldiKnapsack
+    ) -> CandidateDomain? {
+        let tolerance = 1e-6
+        let lower = SIMD3<Double>.zero
+        let upper = SIMD3<Double>(
+            Double(knapsack.size.x), Double(knapsack.size.y), Double(knapsack.size.z)
+        ) - item.extent
+        for axis in 0..<3 where upper[axis] < -tolerance { return nil }
+        return CandidateDomain(lower: lower, upper: upper)
+    }
+
+    /// Builds a deterministic bounded neighbourhood containing the desired point, floor and
+    /// support-plane variants, one-axis refinements, and positions adjacent to existing package
+    /// faces. The edge coordinates let the search find open gaps when the exact desired point is
+    /// occupied. Candidate count is capped because each one receives a whole-packing validation.
+    private static func centredCandidateOrigins(
+        for index: Int,
+        desired: SIMD3<Double>,
+        in placements: [BaldiPlacement],
+        domain: CandidateDomain
+    ) -> [SIMD3<Double>] {
+        let maximumAxisCoordinates = 8
+        let maximumCandidates = 48
+        let item = placements[index]
+        let original = placements[index].origin
+        let others = placements.indices.filter { $0 != index }.map { placements[$0] }
+
+        let xCoordinates = boundedCoordinates(
+            required: [desired.x, original.x, domain.lower.x, domain.upper.x],
+            alternatives: others.flatMap { [$0.origin.x - item.extent.x, $0.maximum.x] },
+            lower: domain.lower.x,
+            upper: domain.upper.x,
+            desired: desired.x,
+            limit: maximumAxisCoordinates
+        )
+        let yCoordinates = boundedCoordinates(
+            required: [desired.y, original.y, domain.lower.y, domain.upper.y],
+            alternatives: others.flatMap { [$0.origin.y - item.extent.y, $0.maximum.y] },
+            lower: domain.lower.y,
+            upper: domain.upper.y,
+            desired: desired.y,
+            limit: maximumAxisCoordinates
+        )
+        let supportHeights = boundedCoordinates(
+            required: [desired.z, original.z, domain.lower.z, domain.upper.z],
+            alternatives: others.map(\.maximum.z),
+            lower: domain.lower.z,
+            upper: domain.upper.z,
+            desired: desired.z,
+            limit: maximumAxisCoordinates
+        )
+
+        var priority: [SIMD3<Double>] = [desired]
+        for height in supportHeights {
+            priority.append(SIMD3(desired.x, desired.y, height))
+        }
+
+        for axis in 0..<3 {
+            var candidate = original
+            candidate[axis] = desired[axis]
+            priority.append(candidate)
+        }
+
+        var neighbourhood: [SIMD3<Double>] = []
+        for x in xCoordinates {
+            for y in yCoordinates {
+                for z in supportHeights {
+                    neighbourhood.append(SIMD3(x, y, z))
+                }
+            }
+        }
+        neighbourhood.sort { first, second in
+            let firstDistance = simd_distance_squared(first, desired)
+            let secondDistance = simd_distance_squared(second, desired)
+            if firstDistance != secondDistance { return firstDistance < secondDistance }
+            if first.x != second.x { return first.x < second.x }
+            if first.y != second.y { return first.y < second.y }
+            return first.z < second.z
+        }
+
+        var seen: Set<SIMD3<Double>> = []
+        var result: [SIMD3<Double>] = []
+        for candidate in priority + neighbourhood {
+            guard simd_distance_squared(candidate, original) >= 1e-12 else { continue }
+            guard seen.insert(candidate).inserted else { continue }
+            result.append(candidate)
+            if result.count == maximumCandidates { break }
+        }
+        return result
+    }
+
+    /// The smaller paper-mode neighbourhood approximates the desired local origin on available
+    /// support planes and one axis at a time. Final whole-packing validation still enforces the
+    /// Junqueira support rule, which is the documented addition to Baldi.
+    private static func localCandidateOrigins(
         for index: Int,
         desired: SIMD3<Double>,
         in placements: [BaldiPlacement],
@@ -200,22 +337,89 @@ nonisolated enum BaldiCentreOfMassOptimisation {
             .filter { simd_distance_squared($0, original) >= 1e-12 }
             .filter { seen.insert($0).inserted }
             .sorted {
-                simd_distance_squared($0, desired) < simd_distance_squared($1, desired)
+                let firstDistance = simd_distance_squared($0, desired)
+                let secondDistance = simd_distance_squared($1, desired)
+                if firstDistance != secondDistance { return firstDistance < secondDistance }
+                if $0.x != $1.x { return $0.x < $1.x }
+                if $0.y != $1.y { return $0.y < $1.y }
+                return $0.z < $1.z
             }
     }
 
-    /// A movement is accepted only when the moved package remains contained and non-overlapping
-    /// and the complete packing still satisfies Junqueira's full-support rule. The whole-packing
-    /// check is necessary because moving a lower package can strand packages above it.
-    private static func isAcceptableMove(
+    private static func boundedCoordinates(
+        required: [Double],
+        alternatives: [Double],
+        lower: Double,
+        upper: Double,
+        desired: Double,
+        limit: Int
+    ) -> [Double] {
+        func clamped(_ value: Double) -> Double {
+            min(max(value, lower), upper)
+        }
+
+        var seen: Set<Double> = []
+        var result: [Double] = []
+        for value in required where value.isFinite {
+            let value = clamped(value)
+            if seen.insert(value).inserted { result.append(value) }
+        }
+
+        let orderedAlternatives = alternatives
+            .filter(\.isFinite)
+            .map(clamped)
+            .sorted { first, second in
+                let firstDistance = abs(first - desired)
+                let secondDistance = abs(second - desired)
+                return firstDistance == secondDistance
+                    ? first < second
+                    : firstDistance < secondDistance
+            }
+        for value in orderedAlternatives where result.count < limit {
+            if seen.insert(value).inserted { result.append(value) }
+        }
+        return Array(result.prefix(limit))
+    }
+
+    /// Selects the spatially valid candidate that puts the overall cargo centre of mass closest to
+    /// the ideal point. A move is returned only for a strict numerical improvement. Evaluating the
+    /// complete proposed packing is necessary because moving a lower package can strand packages
+    /// above it. With one package moving, minimising this aggregate distance is algebraically
+    /// equivalent to choosing the candidate origin closest to Baldi's equation (29) target.
+    private static func bestImprovingMove(
         of index: Int,
-        to origin: SIMD3<Double>,
+        toOneOf origins: [SIMD3<Double>],
         in placements: [BaldiPlacement],
-        knapsack: BaldiKnapsack
-    ) -> Bool {
-        var proposed = placements
-        proposed[index].origin = origin
-        return isSpatiallyValid(proposed, in: knapsack)
+        knapsack: BaldiKnapsack,
+        target: SIMD3<Double>,
+        currentQuality: Double,
+        mustRemainBalanced: Bool
+    ) -> [BaldiPlacement]? {
+        var best: [BaldiPlacement]?
+        var bestQuality = currentQuality
+
+        for origin in origins {
+            var proposed = placements
+            proposed[index].origin = origin
+            guard isSpatiallyValid(proposed, in: knapsack) else { continue }
+
+            let proposedCentre = centreOfMass(of: proposed)
+            if mustRemainBalanced,
+               !knapsack.containsCentreOfMass(proposedCentre) { continue }
+            let proposedQuality = simd_distance_squared(proposedCentre, target)
+            guard isStrictImprovement(proposedQuality, over: bestQuality) else { continue }
+            best = proposed
+            bestQuality = proposedQuality
+        }
+        return best
+    }
+
+    /// Ignores changes at floating-point noise scale, while requiring a genuinely smaller squared
+    /// distance for every committed move.
+    private static func isStrictImprovement(_ candidate: Double, over incumbent: Double) -> Bool {
+        guard candidate.isFinite, incumbent.isFinite else { return false }
+        let scale = max(1, max(abs(candidate), abs(incumbent)))
+        return candidate < incumbent - scale * 1e-12
     }
 
     /// Whole-packing validation used at entry and after every tentative movement. Checking the
@@ -274,4 +478,5 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         default: (0, 1)
         }
     }
+
 }

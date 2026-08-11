@@ -13,6 +13,7 @@ struct MesOverlayView: View {
     @Binding var workflowMode: MeasurementWorkflowMode
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showsPanel = false
     @State private var showsLiDARLimitations = false
     @State private var objectDetailsContext: ObjectDetailsContext?
@@ -148,17 +149,19 @@ struct MesOverlayView: View {
                 lockFeedback.prepare()
             }
         }
-        .onAppear {
-            if !isAutomaticCaptureSupported, workflowMode == .top {
-                workflowMode = .spatial3D
-            }
+        .onAppear(perform: handleAppearance)
+        .onChange(of: scenePhase) { _, phase in
+            handleScenePhaseChange(phase)
+        }
+        .onChange(of: showsArrangement) { _, isPresented in
+            handleArrangementPresentationChange(isPresented)
         }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
-        .sheet(isPresented: $showsArrangement) {
+        .fullScreenCover(isPresented: $showsArrangement) {
             PackingArrangementView(
                 captureEngine: captureEngine,
                 store: packingStore
@@ -242,6 +245,21 @@ struct MesOverlayView: View {
         } message: {
             Text("Changing the measurement method clears the current scan and all saved objects.")
         }
+    }
+
+    private func handleAppearance() {
+        sessionManager.setApplicationActive(scenePhase == .active)
+        if !isAutomaticCaptureSupported, workflowMode == .top {
+            workflowMode = .spatial3D
+        }
+    }
+
+    private func handleScenePhaseChange(_ phase: ScenePhase) {
+        sessionManager.setApplicationActive(phase == .active)
+    }
+
+    private func handleArrangementPresentationChange(_ isPresented: Bool) {
+        sessionManager.setPackingArrangementPresented(isPresented)
     }
 
     @ViewBuilder

@@ -89,7 +89,9 @@ This matches Baldi's benchmark-instance generator, but is narrower than the gene
 The merit coefficient in Eq. (24) is fixed to zero, so the ranking objective is package count.
 Cargo-COM membership in `[L,U]` is independently mandatory. This coefficient is not Baldi §5.3's
 score-decrease value: score decrease and score increase both begin at `0.1` and are dynamically
-updated.
+updated. Cargo-COM distance from the centre of `[L,U]` is an implementation tie-break only between
+verified packings with the same loaded-package count; it cannot replace or reduce the primary
+cardinality objective.
 
 ### One container and rigid packages
 
@@ -182,6 +184,9 @@ Full support is an invariant across the complete production pipeline:
 - EP-BPH therefore constructs only fully supported partial packings;
 - COM adjustment validates the entire tentative packing after every proposed movement, because
   moving a supporter can invalidate packages above it;
+- Paper mode stops adjustment at first entry into `[L,U]`, as Baldi §5.2 states;
+- Centred mode may continue seeking strict cargo-COM improvement, while every later move is required
+  to remain inside the domain;
 - unsupported movement is rolled back by never accepting the tentative coordinates;
 - no separate partial-contact gravity repair is used;
 - `BaldiGeometryCheck` recomputes support for every final placement;
@@ -196,9 +201,12 @@ membership is checked before a candidate can become the best reportable solution
 | --- | --- | --- |
 | sorting cluster width `theta` | `20%` | five clusters |
 | ideal COM `r_CM^0` | centre of `[L,U]` | symmetric movement target |
+| Paper equal-count feasible tie | no aggregate cargo-COM-distance preference | retains the specialised `F = P` comparison |
+| Centred equal-count feasible tie | smaller cargo-COM distance to `r_CM^0` | disclosed refinement without sacrificing package count |
 | COM-adjustment cap | 50 iterations | finite deterministic stopping condition |
 | COM movement order | heaviest first | deterministic resolution of unspecified order |
-| candidate movement domain | axis-wise bounds inspired by Baldi `D_i` | every candidate still receives explicit collision/support checks |
+| Paper movement neighbourhood | local blocker-bounded positions | approximates Baldi's connected `D_i` and stops on balance |
+| Centred movement neighbourhood | bounded desired/floor/support-plane/package-edge positions across the container | can relocate a stacked package into an open floor gap; every candidate receives complete collision/support checks |
 | location of COM adjustment | after every EP-BPH result, including PCH | one consistent balance stage |
 | score parameters | start at `0.1`, clamp to `[1e-4,0.9]` | avoids repeated doubling leaving Baldi's stated interval |
 | reinitialisation trigger | 1000 non-improving iterations | resolves §5.3.4/Fig. 6 wording |
@@ -210,8 +218,10 @@ membership is checked before a candidate can become the best reportable solution
 | measured dimensions | package up/container down to integral millimetres | conservative preprocessing |
 | oversized packages | removed before search and reported | cannot enter any feasible rotation |
 
-The code calls its axis-aligned movement box a candidate domain rather than claiming it is Baldi's
-exact convex collision-free `D_i`. Explicit validation is authoritative.
+Paper mode's local axis-aligned movement box is an implementation approximation, not a claim that it
+reconstructs Baldi's exact convex collision-free `D_i`. Centred mode deliberately searches static
+final positions farther across the container. Explicit final-position validation is authoritative in
+both modes.
 
 ## 8. Production heuristic versus reference MIP
 
@@ -228,7 +238,8 @@ Consequently:
 - `UB_1D` is likewise only a volume-based upper bound and ignores geometry, COM balance and support;
 - the UI does not offer an "exact hybrid" mode or a printed-Eq. (16) switch.
 
-The production driver runs only the support-aware 3BKP-H heuristic.
+The production driver runs the support-aware heuristic twice: once with Baldi's paper stopping rule
+and once with the disclosed Centred refinement. Neither result is presented as an exact optimum.
 
 ## 9. Independent verification boundary
 

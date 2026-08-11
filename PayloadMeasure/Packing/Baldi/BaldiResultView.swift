@@ -1,442 +1,400 @@
 import SwiftUI
 
-/// Result screen for the support-aware Baldi–Junqueira heuristic.
+/// Operator-facing result for the two support-aware Baldi packing modes.
+///
+/// Detailed method evidence lives in the audit documentation and verifier. This screen stays
+/// focused on the physical task: choose a result, inspect it, then load one complete layer at a
+/// time from the floor upward.
 struct BaldiResultView: View {
-    let result: Baldi3BKPResult
+    let comparison: Baldi3BKPComparison
     let colours: [UUID: Color]
     @Binding var highlightedPackageID: UUID?
 
-    @State private var showsDiagnostics = false
+    @State private var selectedMode: BaldiPackingMode = .paper
+    @State private var selectedLayerIndex: Int?
 
-    var body: some View {
-        statusCard
-
-        if result.status == .feasible,
-           let solution = result.solution,
-           let verification = result.verification,
-           verification.isValid {
-            drawingCard(solution)
-            loadCard(solution)
-            balanceCard(solution)
-            supportCard(solution, verification: verification)
-            placementCard(solution)
-            if !solution.unloaded.isEmpty { unloadedCard(solution) }
-        }
-
-        if let verification = result.verification {
-            verificationCard(verification)
-        }
-        diagnosticsCard
-        scopeCard
+    private var result: Baldi3BKPResult {
+        comparison.result(for: selectedMode)
     }
 
-    // MARK: - Result summary
+    var body: some View {
+        Group {
+            modeControl
+            readySummary
 
-    private var statusCard: some View {
+            if let solution = verifiedSolution,
+               let verification = result.verification {
+                interactivePacking(solution)
+                openingInstruction
+                loadingGuide(solution, verification: verification)
+                if !solution.unloaded.isEmpty {
+                    unloadedWarning(solution)
+                }
+            }
+        }
+        .onChange(of: selectedMode) { _, _ in
+            highlightedPackageID = nil
+            selectedLayerIndex = nil
+        }
+    }
+
+    // MARK: - Mode and readiness
+
+    private var modeControl: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Packing version")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Picker("Packing version", selection: $selectedMode) {
+                ForEach(BaldiPackingMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityHint("Switches between the paper stopping rule and the additional centring refinement.")
+
+            Text(
+                selectedMode == .paper
+                    ? "Paper stops when the load first reaches the allowed balance region."
+                    : "Centred adds a bounded refinement toward the middle of that region."
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var readySummary: some View {
         card {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    Image(systemName: statusSymbol)
-                        .font(.title2)
-                        .foregroundStyle(statusColour)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(statusTitle).font(.headline)
-                        Text(statusDetail)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 0)
-                }
-                if result.status == .invalidInput
-                    || (result.status == .verificationFailed && result.verification == nil) {
-                    ForEach(result.errors, id: \.self) { message in
-                        Label(message, systemImage: "exclamationmark.circle")
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: statusSymbol)
+                    .font(.title3)
+                    .foregroundStyle(statusColour)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(statusTitle)
+                        .font(.headline)
+                    Text(statusDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if verifiedSolution == nil {
+                        ForEach(result.errors.prefix(4), id: \.self) { message in
+                            Text(message)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
+                Spacer(minLength: 0)
             }
         }
     }
 
-    private func drawingCard(_ solution: BaldiSolution) -> some View {
+    // MARK: - Interactive overview
+
+    private func interactivePacking(_ solution: BaldiSolution) -> some View {
         card {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("1. Inspect the load")
+                    .font(.headline)
                 BaldiPlanView(
                     solution: solution,
                     colours: colours,
-                    highlightedPackageID: highlightedPackageID
+                    highlightedPackageID: packageSelection(in: solution),
+                    selectedLayerIndex: selectedLayerIndex
                 )
-                HStack(spacing: 14) {
-                    legend(symbol: "plus", colour: .orange, title: "Centre of mass")
-                    legend(symbol: "rectangle.dashed", colour: .green, title: "Allowable domain")
-                    Spacer(minLength: 0)
-                }
-                .font(.caption2)
-                Text("Drawn to scale from the bottom-left-back origin. Dashed packages are above the floor and have their complete bottom face supported.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
+                .id(selectedMode)
 
-    private func legend(symbol: String, colour: Color, title: String) -> some View {
-        Label {
-            Text(title).foregroundStyle(.secondary)
-        } icon: {
-            Image(systemName: symbol).foregroundStyle(colour)
-        }
-    }
-
-    private func loadCard(_ solution: BaldiSolution) -> some View {
-        card {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Load").font(.headline)
-                row("Packages loaded", "\(solution.loadedCount) of \(solution.loadedCount + solution.unloaded.count)")
-                row("Mass loaded", String(format: "%.2f kg", solution.totalMass))
-                row("Volume used", String(format: "%.1f%%", solution.fillRatio * 100))
-            }
-        }
-    }
-
-    private func balanceCard(_ solution: BaldiSolution) -> some View {
-        card {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("Cargo balance").font(.headline)
-                    Spacer()
-                    Label("Inside the domain", systemImage: "checkmark.circle.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.green)
-                }
-
-                let names = ["x — along", "y — across", "z — height"]
-                ForEach(0..<3, id: \.self) { axis in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(names[axis]).font(.subheadline)
-                            Spacer(minLength: 8)
-                            Text(String(format: "%.1f mm", solution.centreOfMass[axis]))
-                                .font(.subheadline.monospacedDigit())
-                        }
-                        Text(
-                            String(
-                                format: "allowed %.0f … %.0f mm",
-                                solution.knapsack.domainLower[axis],
-                                solution.knapsack.domainUpper[axis]
-                            )
-                        )
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-    }
-
-    private func supportCard(_ solution: BaldiSolution, verification: BaldiVerification) -> some View {
-        card {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("Vertical support").font(.headline)
-                    Spacer()
-                    Label("100% verified", systemImage: "checkmark.circle.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.green)
-                }
-                Text("Every non-floor package is covered across its complete bottom face by top faces in direct contact below it.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                ForEach(solution.placements.sorted(by: placementOrder)) { placement in
-                    let report = verification.supportReports.first { $0.packageID == placement.id }
-                    HStack {
-                        Text(placement.name).font(.subheadline)
-                        Spacer(minLength: 8)
-                        Text(supportDescription(report))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: - Placement
-
-    private func placementCard(_ solution: BaldiSolution) -> some View {
-        let ordered = solution.placements.sorted(by: placementOrder)
-        return card {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Placement").font(.headline)
-                Text("Coordinates are to each package's bottom-left-back corner. Load in this order, lowest first.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                ForEach(Array(ordered.enumerated()), id: \.element.id) { index, placement in
-                    placementRow(index: index + 1, placement: placement, solution: solution)
-                }
-            }
-        }
-    }
-
-    private func placementRow(
-        index: Int,
-        placement: BaldiPlacement,
-        solution: BaldiSolution
-    ) -> some View {
-        let isHighlighted = highlightedPackageID == placement.id
-        let support = BaldiVerticalSupport.report(for: placement, among: solution.placements)
-        return Button {
-            highlightedPackageID = isHighlighted ? nil : placement.id
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    Circle().fill((colours[placement.id] ?? .accentColor).opacity(0.3))
-                    Text("\(index)")
-                        .font(.caption.weight(.bold).monospacedDigit())
-                        .foregroundStyle(.primary)
-                }
-                .frame(width: 28, height: 28)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text(placement.name)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                        if !support.isFloorSupported {
-                            Text("100% supported")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.16), in: .capsule)
-                                .foregroundStyle(.green)
-                        }
-                    }
-                    Text(
-                        String(
-                            format: "x %.0f · y %.0f · z %.0f mm",
-                            placement.origin.x,
-                            placement.origin.y,
-                            placement.origin.z
-                        )
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Text(
-                        String(
-                            format: "%@ · %d × %d × %d mm · %.2f kg",
-                            placement.rotation.restingDescription,
-                            placement.size.x,
-                            placement.size.y,
-                            placement.size.z,
-                            placement.mass
-                        )
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(10)
-            .background(
-                isHighlighted ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.04),
-                in: .rect(cornerRadius: 12)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func unloadedCard(_ solution: BaldiSolution) -> some View {
-        card {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("Not included", systemImage: "tray.and.arrow.up")
-                    .font(.headline)
-                    .foregroundStyle(.orange)
-                Text("All packages have equal priority. These packages were not included in the highest-cardinality feasible arrangement found within the search time.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                ForEach(solution.unloaded) { item in
-                    HStack {
-                        Text(item.name).font(.subheadline)
-                        Spacer(minLength: 8)
-                        Text(String(format: "%d × %d × %d mm", item.size.x, item.size.y, item.size.z))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if !result.oversizedItems.isEmpty {
-                    Text("\(result.oversizedItems.count) of these do not fit the container in any allowed rotation.")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-            }
-        }
-    }
-
-    // MARK: - Verification and scope
-
-    private func verificationCard(_ verification: BaldiVerification) -> some View {
-        card {
-            VStack(alignment: .leading, spacing: 8) {
                 Label(
-                    verification.isValid ? "Feasibility independently verified" : "Verification failed",
-                    systemImage: verification.isValid ? "checkmark.seal.fill" : "xmark.seal.fill"
-                )
-                .font(.headline)
-                .foregroundStyle(verification.isValid ? Color.green : Color.red)
-                Text(
-                    verification.isValid
-                        ? "The check independently reconstructed rotations, dimensions, containment, non-overlap, centred package COM, cargo balance and complete vertical support."
-                        : "The heuristic output failed an independent check and is not presented as a usable arrangement."
+                    "Tap a package to reveal its name. Drag to rotate; pinch to zoom.",
+                    systemImage: "hand.tap"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                ForEach(verification.violations, id: \.self) { violation in
-                    Text("• \(violation)")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+
+                HStack(spacing: 12) {
+                    compactKey(colour: .orange, text: "cargo balance")
+                    compactKey(colour: .purple, text: "target")
+                    compactKey(colour: .green, text: "allowed region")
                 }
+                .font(.caption2)
             }
         }
     }
 
-    private var diagnosticsCard: some View {
+    private var openingInstruction: some View {
+        Label {
+            Text("The opening marker identifies the box opening, and measured length runs parallel to it. Rotate the physical package to match before loading.")
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "arrow.left.and.right")
+                .foregroundStyle(.yellow)
+        }
+        .font(.caption.weight(.medium))
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.1), in: .rect(cornerRadius: 12))
+        .accessibilityLabel("Opening marker instruction")
+        .accessibilityValue("The opening marker identifies the box opening, and measured length runs parallel to it. Rotate the physical package to match before loading.")
+    }
+
+    private func compactKey(colour: Color, text: String) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(colour).frame(width: 7, height: 7)
+            Text(text).foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Sequential loading
+
+    private func loadingGuide(
+        _ solution: BaldiSolution,
+        verification: BaldiVerification
+    ) -> some View {
+        let layers = BaldiLoadingGuide.layers(for: solution)
+        let numbering = BaldiLoadingGuide.numbering(for: solution)
+        let reports = Dictionary(
+            uniqueKeysWithValues: verification.supportReports.map { ($0.packageID, $0) }
+        )
+
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("2. Load from the floor up")
+                .font(.headline)
+            Text("Complete each numbered layer before starting the next one.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(layers) { layer in
+                layerStage(
+                    layer,
+                    solution: solution,
+                    numbering: numbering,
+                    reports: reports
+                )
+            }
+        }
+    }
+
+    private func layerStage(
+        _ layer: BaldiLoadingLayer,
+        solution: BaldiSolution,
+        numbering: [UUID: Int],
+        reports: [UUID: BaldiSupportReport]
+    ) -> some View {
         card {
-            DisclosureGroup(isExpanded: $showsDiagnostics) {
-                VStack(alignment: .leading, spacing: 8) {
-                    row("Method", "Support-aware 3BKP-H")
-                    row("Runtime", String(format: "%.2f s", result.runtimeSeconds))
-                    if let detail = result.heuristicDetail {
-                        row("Iterations", "\(detail.iterations)")
-                        row("Feasible improvements", "\(detail.improvements)")
-                        row("Score reinitialisations", "\(detail.reinitialisations)")
-                        row("Best initial criterion", detail.initialCriterion.rawValue)
-                        row("Initial packages loaded", "\(detail.initialSolution.loadedCount)")
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 9) {
+                    Text("\(layer.index + 1)")
+                        .font(.subheadline.weight(.bold).monospacedDigit())
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(Color.accentColor, in: .circle)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(layer.isFloorLayer ? "Place on the payload floor" : "Place after Layer \(layer.index)")
+                            .font(.subheadline.weight(.semibold))
+                        Text(layerAction(layer, reports: reports, numbering: numbering))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
-                    Text("Fixed choices: pᵢ = 1, centred package COM, merit coefficient 0 and Junqueira vertical support α = 1.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
                 }
-                .padding(.top, 8)
-            } label: {
-                Text("Method and diagnostics").font(.headline)
+
+                BaldiLayerFootprintView(
+                    solution: solution,
+                    layer: layer,
+                    colours: colours,
+                    numbering: numbering,
+                    highlightedPackageID: packageSelection(in: solution)
+                )
+
+                packageLegend(
+                    layer.placements,
+                    layerIndex: layer.index,
+                    numbering: numbering
+                )
             }
         }
     }
 
-    private var scopeCard: some View {
+    private func packageLegend(
+        _ placements: [BaldiPlacement],
+        layerIndex: Int,
+        numbering: [UUID: Int]
+    ) -> some View {
+        ScrollViewReader { reader in
+            ScrollView(.horizontal) {
+                HStack(spacing: 7) {
+                    ForEach(placements) { placement in
+                        let selected = highlightedPackageID == placement.id
+                        Button {
+                            if selected {
+                                highlightedPackageID = nil
+                                selectedLayerIndex = nil
+                            } else {
+                                highlightedPackageID = placement.id
+                                selectedLayerIndex = layerIndex
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(colours[placement.id] ?? .accentColor)
+                                        .frame(width: 14, height: 14)
+                                    Text("#\(numbering[placement.id] ?? 0)")
+                                        .font(.caption.weight(.bold).monospacedDigit())
+                                    if selected {
+                                        Text(placement.name)
+                                            .font(.caption.weight(.semibold))
+                                            .lineLimit(1)
+                                    }
+                                }
+                                if selected {
+                                    Text(BaldiOpeningMarker.description(for: placement))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .background(
+                                selected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05),
+                                in: .rect(cornerRadius: 9)
+                            )
+                        }
+                        .id(placement.id)
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Package \(numbering[placement.id] ?? 0), \(placement.name)")
+                        .accessibilityValue(BaldiOpeningMarker.description(for: placement))
+                        .accessibilityHint("Reveals or hides this package name and highlights it in the 3D view.")
+                    }
+                }
+            }
+            .scrollIndicators(.hidden)
+            .onChange(of: highlightedPackageID) { _, id in
+                guard let id, placements.contains(where: { $0.id == id }) else { return }
+                withAnimation { reader.scrollTo(id, anchor: .center) }
+            }
+            .onAppear {
+                guard let id = highlightedPackageID,
+                      placements.contains(where: { $0.id == id }) else { return }
+                reader.scrollTo(id, anchor: .center)
+            }
+        }
+    }
+
+    private func layerAction(
+        _ layer: BaldiLoadingLayer,
+        reports: [UUID: BaldiSupportReport],
+        numbering: [UUID: Int]
+    ) -> String {
+        if layer.isFloorLayer {
+            return "Set every coloured package in this plan directly on the floor."
+        }
+
+        let supporterNumbers = Set(
+            layer.placements.flatMap { reports[$0.id]?.supporterIDs ?? [] }
+                .compactMap { numbering[$0] }
+        ).sorted()
+        guard !supporterNumbers.isEmpty else {
+            return "Finish all earlier layers, then place every package in this plan."
+        }
+        let supporters = supporterNumbers.map { "#\($0)" }.joined(separator: ", ")
+        return "Finish the earlier layer, then place these on supporter\(supporterNumbers.count == 1 ? "" : "s") \(supporters)."
+    }
+
+    // MARK: - Exceptions
+
+    private func unloadedWarning(_ solution: BaldiSolution) -> some View {
         card {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Assumptions and limits").font(.headline)
-                ForEach(scopeLines, id: \.self) { line in
-                    Text("• \(line)")
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: "shippingbox.and.arrow.backward")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(solution.unloaded.count) not loaded")
+                        .font(.subheadline.weight(.semibold))
+                    Text(solution.unloaded.map(\.name).joined(separator: ", "))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    if !result.oversizedItems.isEmpty {
+                        Text("\(result.oversizedItems.count) cannot fit in any allowed rotation.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                 }
+                Spacer(minLength: 0)
             }
         }
     }
 
-    private var scopeLines: [String] {
-        [
-            "Baldi supplies selection, rotation, Extreme Point placement and cargo-COM balancing; a continuous-coordinate evaluation of Junqueira equation (11) enforces complete vertical support.",
-            "Packages are rigid and assumed strong enough to carry packages above them. Load-bearing pressure and fragility are not modelled.",
-            "Mechanical restraint is assumed to prevent horizontal sliding. Friction, vibration, deformation and flight acceleration loads are outside the model.",
-            "The method is a heuristic: it reports the best feasible load found within its search time, not a globally proven optimum.",
-        ]
+    // MARK: - State and status
+
+    private var verifiedSolution: BaldiSolution? {
+        guard result.status == .feasible,
+              result.verification?.isValid == true else { return nil }
+        return result.solution
     }
 
-    // MARK: - Helpers
-
-    private func supportDescription(_ report: BaldiSupportReport?) -> String {
-        guard let report else { return "not assessed" }
-        if report.isFloorSupported { return "floor" }
-        let noun = report.supporterIDs.count == 1 ? "supporter" : "supporters"
-        return String(format: "%.0f%% · %d %@", report.fraction * 100, report.supporterIDs.count, noun)
+    private func packageSelection(in solution: BaldiSolution) -> Binding<UUID?> {
+        Binding(
+            get: { highlightedPackageID },
+            set: { id in
+                highlightedPackageID = id
+                guard let id else {
+                    selectedLayerIndex = nil
+                    return
+                }
+                selectedLayerIndex = BaldiLoadingGuide.layers(for: solution).first {
+                    $0.placements.contains { $0.id == id }
+                }?.index
+            }
+        )
     }
 
-    private func placementOrder(_ first: BaldiPlacement, _ second: BaldiPlacement) -> Bool {
-        if first.origin.z != second.origin.z { return first.origin.z < second.origin.z }
-        if first.origin.x != second.origin.x { return first.origin.x < second.origin.x }
-        if first.origin.y != second.origin.y { return first.origin.y < second.origin.y }
-        return first.id.uuidString < second.id.uuidString
-    }
-
-    private func row(_ title: String, _ value: String) -> some View {
-        HStack {
-            Text(title).font(.subheadline).foregroundStyle(.secondary)
-            Spacer(minLength: 8)
-            Text(value).font(.subheadline.monospacedDigit())
+    private var statusTitle: String {
+        if verifiedSolution != nil { return "Ready to load" }
+        return switch result.status {
+        case .feasible: "Packing is not ready"
+        case .notFound: "No usable load found"
+        case .invalidInput: "Arrangement needs input"
+        case .verificationFailed: "Packing failed its checks"
         }
+    }
+
+    private var statusDetail: String {
+        if let solution = verifiedSolution {
+            let layers = BaldiLoadingGuide.layers(for: solution)
+            let layerWord = layers.count == 1 ? "layer" : "layers"
+            let total = solution.loadedCount + solution.unloaded.count
+            return "\(solution.loadedCount) of \(total) packages · \(layers.count) bottom-up \(layerWord) · balance and support checked"
+        }
+        return switch result.status {
+        case .feasible: "The result is incomplete or could not be verified."
+        case .notFound: "Try the other packing version or revise the load."
+        case .invalidInput: "Correct the package or container details, then arrange again."
+        case .verificationFailed: "This arrangement is hidden and must not be used."
+        }
+    }
+
+    private var statusSymbol: String {
+        verifiedSolution != nil ? "checkmark.circle.fill" : {
+            switch result.status {
+            case .notFound: "magnifyingglass"
+            case .feasible, .invalidInput: "exclamationmark.triangle.fill"
+            case .verificationFailed: "xmark.seal.fill"
+            }
+        }()
+    }
+
+    private var statusColour: Color {
+        verifiedSolution != nil ? .green : result.status == .notFound ? .orange : .red
     }
 
     private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         content()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
-    }
-
-    private var statusSymbol: String {
-        switch result.status {
-        case .feasible: "checkmark.circle.fill"
-        case .notFound: "magnifyingglass"
-        case .invalidInput: "exclamationmark.triangle.fill"
-        case .verificationFailed: "xmark.seal.fill"
-        }
-    }
-
-    private var statusColour: Color {
-        switch result.status {
-        case .feasible: .green
-        case .notFound: .orange
-        case .invalidInput, .verificationFailed: .red
-        }
-    }
-
-    private var statusTitle: String {
-        switch result.status {
-        case .feasible:
-            guard let solution = result.solution else { return "Best feasible load found" }
-            return solution.unloaded.isEmpty ? "All packages loaded" : "Best feasible load found"
-        case .notFound:
-            return noPackageFits ? "No package fits the container" : "No feasible load found in time"
-        case .invalidInput: return "Cannot arrange this load yet"
-        case .verificationFailed: return "Packing rejected by verification"
-        }
-    }
-
-    private var statusDetail: String {
-        switch result.status {
-        case .feasible:
-            guard let solution = result.solution else { return "The independently verified heuristic result is ready." }
-            if solution.unloaded.isEmpty {
-                return "All \(solution.loadedCount) packages fit in an independently verified supported and balanced arrangement."
-            }
-            return "The heuristic loaded \(solution.loadedCount) of \(solution.loadedCount + solution.unloaded.count) packages. This is the highest-cardinality feasible load it found within the search time; global optimality is not claimed."
-        case .notFound:
-            if noPackageFits {
-                return "None of the measured packages fits inside the payload container in any of the six allowed rotations."
-            }
-            return "The heuristic did not find a supported and balanced arrangement before it stopped. This does not prove that none exists."
-        case .invalidInput:
-            return "Fix the input problems below, then run the search again."
-        case .verificationFailed:
-            return "The result failed an independent invariant check and must not be used."
-        }
-    }
-
-    private var noPackageFits: Bool {
-        result.status == .notFound
-            && result.heuristicDetail == nil
-            && !result.oversizedItems.isEmpty
+            .padding(14)
+            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 16))
     }
 }

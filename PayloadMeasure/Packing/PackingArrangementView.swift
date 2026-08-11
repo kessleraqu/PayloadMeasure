@@ -36,9 +36,9 @@ struct PackingArrangementView: View {
                             }
                         case .knapsack3D:
                             if !missingWeightIDs.isEmpty { missingWeightCard }
-                            if let result = store.baldiResult {
+                            if let comparison = store.baldiComparison {
                                 BaldiResultView(
-                                    result: result,
+                                    comparison: comparison,
                                     colours: colourMap,
                                     highlightedPackageID: $highlightedPackageID
                                 )
@@ -76,7 +76,7 @@ struct PackingArrangementView: View {
                         store.solve(packages: packages)
                     }
                 case .knapsack3D:
-                    if store.baldiResult == nil || store.isBaldiStale(for: baldiProblem) {
+                    if store.baldiComparison == nil || store.isBaldiStale(for: baldiProblem) {
                         store.solveBaldi(problem: baldiProblem)
                     }
                 }
@@ -106,8 +106,8 @@ struct PackingArrangementView: View {
 
             Text(
                 store.approach == .knapsack3D
-                    ? "\(store.approach.citation) — searches for the largest equal-priority subset with complete vertical support and cargo centre of mass inside its domain."
-                    : "\(store.approach.citation) — loads every package on the module floor and minimises the deviation of the centre of mass from a target."
+                    ? "Stacks packages in supported layers; some may be left out."
+                    : "Places every package on the floor and balances the load."
             )
             .font(.caption2)
             .foregroundStyle(.secondary)
@@ -122,11 +122,15 @@ struct PackingArrangementView: View {
             HStack(spacing: 14) {
                 ProgressView()
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Optimising the arrangement")
+                    Text(
+                        store.approach == .knapsack3D
+                            ? "Preparing both 3D layouts"
+                            : "Optimising the arrangement"
+                    )
                         .font(.headline)
                     Text(
                         store.approach == .knapsack3D
-                            ? "Searching for a supported, balanced 3D load for \(packages.count) packages."
+                            ? "Preparing the Paper-mode and centre-refined supported layouts for \(packages.count) packages."
                             : "Solving one mixed-integer program for all \(packages.count) packages at once."
                     )
                         .font(.footnote)

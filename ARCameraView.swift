@@ -311,6 +311,7 @@ struct ARCameraView: UIViewRepresentable {
         private var lastAimerRaycastTransform: simd_float4x4?
         private var aimerUpdateTimer: Timer?
         private var maskDisplayLink: CADisplayLink?
+        private var isRealtimeProcessingSuspended = true
         private var memoryWarningObserver: NSObjectProtocol?
         private var observedResetRevision = 0
         private var observedPlacementRequestRevision = 0
@@ -359,45 +360,7 @@ struct ARCameraView: UIViewRepresentable {
             createContentAnchorIfNeeded(in: arView)
             updateMeshVisibility()
 
-            rendererWarmupTask?.cancel()
-            rendererWarmupTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(600))
-                guard !Task.isCancelled else {
-                    return
-                }
-                await self?.prepareRenderersForFirstCapture()
-            }
-
-            aimerUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self, weak arView] _ in
-                guard let self, let arView else {
-                    return
-                }
-
-                Task { @MainActor in
-                    // First and unconditional: this is the backstop that applies the pause and
-                    // finalize workflow requests, so it has to run even while the rest is idle.
-                    self.handleEngineRevisionChange()
-                    self.updateSessionFrameStatus(in: arView)
-                    self.updateAimerSurface(in: arView)
-                    self.updatePlacedPointBillboards(in: arView)
-                    self.updateFastObjectMaskMarkers(in: arView)
-                    self.updateScanLive(in: arView)
-                    self.refreshSupportPlaneBindings(in: arView)
-                    self.updateCaptureBoxLineStyles(in: arView)
-                }
-            }
-
-            let maskDisplayLink = CADisplayLink(
-                target: self,
-                selector: #selector(updateMaskDisplay)
-            )
-            maskDisplayLink.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 30,
-                maximum: 60,
-                preferred: 60
-            )
-            maskDisplayLink.add(to: .main, forMode: .common)
-            self.maskDisplayLink = maskDisplayLink
+            synchronizeRealtimeProcessing()
 
             memoryWarningObserver = NotificationCenter.default.addObserver(
                 forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -423,23 +386,111 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         @objc private func updateMaskDisplay() {
-            guard let arView else {
+            guard !sessionManager.isTrackingSuspended,
+                  let arView else {
                 return
             }
             updateFastObjectMaskPreview(in: arView)
             updateObjectMaskPreview(in: arView)
         }
 
+        /// ARKit owns camera capture, while this coordinator owns the app's frame-driven work.
+        /// Both must stop together or a paused camera still leaves mask projection, fitting and UI
+        /// polling consuming CPU/GPU behind the arrangement screen.
+        private func synchronizeRealtimeProcessing() {
+            let shouldSuspend = sessionManager.isTrackingSuspended
+            guard shouldSuspend != isRealtimeProcessingSuspended else {
+                return
+            }
+            if shouldSuspend {
+                isRealtimeProcessingSuspended = true
+                stopRealtimeProcessing()
+            } else {
+                // An observation callback can arrive after dismantling. Keep the state suspended
+                // until a view is attached so a later attach still starts both live loops.
+                guard arView != nil else {
+                    return
+                }
+                isRealtimeProcessingSuspended = false
+                startRealtimeProcessingIfNeeded()
+            }
+        }
+
+        private func startRealtimeProcessingIfNeeded() {
+            guard !sessionManager.isTrackingSuspended,
+                  let arView else {
+                return
+            }
+
+            if rendererWarmupTask == nil {
+                rendererWarmupTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(600))
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    await self?.prepareRenderersForFirstCapture()
+                }
+            }
+
+            if aimerUpdateTimer == nil {
+                aimerUpdateTimer = Timer.scheduledTimer(
+                    withTimeInterval: 1.0 / 15.0,
+                    repeats: true
+                ) { [weak self, weak arView] _ in
+                    guard let self, let arView else {
+                        return
+                    }
+
+                    Task { @MainActor in
+                        // This remains the polling backstop for workflow revisions while live.
+                        self.handleEngineRevisionChange()
+                        guard !self.sessionManager.isTrackingSuspended else {
+                            return
+                        }
+                        self.updateSessionFrameStatus(in: arView)
+                        self.updateAimerSurface(in: arView)
+                        self.updatePlacedPointBillboards(in: arView)
+                        self.updateFastObjectMaskMarkers(in: arView)
+                        self.updateScanLive(in: arView)
+                        self.refreshSupportPlaneBindings(in: arView)
+                        self.updateCaptureBoxLineStyles(in: arView)
+                    }
+                }
+            }
+
+            if maskDisplayLink == nil {
+                let displayLink = CADisplayLink(
+                    target: self,
+                    selector: #selector(updateMaskDisplay)
+                )
+                displayLink.preferredFrameRateRange = CAFrameRateRange(
+                    minimum: 30,
+                    maximum: 60,
+                    preferred: 60
+                )
+                displayLink.add(to: .main, forMode: .common)
+                maskDisplayLink = displayLink
+            }
+        }
+
+        private func stopRealtimeProcessing() {
+            aimerUpdateTimer?.invalidate()
+            aimerUpdateTimer = nil
+            maskDisplayLink?.invalidate()
+            maskDisplayLink = nil
+            rendererWarmupTask?.cancel()
+            rendererWarmupTask = nil
+            invalidateInFlightFrameWork()
+        }
+
         func detach() {
+            isRealtimeProcessingSuspended = true
+            stopRealtimeProcessing()
             coachingOverlayView?.delegate = nil
             coachingOverlayView?.session = nil
             coachingOverlayView?.removeFromSuperview()
             coachingOverlayView = nil
             sessionManager.updateCoachingState(isActive: false)
-            aimerUpdateTimer?.invalidate()
-            aimerUpdateTimer = nil
-            maskDisplayLink?.invalidate()
-            maskDisplayLink = nil
             if let memoryWarningObserver {
                 NotificationCenter.default.removeObserver(memoryWarningObserver)
                 self.memoryWarningObserver = nil
@@ -466,8 +517,6 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
-            rendererWarmupTask?.cancel()
-            rendererWarmupTask = nil
             removeAllObjectMaskAnchors()
             captureEngine.updateLockedObjectMaskCount(0)
             captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
@@ -568,6 +617,7 @@ struct ARCameraView: UIViewRepresentable {
                 _ = captureEngine.isMeshVisible
                 _ = captureEngine.showsSelectedPoints
                 _ = captureEngine.showsBoundingBoxes
+                _ = sessionManager.isTrackingSuspended
                 _ = sessionManager.frameEpoch
             } onChange: { [weak self] in
                 Task { @MainActor [weak self] in
@@ -593,6 +643,11 @@ struct ARCameraView: UIViewRepresentable {
         /// syncs, so the whole thing is idempotent and safe to poll. The scan timer calls it each
         /// tick as a backstop; the observation path still provides the immediate response.
         private func handleEngineRevisionChange() {
+            synchronizeRealtimeProcessing()
+            guard !sessionManager.isTrackingSuspended else {
+                return
+            }
+
             if sessionManager.frameEpoch != observedFrameEpoch {
                 observedFrameEpoch = sessionManager.frameEpoch
                 invalidateInFlightFrameWork()

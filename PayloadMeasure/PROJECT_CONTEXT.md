@@ -245,7 +245,9 @@ equal value `p_i = 1`, so the search objective is loaded-package count, and pack
 are assumed to be at their geometric centres, as in Baldi's benchmark instances. Junqueira,
 Morabito & Yamashita's (2012) area-based vertical-support principle is evaluated directly on the
 continuous placements with `alpha = 1`, requiring complete bottom-face support for every non-floor
-package.
+package. The app computes both a Paper mode, which stops COM movement at first valid balance as
+Baldi §5.2 states, and a disclosed Centred mode, which uses cargo-COM proximity only between
+equal-count feasible candidates and never changes the cardinality objective.
 
 ✅ The production Baldi–Junqueira path is heuristic-only. Every Extreme Point insertion and every
 centre-of-mass movement preserves full support, and an independent final verifier recomputes
@@ -256,6 +258,18 @@ proof of infeasibility. `Baldi3BKPModel.swift` remains a clearly labelled Baldi-
 equations (5)–(20), including the documented Eq. (10) and Eq. (16) corrections. It contains no
 Junqueira support constraint and is not a production hybrid solver. See
 `Packing/Baldi/BALDI_3BKP_NOTES.md` and `Packing/Baldi/BALDI_FIDELITY_AUDIT.md`.
+
+✅ The support-aware result screen is an operator loading guide rather than an algorithm report. A
+top comparison control switches between the two precomputed packings. It presents a tappable 3D
+load followed by bottom-to-top coloured floor plans; package names stay out of the drawings until a
+package is selected. The same opening-edge marker appears in 2D and 3D, with the measured package
+length defined parallel to that marker so the operator can match the physical orientation.
+
+✅ Opening the arrangement workflow suspends the AR session and the app's frame-driven mask,
+projection, fitting and display loops. The arrangement is presented full-screen; dismissal resumes
+the existing AR world without resetting anchors or measured packages. Scene inactivity and the
+arrangement presentation are independent suspension reasons, so overlapping lifecycle transitions
+cannot restart the camera prematurely.
 
 ✅ The separate floor-only mixed-integer program uses a self-contained exact solver: a
 bounded-variable primal and dual simplex with refactorisation and a Harris ratio test, driven by a

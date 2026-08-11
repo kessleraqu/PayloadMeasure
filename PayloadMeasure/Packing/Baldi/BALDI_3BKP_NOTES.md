@@ -27,7 +27,7 @@ PackingStore
     |
     v
 Baldi3BKPSolver
-  input validation + oversized-package partition
+  input validation + oversized-package partition + both comparison modes
     |
     v
 BaldiHeuristic
@@ -37,7 +37,8 @@ BaldiHeuristic
     |
     v
 BaldiCentreOfMassOptimisation
-  support-preserving tentative movements
+  Paper: stop at first valid balance
+  Centred: support-preserving secondary refinement
     |
     v
 BaldiGeometryCheck
@@ -115,6 +116,12 @@ decrease and score increase both start at `0.1`, as stated in §5.3.4, and conti
 the heuristic. Balance is not traded against package count: cargo-COM compliance remains a hard
 feasibility condition.
 
+The app computes two independently verified views of that equal-priority search. **Paper** uses
+Baldi §5.2's explicit stop as soon as the cargo COM enters `[L,U]` and does not add a cargo-COM
+distance tie-break. **Centred** is a disclosed secondary refinement: between equal-count feasible
+packings it prefers the smaller cargo-COM distance to the centre of `[L,U]` and continues only with
+strictly improving, still-feasible movements. It never prefers fewer packages.
+
 ## Centre of mass
 
 For package `i` under rotation `r`, the rotated extent along axis `delta` is `s_ir^delta`. The project
@@ -180,10 +187,13 @@ The production path is deliberately heuristic-only:
 2. Generate Baldi's sorting orders and Extreme Points.
 3. For each package, rotation and candidate Extreme Point, reject containment failures, overlaps and
    any non-floor placement without complete bottom support.
-4. Run Baldi's centre-of-mass adjustment. Each proposed movement is accepted atomically only if the
-   complete packing remains contained, non-overlapping and fully supported, including packages above
-   the moved supporter.
-5. Keep the best nonempty candidate that also satisfies the cargo-COM domain.
+4. Compute both support-aware centre-of-mass modes from the same measured problem:
+   - **Paper** uses the §5.2 stopping rule and stops moving a packing once its COM enters `[L,U]`;
+   - **Centred** may continue with bounded static relocation candidates, but accepts only a strict
+     improvement that leaves the complete packing contained, non-overlapping, balanced and fully
+     supported, including packages above a moved supporter.
+5. Keep the best nonempty candidate that satisfies the cargo-COM domain. Package count is primary in
+   both modes; only Centred uses cargo-COM proximity between equal-count candidates.
 6. Independently recompute every feasibility condition before exposing the arrangement to the UI.
 
 An invalid or unbalanced exploratory candidate may guide the heuristic internally, but it is never
@@ -202,8 +212,12 @@ result says that none was **found**; it does not claim that none exists.
 | Added condition | Junqueira Eq. (11), `alpha_j = 1` | every non-floor bottom face is completely supported |
 | Implementation choice | `theta = 20%` | five sorting clusters; Baldi defines but does not value it |
 | Implementation choice | ideal COM is the domain centre | target used by Baldi's COM adjustment |
+| Comparison mode | Paper: no cargo-COM proximity tie-break | follows Baldi's first-feasible-balance stop |
+| Comparison mode | Centred: cargo-COM proximity breaks equal-count ties | disclosed refinement without changing `max sum_i t_i` |
 | Implementation choice | at most 50 COM-adjustment iterations | Baldi names a limit but does not value it |
 | Implementation choice | heaviest package considered first for movement | deterministic order where Baldi gives none |
+| Comparison mode | Paper: local blocker-bounded movement candidates | approximates Baldi's connected movement domain `D_i` |
+| Comparison mode | Centred: bounded container-wide relocation candidates | can move a stack item into an open floor gap; every final position is revalidated |
 | Implementation choice | seeded random score reinitialisation | reproducible runs |
 | Implementation choice | deterministic input/rotation/Extreme Point tie-breaking | reproducible runs |
 | Implementation choice | 1000 non-improving iterations and 5% distinct swap pairs | resolves the wording of Baldi §5.3/Fig. 6 |
@@ -244,7 +258,7 @@ Only a result passing all of these checks is surfaced as feasible.
 | PCH, scoring, parameter update and 3BKP-H loop | `BaldiHeuristic.swift` |
 | production validation and result orchestration | `Baldi3BKPSolver.swift` |
 | Baldi-only, non-production reference MIP and `UB_1D` | `Baldi3BKPModel.swift` |
-| result and plan presentation | `BaldiResultView.swift`, `BaldiPlanView.swift` |
+| two-mode, instruction-first result and plan presentation | `BaldiResultView.swift`, `BaldiPlanView.swift` |
 
 The defensible project description is:
 

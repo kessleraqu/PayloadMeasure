@@ -33,9 +33,47 @@ nonisolated struct Baldi3BKPResult: Sendable {
     var heuristicDetail: BaldiHeuristicResult?
 }
 
+/// The two explicitly labelled outcomes for the same validated problem and base options.
+nonisolated struct Baldi3BKPComparison: Sendable {
+    let paper: Baldi3BKPResult
+    let centred: Baldi3BKPResult
+
+    func result(for mode: BaldiPackingMode) -> Baldi3BKPResult {
+        switch mode {
+        case .paper: paper
+        case .centred: centred
+        }
+    }
+}
+
 /// Validates inputs, runs the support-aware Baldi heuristic and exposes a solution only after an
 /// independent check of containment, rotations, non-overlap, full support and cargo balance.
 nonisolated enum Baldi3BKPSolver {
+    /// Solves the same problem under both CoM policies using structured child tasks. Each result
+    /// retains its own status and verification; one mode failing does not erase the other result.
+    static func solveBoth(
+        _ problem: BaldiProblem,
+        options: Baldi3BKPOptions = Baldi3BKPOptions()
+    ) async -> Baldi3BKPComparison {
+        let paperOptions: Baldi3BKPOptions = {
+            var configured = options
+            configured.heuristic.centreOfMass.mode = .paper
+            return configured
+        }()
+        let centredOptions: Baldi3BKPOptions = {
+            var configured = options
+            configured.heuristic.centreOfMass.mode = .centred
+            return configured
+        }()
+
+        async let paperResult = solve(problem, options: paperOptions)
+        async let centredResult = solve(problem, options: centredOptions)
+        return await Baldi3BKPComparison(
+            paper: paperResult,
+            centred: centredResult
+        )
+    }
+
     static func solve(
         _ problem: BaldiProblem,
         options: Baldi3BKPOptions = Baldi3BKPOptions()

@@ -6,9 +6,16 @@ import Observation
 @MainActor
 @Observable
 final class ARSessionManager: NSObject, ARSessionDelegate {
+    private enum SuspensionReason: Hashable {
+        case packingArrangement
+        case applicationInactive
+    }
+
     private weak var activeSession: ARSession?
     private var activeConfiguration: ARWorldTrackingConfiguration?
     private var sessionStartTask: Task<Void, Never>?
+    private var suspensionReasons: Set<SuspensionReason> = []
+    private var isSessionRunning = false
     private var automaticRecoveryAttempts = 0
     private var horizontalPlaneAnchorIDs: Set<UUID> = []
     private var verticalPlaneAnchorIDs: Set<UUID> = []
@@ -96,13 +103,16 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var hasReconstructedMesh = false
     private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
     private(set) var isCoachingActive = false
+    /// True while some UI or lifecycle owner requires both AR capture and frame processing to stop.
+    /// Multiple reasons may overlap; the session resumes only after the final reason is removed.
+    private(set) var isTrackingSuspended = false
     private(set) var frameEpoch = 0
     private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
         "Move the iPhone slowly across the object and its supporting surface."
     )
 
     var isTrackingReady: Bool {
-        trackingStatus == .normal
+        !isTrackingSuspended && trackingStatus == .normal
     }
 
     var isLiDARAvailable: Bool {
@@ -174,6 +184,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     func configure(_ session: ARSession) {
         sessionStartTask?.cancel()
         sessionStartTask = nil
+        isSessionRunning = false
         automaticRecoveryAttempts = 0
         activeSession = session
         session.delegate = self
@@ -214,7 +225,12 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
 
         activeConfiguration = configuration
-        startWhenCameraIsAuthorized(session, configuration: configuration)
+        if isTrackingSuspended {
+            session.pause()
+            updateSuspendedReadiness()
+        } else {
+            startWhenCameraIsAuthorized(session, configuration: configuration)
+        }
     }
 
     func detach(_ session: ARSession) {
@@ -226,7 +242,21 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         session.delegate = nil
         activeSession = nil
         activeConfiguration = nil
+        isSessionRunning = false
         isCoachingActive = false
+    }
+
+    /// Suspends camera capture for the lifetime of the packing/result presentation. Repeating the
+    /// same value is intentionally a no-op so SwiftUI presentation and dismissal callbacks cannot
+    /// cause duplicate session runs.
+    func setPackingArrangementPresented(_ isPresented: Bool) {
+        setSuspensionReason(.packingArrangement, isActive: isPresented)
+    }
+
+    /// Keeps a dismissed arrangement from restarting the camera while the scene is inactive.
+    /// Tracking resumes once, when both this and every UI suspension reason have cleared.
+    func setApplicationActive(_ isActive: Bool) {
+        setSuspensionReason(.applicationInactive, isActive: !isActive)
     }
 
     func updateCoachingState(isActive: Bool) {
@@ -240,6 +270,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
               let activeConfiguration else {
             return
         }
+        guard !isTrackingSuspended else { return }
         automaticRecoveryAttempts = 0
         frameEpoch &+= 1
         trackingStatus = .starting
@@ -254,8 +285,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         environmentReadiness = .preparing(
             "Restarting tracking. Move the iPhone slowly around the payload area."
         )
-        session.run(
-            activeConfiguration,
+        run(
+            session,
+            configuration: activeConfiguration,
             options: [.resetTracking, .removeExistingAnchors]
         )
     }
@@ -264,10 +296,18 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         _ session: ARSession,
         configuration: ARWorldTrackingConfiguration
     ) {
+        guard activeSession === session,
+              !isTrackingSuspended,
+              !isSessionRunning else {
+            return
+        }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             startSession(session, configuration: configuration)
         case .notDetermined:
+            guard sessionStartTask == nil else {
+                return
+            }
             environmentReadiness = .preparing(
                 "Allow camera access, then move slowly across the payload area."
             )
@@ -276,7 +316,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
                 guard !Task.isCancelled,
                       let self,
                       let session,
-                      self.activeSession === session else {
+                      self.activeSession === session,
+                      !self.isTrackingSuspended else {
                     return
                 }
                 self.sessionStartTask = nil
@@ -297,13 +338,94 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         _ session: ARSession,
         configuration: ARWorldTrackingConfiguration
     ) {
-        guard activeSession === session else {
+        guard activeSession === session,
+              !isTrackingSuspended,
+              !isSessionRunning else {
             return
         }
         trackingStatus = .starting
-        session.run(
-            configuration,
+        run(
+            session,
+            configuration: configuration,
             options: [.resetTracking, .removeExistingAnchors]
+        )
+    }
+
+    private func setSuspensionReason(
+        _ reason: SuspensionReason,
+        isActive: Bool
+    ) {
+        let didChange = isActive
+            ? suspensionReasons.insert(reason).inserted
+            : suspensionReasons.remove(reason) != nil
+        guard didChange else {
+            return
+        }
+
+        let shouldSuspend = !suspensionReasons.isEmpty
+        guard shouldSuspend != isTrackingSuspended else {
+            return
+        }
+        isTrackingSuspended = shouldSuspend
+        frameEpoch &+= 1
+
+        if shouldSuspend {
+            suspendActiveSession()
+        } else {
+            resumeActiveSessionIfPossible()
+        }
+    }
+
+    private func suspendActiveSession() {
+        sessionStartTask?.cancel()
+        sessionStartTask = nil
+        if let activeSession, isSessionRunning {
+            activeSession.pause()
+        }
+        isSessionRunning = false
+        updateSuspendedReadiness()
+    }
+
+    private func resumeActiveSessionIfPossible() {
+        guard !isTrackingSuspended,
+              let activeSession,
+              let activeConfiguration,
+              !isSessionRunning else {
+            return
+        }
+
+        trackingStatus = .starting
+        environmentReadiness = .preparing(
+            "Resuming AR tracking. Keep the camera pointed at the payload area."
+        )
+
+        if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+            // No reset options: preserve the world map, anchors and every measured package.
+            run(activeSession, configuration: activeConfiguration)
+        } else {
+            startWhenCameraIsAuthorized(
+                activeSession,
+                configuration: activeConfiguration
+            )
+        }
+    }
+
+    private func run(
+        _ session: ARSession,
+        configuration: ARWorldTrackingConfiguration,
+        options: ARSession.RunOptions = []
+    ) {
+        guard activeSession === session,
+              !isTrackingSuspended else {
+            return
+        }
+        session.run(configuration, options: options)
+        isSessionRunning = true
+    }
+
+    private func updateSuspendedReadiness() {
+        environmentReadiness = .preparing(
+            "Camera capture and AR tracking are paused."
         )
     }
 
@@ -317,6 +439,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     @discardableResult
     func recoverFailedSessionIfPossible(_ session: ARSession) -> Bool {
         guard activeSession === session,
+              !isTrackingSuspended,
               case .failed = trackingStatus,
               automaticRecoveryAttempts == 0,
               AVCaptureDevice.authorizationStatus(for: .video) == .authorized,
@@ -337,8 +460,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         environmentReadiness = .preparing(
             "Restarting AR tracking. Move slowly across the payload area."
         )
-        session.run(
-            activeConfiguration,
+        run(
+            session,
+            configuration: activeConfiguration,
             options: [.resetTracking, .removeExistingAnchors]
         )
         return true
@@ -346,7 +470,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         Task { @MainActor in
-            guard activeSession === session else {
+            guard activeSession === session,
+                  !isTrackingSuspended else {
                 return
             }
             updateTrackingStatus(from: camera.trackingState)
@@ -355,7 +480,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         Task { @MainActor in
-            guard activeSession === session else {
+            guard activeSession === session,
+                  !isTrackingSuspended else {
                 return
             }
             updateEnvironmentAnchors(from: anchors)
@@ -365,7 +491,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         Task { @MainActor in
-            guard activeSession === session else {
+            guard activeSession === session,
+                  !isTrackingSuspended else {
                 return
             }
             // Plane transforms and detailed boundaries improve as ARKit observes more of the
@@ -377,7 +504,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     nonisolated func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         Task { @MainActor in
-            guard activeSession === session else {
+            guard activeSession === session,
+                  !isTrackingSuspended else {
                 return
             }
             for anchor in anchors {
@@ -391,6 +519,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     }
 
     func updateFrameStatus(from frame: ARFrame) {
+        guard !isTrackingSuspended else {
+            return
+        }
         let mappingStatus = frame.worldMappingStatus
         let depthData = frame.sceneDepth
         let receivedDepth = depthData != nil
@@ -416,6 +547,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             guard activeSession === session else {
                 return
             }
+            isSessionRunning = false
             frameEpoch &+= 1
             trackingStatus = .interrupted
             refreshEnvironmentReadiness()
@@ -433,11 +565,11 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             guard activeSession === session else {
                 return
             }
-            trackingStatus = .starting
-            if let activeConfiguration {
-                session.run(activeConfiguration)
+            guard !isTrackingSuspended else {
+                updateSuspendedReadiness()
+                return
             }
-            refreshEnvironmentReadiness()
+            resumeActiveSessionIfPossible()
         }
     }
 
@@ -446,6 +578,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             guard activeSession === session else {
                 return
             }
+            isSessionRunning = false
             frameEpoch &+= 1
             trackingStatus = .failed(error.localizedDescription)
             refreshEnvironmentReadiness()
@@ -505,6 +638,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     }
 
     private func refreshEnvironmentReadiness() {
+        guard !isTrackingSuspended else {
+            updateSuspendedReadiness()
+            return
+        }
         guard trackingStatus == .normal else {
             setEnvironmentReadiness(.preparing(trackingStatus.detail))
             return

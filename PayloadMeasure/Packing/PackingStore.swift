@@ -40,7 +40,9 @@ final class PackingStore {
     /// Which method to run. Both are kept so they can be compared on the same measurements.
     var approach: PackingApproach = .knapsack3D
     var baldiOptions = Baldi3BKPOptions()
-    private(set) var baldiResult: Baldi3BKPResult?
+    /// The Paper-mode placement and the optional centre-refined placement for the same input.
+    /// Publishing them together prevents the result screen from mixing generations.
+    private(set) var baldiComparison: Baldi3BKPComparison?
 
     /// Geometry and mass properties of the payload module, editable in the arrangement settings.
     var module: PayloadModule = .standard
@@ -68,7 +70,7 @@ final class PackingStore {
 
     private var solveTask: Task<Void, Never>?
     private var solveWork: Task<PackingResult, Never>?
-    private var baldiWork: Task<Baldi3BKPResult, Never>?
+    private var baldiWork: Task<Baldi3BKPComparison, Never>?
 
     /// The module as the optimiser sees it, with the operator's envelope and mass limit folded in.
     var effectiveModule: PayloadModule {
@@ -204,11 +206,11 @@ final class PackingStore {
         }
     }
 
-    /// Runs the support-aware 3BKP-H heuristic.
+    /// Runs the Paper stopping-rule and centre-refined 3BKP-H modes concurrently.
     func solveBaldi(problem: BaldiProblem) {
         cancel()
         guard !problem.items.isEmpty else {
-            baldiResult = nil
+            baldiComparison = nil
             solvedSignature = nil
             return
         }
@@ -218,14 +220,14 @@ final class PackingStore {
         let expected = baldiSignature(for: problem)
 
         let work = Task.detached(priority: .userInitiated) {
-            Baldi3BKPSolver.solve(problem, options: options)
+            await Baldi3BKPSolver.solveBoth(problem, options: options)
         }
         baldiWork = work
 
         solveTask = Task { [weak self] in
             let outcome = await work.value
             guard !Task.isCancelled else { return }
-            self?.baldiResult = outcome
+            self?.baldiComparison = outcome
             self?.solvedSignature = expected
             self?.isSolving = false
         }
@@ -233,12 +235,12 @@ final class PackingStore {
 
     /// True when the measurements or settings have changed since the displayed 3BKP packing.
     func isBaldiStale(for problem: BaldiProblem) -> Bool {
-        baldiResult != nil && solvedSignature != baldiSignature(for: problem)
+        baldiComparison != nil && solvedSignature != baldiSignature(for: problem)
     }
 
     func baldiSignature(for problem: BaldiProblem) -> String {
         var parts: [String] = [
-            "baldi-junqueira-v1",
+            "baldi-junqueira-v3-paper-stop-and-centred",
             "\(problem.knapsack.size.x)/\(problem.knapsack.size.y)/\(problem.knapsack.size.z)",
             String(
                 format: "L%.2f,%.2f,%.2f U%.2f,%.2f,%.2f",
@@ -257,7 +259,7 @@ final class PackingStore {
                 baldiOptions.heuristic.centreOfMass.maximumIterations,
                 baldiOptions.heuristic.randomSeed
             ),
-            "equal-priority|centred-com|support-alpha-1",
+            "dual-mode|paper-stop|centred-refinement|equal-priority|support-alpha-1",
         ]
         for item in problem.items.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
             parts.append(
@@ -283,7 +285,7 @@ final class PackingStore {
     func clear() {
         cancel()
         result = nil
-        baldiResult = nil
+        baldiComparison = nil
         solvedSignature = nil
     }
 

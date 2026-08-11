@@ -15,6 +15,8 @@ import simd
 /// Every project item has `p_i = 1`. The merit coefficient in equation (24) is fixed to zero, so
 /// the search ranks solutions by loaded-package count while balance remains a hard feasibility
 /// condition. Exploratory unbalanced solutions are kept separate from the best reportable result.
+/// Paper mode retains the first equal-count incumbent; centred mode may replace it with an
+/// equal-count solution whose aggregate cargo CoM is closer to the centre of `[L,U]`.
 nonisolated struct BaldiHeuristicOptions: Sendable, Equatable {
     /// Paper §5.3.4: "The overall process stops after 5 s."
     var timeLimitSeconds: Double = 5
@@ -87,13 +89,24 @@ nonisolated enum BaldiHeuristic {
                 BaldiEPBPH.pack(order: order, knapsack: problem.knapsack),
                 options: options
             )
-            if bestForSearch == nil || isBetterForSearch(packed, than: bestForSearch!) {
+            if bestForSearch == nil || isBetterForSearch(
+                packed,
+                than: bestForSearch!,
+                mode: options.centreOfMass.mode
+            ) {
                 bestForSearch = packed
                 bestCriterion = criterion
             }
-            if isFeasible(packed),
-               bestFeasible == nil || packed.loadedCount > bestFeasible!.loadedCount {
-                bestFeasible = packed
+            if isFeasible(packed) {
+                if let incumbent = bestFeasible {
+                    if isBetterFeasible(
+                        packed,
+                        than: incumbent,
+                        mode: options.centreOfMass.mode
+                    ) { bestFeasible = packed }
+                } else {
+                    bestFeasible = packed
+                }
             }
         }
         return (
@@ -174,16 +187,31 @@ nonisolated enum BaldiHeuristic {
                 )
             }
 
-            if isBetterForSearch(current, than: searchBest) {
+            if isBetterForSearch(
+                current,
+                than: searchBest,
+                mode: options.centreOfMass.mode
+            ) {
                 searchBest = current
                 nonImproving = 0
             } else {
                 nonImproving += 1
             }
 
-            if isFeasible(current), bestFeasible == nil || current.loadedCount > bestFeasible!.loadedCount {
-                bestFeasible = current
-                improvements += 1
+            if isFeasible(current) {
+                if let incumbent = bestFeasible {
+                    if isBetterFeasible(
+                        current,
+                        than: incumbent,
+                        mode: options.centreOfMass.mode
+                    ) {
+                        bestFeasible = current
+                        improvements += 1
+                    }
+                } else {
+                    bestFeasible = current
+                    improvements += 1
+                }
             }
 
             parameterUpdate(
@@ -343,17 +371,47 @@ nonisolated enum BaldiHeuristic {
         }
     }
 
-    /// Search comparison for the paper's "CS better than BS" step. Full support is a construction
-    /// invariant. With `p_i = 1` and the equation (24) coefficient fixed to zero, its primary merit
-    /// is loaded-package count. Balance is only a deterministic tie-break here; a separate
-    /// `bestFeasible` incumbent ensures that an exploratory unbalanced packing is never reported.
-    private static func isBetterForSearch(_ candidate: BaldiSolution, than incumbent: BaldiSolution) -> Bool {
-        if candidate.isFullySupported != incumbent.isFullySupported { return candidate.isFullySupported }
+    /// Search comparison for the paper's "CS better than BS" step. With `p_i = 1` and the equation
+    /// (24) coefficient fixed to zero, loaded-package count is always primary. Support and balance
+    /// break count ties. Centred mode then uses overall cargo CoM proximity to the ideal domain
+    /// centre; paper mode deliberately leaves equal-count ties unchanged. A separate feasible
+    /// incumbent ensures that an exploratory unbalanced packing is not reported.
+    static func isBetterForSearch(
+        _ candidate: BaldiSolution,
+        than incumbent: BaldiSolution,
+        mode: BaldiPackingMode = .paper
+    ) -> Bool {
         if candidate.loadedCount != incumbent.loadedCount {
             return candidate.loadedCount > incumbent.loadedCount
         }
+        if candidate.isFullySupported != incumbent.isFullySupported { return candidate.isFullySupported }
         if candidate.isBalanced != incumbent.isBalanced { return candidate.isBalanced }
-        return false
+        return mode == .centred && isCloserToIdeal(candidate, than: incumbent)
+    }
+
+    /// Reportable solutions already satisfy every construction invariant and the CoM domain. The
+    /// objective remains package count; CoM proximity selects only between equal-cardinality ties.
+    static func isBetterFeasible(
+        _ candidate: BaldiSolution,
+        than incumbent: BaldiSolution,
+        mode: BaldiPackingMode = .paper
+    ) -> Bool {
+        guard isFeasible(candidate) else { return false }
+        guard isFeasible(incumbent) else { return true }
+        if candidate.loadedCount != incumbent.loadedCount {
+            return candidate.loadedCount > incumbent.loadedCount
+        }
+        return mode == .centred && isCloserToIdeal(candidate, than: incumbent)
+    }
+
+    private static func isCloserToIdeal(_ candidate: BaldiSolution, than incumbent: BaldiSolution) -> Bool {
+        let candidateDistance = candidate.centreOfMassDistanceToIdeal
+        let incumbentDistance = incumbent.centreOfMassDistanceToIdeal
+        guard candidateDistance.isFinite, incumbentDistance.isFinite else {
+            return candidateDistance.isFinite && !incumbentDistance.isFinite
+        }
+        let scale = max(1, max(candidateDistance, incumbentDistance))
+        return candidateDistance < incumbentDistance - scale * 1e-12
     }
 
     private static func isFeasible(_ solution: BaldiSolution) -> Bool {

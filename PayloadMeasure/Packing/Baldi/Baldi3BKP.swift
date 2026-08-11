@@ -31,6 +31,23 @@ import simd
 // optimiser. It does not model load-bearing strength, deformation, friction, vibration or dynamic
 // flight loads.
 
+/// Selects how closely the centre-of-mass stage follows Baldi §5.2 after feasibility is reached.
+nonisolated enum BaldiPackingMode: String, Sendable, Equatable, Hashable, CaseIterable, Identifiable {
+    /// Stops as soon as the cargo CoM enters `[L,U]` and uses the paper-style local movement domain.
+    case paper
+    /// Continues with bounded static relocations toward the centre of `[L,U]`.
+    case centred
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .paper: "Paper"
+        case .centred: "Centred"
+        }
+    }
+}
+
 /// One item of the 3BKP.
 nonisolated struct BaldiItem: Sendable, Identifiable {
     var id: UUID
@@ -244,6 +261,23 @@ nonisolated struct BaldiSolution: Sendable {
             moment += placement.centreOfMass * placement.mass
         }
         return moment / mass
+    }
+
+    /// Euclidean distance from the overall cargo centre of mass to the centre of the admissible
+    /// domain. Package count remains the objective; centred mode uses this only as a quality
+    /// tie-break between solutions that load the same number of packages. Paper mode does not.
+    var centreOfMassDistanceToIdeal: Double {
+        guard !placements.isEmpty else { return .infinity }
+        let centre = centreOfMass
+        let ideal = knapsack.idealCentreOfMass
+        guard centre.x.isFinite,
+              centre.y.isFinite,
+              centre.z.isFinite,
+              ideal.x.isFinite,
+              ideal.y.isFinite,
+              ideal.z.isFinite else { return .infinity }
+        let distance = simd_distance(centre, ideal)
+        return distance.isFinite ? distance : .infinity
     }
 
     /// The unbalancing index `U`, eq. (4):
