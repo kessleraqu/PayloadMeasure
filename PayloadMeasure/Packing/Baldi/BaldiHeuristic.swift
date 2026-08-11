@@ -12,7 +12,9 @@ import simd
 ///       – if `CS` is better than `BS`, set `BS` to `CS`;
 ///       – Parameter Update adjusts the parameters internally.
 ///
-/// Solutions are compared by the merit function of eq. (24), `F = P − αU`.
+/// Every project item has `p_i = 1`. The merit coefficient in equation (24) is fixed to zero, so
+/// the search ranks solutions by loaded-package count while balance remains a hard feasibility
+/// condition. Exploratory unbalanced solutions are kept separate from the best reportable result.
 nonisolated struct BaldiHeuristicOptions: Sendable, Equatable {
     /// Paper §5.3.4: "The overall process stops after 5 s."
     var timeLimitSeconds: Double = 5
@@ -28,10 +30,6 @@ nonisolated struct BaldiHeuristicOptions: Sendable, Equatable {
     var reinitialisationPairFraction: Double = 0.05
     /// Cluster width `θ` of eqs. (22)–(23); the paper defines it but never states its value.
     var clusterTheta: Double = BaldiSorting.defaultTheta
-    /// `α` of the merit function eq. (24), a different parameter that shares the paper's symbol
-    /// with the score decrease above. §5.2 refers to §5.3 for its value, but §5.3 only sets the
-    /// scoring `α`. Zero — pure profit — is the default here, and it is exposed as a setting.
-    var meritAlpha: Double = 0
     var centreOfMass = BaldiCentreOfMassOptimisation.Options()
     /// Seed for the random pair selection of §5.3.3, so a run is reproducible.
     var randomSeed: UInt64 = 0x3B_C0_5EED
@@ -69,9 +67,13 @@ nonisolated enum BaldiHeuristic {
     static func constructInitialSolution(
         _ problem: BaldiProblem,
         options: BaldiHeuristicOptions
-    ) -> (solution: BaldiSolution, criterion: BaldiSortingCriterion) {
-        let indexByID = indexMap(problem.items)
-        var best: BaldiSolution?
+    ) -> (
+        solution: BaldiSolution,
+        criterion: BaldiSortingCriterion,
+        feasibleSolution: BaldiSolution?
+    ) {
+        var bestForSearch: BaldiSolution?
+        var bestFeasible: BaldiSolution?
         var bestCriterion = BaldiSortingCriterion.areaSpecificWeight
 
         for criterion in BaldiSortingCriterion.allCases {
@@ -82,15 +84,24 @@ nonisolated enum BaldiHeuristic {
                 theta: options.clusterTheta
             )
             let packed = balance(
-                BaldiEPBPH.pack(order: order, instanceIndexByID: indexByID, knapsack: problem.knapsack),
+                BaldiEPBPH.pack(order: order, knapsack: problem.knapsack),
                 options: options
             )
-            if best == nil || isBetter(packed, than: best!, alpha: options.meritAlpha) {
-                best = packed
+            if bestForSearch == nil || isBetterForSearch(packed, than: bestForSearch!) {
+                bestForSearch = packed
                 bestCriterion = criterion
             }
+            if isFeasible(packed),
+               bestFeasible == nil || packed.loadedCount > bestFeasible!.loadedCount {
+                bestFeasible = packed
+            }
         }
-        return (best ?? BaldiSolution(knapsack: problem.knapsack, placements: [], unloaded: problem.items), bestCriterion)
+        return (
+            bestForSearch
+                ?? BaldiSolution(knapsack: problem.knapsack, placements: [], unloaded: problem.items),
+            bestCriterion,
+            bestFeasible
+        )
     }
 
     // MARK: - 3BKP-H
@@ -103,14 +114,13 @@ nonisolated enum BaldiHeuristic {
         let startedAt = clock.now
         let deadline = startedAt.advanced(by: .seconds(options.timeLimitSeconds))
         let items = problem.items
-        let indexByID = indexMap(items)
 
         let initial = constructInitialSolution(problem, options: options)
-        var best = initial.solution
-        var current = initial.solution
+        var searchBest = initial.solution
+        var bestFeasible = initial.feasibleSolution
 
         // §5.3.1 Score initialisation.
-        var scores = initialScores(for: items, loadedIn: best, options: options)
+        var scores = initialScores(for: items, loadedIn: searchBest, options: options)
         // Long-term memory: how many iterations each item has been loaded / not loaded (§5.3.2).
         var loadedCount = [Int](repeating: 0, count: items.count)
         var unloadedCount = [Int](repeating: 0, count: items.count)
@@ -132,8 +142,8 @@ nonisolated enum BaldiHeuristic {
             let order = items.indices
                 .sorted { scores[$0] == scores[$1] ? $0 < $1 : scores[$0] > scores[$1] }
                 .map { items[$0] }
-            current = balance(
-                BaldiEPBPH.pack(order: order, instanceIndexByID: indexByID, knapsack: problem.knapsack),
+            let current = balance(
+                BaldiEPBPH.pack(order: order, knapsack: problem.knapsack),
                 options: options
             )
 
@@ -146,7 +156,7 @@ nonisolated enum BaldiHeuristic {
                 longTermReinitialisation(
                     scores: &scores,
                     items: items,
-                    best: best,
+                    best: searchBest,
                     options: options,
                     generator: &generator
                 )
@@ -164,16 +174,20 @@ nonisolated enum BaldiHeuristic {
                 )
             }
 
-            if isBetter(current, than: best, alpha: options.meritAlpha) {
-                best = current
-                improvements += 1
+            if isBetterForSearch(current, than: searchBest) {
+                searchBest = current
                 nonImproving = 0
             } else {
                 nonImproving += 1
             }
 
+            if isFeasible(current), bestFeasible == nil || current.loadedCount > bestFeasible!.loadedCount {
+                bestFeasible = current
+                improvements += 1
+            }
+
             parameterUpdate(
-                best: best,
+                best: searchBest,
                 knapsack: problem.knapsack,
                 decrease: &scoreDecrease,
                 increase: &scoreIncrease
@@ -181,8 +195,13 @@ nonisolated enum BaldiHeuristic {
         }
 
         let elapsed = clock.now - startedAt
+        let reported = bestFeasible ?? BaldiSolution(
+            knapsack: problem.knapsack,
+            placements: [],
+            unloaded: problem.items
+        )
         return BaldiHeuristicResult(
-            solution: best,
+            solution: reported,
             initialSolution: initial.solution,
             initialCriterion: initial.criterion,
             iterations: iterations,
@@ -282,8 +301,9 @@ nonisolated enum BaldiHeuristic {
         let pairs = max(1, Int((Double(items.count) * options.reinitialisationPairFraction).rounded()))
         for _ in 0..<pairs {
             let first = Int.random(in: 0..<items.count, using: &generator)
-            let second = Int.random(in: 0..<items.count, using: &generator)
-            if first != second { scores.swapAt(first, second) }
+            let offset = Int.random(in: 0..<(items.count - 1), using: &generator)
+            let second = offset >= first ? offset + 1 : offset
+            scores.swapAt(first, second)
         }
     }
 
@@ -323,20 +343,21 @@ nonisolated enum BaldiHeuristic {
         }
     }
 
-    /// Comparison used for "if CS is better than BS".
-    ///
-    /// The paper compares by the merit function of eq. (24). It also allows the best solution to be
-    /// unfeasible — the Parameter Update reacts to exactly that case — so a solution whose centre of
-    /// mass is inside the allowable domain is preferred to one that is not, and the merit function
-    /// decides between two of the same kind.
-    static func isBetter(_ candidate: BaldiSolution, than incumbent: BaldiSolution, alpha: Double) -> Bool {
+    /// Search comparison for the paper's "CS better than BS" step. Full support is a construction
+    /// invariant. With `p_i = 1` and the equation (24) coefficient fixed to zero, its primary merit
+    /// is loaded-package count. Balance is only a deterministic tie-break here; a separate
+    /// `bestFeasible` incumbent ensures that an exploratory unbalanced packing is never reported.
+    private static func isBetterForSearch(_ candidate: BaldiSolution, than incumbent: BaldiSolution) -> Bool {
+        if candidate.isFullySupported != incumbent.isFullySupported { return candidate.isFullySupported }
+        if candidate.loadedCount != incumbent.loadedCount {
+            return candidate.loadedCount > incumbent.loadedCount
+        }
         if candidate.isBalanced != incumbent.isBalanced { return candidate.isBalanced }
-        return candidate.merit(alpha: alpha) > incumbent.merit(alpha: alpha)
+        return false
     }
 
-    private static func indexMap(_ items: [BaldiItem]) -> [UUID: Int] {
-        var map: [UUID: Int] = [:]
-        for (index, item) in items.enumerated() { map[item.id] = index }
-        return map
+    private static func isFeasible(_ solution: BaldiSolution) -> Bool {
+        solution.loadedCount > 0 && solution.isBalanced && solution.isFullySupported
     }
+
 }

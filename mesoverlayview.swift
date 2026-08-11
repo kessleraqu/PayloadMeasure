@@ -1295,7 +1295,7 @@ struct MesOverlayView: View {
             .accessibilityHint(
                 isMeasuring
                     ? "Lock the object being measured first."
-                    : "Computes and shows where to place every measured package."
+                    : "Searches for a supported, balanced arrangement of the measured packages."
             )
 
             if missingWeights > 0 {

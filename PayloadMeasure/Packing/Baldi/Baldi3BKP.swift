@@ -1,20 +1,24 @@
 import Foundation
 import simd
 
-// MARK: - The three-dimensional knapsack problem with balancing constraints (3BKP)
+// MARK: - Support-aware three-dimensional knapsack heuristic
 //
 // Baldi, Perboli & Tadei, "The three-dimensional knapsack problem with balancing constraints",
 // Applied Mathematics and Computation 218 (2012) 9802–9818, doi:10.1016/j.amc.2012.03.052.
 //
-// Problem statement, paper §2, reproduced exactly:
+// Baldi supplies the item selection, six orthogonal rotations, containment, non-overlap, Extreme
+// Point construction and centre-of-mass domain. This project deliberately specialises that model:
 //
-//   Given a knapsack K with size W (width), D (depth) and H (height), and a set of items
-//   J = {1,…,n} with profit p_j, size (w_j, d_j, h_j) and mass m_j, assign a subset J' ⊆ J to K
-//   such that J' is a feasible loading and the total profit of the loaded items is maximum.
-//   Feasibility requires that loaded items do not overlap and that the overall centre of mass
-//   lies inside a given box domain [L¹,U¹] × [L²,U²] × [L³,U³].
+//   * every item has equal value p_i = 1, so the objective is loaded-package count;
+//   * every item's centre of mass is its geometric centre, as in Baldi's benchmark instances;
+//   * equation (10)'s apparent rotation-index typo is corrected;
+//   * equation (16) is repaired to Σ_r ρ_ir = t_i, so an unloaded item has no rotation.
 //
-// The paper's assumptions, all of which this implementation keeps:
+// Junqueira, Morabito & Yamashita, "Three-dimensional container loading models with cargo
+// stability and load bearing constraints", Computers & Operations Research 39 (2012) 74–85,
+// equation (11), adds the condition Baldi deliberately omits: every non-floor package must have
+// its complete bottom face supported by top faces in direct contact below it (`alpha = 1`). The
+// continuous-coordinate evaluation is in `BaldiVerticalSupport`.
 //
 //   * items and knapsack are parallelepipeds;
 //   * the origin of the knapsack and of every item is its bottom-left-back corner;
@@ -23,11 +27,9 @@ import simd
 //   * walls have negligible thickness, so the whole volume W·D·H is usable;
 //   * knapsack and item sizes are non-negative integers.
 //
-// Note what the problem deliberately does **not** contain, paper §2, first paragraph of page 9803:
-// balancing conditions are not stability conditions. There is no supporting-surface requirement,
-// no limit on the number of supporting items and no load-bearing limit along the vertical axis.
-// An item may therefore float. That is the paper's model, and this is a 1-to-1 implementation of
-// it, so the result screen says so rather than quietly adding a support constraint.
+// This is therefore a documented hybrid heuristic, not a 1-to-1 implementation and not an exact
+// optimiser. It does not model load-bearing strength, deformation, friction, vibration or dynamic
+// flight loads.
 
 /// One item of the 3BKP.
 nonisolated struct BaldiItem: Sendable, Identifiable {
@@ -35,10 +37,12 @@ nonisolated struct BaldiItem: Sendable, Identifiable {
     var name: String
     /// `(w_j, d_j, h_j)` — the item's size in its own frame. Integers, per the paper's assumption.
     var size: SIMD3<Int>
-    /// `p_j`.
-    var profit: Double
     /// `m_j`.
     var mass: Double
+
+    /// All packages have equal priority. Keeping the paper's name makes the sorting/model mapping
+    /// readable while preventing UI or captured data from silently changing the objective.
+    var profit: Double { 1 }
 
     /// `w_j · d_j · h_j`.
     var volume: Int { size.x * size.y * size.z }
@@ -68,7 +72,11 @@ nonisolated struct BaldiKnapsack: Sendable, Equatable {
     var idealCentreOfMass: SIMD3<Double> { (domainLower + domainUpper) / 2 }
 
     func containsCentreOfMass(_ centre: SIMD3<Double>, tolerance: Double = 1e-9) -> Bool {
+        guard tolerance.isFinite, tolerance >= 0 else { return false }
         for axis in 0..<3 {
+            guard centre[axis].isFinite,
+                  domainLower[axis].isFinite,
+                  domainUpper[axis].isFinite else { return false }
             if centre[axis] < domainLower[axis] - tolerance { return false }
             if centre[axis] > domainUpper[axis] + tolerance { return false }
         }
@@ -149,11 +157,8 @@ nonisolated struct BaldiProblem: Sendable {
 
     /// Items that cannot fit in the knapsack in any rotation.
     ///
-    /// These have to be removed before the model is built. Constraint (8) applies to *every* item,
-    /// selected or not, and constraint (16) forces every item to take exactly one rotation, so a
-    /// single item that does not fit makes the whole model infeasible rather than merely unloadable.
-    /// Dropping such items is exact — they can never appear in a feasible solution — but it is a
-    /// preprocessing step and is reported separately rather than hidden.
+    /// Removing these before the search is exact: no allowed orientation can place them inside the
+    /// container. They are still reported as unloaded rather than silently discarded.
     func partitionByFit() -> (fitting: [BaldiItem], oversized: [BaldiItem]) {
         var fitting: [BaldiItem] = []
         var oversized: [BaldiItem] = []
@@ -175,7 +180,6 @@ nonisolated struct BaldiProblem: Sendable {
 /// One loaded item: its origin `χ^δ_i` (bottom-left-back corner) and its rotation.
 nonisolated struct BaldiPlacement: Sendable, Identifiable {
     var id: UUID
-    var itemIndex: Int
     var name: String
     /// `χ^δ_i`. Continuous, because equation (17) makes it continuous: the paper's integrality
     /// assumption covers the knapsack and item *sizes*, not the placement coordinates. The
@@ -186,7 +190,6 @@ nonisolated struct BaldiPlacement: Sendable, Identifiable {
     /// `s^δ_ir`.
     var size: SIMD3<Int>
     var mass: Double
-    var profit: Double
 
     var extent: SIMD3<Double> { SIMD3(Double(size.x), Double(size.y), Double(size.z)) }
     var maximum: SIMD3<Double> { origin + extent }
@@ -212,8 +215,8 @@ nonisolated struct BaldiSolution: Sendable {
 
     /// `k`, the number of loaded items (paper §2).
     var loadedCount: Int { placements.count }
-    /// `P = Σ_{j∈J'} p_j`, eq. (1).
-    var profit: Double { placements.reduce(0) { $0 + $1.profit } }
+    /// `P = Σ_i t_i`. With the fixed `p_i = 1`, this is the loaded-package count.
+    var profit: Double { Double(loadedCount) }
     /// `M = Σ_{j∈J'} m_j`.
     var totalMass: Double { placements.reduce(0) { $0 + $1.mass } }
     var loadedVolume: Int { placements.reduce(0) { $0 + $1.size.x * $1.size.y * $1.size.z } }
@@ -223,8 +226,19 @@ nonisolated struct BaldiSolution: Sendable {
 
     /// `r_CM = Σ_{j∈J'} r_CMj · m_j / M`, eq. (2).
     var centreOfMass: SIMD3<Double> {
+        guard !placements.isEmpty else { return .zero }
+        guard placements.allSatisfy({ placement in
+            placement.mass.isFinite
+                && placement.mass > 0
+                && placement.size.x > 0
+                && placement.size.y > 0
+                && placement.size.z > 0
+                && placement.origin.x.isFinite
+                && placement.origin.y.isFinite
+                && placement.origin.z.isFinite
+        }) else { return SIMD3<Double>(repeating: .nan) }
         let mass = totalMass
-        guard mass > 0 else { return .zero }
+        guard mass.isFinite, mass > 0 else { return SIMD3<Double>(repeating: .nan) }
         var moment = SIMD3<Double>.zero
         for placement in placements {
             moment += placement.centreOfMass * placement.mass
@@ -251,12 +265,12 @@ nonisolated struct BaldiSolution: Sendable {
 
     /// True when the packing centre of mass lies inside the allowable domain.
     var isBalanced: Bool {
-        loadedCount == 0 || knapsack.containsCentreOfMass(centreOfMass)
+        loadedCount > 0 && knapsack.containsCentreOfMass(centreOfMass)
     }
 
-    /// The merit function `F = P − αU`, eq. (24).
-    func merit(alpha: Double) -> Double {
-        profit - alpha * unbalancingIndex
+    /// Junqueira equation (11), specialised to complete bottom-face support (`alpha = 1`).
+    var isFullySupported: Bool {
+        loadedCount > 0 && BaldiVerticalSupport.allFullySupported(placements)
     }
 }
 
@@ -268,16 +282,60 @@ nonisolated struct BaldiVerification: Sendable {
     var violations: [String]
     var recomputedCentreOfMass: SIMD3<Double>
     var isBalanced: Bool
+    var isFullySupported: Bool
+    var supportReports: [BaldiSupportReport]
 }
 
 nonisolated enum BaldiGeometryCheck {
-    static func verify(_ solution: BaldiSolution) -> BaldiVerification {
+    static func verify(_ solution: BaldiSolution, against problem: BaldiProblem) -> BaldiVerification {
         var violations: [String] = []
-        let knapsack = solution.knapsack
+        let knapsack = problem.knapsack
 
         let tolerance = 1e-6
+        if solution.knapsack != problem.knapsack {
+            violations.append("The reported container does not match the problem that was solved.")
+        }
+        if solution.placements.isEmpty {
+            violations.append("The heuristic did not produce a non-empty packing.")
+        }
+
+        var sourceByID: [UUID: BaldiItem] = [:]
+        for item in problem.items {
+            if sourceByID[item.id] != nil {
+                violations.append("The input contains the same package identifier more than once.")
+            } else {
+                sourceByID[item.id] = item
+            }
+        }
+
         for placement in solution.placements {
+            guard let source = sourceByID[placement.id] else {
+                violations.append("“\(placement.name)” was not present in the input problem.")
+                continue
+            }
+            let usesAllowedRotation = BaldiRotation.all.contains(placement.rotation)
+            if !usesAllowedRotation {
+                violations.append("“\(placement.name)” uses a rotation outside Baldi's six allowed rotations.")
+            }
+            if usesAllowedRotation,
+               placement.size != placement.rotation.size(of: source.size) {
+                violations.append("“\(placement.name)” has dimensions inconsistent with its reported rotation.")
+            }
+            if placement.size.x <= 0 || placement.size.y <= 0 || placement.size.z <= 0 {
+                violations.append("“\(placement.name)” has a non-positive reported dimension.")
+            }
+            if !placement.mass.isFinite || placement.mass <= 0 {
+                violations.append("“\(placement.name)” has an invalid reported mass.")
+            } else if !source.mass.isFinite
+                || source.mass <= 0
+                || abs(placement.mass - source.mass) > tolerance {
+                violations.append("“\(placement.name)” has a mass inconsistent with the measured package.")
+            }
             for axis in 0..<3 {
+                guard placement.origin[axis].isFinite else {
+                    violations.append("“\(placement.name)” has a non-finite coordinate on axis \(axis + 1).")
+                    continue
+                }
                 if placement.origin[axis] < -tolerance {
                     violations.append("“\(placement.name)” has a negative coordinate on axis \(axis + 1).")
                 }
@@ -307,10 +365,44 @@ nonisolated enum BaldiGeometryCheck {
         if identifiers.count != solution.placements.count {
             violations.append("The packing contains the same item more than once.")
         }
+        let unloadedIdentifiers = Set(solution.unloaded.map(\.id))
+        if unloadedIdentifiers.count != solution.unloaded.count {
+            violations.append("The unloaded list contains the same item more than once.")
+        }
+        if !identifiers.isDisjoint(with: unloadedIdentifiers) {
+            violations.append("A package is reported as both loaded and unloaded.")
+        }
+        if identifiers.union(unloadedIdentifiers) != Set(problem.items.map(\.id)) {
+            violations.append("The loaded and unloaded packages do not exactly match the input problem.")
+        }
 
-        let centre = solution.centreOfMass
-        let balanced = solution.loadedCount == 0 || knapsack.containsCentreOfMass(centre, tolerance: tolerance)
-        if !balanced {
+        let supportReports = BaldiVerticalSupport.reports(for: solution.placements, tolerance: tolerance)
+        let fullySupported = !solution.placements.isEmpty && supportReports.allSatisfy(\.isFullySupported)
+        for report in supportReports where !report.isFullySupported {
+            let name = solution.placements.first(where: { $0.id == report.packageID })?.name ?? "A package"
+            violations.append(
+                String(
+                    format: "“%@” has only %.2f%% bottom-face support; 100%% is required.",
+                    name,
+                    report.fraction * 100
+                )
+            )
+        }
+
+        let hasValidMasses = solution.placements.allSatisfy {
+            $0.mass.isFinite && $0.mass > 0
+        }
+        let mass = solution.placements.reduce(0) { $0 + $1.mass }
+        let moment = solution.placements.reduce(into: SIMD3<Double>.zero) {
+            $0 += $1.mass * ($1.origin + $1.extent / 2)
+        }
+        let hasValidTotalMass = hasValidMasses && mass.isFinite && mass > 0
+        let centre = hasValidTotalMass
+            ? moment / mass
+            : SIMD3<Double>(repeating: .nan)
+        let balanced = solution.loadedCount > 0 && hasValidTotalMass
+            && knapsack.containsCentreOfMass(centre, tolerance: tolerance)
+        if solution.loadedCount > 0, !balanced {
             violations.append(
                 String(
                     format: "The packing centre of mass (%.1f, %.1f, %.1f) lies outside the allowable domain.",
@@ -323,7 +415,9 @@ nonisolated enum BaldiGeometryCheck {
             isValid: violations.isEmpty,
             violations: violations,
             recomputedCentreOfMass: centre,
-            isBalanced: balanced
+            isBalanced: balanced,
+            isFullySupported: fullySupported,
+            supportReports: supportReports
         )
     }
 }

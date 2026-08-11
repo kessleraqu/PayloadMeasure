@@ -6,7 +6,6 @@ import simd
 struct PackingSettingsView: View {
     @Bindable var store: PackingStore
     var packages: [PackingItem] = []
-    var baldiItems: [BaldiItem] = []
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -15,8 +14,8 @@ struct PackingSettingsView: View {
                 moduleSection
                 if store.approach == .knapsack3D {
                     knapsackDomainSection
-                    knapsackProfitSection
-                    knapsackSolverSection
+                    knapsackSearchSection
+                    knapsackAssumptionsSection
                 } else {
                     clearanceSection
                     balanceSection
@@ -47,7 +46,11 @@ struct PackingSettingsView: View {
         } header: {
             Text("Payload module")
         } footer: {
-            Text("Usable interior of one module. The origin is the centre of its floor: x runs along the module, y across it, z upwards.")
+            Text(
+                store.approach == .knapsack3D
+                    ? "Usable interior of one module. The 3D packing origin is its bottom-left-back corner; x runs along the module, y across it and z upwards."
+                    : "Usable interior of one module. The balance-model origin is the centre of its floor; x runs along the module, y across it and z upwards."
+            )
         }
     }
 
@@ -58,7 +61,7 @@ struct PackingSettingsView: View {
         } header: {
             Text("Clearances")
         } footer: {
-            Text("Package clearance is kept between neighbours and, where it is larger, to the walls as well. Both are the paper's item spacing requirement s.")
+            Text("Package clearance is kept between neighbours and, where it is larger, to the walls as well. Both are the paper's item spacing requirements.")
         }
     }
 
@@ -205,97 +208,40 @@ struct PackingSettingsView: View {
         String(format: "%.0f, %.0f, %.0f mm", vector.x, vector.y, vector.z)
     }
 
-    @ViewBuilder
-    private var knapsackProfitSection: some View {
-        if !baldiItems.isEmpty {
-            Section {
-                ForEach(baldiItems) { item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.name).font(.subheadline)
-                        HStack(spacing: 6) {
-                            Text(
-                                String(
-                                    format: "%d × %d × %d mm · %.2f kg",
-                                    item.size.x, item.size.y, item.size.z, item.mass
-                                )
-                            )
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            Spacer(minLength: 8)
-                            TextField(
-                                "Profit",
-                                value: profitBinding(for: item),
-                                format: .number.precision(.fractionLength(0))
-                            )
-                            .keyboardType(.decimalPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 110)
-                        }
-                    }
+    private var knapsackSearchSection: some View {
+        Section {
+            timeField("Search time limit", value: $store.baldiOptions.heuristic.timeLimitSeconds)
+            LabeledContent("Cluster width θ") {
+                HStack(spacing: 6) {
+                    Text(String(format: "%.0f%%", store.baldiOptions.heuristic.clusterTheta))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    Stepper(
+                        "Cluster width",
+                        value: $store.baldiOptions.heuristic.clusterTheta,
+                        in: 1...100,
+                        step: 5
+                    )
+                    .labelsHidden()
                 }
-            } header: {
-                Text("Profit p_j")
-            } footer: {
-                Text("The knapsack maximises the total profit of the loaded packages, so profit is what decides which package is left behind when the module is full. The default is the paper's own instance rule, p_j = 200 + w·d·h. Raise a value to force a package in.")
             }
+        } header: {
+            Text("Search")
+        } footer: {
+            Text("The support-aware 3BKP-H heuristic keeps the largest feasible load it finds before this limit. It does not prove global optimality. θ controls the attribute clusters used to create Baldi's initial package orders; the paper does not prescribe its value.")
         }
     }
 
-    private func profitBinding(for item: BaldiItem) -> Binding<Double> {
-        Binding(
-            get: {
-                store.profitOverrides[item.id]
-                    ?? PackingStore.defaultProfit(forVolume: max(item.volume, 1))
-            },
-            set: { store.profitOverrides[item.id] = $0 }
-        )
-    }
-
-    private var knapsackSolverSection: some View {
+    private var knapsackAssumptionsSection: some View {
         Section {
-            Picker("Method", selection: $store.baldiOptions.method) {
-                ForEach(BaldiMethod.allCases) { method in
-                    Text(method.title).tag(method)
-                }
-            }
-            if store.baldiOptions.method == .heuristic {
-                timeField("3BKP-H time limit", value: $store.baldiOptions.heuristic.timeLimitSeconds)
-                LabeledContent("Merit weight α") {
-                    HStack(spacing: 6) {
-                        Text(String(format: "%.0f", store.baldiOptions.heuristic.meritAlpha))
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                        Stepper(
-                            "Merit weight",
-                            value: $store.baldiOptions.heuristic.meritAlpha,
-                            in: 0...100_000,
-                            step: 1000
-                        )
-                        .labelsHidden()
-                    }
-                }
-                LabeledContent("Cluster width θ") {
-                    HStack(spacing: 6) {
-                        Text(String(format: "%.0f%%", store.baldiOptions.heuristic.clusterTheta))
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                        Stepper(
-                            "Cluster width",
-                            value: $store.baldiOptions.heuristic.clusterTheta,
-                            in: 1...100,
-                            step: 5
-                        )
-                        .labelsHidden()
-                    }
-                }
-            } else {
-                timeField("3BKP-M time limit", value: $store.baldiOptions.modelTimeLimitSeconds)
-                Toggle("Equation (16) exactly as printed", isOn: $store.baldiOptions.usesPrintedRotationEquality)
-            }
+            LabeledContent("Package priority", value: "Equal (pᵢ = 1)")
+            LabeledContent("Package centre of mass", value: "Geometric centre")
+            LabeledContent("Allowed orientations", value: "Six")
+            LabeledContent("Vertical support", value: "100% bottom face (αⱼ = 1)")
         } header: {
-            Text("Method")
+            Text("Fixed assumptions")
         } footer: {
-            Text("3BKP-H is the paper's heuristic and stops after its time limit with no optimality proof; α is the weight of the unbalancing index in the merit function F = P − αU, which the paper defines but never gives a value for, and θ is the cluster width of equations (22)–(23), likewise unspecified. 3BKP-M is the exact model, which the paper reports cannot handle more than about twenty items — on a phone the practical limit is far lower. Equation (16) as printed makes any packing that leaves an item out infeasible; the switch is there so that can be seen.")
+            Text("Baldi supplies the 3D placement and cargo-balance framework. A continuous-coordinate evaluation of Junqueira equation (11) enforces complete bottom-face support. Packages are treated as rigid and strong enough to carry the load above. Mechanical restraint is assumed to prevent sliding; friction, vibration, deformation, fragility and flight acceleration loads are outside this model.")
         }
     }
 
@@ -311,7 +257,6 @@ struct PackingSettingsView: View {
                 store.maximumPayloadMass = 5
                 store.baldiOptions = Baldi3BKPOptions()
                 store.usesStandardDomain = true
-                store.profitOverrides = [:]
             }
         }
     }

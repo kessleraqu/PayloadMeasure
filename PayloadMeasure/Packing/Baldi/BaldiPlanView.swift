@@ -6,8 +6,8 @@ import simd
 ///
 /// Unlike the load-balanced arrangement, a 3BKP packing stacks, so the plan alone is ambiguous —
 /// two boxes can share a footprint at different heights. Items are therefore drawn from the floor
-/// upwards, anything resting above the floor carries its height, and the elevation shows the
-/// stacking directly.
+/// upwards, every item above the floor has complete bottom-face support from one or more packages,
+/// and the elevation shows the stacking directly.
 struct BaldiPlanView: View {
     let solution: BaldiSolution
     let colours: [UUID: Color]
@@ -69,14 +69,17 @@ struct BaldiPlanView: View {
     }
 
     var orderedPlacements: [BaldiPlacement] {
-        solution.placements.sorted {
-            $0.origin.z == $1.origin.z ? $0.origin.x < $1.origin.x : $0.origin.z < $1.origin.z
+        solution.placements.sorted { first, second in
+            if first.origin.z != second.origin.z { return first.origin.z < second.origin.z }
+            if first.origin.x != second.origin.x { return first.origin.x < second.origin.x }
+            if first.origin.y != second.origin.y { return first.origin.y < second.origin.y }
+            return first.id.uuidString < second.id.uuidString
         }
     }
 
     private var accessibilityLabel: String {
         let names = orderedPlacements.map(\.name).joined(separator: ", ")
-        return "Plan of the knapsack. Loading order: \(names)."
+        return "Plan of the supported 3D packing. Loading order: \(names)."
     }
 
     private func header(_ title: String, trailing: String) -> some View {
@@ -107,7 +110,7 @@ struct BaldiPlanView: View {
         drawDomain(context, rect: outline, scale: scale)
 
         let labels = numbering
-        // Floor level first, so a stacked item is drawn over the one carrying it.
+        // Floor level first, so a stacked item is drawn over its one or more supporters.
         for placement in solution.placements.sorted(by: { $0.origin.z < $1.origin.z }) {
             let rect = CGRect(
                 x: originPoint.x + placement.origin.x * scale,
@@ -228,8 +231,8 @@ struct BaldiPlanView: View {
         let isHighlighted = highlightedPackageID == placement.id
         let isStacked = placement.origin.z > 1e-6
         let shape = Path(roundedRect: rect, cornerRadius: min(3, rect.height / 4))
-        // A stacked package is drawn over the one carrying it, so it is kept translucent enough to
-        // leave the layer underneath readable.
+        // A stacked package may be carried by one or more packages, so it is kept translucent enough
+        // to leave the supporting layer underneath readable.
         let fill = isHighlighted ? 0.6 : (isStacked ? 0.2 : 0.32)
         context.fill(shape, with: .color(colour.opacity(fill)))
         context.stroke(

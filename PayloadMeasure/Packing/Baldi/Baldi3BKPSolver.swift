@@ -1,214 +1,190 @@
 import Foundation
-import simd
 
-/// Which of the paper's two solution methods to run.
+/// Production options for the support-aware 3BKP-H heuristic.
 ///
-/// The paper's own finding, §4 and §6.2: the MIP model "is not able to solve instances with more
-/// than 20 items", is used mainly to compute bounds, and is outperformed by the heuristic from 40
-/// items upwards, while being better on 20-item instances. Both are offered here for the same
-/// reason.
-nonisolated enum BaldiMethod: String, Sendable, CaseIterable, Identifiable {
-    /// 3BKP-H, paper §5.
-    case heuristic
-    /// 3BKP-M, paper §2.1, solved exactly.
-    case model
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .heuristic: "3BKP-H heuristic"
-        case .model: "3BKP-M exact model"
-        }
-    }
-}
-
+/// The Baldi-only MIP remains in `Baldi3BKPModel.swift` as a formulation reference. It is not a
+/// solver for the Baldi–Junqueira hybrid because Junqueira's continuous support-area predicate is
+/// evaluated on known placements rather than represented by that MIP.
 nonisolated struct Baldi3BKPOptions: Sendable, Equatable {
-    var method: BaldiMethod = .heuristic
     var heuristic = BaldiHeuristicOptions()
-    /// Time limit for the exact model. The paper uses 200 s on a workstation; the default here is
-    /// shorter because this runs on a phone, and it is adjustable.
-    var modelTimeLimitSeconds: Double = 20
-    /// Largest dense tableau the device should be asked to hold, in matrix entries.
-    var maximumTableauElements = 4_000_000
-    /// Uses equation (16) exactly as printed rather than the repaired form. The printed equation
-    /// makes any packing that leaves items out infeasible; see `Baldi3BKPModel`.
-    var usesPrintedRotationEquality = false
 
     init() {}
 }
 
 nonisolated struct Baldi3BKPResult: Sendable {
-    nonisolated enum Status: String, Sendable {
-        /// A packing was found and, for the model, proven optimal.
-        case optimal
-        /// A packing was found; optimality was not proven.
+    nonisolated enum Status: String, Sendable, Equatable {
+        /// A nonempty packing passed every independent feasibility check.
         case feasible
-        /// Nothing could be loaded.
-        case empty
+        /// The heuristic found no reportable packing before its stopping condition.
+        case notFound
         case invalidInput
-        case modelTooLarge
+        /// A defensive state: heuristic output failed the independent verifier.
+        case verificationFailed
     }
 
     var status: Status
     var solution: BaldiSolution?
     var verification: BaldiVerification?
-    var method: BaldiMethod
     var errors: [String] = []
-    /// Items removed before solving because they do not fit in the knapsack in any rotation.
+    /// Items removed before searching because they do not fit in the container in any rotation.
     var oversizedItems: [BaldiItem] = []
-
-    /// `UB_1D`, paper §4.
-    var upperBound: Double?
-    var dualBound: Double?
-    var provenOptimal = false
-    /// Percentage gap of the reported profit against `UB_1D`, the figure the paper's tables report.
-    var gapToUpperBound: Double? {
-        guard let upperBound, upperBound > 0, let solution else { return nil }
-        return (upperBound - solution.profit) / upperBound * 100
-    }
 
     var runtimeSeconds: Double = 0
     var heuristicDetail: BaldiHeuristicResult?
-    var modelStatistics: LinearProgram.Statistics?
-    var modelNodeCount: Int?
 }
 
-/// Drives the paper's two methods and the `UB_1D` bound.
+/// Validates inputs, runs the support-aware Baldi heuristic and exposes a solution only after an
+/// independent check of containment, rotations, non-overlap, full support and cargo balance.
 nonisolated enum Baldi3BKPSolver {
-    static func solve(_ problem: BaldiProblem, options: Baldi3BKPOptions = Baldi3BKPOptions()) -> Baldi3BKPResult {
+    static func solve(
+        _ problem: BaldiProblem,
+        options: Baldi3BKPOptions = Baldi3BKPOptions()
+    ) -> Baldi3BKPResult {
         let clock = ContinuousClock()
         let startedAt = clock.now
         func elapsed() -> Double {
             let duration = clock.now - startedAt
-            return Double(duration.components.seconds) + Double(duration.components.attoseconds) * 1e-18
+            return Double(duration.components.seconds)
+                + Double(duration.components.attoseconds) * 1e-18
         }
 
+        let errors = validationErrors(in: problem, options: options)
+        guard errors.isEmpty else {
+            var result = Baldi3BKPResult(status: .invalidInput, errors: errors)
+            result.runtimeSeconds = elapsed()
+            return result
+        }
+
+        let (fitting, oversized) = problem.partitionByFit()
+        let reduced = BaldiProblem(knapsack: problem.knapsack, items: fitting)
+
+        guard !fitting.isEmpty else {
+            var result = Baldi3BKPResult(
+                status: .notFound,
+                errors: ["No measured package fits inside the payload container in any allowed rotation."],
+                oversizedItems: oversized
+            )
+            result.runtimeSeconds = elapsed()
+            return result
+        }
+
+        let detail = BaldiHeuristic.solve(reduced, options: options.heuristic)
+        var solution = detail.solution
+        solution.unloaded += oversized
+
+        guard !solution.placements.isEmpty else {
+            var result = Baldi3BKPResult(
+                status: .notFound,
+                errors: [
+                    "No supported and balanced arrangement was found within the search time. This does not prove that none exists.",
+                ],
+                oversizedItems: oversized,
+                heuristicDetail: detail
+            )
+            result.runtimeSeconds = elapsed()
+            return result
+        }
+
+        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verified = verification.isValid
+        var result = Baldi3BKPResult(
+            status: verified ? .feasible : .verificationFailed,
+            solution: verified ? solution : nil,
+            verification: verification,
+            errors: verified ? [] : verification.violations,
+            oversizedItems: oversized,
+            heuristicDetail: detail
+        )
+        result.runtimeSeconds = elapsed()
+        return result
+    }
+
+    private static func validationErrors(
+        in problem: BaldiProblem,
+        options: Baldi3BKPOptions
+    ) -> [String] {
         var errors: [String] = []
-        if problem.knapsack.size.x <= 0 || problem.knapsack.size.y <= 0 || problem.knapsack.size.z <= 0 {
-            errors.append("The knapsack must have a positive size on every axis.")
-        }
-        for item in problem.items {
-            if item.size.x <= 0 || item.size.y <= 0 || item.size.z <= 0 {
-                errors.append("“\(item.name)” has a non-positive dimension.")
+        let size = problem.knapsack.size
+        if size.x <= 0 || size.y <= 0 || size.z <= 0 {
+            errors.append("The payload container must have a positive size on every axis.")
+        } else {
+            let (baseArea, areaOverflow) = size.x.multipliedReportingOverflow(by: size.y)
+            let (_, volumeOverflow) = baseArea.multipliedReportingOverflow(by: size.z)
+            if areaOverflow || volumeOverflow {
+                errors.append("The payload container dimensions are too large to represent safely.")
             }
-            if item.mass <= 0 {
-                errors.append("“\(item.name)” has no weight. Enter its weight before arranging the load.")
-            }
-        }
-        for axis in 0..<3 where problem.knapsack.domainLower[axis] > problem.knapsack.domainUpper[axis] {
-            errors.append("The centre-of-mass domain is empty on axis \(axis + 1).")
         }
         if problem.items.isEmpty {
             errors.append("Add at least one measured package.")
         }
-        guard errors.isEmpty else {
-            var result = Baldi3BKPResult(status: .invalidInput, method: options.method, errors: errors)
-            result.runtimeSeconds = elapsed()
-            return result
+
+        var identifiers: Set<UUID> = []
+        for item in problem.items {
+            if !identifiers.insert(item.id).inserted {
+                errors.append("The package list contains a duplicate identifier for “\(item.name)”.")
+            }
+            if item.size.x <= 0 || item.size.y <= 0 || item.size.z <= 0 {
+                errors.append("“\(item.name)” has a non-positive dimension.")
+            } else {
+                let (baseArea, areaOverflow) = item.size.x.multipliedReportingOverflow(by: item.size.y)
+                let (_, volumeOverflow) = baseArea.multipliedReportingOverflow(by: item.size.z)
+                if areaOverflow || volumeOverflow {
+                    errors.append("“\(item.name)” has dimensions too large to represent safely.")
+                }
+            }
+            if !item.mass.isFinite || item.mass <= 0 {
+                errors.append("“\(item.name)” has no weight. Enter its weight before arranging the load.")
+            }
         }
 
-        // Items that cannot fit in any rotation are removed first; see `partitionByFit`.
-        let (fitting, oversized) = problem.partitionByFit()
-        let reduced = BaldiProblem(knapsack: problem.knapsack, items: fitting)
-        let bound = BaldiUpperBound.oneDimensional(reduced)
-
-        guard !fitting.isEmpty else {
-            var result = Baldi3BKPResult(
-                status: .empty,
-                solution: BaldiSolution(knapsack: problem.knapsack, placements: [], unloaded: problem.items),
-                method: options.method,
-                oversizedItems: oversized,
-                upperBound: bound
-            )
-            result.runtimeSeconds = elapsed()
-            return result
+        for axis in 0..<3 {
+            let lower = problem.knapsack.domainLower[axis]
+            let upper = problem.knapsack.domainUpper[axis]
+            guard lower.isFinite, upper.isFinite else {
+                errors.append("The centre-of-mass domain has a non-finite value on axis \(axis + 1).")
+                continue
+            }
+            if lower > upper {
+                errors.append("The centre-of-mass domain is empty on axis \(axis + 1).")
+            }
+            if lower < 0 || upper > Double(size[axis]) {
+                errors.append("The centre-of-mass domain lies outside the container on axis \(axis + 1).")
+            }
         }
 
-        switch options.method {
-        case .heuristic:
-            let detail = BaldiHeuristic.solve(reduced, options: options.heuristic)
-            var solution = detail.solution
-            solution.unloaded += oversized
-            var result = Baldi3BKPResult(
-                status: solution.placements.isEmpty ? .empty : .feasible,
-                solution: solution,
-                verification: BaldiGeometryCheck.verify(solution),
-                method: .heuristic,
-                oversizedItems: oversized,
-                upperBound: bound
-            )
-            result.heuristicDetail = detail
-            result.runtimeSeconds = elapsed()
-            return result
-
-        case .model:
-            let model = Baldi3BKPModelBuilder.build(
-                reduced,
-                usesPrintedRotationEquality: options.usesPrintedRotationEquality
-            )
-            let statistics = model.program.statistics
-            let elements = Simplex.tableauElementCount(
-                rowCount: statistics.rowCount,
-                structuralCount: statistics.variableCount
-            )
-            if elements > options.maximumTableauElements {
-                var result = Baldi3BKPResult(
-                    status: .modelTooLarge,
-                    method: .model,
-                    errors: [
-                        "\(fitting.count) items produce a 3BKP-M model too large to solve on this device — \(statistics.rowCount) rows and \(statistics.variableCount) variables. The paper reports the same limit: the model cannot handle instances with more than about twenty items. Use the 3BKP-H heuristic instead.",
-                    ],
-                    oversizedItems: oversized,
-                    upperBound: bound
-                )
-                result.modelStatistics = statistics
-                result.runtimeSeconds = elapsed()
-                return result
-            }
-
-            var branchOptions = BranchAndBound.Options()
-            branchOptions.timeLimitSeconds = options.modelTimeLimitSeconds
-            // The objective is −Σ p_j t_j, so it can never go below minus the total profit.
-            branchOptions.objectiveLowerBound = -model.totalProfit / model.profitScale
-            let search = BranchAndBound(program: model.program, options: branchOptions)
-            var outcome = search.solve()
-
-            guard !outcome.values.isEmpty else {
-                var result = Baldi3BKPResult(
-                    status: .empty,
-                    solution: BaldiSolution(knapsack: problem.knapsack, placements: [], unloaded: problem.items),
-                    method: .model,
-                    oversizedItems: oversized,
-                    upperBound: bound
-                )
-                result.modelStatistics = statistics
-                result.modelNodeCount = outcome.nodeCount
-                result.runtimeSeconds = elapsed()
-                return result
-            }
-
-            if let polished = search.polishedSolution(for: outcome.values) {
-                outcome.values = polished.values
-            }
-            var solution = Baldi3BKPModelBuilder.readSolution(model, values: outcome.values)
-            solution.unloaded += oversized
-
-            var result = Baldi3BKPResult(
-                status: outcome.provenOptimal ? .optimal : .feasible,
-                solution: solution,
-                verification: BaldiGeometryCheck.verify(solution),
-                method: .model,
-                oversizedItems: oversized,
-                upperBound: bound
-            )
-            // The model maximises, so the search's bounds are negated back into profit terms.
-            result.dualBound = outcome.dualBound.isFinite ? -outcome.dualBound * model.profitScale : nil
-            result.provenOptimal = outcome.provenOptimal
-            result.modelStatistics = statistics
-            result.modelNodeCount = outcome.nodeCount
-            result.runtimeSeconds = elapsed()
-            return result
+        let heuristic = options.heuristic
+        if !heuristic.timeLimitSeconds.isFinite || heuristic.timeLimitSeconds <= 0 {
+            errors.append("The heuristic time limit must be a finite positive number.")
         }
+        if !heuristic.scoreDecrease.isFinite
+            || heuristic.scoreDecrease <= 0
+            || heuristic.scoreDecrease >= 1 {
+            errors.append("The score-decrease fraction must lie strictly between zero and one.")
+        }
+        if !heuristic.scoreIncrease.isFinite
+            || heuristic.scoreIncrease <= 0
+            || heuristic.scoreIncrease >= 1 {
+            errors.append("The score-increase fraction must lie strictly between zero and one.")
+        }
+        if !heuristic.loadedScoreFactor.isFinite || heuristic.loadedScoreFactor <= 0 {
+            errors.append("The loaded-item score factor must be a finite positive number.")
+        }
+        if heuristic.nonImprovingLimit <= 0 {
+            errors.append("The non-improving iteration limit must be positive.")
+        }
+        if !heuristic.reinitialisationPairFraction.isFinite
+            || heuristic.reinitialisationPairFraction <= 0
+            || heuristic.reinitialisationPairFraction > 1 {
+            errors.append("The score-reinitialisation pair fraction must lie in (0, 1].")
+        }
+        if !heuristic.clusterTheta.isFinite
+            || heuristic.clusterTheta < 1
+            || heuristic.clusterTheta > 100 {
+            errors.append("The clustering width must lie between 1% and 100%.")
+        }
+        if heuristic.centreOfMass.maximumIterations < 0 {
+            errors.append("The centre-of-mass iteration limit cannot be negative.")
+        }
+        return errors
     }
 }

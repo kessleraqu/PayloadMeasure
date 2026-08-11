@@ -1,8 +1,6 @@
 import SwiftUI
-import simd
 
-/// The 3BKP result screen: which packages were loaded, where each one goes in three dimensions,
-/// and where the packing centre of mass ended up relative to its allowable domain.
+/// Result screen for the support-aware Baldi–Junqueira heuristic.
 struct BaldiResultView: View {
     let result: Baldi3BKPResult
     let colours: [UUID: Color]
@@ -12,15 +10,19 @@ struct BaldiResultView: View {
 
     var body: some View {
         statusCard
-        if let solution = result.solution, !solution.placements.isEmpty {
+
+        if result.status == .feasible,
+           let solution = result.solution,
+           let verification = result.verification,
+           verification.isValid {
             drawingCard(solution)
             loadCard(solution)
             balanceCard(solution)
+            supportCard(solution, verification: verification)
             placementCard(solution)
-            if !solution.unloaded.isEmpty {
-                unloadedCard(solution)
-            }
+            if !solution.unloaded.isEmpty { unloadedCard(solution) }
         }
+
         if let verification = result.verification {
             verificationCard(verification)
         }
@@ -28,7 +30,7 @@ struct BaldiResultView: View {
         scopeCard
     }
 
-    // MARK: - Cards
+    // MARK: - Result summary
 
     private var statusCard: some View {
         card {
@@ -38,8 +40,7 @@ struct BaldiResultView: View {
                         .font(.title2)
                         .foregroundStyle(statusColour)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(statusTitle)
-                            .font(.headline)
+                        Text(statusTitle).font(.headline)
                         Text(statusDetail)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
@@ -47,11 +48,14 @@ struct BaldiResultView: View {
                     }
                     Spacer(minLength: 0)
                 }
-                ForEach(result.errors, id: \.self) { message in
-                    Label(message, systemImage: "exclamationmark.circle")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
+                if result.status == .invalidInput
+                    || (result.status == .verificationFailed && result.verification == nil) {
+                    ForEach(result.errors, id: \.self) { message in
+                        Label(message, systemImage: "exclamationmark.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -66,12 +70,12 @@ struct BaldiResultView: View {
                     highlightedPackageID: highlightedPackageID
                 )
                 HStack(spacing: 14) {
-                    legend(symbol: "plus", colour: solution.isBalanced ? .orange : .red, title: "Centre of mass")
+                    legend(symbol: "plus", colour: .orange, title: "Centre of mass")
                     legend(symbol: "rectangle.dashed", colour: .green, title: "Allowable domain")
                     Spacer(minLength: 0)
                 }
                 .font(.caption2)
-                Text("Drawn to scale, origin at the bottom-left-back corner. A dashed outline marks a package resting on top of another.")
+                Text("Drawn to scale from the bottom-left-back origin. Dashed packages are above the floor and have their complete bottom face supported.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -90,16 +94,8 @@ struct BaldiResultView: View {
     private func loadCard(_ solution: BaldiSolution) -> some View {
         card {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Load")
-                    .font(.headline)
+                Text("Load").font(.headline)
                 row("Packages loaded", "\(solution.loadedCount) of \(solution.loadedCount + solution.unloaded.count)")
-                row("Total profit P", String(format: "%.0f", solution.profit))
-                if let bound = result.upperBound {
-                    row("Upper bound UB₁D", String(format: "%.0f", bound))
-                }
-                if let gap = result.gapToUpperBound {
-                    row("Gap to UB₁D", String(format: "%.1f%%", gap))
-                }
                 row("Mass loaded", String(format: "%.2f kg", solution.totalMass))
                 row("Volume used", String(format: "%.1f%%", solution.fillRatio * 100))
             }
@@ -110,73 +106,90 @@ struct BaldiResultView: View {
         card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text("Balance")
-                        .font(.headline)
+                    Text("Cargo balance").font(.headline)
                     Spacer()
-                    Label(
-                        solution.isBalanced ? "Inside the domain" : "Outside the domain",
-                        systemImage: solution.isBalanced ? "checkmark.circle.fill" : "xmark.circle.fill"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(solution.isBalanced ? Color.green : Color.red)
+                    Label("Inside the domain", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
                 }
 
                 let names = ["x — along", "y — across", "z — height"]
                 ForEach(0..<3, id: \.self) { axis in
-                    let value = solution.centreOfMass[axis]
-                    let low = solution.knapsack.domainLower[axis]
-                    let high = solution.knapsack.domainUpper[axis]
-                    let inside = value >= low - 1e-6 && value <= high + 1e-6
                     VStack(alignment: .leading, spacing: 2) {
                         HStack {
                             Text(names[axis]).font(.subheadline)
                             Spacer(minLength: 8)
-                            Text(String(format: "%.1f mm", value))
+                            Text(String(format: "%.1f mm", solution.centreOfMass[axis]))
                                 .font(.subheadline.monospacedDigit())
                         }
-                        Text(String(format: "allowed %.0f … %.0f mm", low, high))
-                            .font(.caption2)
-                            .foregroundStyle(inside ? Color.secondary : Color.red)
+                        Text(
+                            String(
+                                format: "allowed %.0f … %.0f mm",
+                                solution.knapsack.domainLower[axis],
+                                solution.knapsack.domainUpper[axis]
+                            )
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     }
                 }
-
-                Divider()
-                LabeledContent {
-                    Text(String(format: "%.1f mm", solution.unbalancingIndex))
-                        .monospacedDigit()
-                } label: {
-                    Text("Unbalancing index U")
-                    Text("eq. (4): the spread of the loaded items' own centres of mass about the ideal point")
-                        .font(.caption2)
-                }
-                .font(.subheadline)
             }
         }
     }
 
-    private func placementCard(_ solution: BaldiSolution) -> some View {
-        let ordered = solution.placements.sorted {
-            $0.origin.z == $1.origin.z ? $0.origin.x < $1.origin.x : $0.origin.z < $1.origin.z
-        }
-        return card {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Placement")
-                    .font(.headline)
-                Text("Coordinates are to each package's bottom-left-back corner, measured from the same corner of the module. Load in this order, lowest first.")
+    private func supportCard(_ solution: BaldiSolution, verification: BaldiVerification) -> some View {
+        card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Vertical support").font(.headline)
+                    Spacer()
+                    Label("100% verified", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+                Text("Every non-floor package is covered across its complete bottom face by top faces in direct contact below it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                ForEach(Array(ordered.enumerated()), id: \.element.id) { index, placement in
-                    placementRow(index: index + 1, placement: placement)
+                ForEach(solution.placements.sorted(by: placementOrder)) { placement in
+                    let report = verification.supportReports.first { $0.packageID == placement.id }
+                    HStack {
+                        Text(placement.name).font(.subheadline)
+                        Spacer(minLength: 8)
+                        Text(supportDescription(report))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
     }
 
-    private func placementRow(index: Int, placement: BaldiPlacement) -> some View {
+    // MARK: - Placement
+
+    private func placementCard(_ solution: BaldiSolution) -> some View {
+        let ordered = solution.placements.sorted(by: placementOrder)
+        return card {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Placement").font(.headline)
+                Text("Coordinates are to each package's bottom-left-back corner. Load in this order, lowest first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(Array(ordered.enumerated()), id: \.element.id) { index, placement in
+                    placementRow(index: index + 1, placement: placement, solution: solution)
+                }
+            }
+        }
+    }
+
+    private func placementRow(
+        index: Int,
+        placement: BaldiPlacement,
+        solution: BaldiSolution
+    ) -> some View {
         let isHighlighted = highlightedPackageID == placement.id
-        let isStacked = placement.origin.z > 1e-6
+        let support = BaldiVerticalSupport.report(for: placement, among: solution.placements)
         return Button {
             highlightedPackageID = isHighlighted ? nil : placement.id
         } label: {
@@ -194,19 +207,21 @@ struct BaldiResultView: View {
                         Text(placement.name)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
-                        if isStacked {
-                            Text(String(format: "on top, %.0f mm up", placement.origin.z))
+                        if !support.isFloorSupported {
+                            Text("100% supported")
                                 .font(.caption2.weight(.semibold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.18), in: .capsule)
-                                .foregroundStyle(.orange)
+                                .background(Color.green.opacity(0.16), in: .capsule)
+                                .foregroundStyle(.green)
                         }
                     }
                     Text(
                         String(
                             format: "x %.0f · y %.0f · z %.0f mm",
-                            placement.origin.x, placement.origin.y, placement.origin.z
+                            placement.origin.x,
+                            placement.origin.y,
+                            placement.origin.z
                         )
                     )
                     .font(.caption)
@@ -215,7 +230,9 @@ struct BaldiResultView: View {
                         String(
                             format: "%@ · %d × %d × %d mm · %.2f kg",
                             placement.rotation.restingDescription,
-                            placement.size.x, placement.size.y, placement.size.z,
+                            placement.size.x,
+                            placement.size.y,
+                            placement.size.z,
                             placement.mass
                         )
                     )
@@ -237,10 +254,10 @@ struct BaldiResultView: View {
     private func unloadedCard(_ solution: BaldiSolution) -> some View {
         card {
             VStack(alignment: .leading, spacing: 8) {
-                Label("Left out", systemImage: "tray.and.arrow.up")
+                Label("Not included", systemImage: "tray.and.arrow.up")
                     .font(.headline)
                     .foregroundStyle(.orange)
-                Text("The 3BKP loads the most valuable subset that fits and balances, so these were not loaded. Raise a package's profit in the settings to force it in.")
+                Text("All packages have equal priority. These packages were not included in the highest-cardinality feasible arrangement found within the search time.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -248,13 +265,13 @@ struct BaldiResultView: View {
                     HStack {
                         Text(item.name).font(.subheadline)
                         Spacer(minLength: 8)
-                        Text(String(format: "%d × %d × %d mm · %.0f", item.size.x, item.size.y, item.size.z, item.profit))
+                        Text(String(format: "%d × %d × %d mm", item.size.x, item.size.y, item.size.z))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
                 if !result.oversizedItems.isEmpty {
-                    Text("\(result.oversizedItems.count) of these do not fit the module in any rotation.")
+                    Text("\(result.oversizedItems.count) of these do not fit the container in any allowed rotation.")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 }
@@ -262,19 +279,21 @@ struct BaldiResultView: View {
         }
     }
 
+    // MARK: - Verification and scope
+
     private func verificationCard(_ verification: BaldiVerification) -> some View {
         card {
             VStack(alignment: .leading, spacing: 8) {
                 Label(
-                    verification.isValid ? "Geometry verified" : "Verification failed",
+                    verification.isValid ? "Feasibility independently verified" : "Verification failed",
                     systemImage: verification.isValid ? "checkmark.seal.fill" : "xmark.seal.fill"
                 )
                 .font(.headline)
                 .foregroundStyle(verification.isValid ? Color.green : Color.red)
                 Text(
                     verification.isValid
-                        ? "Every package is inside the module, no two overlap, and the packing centre of mass recomputes to the reported value inside its domain."
-                        : "The reported packing did not pass the independent geometric check, so it must not be used."
+                        ? "The check independently reconstructed rotations, dimensions, containment, non-overlap, centred package COM, cargo balance and complete vertical support."
+                        : "The heuristic output failed an independent check and is not presented as a usable arrangement."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -283,7 +302,6 @@ struct BaldiResultView: View {
                     Text("• \(violation)")
                         .font(.caption)
                         .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -293,27 +311,18 @@ struct BaldiResultView: View {
         card {
             DisclosureGroup(isExpanded: $showsDiagnostics) {
                 VStack(alignment: .leading, spacing: 8) {
-                    row("Method", result.method.title)
+                    row("Method", "Support-aware 3BKP-H")
                     row("Runtime", String(format: "%.2f s", result.runtimeSeconds))
                     if let detail = result.heuristicDetail {
                         row("Iterations", "\(detail.iterations)")
-                        row("Improvements", "\(detail.improvements)")
+                        row("Feasible improvements", "\(detail.improvements)")
                         row("Score reinitialisations", "\(detail.reinitialisations)")
                         row("Best initial criterion", detail.initialCriterion.rawValue)
-                        row("PCH initial profit", String(format: "%.0f", detail.initialSolution.profit))
+                        row("Initial packages loaded", "\(detail.initialSolution.loadedCount)")
                     }
-                    if let statistics = result.modelStatistics {
-                        row("Variables", "\(statistics.variableCount) (\(statistics.integerVariableCount) binary)")
-                        row("Rows", "\(statistics.rowCount)")
-                        row("Nodes", "\(result.modelNodeCount ?? 0)")
-                        if let dual = result.dualBound {
-                            row("Dual bound", String(format: "%.0f", dual))
-                        }
-                    }
-                    Text("Equation (16) is solved in its repaired form, Σ_r ρ_ir = t_i. As printed, Σ_r ρ_ir = 1 makes every packing that leaves an item out infeasible.")
+                    Text("Fixed choices: pᵢ = 1, centred package COM, merit coefficient 0 and Junqueira vertical support α = 1.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.top, 8)
             } label: {
@@ -325,13 +334,7 @@ struct BaldiResultView: View {
     private var scopeCard: some View {
         card {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Outside the model")
-                    .font(.headline)
-                Text("Paper §2: balancing conditions are not stability conditions. The 3BKP constrains where the centre of mass ends up; it says nothing about whether a stacked package is safely carried.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
+                Text("Assumptions and limits").font(.headline)
                 ForEach(scopeLines, id: \.self) { line in
                     Text("• \(line)")
                         .font(.caption)
@@ -342,24 +345,30 @@ struct BaldiResultView: View {
         }
     }
 
-    /// What the formulation leaves out. The two methods differ on one point that matters
-    /// physically, so the text is not the same for both.
     private var scopeLines: [String] {
-        var lines: [String] = []
-        switch result.method {
-        case .heuristic:
-            lines.append("No supporting-surface requirement. §5.2's gravity step settles every package down onto whatever is beneath it, so nothing floats — but a package may come to rest on a small part of its base. Check the elevation before trusting a stacked package.")
-        case .model:
-            lines.append("No support constraint of any kind. Constraints (5)–(20) contain nothing that requires a package to rest on anything, and the exact model does place packages in mid-air. Only the 3BKP-H heuristic applies the gravity step of §5.2.")
-        }
-        lines.append("No limit on the number of supporting items, and no load-bearing or fragility limit along the vertical axis. The paper names all three as stability conditions it does not model.")
-        lines.append("No clearances. The 3BKP has no item spacing; packages may touch, and the module walls are assumed to have negligible thickness.")
-        lines.append("No tie-down or flight loads.")
-        lines.append("Every package's centre of mass is taken to be its geometric centre, as in the paper's instances.")
-        return lines
+        [
+            "Baldi supplies selection, rotation, Extreme Point placement and cargo-COM balancing; a continuous-coordinate evaluation of Junqueira equation (11) enforces complete vertical support.",
+            "Packages are rigid and assumed strong enough to carry packages above them. Load-bearing pressure and fragility are not modelled.",
+            "Mechanical restraint is assumed to prevent horizontal sliding. Friction, vibration, deformation and flight acceleration loads are outside the model.",
+            "The method is a heuristic: it reports the best feasible load found within its search time, not a globally proven optimum.",
+        ]
     }
 
     // MARK: - Helpers
+
+    private func supportDescription(_ report: BaldiSupportReport?) -> String {
+        guard let report else { return "not assessed" }
+        if report.isFloorSupported { return "floor" }
+        let noun = report.supporterIDs.count == 1 ? "supporter" : "supporters"
+        return String(format: "%.0f%% · %d %@", report.fraction * 100, report.supporterIDs.count, noun)
+    }
+
+    private func placementOrder(_ first: BaldiPlacement, _ second: BaldiPlacement) -> Bool {
+        if first.origin.z != second.origin.z { return first.origin.z < second.origin.z }
+        if first.origin.x != second.origin.x { return first.origin.x < second.origin.x }
+        if first.origin.y != second.origin.y { return first.origin.y < second.origin.y }
+        return first.id.uuidString < second.id.uuidString
+    }
 
     private func row(_ title: String, _ value: String) -> some View {
         HStack {
@@ -378,49 +387,56 @@ struct BaldiResultView: View {
 
     private var statusSymbol: String {
         switch result.status {
-        case .optimal: "checkmark.circle.fill"
-        case .feasible: "shippingbox.fill"
-        case .empty: "tray"
+        case .feasible: "checkmark.circle.fill"
+        case .notFound: "magnifyingglass"
         case .invalidInput: "exclamationmark.triangle.fill"
-        case .modelTooLarge: "exclamationmark.triangle.fill"
+        case .verificationFailed: "xmark.seal.fill"
         }
     }
 
     private var statusColour: Color {
         switch result.status {
-        case .optimal: .green
-        case .feasible: .blue
-        case .empty: .orange
-        case .invalidInput, .modelTooLarge: .red
+        case .feasible: .green
+        case .notFound: .orange
+        case .invalidInput, .verificationFailed: .red
         }
     }
 
     private var statusTitle: String {
         switch result.status {
-        case .optimal: "Best possible load"
-        case .feasible: result.method == .model ? "Load found" : "Load found"
-        case .empty: "Nothing could be loaded"
-        case .invalidInput: "Cannot arrange this load yet"
-        case .modelTooLarge: "Too large for the exact model"
+        case .feasible:
+            guard let solution = result.solution else { return "Best feasible load found" }
+            return solution.unloaded.isEmpty ? "All packages loaded" : "Best feasible load found"
+        case .notFound:
+            return noPackageFits ? "No package fits the container" : "No feasible load found in time"
+        case .invalidInput: return "Cannot arrange this load yet"
+        case .verificationFailed: return "Packing rejected by verification"
         }
     }
 
     private var statusDetail: String {
         switch result.status {
-        case .optimal:
-            return "Proven optimal: no other subset of these packages has a higher total profit while fitting and staying balanced."
         case .feasible:
-            if result.method == .heuristic {
-                let gap = result.gapToUpperBound.map { String(format: " It is within %.1f%% of the UB₁D upper bound.", $0) } ?? ""
-                return "3BKP-H ran for its time limit and returned the best load it found.\(gap) The heuristic gives no optimality proof."
+            guard let solution = result.solution else { return "The independently verified heuristic result is ready." }
+            if solution.unloaded.isEmpty {
+                return "All \(solution.loadedCount) packages fit in an independently verified supported and balanced arrangement."
             }
-            return "The time limit was reached before optimality could be proven."
-        case .empty:
-            return "No package could be placed while keeping the centre of mass inside its allowable domain."
+            return "The heuristic loaded \(solution.loadedCount) of \(solution.loadedCount + solution.unloaded.count) packages. This is the highest-cardinality feasible load it found within the search time; global optimality is not claimed."
+        case .notFound:
+            if noPackageFits {
+                return "None of the measured packages fits inside the payload container in any of the six allowed rotations."
+            }
+            return "The heuristic did not find a supported and balanced arrangement before it stopped. This does not prove that none exists."
         case .invalidInput:
-            return "Fix the problems below, then optimise again."
-        case .modelTooLarge:
-            return "Switch to the 3BKP-H heuristic in the settings."
+            return "Fix the input problems below, then run the search again."
+        case .verificationFailed:
+            return "The result failed an independent invariant check and must not be used."
         }
+    }
+
+    private var noPackageFits: Bool {
+        result.status == .notFound
+            && result.heuristicDetail == nil
+            && !result.oversizedItems.isEmpty
     }
 }

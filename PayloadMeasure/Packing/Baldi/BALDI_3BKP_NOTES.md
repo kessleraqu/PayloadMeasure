@@ -1,176 +1,258 @@
-# 3BKP — the three-dimensional knapsack problem with balancing constraints
+# Support-aware 3D packing
 
-A 1-to-1 implementation of
+The production 3D packing path is a documented hybrid heuristic based on two sources:
 
 > M. M. Baldi, G. Perboli, R. Tadei, **"The three-dimensional knapsack problem with balancing
 > constraints"**, *Applied Mathematics and Computation* 218 (2012) 9802–9818,
-> doi:[10.1016/j.amc.2012.03.052](https://doi.org/10.1016/j.amc.2012.03.052)
+> doi:[10.1016/j.amc.2012.03.052](https://doi.org/10.1016/j.amc.2012.03.052).
 
-This is the app's second arrangement formulation. It sits beside the load-balanced one
-(`../PACKING_NOTES.md`, Kaluzny & Shaw 2009 as adapted in the project chapter) and is selected with
-the segmented control at the top of the arrangement screen. The two solve different problems on the
-same measurements:
+> L. Junqueira, R. Morabito, D. S. Yamashita, **"Three-dimensional container loading models with
+> cargo stability and load bearing constraints"**, *Computers & Operations Research* 39 (2012)
+> 74–85.
 
-| | Load balanced (Kaluzny) | 3D knapsack (Baldi) |
+Baldi supplies item selection, six orthogonal rotations, Extreme Point placement, non-overlap,
+containment and cargo-centre-of-mass balancing. Junqueira supplies the area-based vertical-support
+principle. The project fixes each package value to one, assumes that each package centre of mass is
+at its geometric centre, and requires complete bottom-face support.
+
+This is **not** a 1-to-1 implementation of either paper, an exact hybrid solver, or a proof of global
+optimality. The production result is the highest-cardinality feasible packing found by the heuristic
+within its configured search time.
+
+## Production flow at a glance
+
+```text
+PackingStore
+  measured dimensions/masses -> equal-priority BaldiProblem
+    |
+    v
+Baldi3BKPSolver
+  input validation + oversized-package partition
+    |
+    v
+BaldiHeuristic
+  BaldiSorting -> BaldiEPBPH/BaldiExtremePoints
+                         |
+                         +-> BaldiVerticalSupport candidate gate
+    |
+    v
+BaldiCentreOfMassOptimisation
+  support-preserving tentative movements
+    |
+    v
+BaldiGeometryCheck
+  independent bounds/rotation/overlap/support/COM verification
+    |
+    v
+BaldiResultView -> BaldiPlanView
+```
+
+The files remain separated by responsibility so a reviewer can follow the paper algorithm without
+mixing it with UI state, and so every construction, movement and final check shares one canonical
+support implementation. `Baldi3BKPModel.swift` is deliberately absent from this production flow: it
+is a **Baldi-only reference model**, contains no Junqueira support constraint, and is not used by the
+production workflow to claim hybrid optimality.
+
+## Relationship to the other arrangement method
+
+This method sits beside the floor-only load-balancing formulation documented in
+[`../PACKING_NOTES.md`](../PACKING_NOTES.md). They solve different problems on the same measured
+packages:
+
+| | Floor-only load balancing | Support-aware 3D packing |
 | --- | --- | --- |
-| Items loaded | all of them, or infeasible | the most profitable subset that fits |
-| Objective | minimise centre-of-mass deviation | maximise profit |
-| Balance | objective, with an optional envelope | **hard constraint**, a box domain |
-| Placement | 2D, everything on the floor | **3D, stacking allowed** |
-| Clearances | per item, to walls and neighbours | none — the 3BKP has no spacing |
-| Method | one exact MILP | 3BKP-M exact model, or the 3BKP-H heuristic |
+| Packages | all packages, or no complete arrangement | a subset may be omitted |
+| Objective | minimise centre-of-mass deviation | maximise loaded-package count |
+| Balance | objective, optionally with an envelope | hard cargo-COM domain |
+| Placement | every package on the container floor | stacking in three dimensions |
+| Vertical support | automatic because every package is on the floor | 100% of every non-floor bottom face |
+| Production method | mixed-integer model | Baldi 3BKP-H-based heuristic |
+| Optimality claim | reported by that separate solver when proved | none |
 
-## Coordinate system
+## Coordinate system and inputs
 
-The paper's, unchanged: origin at the bottom-left-back corner, knapsack in the first octant from
-`(0,0,0)` to `(W, D, H)`, and `χ^δ_i` the bottom-left-back corner of item `i`. The app's 20 × 80 ×
-10 cm module maps to `(S¹, S², S³) = (800, 200, 100)` mm, with `S¹` along the drone's longitudinal
-axis.
+The origin is the bottom-left-back corner of one rectangular payload container. Its usable volume is
+the first octant from `(0,0,0)` to `(W,D,H)`. A package origin is its bottom-left-back corner and its
+dimensions after rotation are aligned with the container axes.
 
-## Equation map
+The project assumes:
 
-Everything is annotated in the source with the equation it implements.
+- one fixed rectangular payload container;
+- rigid rectangular packages with measured dimensions and known positive mass;
+- packages may be omitted;
+- the six orthogonal rotations used by Baldi;
+- negligible wall thickness and no inter-package clearance in the packing model;
+- conservative millimetre discretisation: package dimensions round up and container dimensions
+  round down;
+- package centres of mass coincide with their geometric centres;
+- supporting packages have sufficient load-bearing strength;
+- installed mechanical restraint prevents horizontal sliding.
 
-| Element | Paper | File |
+Friction, vibration, deformation, fragility, restraint failure and acceleration loads during flight
+are outside this packing model. Complete geometric support alone is not a flight-safety or structural
+certification.
+
+## Equal-priority objective
+
+Baldi defines the selection variable `t_i`, which is one when package `i` is loaded. This project sets
+
+```text
+p_i = 1  for every package i.
+```
+
+Therefore Baldi's objective becomes
+
+```text
+maximise P = sum_i t_i,
+```
+
+so `P` is the number of loaded packages. There is no package-specific profit editor or hidden
+volume-derived priority.
+
+The coefficient in Baldi's merit function `F = P - alpha U` is fixed to zero for this project, so
+`F = P`. This `alpha` is distinct from the score-decrease parameter in Baldi §5.3.2. The score
+decrease and score increase both start at `0.1`, as stated in §5.3.4, and continue to be updated by
+the heuristic. Balance is not traded against package count: cargo-COM compliance remains a hard
+feasibility condition.
+
+## Centre of mass
+
+For package `i` under rotation `r`, the rotated extent along axis `delta` is `s_ir^delta`. The project
+specialisation is
+
+```text
+c_ir^delta = s_ir^delta / 2.
+```
+
+Baldi's general formulation permits an arbitrary package COM coordinate. The centred value above is
+a project input assumption and is also the value used in Baldi's benchmark instances; it is not a
+claim that the general formulation requires centred mass.
+
+For a nonempty loaded set, the cargo COM is
+
+```text
+r_CM^delta =
+    sum_i m_i t_i (v_i^delta + c_i,r(i)^delta)
+    / sum_i m_i t_i.
+```
+
+It must satisfy
+
+```text
+L^delta <= r_CM^delta <= U^delta
+```
+
+on all three axes. The standard instance domain is `L = (W/4,D/4,0)` and
+`U = (3W/4,3D/4,H/2)`. The empty packing has no defined cargo COM and is not classified as balanced.
+
+## Full vertical support
+
+Baldi explicitly distinguishes balancing from stability and does not include a supporting-surface
+constraint. The production heuristic adds a continuous-coordinate evaluation of Junqueira equation
+(11), with the required support fraction fixed to
+
+```text
+alpha_j = 1.
+```
+
+For a non-floor package `j`, only packages whose top face is in direct contact with the bottom of
+`j` may support it. Each contacting top face is clipped to `j`'s footprint. The implementation then
+computes the **union** of those contact rectangles, rather than blindly summing their areas, and
+requires
+
+```text
+supportUnionArea_j = length_j * width_j.
+```
+
+A floor package is automatically fully supported. A small `1e-6 mm` contact tolerance handles
+floating-point noise only; it is not a measurement allowance and does not legitimise a visible gap
+or overhang. The area comparison uses only a correspondingly small numerical tolerance.
+
+This direct geometric evaluation has the same full-area meaning as the selected Junqueira condition
+for an already known orthogonal placement, but it is not Junqueira's original grid-based MILP
+encoding. That distinction is why the result is described as a hybrid heuristic.
+
+## Production flow
+
+The production path is deliberately heuristic-only:
+
+1. Remove and report packages that cannot fit in any of the six rotations.
+2. Generate Baldi's sorting orders and Extreme Points.
+3. For each package, rotation and candidate Extreme Point, reject containment failures, overlaps and
+   any non-floor placement without complete bottom support.
+4. Run Baldi's centre-of-mass adjustment. Each proposed movement is accepted atomically only if the
+   complete packing remains contained, non-overlapping and fully supported, including packages above
+   the moved supporter.
+5. Keep the best nonempty candidate that also satisfies the cargo-COM domain.
+6. Independently recompute every feasibility condition before exposing the arrangement to the UI.
+
+An invalid or unbalanced exploratory candidate may guide the heuristic internally, but it is never
+returned or labelled feasible. If no verified packing is found before the stopping condition, the
+result says that none was **found**; it does not claim that none exists.
+
+## Paper corrections and implementation choices
+
+| Category | Choice | Scope |
 | --- | --- | --- |
-| Problem, assumptions, rotation set `R` (`\|R\| = 6`) | §2, §2.1 | `Baldi3BKP.swift` |
-| Total profit `P` | (1) | `Baldi3BKP.swift` |
-| Packing centre of mass `r_CM` | (2) | `Baldi3BKP.swift`, `BaldiCentreOfMass.swift` |
-| Unbalancing index `U` | (3)–(4) | `Baldi3BKP.swift` |
-| MIP model 3BKP-M | (5)–(20) | `Baldi3BKPModel.swift` |
-| Upper bound `UB_1D` | §4 | `Baldi3BKPModel.swift` |
-| Extreme Points, Residual Space, EP-BPH | §5.1, (21) | `BaldiExtremePoints.swift` |
-| Clustering and the six sorting criteria | §5.1, (22)–(23) | `BaldiSorting.swift` |
-| Merit function `F = P − αU` | (24) | `Baldi3BKP.swift`, `BaldiHeuristic.swift` |
-| Centre-of-mass optimisation | §5.2, (25)–(29) | `BaldiCentreOfMass.swift` |
-| PCH, 3BKP-H loop, scoring, parameters | §5, §5.3, Fig. 6 | `BaldiHeuristic.swift` |
-| Method selection and driver | §4, §6.2 | `Baldi3BKPSolver.swift` |
+| Project specialisation | `p_i = 1` | objective is loaded-package cardinality |
+| Project specialisation | `c_ir^delta = s_ir^delta / 2` | centred package COM, matching Baldi's benchmarks |
+| Project specialisation | merit coefficient `alpha = 0` | `F = P`; COM domain remains mandatory |
+| Printed-model correction | Baldi Eq. (10) uses `rho_jr` for package `j` | retained in the Baldi-only reference MIP |
+| Printed-model correction | Baldi Eq. (16) is `sum_r rho_ir = t_i` | retained in the Baldi-only reference MIP |
+| Added condition | Junqueira Eq. (11), `alpha_j = 1` | every non-floor bottom face is completely supported |
+| Implementation choice | `theta = 20%` | five sorting clusters; Baldi defines but does not value it |
+| Implementation choice | ideal COM is the domain centre | target used by Baldi's COM adjustment |
+| Implementation choice | at most 50 COM-adjustment iterations | Baldi names a limit but does not value it |
+| Implementation choice | heaviest package considered first for movement | deterministic order where Baldi gives none |
+| Implementation choice | seeded random score reinitialisation | reproducible runs |
+| Implementation choice | deterministic input/rotation/Extreme Point tie-breaking | reproducible runs |
+| Implementation choice | 1000 non-improving iterations and 5% distinct swap pairs | resolves the wording of Baldi §5.3/Fig. 6 |
+| Numerical choice | score parameters clamped to `[1e-4,0.9]` | prevents repeated doubling leaving Baldi's stated interval |
+| Numerical choice | rectangle-union support with contact/area tolerances | prevents overlap double-counting and absorbs only round-off |
 
-## Two places where the printed model cannot be transcribed literally
+The reference MIP in `Baldi3BKPModel.swift` documents Baldi equations (5)–(20) and the two printed
+equation corrections. It does **not** contain the Junqueira support rule, is not used by the
+production hybrid workflow, and is not used to certify a hybrid result as optimal. Its objective and
+`UB_1D` can only bound the more restricted hybrid problem from above because they ignore at least
+support; the UI makes no optimality claim from those bounds.
 
-Both are flagged in the source and the second is switchable in the app so it can be demonstrated.
+## Independent verification
 
-### Equation (10) is misprinted
+`BaldiGeometryCheck` derives the final result from the reported placements rather than trusting
+heuristic state. It verifies:
 
-It appears as
+- a nonempty load;
+- one of Baldi's six rotations and dimensions consistent with that rotation;
+- source-package identity, mass and unique identifiers;
+- containment and pairwise non-overlap;
+- an exact partition between loaded and unloaded input packages;
+- complete bottom-face support, including its supporters and support fraction;
+- cargo COM recomputed from centred package COMs;
+- cargo COM inside `[L,U]`.
 
-    χ^δ_j + Σ_r s^δ_jr ρ_ir ≤ χ^δ_i + M(1 − b^δ_ji)
+Only a result passing all of these checks is surfaced as feasible.
 
-with `ρ_ir` under a summation over item *j*'s sizes. Taken literally the row sizes item `j` by item
-`i`'s rotation. That contradicts the constraint's stated meaning — "the same meaning, this time with
-item j coming before item i" — and its symmetry with (9). Implemented as `ρ_jr`.
+## Source map
 
-### Equation (16) makes the model infeasible as printed
+| Responsibility | File |
+| --- | --- |
+| problem, rotations, placements, cargo COM and verifier | `Baldi3BKP.swift` |
+| continuous rectangle-union support rule | `BaldiVerticalSupport.swift` |
+| Extreme Points, residual space and EP-BPH | `BaldiExtremePoints.swift` |
+| clustering and six Baldi sorting criteria | `BaldiSorting.swift` |
+| support-preserving cargo-COM adjustment | `BaldiCentreOfMass.swift` |
+| PCH, scoring, parameter update and 3BKP-H loop | `BaldiHeuristic.swift` |
+| production validation and result orchestration | `Baldi3BKPSolver.swift` |
+| Baldi-only, non-production reference MIP and `UB_1D` | `Baldi3BKPModel.swift` |
+| result and plan presentation | `BaldiResultView.swift`, `BaldiPlanView.swift` |
 
-`Σ_r ρ_ir = 1` forces *every* item to take a rotation, loaded or not. The moment term of (14)–(15)
-is `Σ_i m_i χ^δ_i + Σ_i Σ_r m_i γ^δ_ir ρ_ir`, summed over all of `J`. An unloaded item is held at
-the origin by (11), but its `γ^δ_ir` term stays in the moment while contributing nothing to the mass
-`Σ_i m_i t_i` on the right-hand side. So an unloaded item is treated as a point mass sitting near
-the origin.
+The defensible project description is:
 
-With every item unloaded, (15) reads `Σ_i m_i γ^δ_ir ≤ 0`, which no rotation satisfies. The empty
-packing is infeasible, and so is any packing that leaves out enough mass — in a *knapsack*. The same
-defect makes (8) reject an instance containing an item that fits in no rotation, even though the
-knapsack is free to not load it.
+> Baldi et al.'s 3BKP-H supplies the item-selection, orthogonal-rotation, Extreme Point placement,
+> non-overlap, containment and cargo-COM balancing framework. Packages have equal value and centred
+> COMs. A continuous-coordinate evaluation of Junqueira et al.'s area support condition is added
+> with `alpha = 1`. The resulting method is a reproducible hybrid heuristic and does not provide a
+> global-optimality guarantee.
 
-Verified directly: for a single 200 × 100 × 60 item in a 300 × 200 × 100 knapsack, the point
-`t = 0, χ = 0, ρ = e₁` gives row `balanceHigh_1` a left-hand side of 100 against a right-hand side
-of 0.
-
-**The repair is one right-hand side:** `Σ_r ρ_ir = t_i`. An unloaded item then selects no rotation,
-its `γ` term vanishes, and the moment becomes exactly the numerator the paper itself writes for
-`r^δ_CM` immediately below (15). For a fully loaded packing the two forms coincide, which is
-presumably why the paper's own experiments — where the model is only run on instances it can solve
-and the balancing domain is generous — never expose it.
-
-`usesPrintedRotationEquality` in the solver options, surfaced as **Equation (16) exactly as
-printed** in the arrangement settings, restores the literal form.
-
-## Parameters the paper defines but never gives a value for
-
-Each is a setting in the app rather than a buried constant.
-
-| Symbol | Where | Value used | Why |
-| --- | --- | --- | --- |
-| `M` | (9)–(11) | `S^δ` per dimension | The smallest value that cannot cut off a feasible point, given (8) and (17). A tighter big-M changes no feasible solution, only the relaxation. |
-| `α` in `F = P − αU` | (24) | `0` | §5.2 refers to §5.3 for it, but §5.3 only sets the *scoring* `α = 0.1` of §5.3.2 — the paper reuses the symbol for two different parameters and never states this one. Zero means the merit function is pure profit; balance still enters as the hard domain and through the §5.2 optimisation. |
-| `θ` | (22)–(23) | `20%`, i.e. 5 clusters | The paper defines `θ ∈ [1,100]` and `n_c = ⌈100/θ⌉` but states no value. |
-| `r⁰_CM` | (4), §5.2 | centre of the allowable domain | Eq. (4) refers to [2] for details. The domain centre is the only choice symmetric in the constraint the domain expresses. |
-| Max iterations | §5.2 | 50 | Listed as a stopping condition with no value. |
-| Item order in §5.2 | §5.2 | heaviest first | Not fixed by the paper. Eq. (28) makes the required displacement inversely proportional to mass, so the heaviest item travels least and is most likely to fit inside its `D_i`. |
-| Where §5.2 runs | Fig. 6 | after every EP-BPH call | Fig. 6 has no box for it, but §5.2 describes it as operating on a calculated packing and eq. (24) speaks of balance being addressed "even before the center of mass optimization procedure". |
-| "CS better than BS" | Fig. 6 | balanced beats unbalanced, then higher `F` | The paper compares by (24) and separately allows `BS` to be unfeasible (the Parameter Update reacts to exactly that), so feasibility is the primary key. |
-| Sort direction | §5.1 | non-increasing | "Giving more importance to an attribute means to favor those items showing the highest values". |
-| `α, β` bounds | §5.3.3 | held inside `(0, 0.9]` | The Parameter Update doubles them on an unfeasible best solution; repeated doubling leaves the paper's stated `(0,1)` and would make the factor `1 − α` negative. |
-| Randomness | §5.3.3 | seeded generator | "Randomly selected" pairs, made reproducible. |
-
-Taken from the paper unchanged: `α = β = 0.1`, `k = 3`, reinitialisation every 1000 non-improving
-iterations, 5 % of the items as swap pairs, a 5 s stopping time, `\|R\| = 6`, `γ` at the geometric
-centre, and the instance domain `L = (W/4, D/4, 0)`, `U = (3W/4, 3D/4, H/2)`.
-
-## Implementation choices forced by the app
-
-* **Discretisation.** The paper assumes integral sizes. Measured millimetres are rounded — item
-  sizes *up*, the knapsack *down* — so the discretisation can only be conservative.
-* **Positions stay continuous.** Equation (17) makes `χ` continuous, and it is kept that way.
-  Rounding the MIP's positions onto the millimetre grid was tried and moves the packing centre of
-  mass by 0.1–0.2 mm, which is enough to push a solution whose balancing constraint is tight just
-  outside the domain — five of twenty-four random instances failed verification that way.
-* **Profit.** The 3BKP needs a profit per item; the app has none to measure. The default is the
-  paper's own instance rule, `p_j = 200 + w·d·h` (§6.1), editable per package so a critical package
-  can be forced into the load.
-* **Scaling.** In the paper's units the rows span 1 to 10⁸ — the capacity row carries volumes, the
-  balancing rows mass × length, the ordering rows ones — and the simplex stalls on the raw matrix.
-  Every row is divided by a positive constant and positions are held as `χ̂ = χ / S^δ`, which puts
-  every coefficient in `[−1, 1]`. This changes no feasible point and no optimal selection.
-* **Oversized items** are removed before solving and reported separately. Required under the printed
-  (16); a model-size reduction under the repaired one.
-
-## What the model does not contain
-
-Straight from the paper, §2, page 9803: *balancing conditions are not equivalent to stability
-conditions.* The paper lists the stability conditions it does not adopt — supporting surface, number
-of supporting items, maximum weight along the vertical axis — and constraints (5)–(20) contain no
-support term.
-
-Measured over 40 random instances (support fraction = share of an item's base resting on the floor
-or on another item's top face):
-
-| | items | fully floating | partly supported | worst support |
-| --- | --- | --- | --- | --- |
-| EP-BPH alone | 239 | 3 | 24 | 0 % |
-| after §5.2's gravity step | 239 | **0** | 24 | 4.1 % |
-| 3BKP-M exact model | 92 | **18** | 1 | 0 % |
-
-So the two methods differ, and the result screen says so per method: **the exact model does place
-packages in mid-air**, because nothing in the printed model forbids it; **the heuristic never does**,
-because §5.2's gravity compaction settles every package. Both allow a package to rest on a small
-part of its base. The 3BKP also has no item spacing and assumes walls of negligible thickness.
-
-Adding a supporting-surface or load-bearing constraint would make the arrangement physically safer
-but would no longer be this paper's model, so it is reported rather than silently added.
-
-A full line-by-line comparison, with file and line for every equation and every divergence, is in
-`BALDI_FIDELITY_AUDIT.md`.
-
-## Validation
-
-`swiftc` harness, not shipped in the app:
-
-* `\|R\| = 6`, six distinct size assignments, `γ` at the geometric centre, and the §6.1 domain
-  reproduce exactly.
-* `U` matches eq. (4) by hand on a two-item packing.
-* Stacking is used when the floor runs out; items are left out when the knapsack is full; an item
-  that fits in no rotation is reported rather than making the instance infeasible.
-* **24 random instances, 3–6 items, exact model against heuristic.** The model proved optimality on
-  15 of them. The heuristic never beat a proven optimum, matched it on 14 of 15, and was 10 % below
-  on one. Zero geometry violations across all 48 solves.
-
-## Practical limits
-
-3BKP-M is far weaker than 3BKP-H here, and more so than in the paper — the paper used Gurobi on a
-workstation and still reported that the model "is not able to solve instances with more than 20
-items", while this app carries its own dense-tableau branch and bound. In testing the model proves
-optimality up to about 4–5 items and times out beyond that. **3BKP-H is the default and the
-practical method**; the model is there for small instances, for the bound, and because the paper
-presents both.
+The project's contribution is the AR measurement and integration workflow, not a new packing
+algorithm.

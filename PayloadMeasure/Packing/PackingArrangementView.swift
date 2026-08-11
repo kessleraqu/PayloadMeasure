@@ -1,8 +1,8 @@
 import SwiftUI
 import simd
 
-/// The arrangement result screen: where every measured package goes inside the payload module, and
-/// how well the resulting load is balanced.
+/// The arrangement result screen: where the selected measured packages go inside the payload
+/// module and how well the resulting load is balanced. The 3D knapsack path may omit packages.
 struct PackingArrangementView: View {
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
@@ -67,7 +67,7 @@ struct PackingArrangementView: View {
                 }
             }
             .sheet(isPresented: $showsSettings) {
-                PackingSettingsView(store: store, packages: packages, baldiItems: baldiProblem.items)
+                PackingSettingsView(store: store, packages: packages)
             }
             .task(id: solveTrigger) {
                 switch store.approach {
@@ -85,7 +85,7 @@ struct PackingArrangementView: View {
         }
     }
 
-    /// Re-solves whenever the measured load, the chosen formulation, or any setting they depend on
+    /// Re-solves whenever the measured load, the chosen method, or any setting it depends on
     /// changes.
     private var solveTrigger: String {
         switch store.approach {
@@ -94,10 +94,10 @@ struct PackingArrangementView: View {
         }
     }
 
-    /// The two published formulations, side by side on the same measurements.
+    /// The two arrangement methods, side by side on the same measurements.
     private var approachPicker: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Picker("Formulation", selection: $store.approach) {
+            Picker("Arrangement method", selection: $store.approach) {
                 ForEach(PackingApproach.allCases) { approach in
                     Text(approach.title).tag(approach)
                 }
@@ -106,7 +106,7 @@ struct PackingArrangementView: View {
 
             Text(
                 store.approach == .knapsack3D
-                    ? "\(store.approach.citation) — stacks in three dimensions, loads the most valuable subset that fits, and keeps the centre of mass inside a box domain."
+                    ? "\(store.approach.citation) — searches for the largest equal-priority subset with complete vertical support and cargo centre of mass inside its domain."
                     : "\(store.approach.citation) — loads every package on the module floor and minimises the deviation of the centre of mass from a target."
             )
             .font(.caption2)
@@ -124,7 +124,11 @@ struct PackingArrangementView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Optimising the arrangement")
                         .font(.headline)
-                    Text("Solving one mixed-integer program for all \(packages.count) packages at once.")
+                    Text(
+                        store.approach == .knapsack3D
+                            ? "Searching for a supported, balanced 3D load for \(packages.count) packages."
+                            : "Solving one mixed-integer program for all \(packages.count) packages at once."
+                    )
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

@@ -15,7 +15,10 @@ nonisolated struct BaldiExtremePoint: Sendable, Hashable {
     var residualSpace: SIMD3<Double>
 }
 
-/// A packing under construction: the placed items and the current Extreme Point set.
+/// A packing under construction: placed items and the current Extreme Point set.
+///
+/// `canPlace` is the single construction gate. A candidate must be contained, non-overlapping and
+/// completely supported before it can enter the packing.
 nonisolated struct BaldiPacking: Sendable {
     let knapsack: BaldiKnapsack
     private(set) var placements: [BaldiPlacement] = []
@@ -48,16 +51,17 @@ nonisolated struct BaldiPacking: Sendable {
 
     // MARK: - Queries
 
-    /// True when a box of `size` placed at `origin` is inside the knapsack and clear of every item.
-    func canPlace(size: SIMD3<Int>, at origin: SIMD3<Double>, ignoring excluded: Int? = nil) -> Bool {
+    /// True when a box is inside the knapsack and clear of every item already placed.
+    private func canPlaceGeometrically(size: SIMD3<Int>, at origin: SIMD3<Double>) -> Bool {
+        guard size.x > 0, size.y > 0, size.z > 0 else { return false }
         let body = SIMD3<Double>(Double(size.x), Double(size.y), Double(size.z))
         for axis in 0..<3 {
+            guard origin[axis].isFinite else { return false }
             if origin[axis] < -tolerance { return false }
             if origin[axis] + body[axis] > extent[axis] + tolerance { return false }
         }
         let maximum = origin + body
-        for (index, placed) in placements.enumerated() {
-            if index == excluded { continue }
+        for placed in placements {
             var separated = false
             for axis in 0..<3
             where origin[axis] >= placed.maximum[axis] - tolerance
@@ -70,47 +74,54 @@ nonisolated struct BaldiPacking: Sendable {
         return true
     }
 
-    // MARK: - Placement
-
-    /// Places an item and refreshes the Extreme Point set.
-    mutating func place(
+    func canPlace(
         item: BaldiItem,
-        itemIndex: Int,
         rotation: BaldiRotation,
         at point: BaldiExtremePoint
-    ) {
-        let size = rotation.size(of: item.size)
-        let placement = BaldiPlacement(
-            id: item.id,
-            itemIndex: itemIndex,
-            name: item.name,
-            origin: point.position,
-            rotation: rotation,
-            size: size,
-            mass: item.mass,
-            profit: item.profit
-        )
+    ) -> Bool {
+        guard BaldiRotation.all.contains(rotation),
+              item.mass.isFinite,
+              item.mass > 0,
+              !placements.contains(where: { $0.id == item.id }) else { return false }
+        let placement = candidate(item: item, rotation: rotation, at: point)
+        guard canPlaceGeometrically(size: placement.size, at: placement.origin) else { return false }
+        return BaldiVerticalSupport.report(for: placement, among: placements).isFullySupported
+    }
+
+    // MARK: - Placement
+
+    /// Places an item and refreshes the Extreme Point set. The check is repeated here so no caller
+    /// can bypass the construction invariant after merely forgetting to call `canPlace` first.
+    @discardableResult
+    mutating func place(
+        item: BaldiItem,
+        rotation: BaldiRotation,
+        at point: BaldiExtremePoint
+    ) -> Bool {
+        guard canPlace(item: item, rotation: rotation, at: point) else { return false }
+        let placement = candidate(item: item, rotation: rotation, at: point)
         placements.append(placement)
 
         // The point just used is consumed, and any point now buried inside an item is dropped.
         extremePoints.removeAll { $0.position == point.position }
         appendGeneratedPoints(for: placement)
         pruneAndRefreshResidualSpace()
+        return true
     }
 
-    /// Rebuilds the Extreme Point set from scratch for the current placements. Used after the
-    /// centre-of-mass optimisation of §5.2 has moved items around.
-    mutating func rebuildExtremePoints() {
-        extremePoints = [BaldiExtremePoint(position: .zero, residualSpace: extent)]
-        for placement in placements {
-            appendGeneratedPoints(for: placement)
-        }
-        pruneAndRefreshResidualSpace()
-    }
-
-    mutating func replacePlacements(_ updated: [BaldiPlacement]) {
-        placements = updated
-        rebuildExtremePoints()
+    private func candidate(
+        item: BaldiItem,
+        rotation: BaldiRotation,
+        at point: BaldiExtremePoint
+    ) -> BaldiPlacement {
+        BaldiPlacement(
+            id: item.id,
+            name: item.name,
+            origin: point.position,
+            rotation: rotation,
+            size: rotation.size(of: item.size),
+            mass: item.mass
+        )
     }
 
     /// The six points the paper's rule produces for a newly placed item: each of the three corner
@@ -239,11 +250,12 @@ nonisolated struct BaldiPacking: Sendable {
 ///
 /// minimised over the points where the item fits. The paper notes that for complex packings the
 /// residual space is only an estimate of the free volume, so potential overlaps are checked
-/// explicitly when accommodating the item on the chosen point.
+/// explicitly when accommodating the item on the chosen point. This adaptation also rejects any
+/// non-floor candidate whose complete bottom face is not supported, following Junqueira equation
+/// (11) with `alpha = 1`.
 nonisolated enum BaldiEPBPH {
     static func pack(
         order: [BaldiItem],
-        instanceIndexByID: [UUID: Int],
         knapsack: BaldiKnapsack
     ) -> BaldiSolution {
         var packing = BaldiPacking(knapsack: knapsack)
@@ -263,7 +275,11 @@ nonisolated enum BaldiEPBPH {
                     if point.residualSpace.x < body.x - 1e-6 { continue }
                     if point.residualSpace.y < body.y - 1e-6 { continue }
                     if point.residualSpace.z < body.z - 1e-6 { continue }
-                    guard packing.canPlace(size: size, at: point.position) else { continue }
+                    guard packing.canPlace(
+                        item: item,
+                        rotation: rotation,
+                        at: point
+                    ) else { continue }
 
                     let score = (point.residualSpace.x - body.x)
                         + (point.residualSpace.y - body.y)
@@ -277,12 +293,12 @@ nonisolated enum BaldiEPBPH {
             }
 
             if let bestPoint, let bestRotation {
-                packing.place(
+                let placed = packing.place(
                     item: item,
-                    itemIndex: instanceIndexByID[item.id] ?? 0,
                     rotation: bestRotation,
                     at: bestPoint
                 )
+                if !placed { discarded.append(item) }
             } else {
                 discarded.append(item)
             }

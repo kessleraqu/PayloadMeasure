@@ -3,14 +3,13 @@ import Observation
 import SwiftUI
 import simd
 
-/// Which published formulation the arrangement screen is running.
+/// Which arrangement method the screen is running.
 enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
     /// Kaluzny & Shaw (2009) as adapted in the project chapter: load every package on the module
     /// floor and minimise the deviation of the centre of mass from a target.
     case loadBalanced
-    /// Baldi, Perboli & Tadei (2012), the three-dimensional knapsack problem with balancing
-    /// constraints: choose the most valuable subset, stack in three dimensions, and keep the
-    /// centre of mass inside a box domain.
+    /// Baldi's three-dimensional knapsack heuristic with a continuous-coordinate evaluation of
+    /// Junqueira's complete vertical-support condition.
     case knapsack3D
 
     var id: String { rawValue }
@@ -25,7 +24,7 @@ enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
     var citation: String {
         switch self {
         case .loadBalanced: "Kaluzny & Shaw (2009), adapted"
-        case .knapsack3D: "Baldi, Perboli & Tadei (2012)"
+        case .knapsack3D: "Baldi et al. (2012) + Junqueira et al. (2012)"
         }
     }
 }
@@ -38,12 +37,9 @@ enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
 @MainActor
 @Observable
 final class PackingStore {
-    /// Which formulation to run. Both are kept so the two can be compared on the same measurements.
+    /// Which method to run. Both are kept so they can be compared on the same measurements.
     var approach: PackingApproach = .knapsack3D
     var baldiOptions = Baldi3BKPOptions()
-    /// Per-package profit `p_j`. Defaults to the paper's own instance rule, `200 + w·d·h`
-    /// (paper §6.1), and can be overridden to force a critical package into the load.
-    var profitOverrides: [UUID: Double] = [:]
     private(set) var baldiResult: Baldi3BKPResult?
 
     /// Geometry and mass properties of the payload module, editable in the arrangement settings.
@@ -140,9 +136,6 @@ final class PackingStore {
             : domainUpper
     }
 
-    /// The paper's own instance rule for the profit of a package, §6.1.
-    static func defaultProfit(forVolume volume: Int) -> Double { 200 + Double(volume) }
-
     func baldiItems(from engine: ObjectCaptureEngine) -> [BaldiItem] {
         engine.measuredObjectIDs.compactMap { id in
             guard let captured = engine.capturedObjectsByID[id] else { return nil }
@@ -151,12 +144,10 @@ final class PackingStore {
                 Int((Double(captured.depthInMeters) * 1000).rounded(.up)),
                 Int((Double(captured.heightInMeters) * 1000).rounded(.up))
             )
-            let volume = max(size.x * size.y * size.z, 1)
             return BaldiItem(
                 id: id,
                 name: engine.name(for: id) ?? "Object \(engine.objectNumber(for: id) ?? 0)",
                 size: size,
-                profit: profitOverrides[id] ?? PackingStore.defaultProfit(forVolume: volume),
                 mass: engine.weightInKilograms(for: id) ?? 0
             )
         }
@@ -184,7 +175,7 @@ final class PackingStore {
     // MARK: - Solving
 
     func solve(packages: [PackingItem]) {
-        solveTask?.cancel()
+        cancel()
         guard !packages.isEmpty else {
             result = nil
             solvedSignature = nil
@@ -213,7 +204,7 @@ final class PackingStore {
         }
     }
 
-    /// Runs the 3BKP method chosen in the settings.
+    /// Runs the support-aware 3BKP-H heuristic.
     func solveBaldi(problem: BaldiProblem) {
         cancel()
         guard !problem.items.isEmpty else {
@@ -247,28 +238,32 @@ final class PackingStore {
 
     func baldiSignature(for problem: BaldiProblem) -> String {
         var parts: [String] = [
-            "3bkp",
+            "baldi-junqueira-v1",
             "\(problem.knapsack.size.x)/\(problem.knapsack.size.y)/\(problem.knapsack.size.z)",
             String(
                 format: "L%.2f,%.2f,%.2f U%.2f,%.2f,%.2f",
                 problem.knapsack.domainLower.x, problem.knapsack.domainLower.y, problem.knapsack.domainLower.z,
                 problem.knapsack.domainUpper.x, problem.knapsack.domainUpper.y, problem.knapsack.domainUpper.z
             ),
-            baldiOptions.method.rawValue,
             String(
-                format: "t%.1f/%.1f a%.4f th%.1f",
+                format: "t%.6g|theta%.6g|score%.6g,%.6g|k%.6g|stall%d|pairs%.6g|com%d|seed%llu",
                 baldiOptions.heuristic.timeLimitSeconds,
-                baldiOptions.modelTimeLimitSeconds,
-                baldiOptions.heuristic.meritAlpha,
-                baldiOptions.heuristic.clusterTheta
+                baldiOptions.heuristic.clusterTheta,
+                baldiOptions.heuristic.scoreDecrease,
+                baldiOptions.heuristic.scoreIncrease,
+                baldiOptions.heuristic.loadedScoreFactor,
+                baldiOptions.heuristic.nonImprovingLimit,
+                baldiOptions.heuristic.reinitialisationPairFraction,
+                baldiOptions.heuristic.centreOfMass.maximumIterations,
+                baldiOptions.heuristic.randomSeed
             ),
-            baldiOptions.usesPrintedRotationEquality ? "eq16-printed" : "eq16-repaired",
+            "equal-priority|centred-com|support-alpha-1",
         ]
         for item in problem.items.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
             parts.append(
                 String(
-                    format: "%@:%d,%d,%d,%.4f,%.2f",
-                    item.id.uuidString, item.size.x, item.size.y, item.size.z, item.mass, item.profit
+                    format: "%@:%d,%d,%d,%.4f",
+                    item.id.uuidString, item.size.x, item.size.y, item.size.z, item.mass
                 )
             )
         }

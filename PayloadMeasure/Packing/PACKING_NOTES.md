@@ -4,6 +4,10 @@ This folder adds the payload-arrangement stage to PayloadMeasure: once the opera
 named and weighed a set of objects, it decides where each one goes inside the payload module and
 shows the result as a to-scale drawing plus a numbered loading order.
 
+This document covers the floor-only Kaluzny & Shaw arrangement. The separate stacked, subset-loading
+production path is the support-aware Baldi 3BKP-H + Junqueira `alpha = 1` heuristic documented in
+[`Baldi/BALDI_3BKP_NOTES.md`](Baldi/BALDI_3BKP_NOTES.md).
+
 It is a Swift reimplementation of the browser tool in `../../../PackingOptimization`, extended with
 the adaptations set out in that project's `modifications` chapter. Nothing in the other project was
 modified; it was read as the reference.

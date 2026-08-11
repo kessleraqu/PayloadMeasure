@@ -1,6 +1,12 @@
 import Foundation
 import simd
 
+// REFERENCE ONLY — NOT THE PRODUCTION PACKING METHOD.
+//
+// This file preserves Baldi's 3BKP-M formulation for equation-level inspection. It does not model
+// Junqueira's complete bottom-face support condition, is never called by `Baldi3BKPSolver`, and
+// cannot certify feasibility or optimality for the support-aware Baldi–Junqueira heuristic.
+
 /// The MIP model 3BKP-M, Baldi, Perboli & Tadei (2012), equations (5)–(20).
 ///
 /// Every row below is annotated with the equation it implements, in the paper's own order and with
@@ -329,13 +335,11 @@ nonisolated enum Baldi3BKPModelBuilder {
             placements.append(
                 BaldiPlacement(
                     id: item.id,
-                    itemIndex: index,
                     name: item.name,
                     origin: origin,
                     rotation: rotation,
                     size: size,
-                    mass: item.mass,
-                    profit: item.profit
+                    mass: item.mass
                 )
             )
         }

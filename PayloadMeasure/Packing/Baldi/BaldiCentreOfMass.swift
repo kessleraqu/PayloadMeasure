@@ -23,9 +23,10 @@ import simd
 /// item moves there; `r'_i ∉ D_i` and the item moves to the point of `D_i` that better approximates
 /// `r'_i` on each axis.
 ///
-/// Finally, "the algorithm simulates the force of gravity by compacting all items along the z axis
-/// towards the (x, y) plan", and stops when the packing is balanced, no item can be moved any more,
-/// or a maximum number of iterations has been reached.
+/// Baldi finally applies gravity because its construction may leave packages floating. This hybrid
+/// never admits such a package: Junqueira's full-support rule is enforced during construction and
+/// after every tentative movement. Consequently there is no separate gravity repair that could
+/// turn a partial contact into an invalid "resting" position.
 nonisolated enum BaldiCentreOfMassOptimisation {
     nonisolated struct Options: Sendable, Equatable {
         /// The paper states a maximum number of iterations as a stopping condition but does not
@@ -42,12 +43,10 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         options: Options = Options()
     ) -> [BaldiPlacement] {
         guard !placements.isEmpty else { return placements }
-        // Gravity is applied before the first balance test as well as after every round of
-        // movements. EP-BPH on its own does leave items unsupported — measured at 3 of 239 items
-        // over 40 random instances — and the paper calls a state that ignores gravity a "faulty
-        // solution for many real-life applications", so the balance decision is always taken on the
-        // settled packing rather than on a floating one.
-        var current = applyGravity(to: placements, knapsack: knapsack)
+        guard options.maximumIterations > 0 else { return placements }
+        guard hasValidDomain(knapsack) else { return placements }
+        guard isSpatiallyValid(placements, in: knapsack) else { return placements }
+        var current = placements
         let target = knapsack.idealCentreOfMass
 
         for _ in 0..<options.maximumIterations {
@@ -65,7 +64,8 @@ nonisolated enum BaldiCentreOfMassOptimisation {
                 if knapsack.containsCentreOfMass(centre) { break }
                 let totalMass = current.reduce(0) { $0 + $1.mass }
                 let item = current[index]
-                guard item.mass > 0, totalMass > 0 else { continue }
+                guard item.mass.isFinite, item.mass > 0,
+                      totalMass.isFinite, totalMass > 0 else { continue }
 
                 // (28) then (29): where this item's origin would have to go to put the packing
                 // centre of mass exactly on the target.
@@ -77,39 +77,28 @@ nonisolated enum BaldiCentreOfMassOptimisation {
                 )
                 let desiredOrigin = desiredItemCentre - halfSize
 
-                guard let domain = freeDomain(for: index, in: current, knapsack: knapsack) else {
-                    continue // D_i = ∅: the item cannot move.
+                guard let domain = candidateDomain(for: index, in: current, knapsack: knapsack) else {
+                    continue
                 }
-                // The point of D_i that better approximates r'_i on each axis.
-                var clamped = simd_clamp(desiredOrigin, domain.lower, domain.upper)
-                if simd_distance_squared(clamped, item.origin) < 1e-12 { continue }
+                let clamped = simd_clamp(desiredOrigin, domain.lower, domain.upper)
+                let candidates = candidateOrigins(
+                    for: index,
+                    desired: clamped,
+                    in: current,
+                    domain: domain
+                )
+                guard let accepted = candidates.first(where: {
+                    isAcceptableMove(
+                        of: index,
+                        to: $0,
+                        in: current,
+                        knapsack: knapsack
+                    )
+                }) else { continue }
 
-                // D_i is built axis by axis, exactly as the residual space of an Extreme Point is,
-                // so a move along a single axis is always safe but a diagonal one need not be.
-                // The combined move is verified and, if it collides, applied one axis at a time.
-                if !isFree(size: item.size, at: clamped, in: current, excluding: index, knapsack: knapsack) {
-                    var stepped = item.origin
-                    for axis in 0..<3 {
-                        var candidate = stepped
-                        candidate[axis] = clamped[axis]
-                        if isFree(size: item.size, at: candidate, in: current, excluding: index, knapsack: knapsack) {
-                            stepped = candidate
-                        }
-                    }
-                    clamped = stepped
-                }
-                if simd_distance_squared(clamped, item.origin) < 1e-12 { continue }
-
-                current[index].origin = clamped
+                current[index].origin = accepted
                 movedAnything = true
             }
-
-            // §5.2: "Items movements may lead to a state that does not take gravity effects into
-            // account ... so the algorithm simulates the force of gravity by compacting all items
-            // along the z axis towards the (x, y) plan." The paper places this paragraph before the
-            // stopping conditions, so it runs inside the iteration and the next balance test sees
-            // the settled packing.
-            current = applyGravity(to: current, knapsack: knapsack)
 
             if !movedAnything { break } // no item can be moved any more
         }
@@ -119,8 +108,16 @@ nonisolated enum BaldiCentreOfMassOptimisation {
 
     /// `r_CM`, eq. (2).
     static func centreOfMass(of placements: [BaldiPlacement]) -> SIMD3<Double> {
+        guard !placements.isEmpty else { return .zero }
+        guard placements.allSatisfy({
+            $0.mass.isFinite
+                && $0.mass > 0
+                && $0.origin.x.isFinite
+                && $0.origin.y.isFinite
+                && $0.origin.z.isFinite
+        }) else { return SIMD3<Double>(repeating: .nan) }
         let mass = placements.reduce(0) { $0 + $1.mass }
-        guard mass > 0 else { return .zero }
+        guard mass.isFinite, mass > 0 else { return SIMD3<Double>(repeating: .nan) }
         var moment = SIMD3<Double>.zero
         for placement in placements {
             moment += placement.centreOfMass * placement.mass
@@ -128,50 +125,20 @@ nonisolated enum BaldiCentreOfMassOptimisation {
         return moment / mass
     }
 
-    /// "The algorithm simulates the force of gravity by compacting all items along the z axis
-    /// towards the (x, y) plan." Each item is dropped as far as it can go, lowest first.
-    static func applyGravity(
-        to placements: [BaldiPlacement],
-        knapsack: BaldiKnapsack
-    ) -> [BaldiPlacement] {
-        var current = placements
-        let tolerance = 1e-6
-        let order = current.indices.sorted { current[$0].origin.z < current[$1].origin.z }
-        for index in order {
-            let item = current[index]
-            // The item comes to rest on the highest face beneath it that its footprint overlaps,
-            // or on the floor. Solving for the resting height directly is exact and avoids
-            // stepping down one unit at a time.
-            var resting = 0.0
-            for (other, placed) in current.enumerated() where other != index {
-                guard placed.maximum.z <= item.origin.z + tolerance else { continue }
-                let overlapsX = item.origin.x < placed.maximum.x - tolerance
-                    && placed.origin.x < item.maximum.x - tolerance
-                let overlapsY = item.origin.y < placed.maximum.y - tolerance
-                    && placed.origin.y < item.maximum.y - tolerance
-                guard overlapsX, overlapsY else { continue }
-                resting = max(resting, placed.maximum.z)
-            }
-            current[index].origin.z = min(item.origin.z, resting)
-        }
-        return current
-    }
+    // MARK: - Candidate movement region
 
-    // MARK: - The domain D_i
-
-    private struct Domain {
+    private struct CandidateDomain {
         var lower: SIMD3<Double>
         var upper: SIMD3<Double>
     }
 
-    /// The positions the origin of item `index` may take, computed axis by axis in the same way as
-    /// the residual space of an Extreme Point: along each axis, how far the item can slide in each
-    /// direction before it meets another item that overlaps it on the other two axes.
-    private static func freeDomain(
+    /// Axis-wise movement bounds inspired by Baldi's `D_i`. This box is only a source of candidate
+    /// positions: every candidate is still checked for collision and full support before use.
+    private static func candidateDomain(
         for index: Int,
         in placements: [BaldiPlacement],
         knapsack: BaldiKnapsack
-    ) -> Domain? {
+    ) -> CandidateDomain? {
         let item = placements[index]
         let tolerance = 1e-6
         var lower = SIMD3<Double>.zero
@@ -198,32 +165,104 @@ nonisolated enum BaldiCentreOfMassOptimisation {
             }
             if lower[axis] > upper[axis] + tolerance { return nil }
         }
-        return Domain(lower: lower, upper: upper)
+        return CandidateDomain(lower: lower, upper: upper)
     }
 
-    private static func isFree(
-        size: SIMD3<Int>,
-        at origin: SIMD3<Double>,
+    /// Tries the desired point, the same horizontal point on every available support plane, and
+    /// safe one-axis moves. Ordering by distance keeps the accepted move as close as possible to
+    /// Baldi equation (29).
+    private static func candidateOrigins(
+        for index: Int,
+        desired: SIMD3<Double>,
         in placements: [BaldiPlacement],
-        excluding index: Int,
+        domain: CandidateDomain
+    ) -> [SIMD3<Double>] {
+        let original = placements[index].origin
+        var candidates: [SIMD3<Double>] = [desired]
+
+        let supportHeights = [0.0] + placements.indices
+            .filter { $0 != index }
+            .map { placements[$0].maximum.z }
+        for height in supportHeights where height >= domain.lower.z && height <= domain.upper.z {
+            var candidate = desired
+            candidate.z = height
+            candidates.append(candidate)
+        }
+
+        for axis in 0..<3 {
+            var candidate = original
+            candidate[axis] = desired[axis]
+            candidates.append(candidate)
+        }
+
+        var seen: Set<SIMD3<Double>> = []
+        return candidates
+            .filter { simd_distance_squared($0, original) >= 1e-12 }
+            .filter { seen.insert($0).inserted }
+            .sorted {
+                simd_distance_squared($0, desired) < simd_distance_squared($1, desired)
+            }
+    }
+
+    /// A movement is accepted only when the moved package remains contained and non-overlapping
+    /// and the complete packing still satisfies Junqueira's full-support rule. The whole-packing
+    /// check is necessary because moving a lower package can strand packages above it.
+    private static func isAcceptableMove(
+        of index: Int,
+        to origin: SIMD3<Double>,
+        in placements: [BaldiPlacement],
         knapsack: BaldiKnapsack
     ) -> Bool {
-        let tolerance = 1e-6
-        let body = SIMD3<Double>(Double(size.x), Double(size.y), Double(size.z))
-        for axis in 0..<3 {
-            if origin[axis] < -tolerance { return false }
-            if origin[axis] + body[axis] > Double(knapsack.size[axis]) + tolerance { return false }
-        }
-        let maximum = origin + body
-        for (other, placed) in placements.enumerated() where other != index {
-            var separated = false
-            for axis in 0..<3
-            where origin[axis] >= placed.maximum[axis] - tolerance
-                || placed.origin[axis] >= maximum[axis] - tolerance {
-                separated = true
-                break
+        var proposed = placements
+        proposed[index].origin = origin
+        return isSpatiallyValid(proposed, in: knapsack)
+    }
+
+    /// Whole-packing validation used at entry and after every tentative movement. Checking the
+    /// complete array makes the support dependency explicit: moving one lower package can make a
+    /// different package above it invalid even when the moved package itself still fits.
+    private static func isSpatiallyValid(
+        _ placements: [BaldiPlacement],
+        in knapsack: BaldiKnapsack
+    ) -> Bool {
+        let tolerance = BaldiVerticalSupport.contactTolerance
+        for placement in placements {
+            guard placement.mass.isFinite,
+                  placement.mass > 0,
+                  placement.size.x > 0,
+                  placement.size.y > 0,
+                  placement.size.z > 0 else { return false }
+            for axis in 0..<3 {
+                guard placement.origin[axis].isFinite else { return false }
+                if placement.origin[axis] < -tolerance { return false }
+                if placement.maximum[axis] > Double(knapsack.size[axis]) + tolerance {
+                    return false
+                }
             }
-            if !separated { return false }
+        }
+
+        for first in placements.indices {
+            for second in placements.indices where second > first {
+                if placements[first].overlaps(placements[second], tolerance: tolerance) {
+                    return false
+                }
+            }
+        }
+        return BaldiVerticalSupport.allFullySupported(placements, tolerance: tolerance)
+    }
+
+    private static func hasValidDomain(_ knapsack: BaldiKnapsack) -> Bool {
+        guard knapsack.size.x > 0, knapsack.size.y > 0, knapsack.size.z > 0 else {
+            return false
+        }
+        for axis in 0..<3 {
+            let lower = knapsack.domainLower[axis]
+            let upper = knapsack.domainUpper[axis]
+            guard lower.isFinite,
+                  upper.isFinite,
+                  lower >= 0,
+                  lower <= upper,
+                  upper <= Double(knapsack.size[axis]) else { return false }
         }
         return true
     }
