@@ -238,6 +238,18 @@ relative placement are decided simultaneously as one mixed-integer linear progra
 sequentially and nothing is repositioned afterwards. Two modules, the choice of module connection
 and stacking with load-bearing constraints remain outside the model.
 
+✅ A second arrangement formulation is implemented in `Packing/Baldi/`: Baldi, Perboli & Tadei
+(2012), the three-dimensional knapsack problem with balancing constraints, reproduced 1-to-1. It
+adds what the Kaluzny chapter cannot express — stacking in three dimensions, selection of the most
+profitable subset when everything does not fit, and the centre of mass as a hard box domain rather
+than an objective. Both the exact model 3BKP-M (eqs. 5–20), the 3BKP-H heuristic (Extreme Points,
+EP-BPH, the six sorting criteria, the scoring scheme and the centre-of-mass optimisation) and the
+UB_1D bound are implemented; a segmented control on the arrangement screen switches between the two
+formulations on the same measurements. Two defects in the printed model are documented and one is
+switchable: equation (10) misprints ρ_ir for ρ_jr, and equation (16) as printed makes any packing
+that leaves an item out infeasible. Every parameter the paper defines without giving a value is a
+setting rather than a buried constant. See `Packing/Baldi/BALDI_3BKP_NOTES.md`.
+
 ✅ The mixed-integer program is solved on the device by a self-contained exact solver — a
 bounded-variable primal and dual simplex with refactorisation and a Harris ratio test, driven by a
 warm-started depth-first branch and bound. No third-party solver is linked. A result is only called

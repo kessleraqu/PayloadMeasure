@@ -6,18 +6,25 @@ import simd
 struct PackingSettingsView: View {
     @Bindable var store: PackingStore
     var packages: [PackingItem] = []
+    var baldiItems: [BaldiItem] = []
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
                 moduleSection
-                clearanceSection
-                balanceSection
-                envelopeSection
-                packageSection
-                massSection
-                solverSection
+                if store.approach == .knapsack3D {
+                    knapsackDomainSection
+                    knapsackProfitSection
+                    knapsackSolverSection
+                } else {
+                    clearanceSection
+                    balanceSection
+                    envelopeSection
+                    packageSection
+                    massSection
+                    solverSection
+                }
                 resetSection
             }
             .navigationTitle("Arrangement settings")
@@ -163,6 +170,135 @@ struct PackingSettingsView: View {
         }
     }
 
+    // MARK: - 3BKP sections
+
+    private var knapsackDomainSection: some View {
+        Section {
+            Toggle("Use the paper's domain", isOn: $store.usesStandardDomain)
+            if !store.usesStandardDomain {
+                offsetField("L¹ along", value: $store.domainLower.x, allowsNegative: false)
+                offsetField("U¹ along", value: $store.domainUpper.x, allowsNegative: false)
+                offsetField("L² across", value: $store.domainLower.y, allowsNegative: false)
+                offsetField("U² across", value: $store.domainUpper.y, allowsNegative: false)
+                offsetField("L³ height", value: $store.domainLower.z, allowsNegative: false)
+                offsetField("U³ height", value: $store.domainUpper.z, allowsNegative: false)
+            } else {
+                LabeledContent("L^δ", value: describe(store.centreOfMassDomainLower(for: knapsackSize)))
+                LabeledContent("U^δ", value: describe(store.centreOfMassDomainUpper(for: knapsackSize)))
+            }
+        } header: {
+            Text("Centre-of-mass domain")
+        } footer: {
+            Text("The 3BKP treats balance as a hard constraint: the packing centre of mass must lie inside [L¹,U¹]×[L²,U²]×[L³,U³]. The paper's own instances use L = (W/4, D/4, 0) and U = (3W/4, 3D/4, H/2), the upper vertical bound being the practical requirement that the centre of mass sit low in the bin.")
+        }
+    }
+
+    private var knapsackSize: SIMD3<Int> {
+        SIMD3(
+            Int(store.module.lengthMillimetres.rounded(.down)),
+            Int(store.module.widthMillimetres.rounded(.down)),
+            Int(store.module.heightMillimetres.rounded(.down))
+        )
+    }
+
+    private func describe(_ vector: SIMD3<Double>) -> String {
+        String(format: "%.0f, %.0f, %.0f mm", vector.x, vector.y, vector.z)
+    }
+
+    @ViewBuilder
+    private var knapsackProfitSection: some View {
+        if !baldiItems.isEmpty {
+            Section {
+                ForEach(baldiItems) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.name).font(.subheadline)
+                        HStack(spacing: 6) {
+                            Text(
+                                String(
+                                    format: "%d × %d × %d mm · %.2f kg",
+                                    item.size.x, item.size.y, item.size.z, item.mass
+                                )
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            Spacer(minLength: 8)
+                            TextField(
+                                "Profit",
+                                value: profitBinding(for: item),
+                                format: .number.precision(.fractionLength(0))
+                            )
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(maxWidth: 110)
+                        }
+                    }
+                }
+            } header: {
+                Text("Profit p_j")
+            } footer: {
+                Text("The knapsack maximises the total profit of the loaded packages, so profit is what decides which package is left behind when the module is full. The default is the paper's own instance rule, p_j = 200 + w·d·h. Raise a value to force a package in.")
+            }
+        }
+    }
+
+    private func profitBinding(for item: BaldiItem) -> Binding<Double> {
+        Binding(
+            get: {
+                store.profitOverrides[item.id]
+                    ?? PackingStore.defaultProfit(forVolume: max(item.volume, 1))
+            },
+            set: { store.profitOverrides[item.id] = $0 }
+        )
+    }
+
+    private var knapsackSolverSection: some View {
+        Section {
+            Picker("Method", selection: $store.baldiOptions.method) {
+                ForEach(BaldiMethod.allCases) { method in
+                    Text(method.title).tag(method)
+                }
+            }
+            if store.baldiOptions.method == .heuristic {
+                timeField("3BKP-H time limit", value: $store.baldiOptions.heuristic.timeLimitSeconds)
+                LabeledContent("Merit weight α") {
+                    HStack(spacing: 6) {
+                        Text(String(format: "%.0f", store.baldiOptions.heuristic.meritAlpha))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Stepper(
+                            "Merit weight",
+                            value: $store.baldiOptions.heuristic.meritAlpha,
+                            in: 0...100_000,
+                            step: 1000
+                        )
+                        .labelsHidden()
+                    }
+                }
+                LabeledContent("Cluster width θ") {
+                    HStack(spacing: 6) {
+                        Text(String(format: "%.0f%%", store.baldiOptions.heuristic.clusterTheta))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Stepper(
+                            "Cluster width",
+                            value: $store.baldiOptions.heuristic.clusterTheta,
+                            in: 1...100,
+                            step: 5
+                        )
+                        .labelsHidden()
+                    }
+                }
+            } else {
+                timeField("3BKP-M time limit", value: $store.baldiOptions.modelTimeLimitSeconds)
+                Toggle("Equation (16) exactly as printed", isOn: $store.baldiOptions.usesPrintedRotationEquality)
+            }
+        } header: {
+            Text("Method")
+        } footer: {
+            Text("3BKP-H is the paper's heuristic and stops after its time limit with no optimality proof; α is the weight of the unbalancing index in the merit function F = P − αU, which the paper defines but never gives a value for, and θ is the cluster width of equations (22)–(23), likewise unspecified. 3BKP-M is the exact model, which the paper reports cannot handle more than about twenty items — on a phone the practical limit is far lower. Equation (16) as printed makes any packing that leaves an item out infeasible; the switch is there so that can be seen.")
+        }
+    }
+
     private var resetSection: some View {
         Section {
             Button("Restore defaults", role: .destructive) {
@@ -173,6 +309,9 @@ struct PackingSettingsView: View {
                 store.centreOfMassTolerance = SIMD3(20, 10, 50)
                 store.limitsPayloadMass = false
                 store.maximumPayloadMass = 5
+                store.baldiOptions = Baldi3BKPOptions()
+                store.usesStandardDomain = true
+                store.profitOverrides = [:]
             }
         }
     }

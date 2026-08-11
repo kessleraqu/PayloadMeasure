@@ -43,6 +43,8 @@
 				Models/EdgeTAM/LICENSE,
 				Models/EdgeTAM/model_info.json,
 				Models/EdgeTAM/README.md,
+				Packing/Baldi/BALDI_FIDELITY_AUDIT.md,
+				Packing/Baldi/BALDI_3BKP_NOTES.md,
 				Packing/PACKING_NOTES.md,
 				PROJECT_CONTEXT.md,
 			);

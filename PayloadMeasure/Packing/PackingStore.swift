@@ -3,14 +3,49 @@ import Observation
 import SwiftUI
 import simd
 
-/// Bridges the measured objects into the packing optimiser and holds the arrangement for the UI.
+/// Which published formulation the arrangement screen is running.
+enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
+    /// Kaluzny & Shaw (2009) as adapted in the project chapter: load every package on the module
+    /// floor and minimise the deviation of the centre of mass from a target.
+    case loadBalanced
+    /// Baldi, Perboli & Tadei (2012), the three-dimensional knapsack problem with balancing
+    /// constraints: choose the most valuable subset, stack in three dimensions, and keep the
+    /// centre of mass inside a box domain.
+    case knapsack3D
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .loadBalanced: "Balance"
+        case .knapsack3D: "3D knapsack"
+        }
+    }
+
+    var citation: String {
+        switch self {
+        case .loadBalanced: "Kaluzny & Shaw (2009), adapted"
+        case .knapsack3D: "Baldi, Perboli & Tadei (2012)"
+        }
+    }
+}
+
+/// Bridges the measured objects into the packing optimisers and holds the arrangement for the UI.
 ///
-/// The solve runs off the main actor. It is pure computation on value types with a hard time limit,
+/// A solve runs off the main actor. It is pure computation on value types with a hard time limit,
 /// so it cannot block the AR session, and a superseded solve is cancelled rather than left to
 /// finish and overwrite a newer one.
 @MainActor
 @Observable
 final class PackingStore {
+    /// Which formulation to run. Both are kept so the two can be compared on the same measurements.
+    var approach: PackingApproach = .knapsack3D
+    var baldiOptions = Baldi3BKPOptions()
+    /// Per-package profit `p_j`. Defaults to the paper's own instance rule, `200 + w·d·h`
+    /// (paper §6.1), and can be overridden to force a critical package into the load.
+    var profitOverrides: [UUID: Double] = [:]
+    private(set) var baldiResult: Baldi3BKPResult?
+
     /// Geometry and mass properties of the payload module, editable in the arrangement settings.
     var module: PayloadModule = .standard
     var options = PackingOptions()
@@ -24,6 +59,10 @@ final class PackingStore {
     var centreOfMassTolerance = SIMD3<Double>(20, 10, 50)
     var limitsPayloadMass = false
     var maximumPayloadMass: Double = 5
+    /// Uses the paper's own centre-of-mass domain, `L = (W/4, D/4, 0)`, `U = (3W/4, 3D/4, H/2)`.
+    var usesStandardDomain = true
+    var domainLower = SIMD3<Double>(200, 50, 0)
+    var domainUpper = SIMD3<Double>(600, 150, 50)
 
     private(set) var result: PackingResult?
     private(set) var isSolving = false
@@ -33,6 +72,7 @@ final class PackingStore {
 
     private var solveTask: Task<Void, Never>?
     private var solveWork: Task<PackingResult, Never>?
+    private var baldiWork: Task<Baldi3BKPResult, Never>?
 
     /// The module as the optimiser sees it, with the operator's envelope and mass limit folded in.
     var effectiveModule: PayloadModule {
@@ -66,6 +106,64 @@ final class PackingStore {
                 keepsUpright: uprightPackageIDs.contains(id)
             )
         }
+    }
+
+    // MARK: - 3BKP inputs
+
+    /// Builds the 3BKP instance. The paper assumes integral knapsack and item sizes, so measured
+    /// millimetres are rounded: item sizes up and the knapsack down, so the discretisation can only
+    /// make the packing more conservative, never claim a fit that does not exist.
+    func knapsack() -> BaldiKnapsack {
+        let size = SIMD3<Int>(
+            Int(module.lengthMillimetres.rounded(.down)),
+            Int(module.widthMillimetres.rounded(.down)),
+            Int(module.heightMillimetres.rounded(.down))
+        )
+        return BaldiKnapsack(
+            size: size,
+            domainLower: centreOfMassDomainLower(for: size),
+            domainUpper: centreOfMassDomainUpper(for: size)
+        )
+    }
+
+    /// `L^δ`. Defaults to the paper's instance domain, §6.1.
+    func centreOfMassDomainLower(for size: SIMD3<Int>) -> SIMD3<Double> {
+        usesStandardDomain
+            ? BaldiKnapsack.standardDomain(size: size).lower
+            : domainLower
+    }
+
+    /// `U^δ`.
+    func centreOfMassDomainUpper(for size: SIMD3<Int>) -> SIMD3<Double> {
+        usesStandardDomain
+            ? BaldiKnapsack.standardDomain(size: size).upper
+            : domainUpper
+    }
+
+    /// The paper's own instance rule for the profit of a package, §6.1.
+    static func defaultProfit(forVolume volume: Int) -> Double { 200 + Double(volume) }
+
+    func baldiItems(from engine: ObjectCaptureEngine) -> [BaldiItem] {
+        engine.measuredObjectIDs.compactMap { id in
+            guard let captured = engine.capturedObjectsByID[id] else { return nil }
+            let size = SIMD3<Int>(
+                Int((Double(captured.widthInMeters) * 1000).rounded(.up)),
+                Int((Double(captured.depthInMeters) * 1000).rounded(.up)),
+                Int((Double(captured.heightInMeters) * 1000).rounded(.up))
+            )
+            let volume = max(size.x * size.y * size.z, 1)
+            return BaldiItem(
+                id: id,
+                name: engine.name(for: id) ?? "Object \(engine.objectNumber(for: id) ?? 0)",
+                size: size,
+                profit: profitOverrides[id] ?? PackingStore.defaultProfit(forVolume: volume),
+                mass: engine.weightInKilograms(for: id) ?? 0
+            )
+        }
+    }
+
+    func baldiProblem(from engine: ObjectCaptureEngine) -> BaldiProblem {
+        BaldiProblem(knapsack: knapsack(), items: baldiItems(from: engine))
     }
 
     /// Locked measurements that cannot be arranged yet because no weight has been entered.
@@ -115,7 +213,71 @@ final class PackingStore {
         }
     }
 
+    /// Runs the 3BKP method chosen in the settings.
+    func solveBaldi(problem: BaldiProblem) {
+        cancel()
+        guard !problem.items.isEmpty else {
+            baldiResult = nil
+            solvedSignature = nil
+            return
+        }
+
+        isSolving = true
+        let options = baldiOptions
+        let expected = baldiSignature(for: problem)
+
+        let work = Task.detached(priority: .userInitiated) {
+            Baldi3BKPSolver.solve(problem, options: options)
+        }
+        baldiWork = work
+
+        solveTask = Task { [weak self] in
+            let outcome = await work.value
+            guard !Task.isCancelled else { return }
+            self?.baldiResult = outcome
+            self?.solvedSignature = expected
+            self?.isSolving = false
+        }
+    }
+
+    /// True when the measurements or settings have changed since the displayed 3BKP packing.
+    func isBaldiStale(for problem: BaldiProblem) -> Bool {
+        baldiResult != nil && solvedSignature != baldiSignature(for: problem)
+    }
+
+    func baldiSignature(for problem: BaldiProblem) -> String {
+        var parts: [String] = [
+            "3bkp",
+            "\(problem.knapsack.size.x)/\(problem.knapsack.size.y)/\(problem.knapsack.size.z)",
+            String(
+                format: "L%.2f,%.2f,%.2f U%.2f,%.2f,%.2f",
+                problem.knapsack.domainLower.x, problem.knapsack.domainLower.y, problem.knapsack.domainLower.z,
+                problem.knapsack.domainUpper.x, problem.knapsack.domainUpper.y, problem.knapsack.domainUpper.z
+            ),
+            baldiOptions.method.rawValue,
+            String(
+                format: "t%.1f/%.1f a%.4f th%.1f",
+                baldiOptions.heuristic.timeLimitSeconds,
+                baldiOptions.modelTimeLimitSeconds,
+                baldiOptions.heuristic.meritAlpha,
+                baldiOptions.heuristic.clusterTheta
+            ),
+            baldiOptions.usesPrintedRotationEquality ? "eq16-printed" : "eq16-repaired",
+        ]
+        for item in problem.items.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            parts.append(
+                String(
+                    format: "%@:%d,%d,%d,%.4f,%.2f",
+                    item.id.uuidString, item.size.x, item.size.y, item.size.z, item.mass, item.profit
+                )
+            )
+        }
+        return parts.joined(separator: "|")
+    }
+
     func cancel() {
+        baldiWork?.cancel()
+        baldiWork = nil
         solveWork?.cancel()
         solveWork = nil
         solveTask?.cancel()
@@ -126,6 +288,7 @@ final class PackingStore {
     func clear() {
         cancel()
         result = nil
+        baldiResult = nil
         solvedSignature = nil
     }
 

@@ -13,21 +13,39 @@ struct PackingArrangementView: View {
     @State private var showsDiagnostics = false
 
     private var packages: [PackingItem] { store.packages(from: captureEngine) }
+    private var baldiProblem: BaldiProblem { store.baldiProblem(from: captureEngine) }
     private var missingWeightIDs: [UUID] { store.packagesMissingWeight(from: captureEngine) }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if store.isSolving {
-                        solvingCard
-                    } else if let result = store.result {
-                        resultContent(result)
-                    } else if packages.isEmpty {
+                    approachPicker
+
+                    if packages.isEmpty {
                         emptyCard
-                    } else {
-                        // Between the view appearing and the solve task starting.
+                    } else if store.isSolving {
                         solvingCard
+                    } else {
+                        switch store.approach {
+                        case .loadBalanced:
+                            if let result = store.result {
+                                resultContent(result)
+                            } else {
+                                solvingCard
+                            }
+                        case .knapsack3D:
+                            if !missingWeightIDs.isEmpty { missingWeightCard }
+                            if let result = store.baldiResult {
+                                BaldiResultView(
+                                    result: result,
+                                    colours: colourMap,
+                                    highlightedPackageID: $highlightedPackageID
+                                )
+                            } else {
+                                solvingCard
+                            }
+                        }
                     }
                 }
                 .padding(20)
@@ -49,19 +67,53 @@ struct PackingArrangementView: View {
                 }
             }
             .sheet(isPresented: $showsSettings) {
-                PackingSettingsView(store: store, packages: packages)
+                PackingSettingsView(store: store, packages: packages, baldiItems: baldiProblem.items)
             }
             .task(id: solveTrigger) {
-                if store.result == nil || store.isStale(for: packages) {
-                    store.solve(packages: packages)
+                switch store.approach {
+                case .loadBalanced:
+                    if store.result == nil || store.isStale(for: packages) {
+                        store.solve(packages: packages)
+                    }
+                case .knapsack3D:
+                    if store.baldiResult == nil || store.isBaldiStale(for: baldiProblem) {
+                        store.solveBaldi(problem: baldiProblem)
+                    }
                 }
             }
             .onDisappear { store.cancel() }
         }
     }
 
-    /// Re-solves whenever the measured load or any setting it depends on changes.
-    private var solveTrigger: String { store.signature(for: packages) }
+    /// Re-solves whenever the measured load, the chosen formulation, or any setting they depend on
+    /// changes.
+    private var solveTrigger: String {
+        switch store.approach {
+        case .loadBalanced: "balance|" + store.signature(for: packages)
+        case .knapsack3D: "knapsack|" + store.baldiSignature(for: baldiProblem)
+        }
+    }
+
+    /// The two published formulations, side by side on the same measurements.
+    private var approachPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Formulation", selection: $store.approach) {
+                ForEach(PackingApproach.allCases) { approach in
+                    Text(approach.title).tag(approach)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(
+                store.approach == .knapsack3D
+                    ? "\(store.approach.citation) — stacks in three dimensions, loads the most valuable subset that fits, and keeps the centre of mass inside a box domain."
+                    : "\(store.approach.citation) — loads every package on the module floor and minimises the deviation of the centre of mass from a target."
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 
     // MARK: - States
 
