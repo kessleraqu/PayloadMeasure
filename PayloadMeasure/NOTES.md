@@ -1,0 +1,126 @@
+# PayloadMeasure
+
+Measure a payload with the phone, then work out how to load it. Two halves:
+
+```
+PayloadMeasureApp
+  └── ContentView
+        ├── ARCameraView          the AR session and everything drawn in it
+        └── MeasurementOverlayView  the HUD, and the way into the packing screens
+
+AR/            session, aimer, and the coordinator that runs the scan
+Capture/       segmentation, depth accumulation, box fitting, session state
+Measurement/   the two measurement methods, and the automatic-lock rule
+Packing/       what to do with the measurements once they exist (own NOTES.md)
+Utilities/     small shared helpers
+```
+
+## Where things live
+
+| File | What it holds |
+| --- | --- |
+| `AR/ARCameraView.swift` | The AR view and its coordinator. Session lifecycle, the mask loop, the scan loop, support-plane tracking, and all RealityKit content. Navigate it by its MARK sections. |
+| `AR/ARSessionManager.swift` | Owns the ARKit session and publishes the readiness flags the UI gates on. |
+| `AR/AimerState.swift` | Shape of the centre aimer, driven by the surface under the crosshair. |
+| `Capture/ObjectMaskProcessor.swift` | Vision foreground segmentation, and keeping masks matched to the same object across frames. |
+| `Capture/ObjectCapture.swift` | Depth to box. Pure computation: accumulate, voxelise, cluster, fit. |
+| `Capture/ObjectCaptureEngine.swift` | Session state: active object, locked objects, names, weights, everything the HUD reads. |
+| `Measurement/MeasurementWorkflowMode.swift` | Full 3D or Top. |
+| `Measurement/MeasurementConvergence.swift` | The sequential stopping rule behind the automatic lock. |
+| `MeasurementOverlayView.swift` | The HUD. |
+
+Everything is inside `PayloadMeasure/`, which is a synchronised Xcode group — new files are picked
+up automatically, and there is nothing to add to the project file.
+
+## Why the code looks the way it does
+
+These are the non-obvious decisions. They were comments in the source and are collected here so the
+code stays readable.
+
+**The coordinator is one long type.** It owns mutable per-frame state. Splitting it across files
+would mean making that state internal, which buys navigability at the cost of the encapsulation.
+The MARK sections do the same job.
+
+**Observation has a gap.** `withObservationTracking` fires `onChange` once and then stops tracking
+until it is re-registered, and re-registering has to hop through a `Task` to get back on the main
+actor. Anything mutated inside that gap is never delivered — and the gap is widest on startup, when
+the main thread is busiest. Every branch in `handleEngineRevisionChange` is therefore guarded by an
+`observed… != current` comparison that it then syncs, so the whole thing is idempotent. The scan
+timer polls it as a backstop.
+
+**Finishing commits first and asks afterwards.** Tapping Finish freezes the dimensions immediately. The
+name and weight sheet comes after, against an object already stored. The old order left the
+transaction open while someone typed, and ARKit kept refining the plane the half-committed box was
+bound to, so the geometry drifted out from under it. Cancel is the opposite door: it throws the
+measurement away and deselects, so nothing half-measured is ever kept. Edit resumes a finished
+object, and is offered only while a marker for it is visible — a stale focus is not enough.
+
+**Anchor corrections rebase, they do not repaint.** ARKit refines an anchor while an object is
+locked. The rendered box follows automatically, but the accumulated depth voxels are still in the
+older world frame. The canonical box is rebased and the evidence reacquired, so unlocking never
+mixes two frames. Box coordinates belong to the world frame captured alongside the published anchor
+transform, and keeping that exact inverse as the child transform is what lets RealityKit apply later
+corrections without dragging the box back into a stale frame.
+
+**Support planes are held across a bad frame or two.** ARKit re-cuts a plane's boundary polygon as
+it refines it, so the ring of validation points can briefly fall outside a plane that is perfectly
+good. The last accepted match is carried over rather than dropped.
+
+**The support surface is the nearest level below, not the lowest.** With the object's own points
+excluded, the closest well-populated level beneath it is the table, not the floor past the table
+edge. The plane search and the depth search break that tie the same way, so they agree.
+
+**Depth noise is rejected by neighbours.** Most stray points are silhouette-ring samples from a
+fuzzy mask edge, or LiDAR flying pixels straddling a depth step. A sample is kept only if at least
+three of its four depth-grid neighbours are also admitted and depth-continuous.
+
+**Each dimension remembers the view that could measure it.** Width and length come from the last
+top-down view, height from the last side view. Without that, a side view — where the background
+leaks into the footprint — would overwrite a good top-down measurement.
+
+**The automatic lock is a sequential stopping rule**, not a timer. The scan republishes a fit many
+times a second, so "is it done?" is a sequential estimation problem. Progress is the fraction of the
+rule satisfied, taken as the minimum over its conditions, so the bar shows the limiting one. A stop
+is only allowed on a full window: both tests sharpen as samples accumulate, and the plateau test
+compares two halves, so short halves are blind to the slow drift it exists to catch. Having a real
+support plane is a condition the statistics cannot see, so it is checked separately.
+
+**The overlay is not torn down for the details sheet.** Rebuilding the whole hierarchy — glass
+containers, mask layers, aimer, every card — in the same frame that presents an alert and cold-starts
+the keyboard was a visible stall. Measurement has already stopped by then, so leaving it up is free.
+
+**Box edges come from a pool.** Every entity beyond the prepared pool is built synchronously, and
+twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
+when the box first appears.
+
+## Sources
+
+Top-view box fitting follows Liu, Liu and Zhang, *Estimation of 2D Bounding Box Orientation with
+Convex-Hull Points*, IV 2020: downsample to 100 points, Graham-scan hull with approximate
+collinearity at τ = 0.01, every hull-point pair as a candidate direction, and the closeness score of
+Zhang, Xu, Dong and Dolan (IV 2017). Three things are worth stating explicitly.
+
+**Closeness is maximised, not minimised.** Liu's Algorithm 2 initialises `S = INT_MAX` and keeps
+`Scur < S`. But closeness is Zhang's β = Σ 1/max(min(d₁,d₂), d₀), which is larger the better the
+points hug the rectangle, and Zhang's own search takes the argmax. Minimising it would deliberately
+select the worst-fitting orientation, so Algorithm 2's comparison is a misprint and the maximum is
+taken here.
+
+**Orientation uses the downsample; the extents use every point.** Liu downsamples once and works
+from that set throughout, but the paper explicitly omits size — "we focus on evaluating the
+orientation accuracy… and omit the size information" — and warns that size is the quantity most
+damaged by missing points. This app is measuring size, and the samples a downsample discards are
+disproportionately the extreme ones. The hull and the candidate-direction search are unchanged.
+
+**Downsampling is seeded reservoir sampling**, so a uniformly random subset, reproducible run to
+run. Liu says "uniformly downsampled" without saying whether that means a random subset or a fixed
+stride.
+
+Side-by-side pseudocode for this and for the packing algorithms is in `../PSEUDOCODE.md`. The
+packing side also has `Packing/METHODS.md`.
+
+## Testing
+
+`PayloadMeasureTests` covers the packing pipeline, box preparation, the AR suspension rules and the
+decimal parsing. The AR and capture pipelines are not unit tested — they need a LiDAR device. Test
+those by running a scan on hardware.

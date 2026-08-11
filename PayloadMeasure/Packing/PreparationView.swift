@@ -1,0 +1,580 @@
+import SwiftUI
+import UIKit
+
+// Step-by-step screen the operator works through before loading. The system assigns the smallest
+// fitting box to every object; the operator is told which one to use, weighs the sealed package,
+// and moves on. From here it goes straight into the arrangement without leaving the sheet.
+//
+// In:  PackingStore and the capture engine.
+// Out: on screen only. Writes names, packed weights, own-box marks and exclusions into the store.
+
+struct PreparationView: View {
+    let captureEngine: ObjectCaptureEngine
+    @Bindable var store: PackingStore
+
+    @State private var stage: Stage = .preparation
+
+    private enum Stage {
+        case preparation
+        case arrangement
+    }
+
+    var body: some View {
+        switch stage {
+        case .preparation:
+            PackingPreparationView(
+                captureEngine: captureEngine,
+                store: store
+            ) {
+                withAnimation(.snappy(duration: 0.25)) {
+                    stage = .arrangement
+                }
+            }
+            .transition(.opacity)
+
+        case .arrangement:
+            ArrangementView(
+                captureEngine: captureEngine,
+                store: store
+            )
+            .transition(.opacity)
+        }
+    }
+}
+
+private struct PackingPreparationView: View {
+    private enum FocusedField: Hashable {
+        case name
+        case weight
+    }
+
+    private struct Draft {
+        var nameText: String
+        var packedWeightText: String
+    }
+
+    let captureEngine: ObjectCaptureEngine
+    @Bindable var store: PackingStore
+    let onComplete: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focusedField: FocusedField?
+    @State private var currentIndex = 0
+    @State private var drafts: [UUID: Draft] = [:]
+    @State private var validationMessage: String?
+    @State private var isShowingBoxCatalog = false
+
+    private var objectIDs: [UUID] {
+        captureEngine.measuredObjectIDs
+    }
+
+    private var currentObjectID: UUID? {
+        guard objectIDs.indices.contains(currentIndex) else { return nil }
+        return objectIDs[currentIndex]
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if let currentObjectID {
+                    preparationContent(for: currentObjectID)
+                } else {
+                    emptyState
+                }
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Prepare packages")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(currentIndex == 0 ? "Back" : "Previous") {
+                        goBack()
+                    }
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            isShowingBoxCatalog = true
+                        } label: {
+                            Label("Boxes…", systemImage: "shippingbox")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel("Preparation options")
+                    .accessibilityHint("Review the boxes, add a size, or delete one.")
+                }
+
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        focusedField = nil
+                    }
+                }
+            }
+        }
+        .onAppear(perform: prepareDrafts)
+        .sheet(isPresented: $isShowingBoxCatalog, onDismiss: reassignBoxes) {
+            BoxCatalogView(store: store)
+        }
+    }
+
+    private func preparationContent(for objectID: UUID) -> some View {
+        let canPrepare = store.isItsOwnBox(objectID, in: captureEngine)
+            || !store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
+
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                progressHeader
+                objectCard(for: objectID, allowsNameEditing: canPrepare)
+
+                if canPrepare {
+                    boxCard(for: objectID)
+                    weightCard(for: objectID)
+                } else {
+                    noFittingBoxCard(for: objectID)
+                }
+
+                if let validationMessage {
+                    Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(20)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .id(objectID)
+        .safeAreaInset(edge: .bottom) {
+            nextButton(for: objectID)
+        }
+    }
+
+    private var progressHeader: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Object \(currentIndex + 1) of \(objectIDs.count)")
+                .font(.subheadline.weight(.semibold))
+            ProgressView(value: progress)
+                .tint(.accentColor)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preparation progress")
+        .accessibilityValue("Object \(currentIndex + 1) of \(objectIDs.count)")
+    }
+
+    private var progress: Double {
+        guard !objectIDs.isEmpty else { return 0 }
+        return Double(currentIndex + 1) / Double(objectIDs.count)
+    }
+
+    private func objectCard(
+        for objectID: UUID,
+        allowsNameEditing: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            objectVisual(for: objectID)
+
+            HStack(alignment: .center, spacing: 9) {
+                Circle()
+                    .fill(objectColour(for: objectID))
+                    .frame(width: 13, height: 13)
+                    .accessibilityHidden(true)
+
+                if allowsNameEditing {
+                    TextField("Object name", text: nameBinding(for: objectID))
+                        .textInputAutocapitalization(.words)
+                        .font(.title3.weight(.semibold))
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focusedField, equals: .name)
+                        .submitLabel(.done)
+                        .onSubmit { focusedField = nil }
+                        .accessibilityLabel("Object name")
+                        .accessibilityHint("This name appears in the loading plan.")
+                } else {
+                    Text(displayName(for: objectID))
+                        .font(.title3.weight(.semibold))
+                        .accessibilityLabel("Object name, \(displayName(for: objectID))")
+                }
+            }
+
+            if let measured = store.measuredSizeMillimetres(for: objectID, in: captureEngine) {
+                Label("Measured \(sizeText(measured))", systemImage: "ruler")
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Measured size \(sizeText(measured))")
+            }
+        }
+        .padding(14)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(objectColour(for: objectID), lineWidth: 3)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func objectVisual(for objectID: UUID) -> some View {
+        if let data = captureEngine.snapshotJPEGData(for: objectID),
+           let image = UIImage(data: data) {
+            ZStack {
+                Color(.tertiarySystemGroupedBackground)
+                objectColour(for: objectID).opacity(0.1)
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(4)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 150)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Photo of \(displayName(for: objectID))")
+        } else {
+            ZStack {
+                objectColour(for: objectID).opacity(0.16)
+                Image(systemName: "shippingbox.fill")
+                    .font(.system(size: 54, weight: .medium))
+                    .foregroundStyle(objectColour(for: objectID))
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 130)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("No photo available for \(displayName(for: objectID))")
+        }
+    }
+
+    @ViewBuilder
+    private func boxCard(for objectID: UUID) -> some View {
+        let isOwnBox = store.isItsOwnBox(objectID, in: captureEngine)
+        let assigned = store.selectedBoxPreset(for: objectID)
+
+        VStack(alignment: .leading, spacing: 12) {
+            Label("1. Box this object", systemImage: "shippingbox")
+                .font(.headline)
+
+            if isOwnBox {
+                Text("This object is already a box, so it is loaded exactly as measured. Nothing to pack.")
+                    .font(.subheadline)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let assigned {
+                Text("Put it in the **\(assigned.name)** box — the smallest one it fits.")
+                    .font(.subheadline)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("\(PackingBoxPreset.sizeName(assigned.usableInnerSizeMillimetres)) inside")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Toggle(isOn: ownBoxBinding(for: objectID)) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Already a box")
+                        .font(.subheadline.weight(.medium))
+                    Text("Load it at its measured size instead of putting it in one.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityHint("Uses the measured dimensions as the package size, with no outer box.")
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Color(.secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 18)
+        )
+    }
+
+    private func ownBoxBinding(for objectID: UUID) -> Binding<Bool> {
+        Binding(
+            get: { store.isItsOwnBox(objectID, in: captureEngine) },
+            set: { isOwnBox in
+                store.setIsItsOwnBox(isOwnBox, for: objectID, in: captureEngine)
+                store.assignBoxesAutomatically(in: captureEngine)
+                validationMessage = nil
+            }
+        )
+    }
+
+    private func noFittingBoxCard(for objectID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Does not fit available boxes", systemImage: "shippingbox.fill")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.orange)
+
+            Text("This object does not fit any available box, even when turned.")
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Continue to leave it out. It will not appear in the loading instructions, and no name or packed weight is required.")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            Toggle(isOn: ownBoxBinding(for: objectID)) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Already a box")
+                        .font(.subheadline.weight(.medium))
+                    Text("Keep it in the plan at its measured size, with no outer box.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Text("Or add a box big enough from the menu at the top right.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.13), in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(Color.orange.opacity(0.7), lineWidth: 2)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(displayName(for: objectID)) does not fit any available box. Continue to leave it out of the loading plan. No name, box choice or packed weight is required."
+        )
+    }
+
+    private func weightCard(for objectID: UUID) -> some View {
+        let packageName = displayName(for: objectID)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            Label("2. Pack and weigh", systemImage: "scalemass")
+                .font(.headline)
+
+            Text(weightInstruction(for: objectID, packageName: packageName))
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                TextField("Total packed weight", text: packedWeightBinding(for: objectID))
+                    .keyboardType(.decimalPad)
+                    .focused($focusedField, equals: .weight)
+                    .font(.title3.monospacedDigit())
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 50)
+                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityLabel("Total packed weight in grams")
+                    .accessibilityHint("Include the object, outer box and all packing material.")
+
+                Text("g")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+
+            Text("Weigh the complete sealed package. The loading plan uses this total in grams.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func nextButton(for objectID: UUID) -> some View {
+        let hasNoFittingBox = store.fittingBoxPresets(
+            for: objectID,
+            in: captureEngine
+        ).isEmpty
+        let isLastObject = currentIndex == objectIDs.count - 1
+
+        return Button {
+            saveAndAdvance(objectID: objectID)
+        } label: {
+            HStack {
+                Text(isLastObject ? "Create loading plan" : hasNoFittingBox ? "Continue" : "Next object")
+                Spacer()
+                Image(systemName: isLastObject ? "square.grid.3x3.square" : "arrow.right")
+            }
+            .font(.headline)
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity, minHeight: 52)
+        }
+        .buttonStyle(.borderedProminent)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(.bar)
+        .accessibilityHint(
+            hasNoFittingBox
+                ? isLastObject
+                    ? "Excludes this object and creates a loading plan from the objects that fit available boxes."
+                    : "Excludes this object from loading instructions and shows the next object."
+                : isLastObject
+                    ? "Checks every prepared package, then opens the loading plan."
+                    : "Saves this box and packed weight, then shows the next object."
+        )
+    }
+
+    private var emptyState: some View {
+        ContentUnavailableView {
+            Label("No locked objects", systemImage: "shippingbox")
+        } description: {
+            Text("Lock at least one measured object before preparing packages.")
+        } actions: {
+            Button("Back") { dismiss() }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private func prepareDrafts() {
+        store.assignBoxesAutomatically(in: captureEngine)
+        for objectID in objectIDs where drafts[objectID] == nil {
+            let weightText = captureEngine.weightInGrams(for: objectID)
+                .flatMap { PositiveDecimalText.format($0, maximumFractionDigits: 3) }
+                ?? ""
+            drafts[objectID] = Draft(
+                nameText: captureEngine.name(for: objectID) ?? "",
+                packedWeightText: weightText
+            )
+        }
+
+        let missingIDs = Set(store.packagesMissingPreparation(from: captureEngine))
+        if let firstMissingIndex = objectIDs.firstIndex(where: missingIDs.contains) {
+            currentIndex = firstMissingIndex
+        }
+    }
+
+    private func nameBinding(for objectID: UUID) -> Binding<String> {
+        Binding(
+            get: { drafts[objectID]?.nameText ?? "" },
+            set: { newValue in
+                updateDraft(for: objectID) { draft in
+                    draft.nameText = newValue
+                }
+            }
+        )
+    }
+
+    private func packedWeightBinding(for objectID: UUID) -> Binding<String> {
+        Binding(
+            get: { drafts[objectID]?.packedWeightText ?? "" },
+            set: { newValue in
+                updateDraft(for: objectID) { draft in
+                    draft.packedWeightText = newValue
+                }
+            }
+        )
+    }
+
+    private func updateDraft(for objectID: UUID, change: (inout Draft) -> Void) {
+        var draft = drafts[objectID] ?? Draft(
+            nameText: captureEngine.name(for: objectID) ?? "",
+            packedWeightText: ""
+        )
+        change(&draft)
+        drafts[objectID] = draft
+        validationMessage = nil
+    }
+
+    private func saveAndAdvance(objectID: UUID) {
+        focusedField = nil
+        validationMessage = nil
+
+        if store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty {
+            guard store.markExcludedBecauseNoStockedBoxFits(
+                objectID,
+                in: captureEngine
+            ) else {
+                validationMessage = "This object could not be excluded. Review the available boxes and try again."
+                return
+            }
+            advanceAfterCurrentObject()
+            return
+        }
+
+        let name = drafts[objectID]?.nameText
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else {
+            validationMessage = "Enter a name for this object."
+            return
+        }
+        guard store.packagedSizeMillimetres(for: objectID, in: captureEngine) != nil else {
+            validationMessage = "No box fits this object any more. Add a bigger box, or mark the object as already a box."
+            return
+        }
+        guard let text = drafts[objectID]?.packedWeightText,
+              let packedWeightGrams = PositiveDecimalText.parse(text) else {
+            validationMessage = "Enter the total packed weight as a number greater than zero grams."
+            return
+        }
+
+        captureEngine.updateName(id: objectID, name: name)
+        captureEngine.updatePackedWeight(
+            id: objectID,
+            weightInGrams: packedWeightGrams
+        )
+
+        advanceAfterCurrentObject()
+    }
+
+    private func advanceAfterCurrentObject() {
+        if currentIndex < objectIDs.count - 1 {
+            currentIndex += 1
+        } else if store.packagesMissingPreparation(from: captureEngine).isEmpty {
+            onComplete()
+        } else {
+            validationMessage = "Finish the name, box and packed weight for every object before creating the plan."
+        }
+    }
+
+    private func goBack() {
+        focusedField = nil
+        validationMessage = nil
+        if currentIndex > 0 {
+            currentIndex -= 1
+        } else {
+            dismiss()
+        }
+    }
+
+    private func displayName(for objectID: UUID) -> String {
+        let name = drafts[objectID]?.nameText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let name, !name.isEmpty {
+            return name
+        }
+        return "Unnamed object"
+    }
+
+    private func objectColour(for objectID: UUID) -> Color {
+        guard let colour = captureEngine.objectColor(for: objectID) else {
+            return .accentColor
+        }
+        return Color(red: colour.red, green: colour.green, blue: colour.blue)
+    }
+
+    private func sizeText(_ size: SIMD3<Double>) -> String {
+        "\(Int(size.x.rounded(.up))) × \(Int(size.y.rounded(.up))) × \(Int(size.z.rounded(.up))) mm"
+    }
+
+    private func weightInstruction(for objectID: UUID, packageName: String) -> String {
+        if store.isItsOwnBox(objectID, in: captureEngine) {
+            return "Weigh \(packageName) as it is."
+        }
+        if let assigned = store.selectedBoxPreset(for: objectID) {
+            return "Put \(packageName) in the \(assigned.name) box, add the packing material, and close it."
+        }
+        return "Pack \(packageName), then weigh it."
+    }
+
+    /// Boxes are assigned by the system, so a new or deleted box size can change what an object
+    /// should go in. Re-run the assignment whenever the catalogue is edited.
+    private func reassignBoxes() {
+        store.assignBoxesAutomatically(in: captureEngine)
+        validationMessage = nil
+    }
+}

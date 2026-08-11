@@ -88,7 +88,7 @@ final class BaldiPipelineTests: XCTestCase {
             size: SIMD3(10, 10, 10)
         )
 
-        let solution = BaldiEPBPH.pack(order: [supporter, target], knapsack: knapsack)
+        let solution = BaldiConstruction.pack(order: [supporter, target], knapsack: knapsack)
 
         XCTAssertEqual(solution.placements.map(\.id), [supporter.id])
         XCTAssertEqual(solution.unloaded.map(\.id), [target.id])
@@ -106,7 +106,7 @@ final class BaldiPipelineTests: XCTestCase {
             size: SIMD3(10, 10, 5)
         )
 
-        let solution = BaldiEPBPH.pack(order: [bottom, top], knapsack: knapsack)
+        let solution = BaldiConstruction.pack(order: [bottom, top], knapsack: knapsack)
 
         XCTAssertEqual(solution.loadedCount, 2)
         XCTAssertTrue(solution.unloaded.isEmpty)
@@ -129,7 +129,7 @@ final class BaldiPipelineTests: XCTestCase {
             size: SIMD3(10, 10, 5)
         )
 
-        let solution = BaldiEPBPH.pack(order: [left, right, top], knapsack: knapsack)
+        let solution = BaldiConstruction.pack(order: [left, right, top], knapsack: knapsack)
         let topReport = solution.placements
             .first(where: { $0.id == top.id })
             .map { BaldiVerticalSupport.report(for: $0, among: solution.placements) }
@@ -158,10 +158,10 @@ final class BaldiPipelineTests: XCTestCase {
             size: SIMD3(10, 10, 5),
             mass: 1
         )
-        var options = BaldiCentreOfMassOptimisation.Options()
+        var options = BaldiBalancer.Options()
         options.maximumIterations = 5
 
-        let adjusted = BaldiCentreOfMassOptimisation.optimise(
+        let adjusted = BaldiBalancer.optimise(
             placements: [bottom, top],
             knapsack: knapsack,
             options: options
@@ -210,7 +210,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertTrue(verification.isValid, verification.violations.joined(separator: "\n"))
         XCTAssertTrue(verification.isBalanced)
@@ -249,7 +249,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertFalse(verification.isValid)
         XCTAssertFalse(verification.isFullySupported)
@@ -271,7 +271,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertFalse(verification.isValid)
         XCTAssertTrue(verification.violations.contains(where: { $0.contains("inconsistent") }))
@@ -298,7 +298,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertFalse(verification.isValid)
         XCTAssertTrue(verification.violations.contains(where: { $0.contains("more than once") }))
@@ -323,7 +323,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertFalse(verification.isValid)
         XCTAssertFalse(verification.isBalanced)
@@ -340,7 +340,7 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let verification = BaldiGeometryCheck.verify(solution, against: problem)
+        let verification = BaldiVerifier.verify(solution, against: problem)
 
         XCTAssertFalse(solution.isBalanced)
         XCTAssertFalse(solution.isFullySupported)
@@ -375,7 +375,7 @@ final class BaldiPipelineTests: XCTestCase {
     }
 
     func testHeuristicDefaultsRetainBaldiScoreUpdatesAndDeterministicSeed() {
-        let options = BaldiHeuristicOptions()
+        let options = BaldiSearchOptions()
 
         XCTAssertEqual(options.scoreDecrease, 0.1, accuracy: 1e-12)
         XCTAssertEqual(options.scoreIncrease, 0.1, accuracy: 1e-12)
@@ -404,9 +404,9 @@ final class BaldiPipelineTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let result = BaldiHeuristic.constructInitialSolution(
+        let result = BaldiSearch.constructInitialSolution(
             problem,
-            options: BaldiHeuristicOptions()
+            options: BaldiSearchOptions()
         )
 
         XCTAssertEqual(result.solution.loadedCount, 2)
@@ -424,10 +424,10 @@ final class BaldiPipelineTests: XCTestCase {
             BaldiTestFixtures.item(name: "C", size: SIMD3(10, 10, 5), mass: 1),
         ]
         let problem = BaldiTestFixtures.problem(items: items, knapsack: knapsack)
-        let options = BaldiHeuristicOptions()
+        let options = BaldiSearchOptions()
 
-        let first = BaldiHeuristic.constructInitialSolution(problem, options: options).solution
-        let second = BaldiHeuristic.constructInitialSolution(problem, options: options).solution
+        let first = BaldiSearch.constructInitialSolution(problem, options: options).solution
+        let second = BaldiSearch.constructInitialSolution(problem, options: options).solution
 
         XCTAssertEqual(first.placements.map(\.id), second.placements.map(\.id))
         XCTAssertEqual(first.placements.map(\.origin), second.placements.map(\.origin))
@@ -435,7 +435,7 @@ final class BaldiPipelineTests: XCTestCase {
     }
 
     func testSolverRejectsInvalidInput() {
-        let result = Baldi3BKPSolver.solve(
+        let result = BaldiSolver.solve(
             BaldiTestFixtures.problem(items: [])
         )
 
@@ -448,7 +448,7 @@ final class BaldiPipelineTests: XCTestCase {
         let item = BaldiTestFixtures.item(size: SIMD3(20, 20, 20))
         let knapsack = BaldiTestFixtures.knapsack(size: SIMD3(10, 10, 10))
 
-        let result = Baldi3BKPSolver.solve(
+        let result = BaldiSolver.solve(
             BaldiTestFixtures.problem(items: [item], knapsack: knapsack)
         )
 
@@ -460,10 +460,10 @@ final class BaldiPipelineTests: XCTestCase {
     func testSolverReturnsOnlyAnIndependentlyVerifiedFeasibleSolution() {
         let item = BaldiTestFixtures.item(size: SIMD3(10, 10, 10))
         let knapsack = BaldiTestFixtures.knapsack(size: SIMD3(10, 10, 10))
-        var options = Baldi3BKPOptions()
+        var options = BaldiOptions()
         options.heuristic.timeLimitSeconds = 1e-6
 
-        let result = Baldi3BKPSolver.solve(
+        let result = BaldiSolver.solve(
             BaldiTestFixtures.problem(items: [item], knapsack: knapsack),
             options: options
         )
@@ -482,10 +482,10 @@ final class BaldiPipelineTests: XCTestCase {
             domainLower: SIMD3(8, 0, 0),
             domainUpper: SIMD3(9, 10, 10)
         )
-        var options = Baldi3BKPOptions()
+        var options = BaldiOptions()
         options.heuristic.timeLimitSeconds = 1e-6
 
-        let result = Baldi3BKPSolver.solve(
+        let result = BaldiSolver.solve(
             BaldiTestFixtures.problem(items: [item], knapsack: knapsack),
             options: options
         )
@@ -497,7 +497,7 @@ final class BaldiPipelineTests: XCTestCase {
 
     func testReferenceModelUsesRepairedRotationSelectionEquality() throws {
         let item = BaldiTestFixtures.item(size: SIMD3(2, 3, 4))
-        let model = Baldi3BKPModelBuilder.build(
+        let model = BaldiReferenceModelBuilder.build(
             BaldiTestFixtures.problem(items: [item])
         )
         let row = try XCTUnwrap(model.program.rows.first(where: { $0.name == "rotation_0" }))
@@ -514,7 +514,7 @@ final class BaldiPipelineTests: XCTestCase {
     func testReferenceModelEquationTenUsesThePrecedingItemsRotationVariables() throws {
         let first = BaldiTestFixtures.item(name: "First", size: SIMD3(2, 3, 4))
         let second = BaldiTestFixtures.item(name: "Second", size: SIMD3(5, 7, 11))
-        let model = Baldi3BKPModelBuilder.build(
+        let model = BaldiReferenceModelBuilder.build(
             BaldiTestFixtures.problem(items: [first, second])
         )
         let row = try XCTUnwrap(model.program.rows.first(where: { $0.name == "before_1_0_1" }))

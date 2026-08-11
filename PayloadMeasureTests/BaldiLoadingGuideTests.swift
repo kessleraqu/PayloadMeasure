@@ -6,12 +6,12 @@ final class BaldiLoadingGuideTests: XCTestCase {
     func testOpeningMarkerFollowsOriginalAxisZeroThroughEveryRotation() {
         let expectedContainerAxes = [0, 0, 1, 2, 1, 2]
         let expectedDescriptions = [
-            "Opening edge along container",
-            "Opening edge along container",
-            "Opening edge across container",
-            "Opening edge vertical",
-            "Opening edge across container",
-            "Opening edge vertical",
+            "Opening and length along the container",
+            "Opening and length along the container",
+            "Opening and length across the container",
+            "Opening and length vertical",
+            "Opening and length across the container",
+            "Opening and length vertical",
         ]
 
         for (index, rotation) in BaldiRotation.all.enumerated() {

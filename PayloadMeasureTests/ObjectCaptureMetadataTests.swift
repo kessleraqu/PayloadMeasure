@@ -198,4 +198,86 @@ final class ObjectCaptureMetadataTests: XCTestCase {
         engine.updateActiveSupportPlaneAvailability(id: id, isAvailable: true)
         return id
     }
+    func testCancellingAMeasurementDiscardsItAndDeselectsTheObject() {
+        let engine = ObjectCaptureEngine()
+        let id = UUID()
+        engine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
+        engine.beginObjectMeasurement(id: id)
+        engine.updateCapture(
+            id: id,
+            object: CapturedObject(
+                dimensions: SIMD3(0.1, 0.08, 0.06),
+                center: .zero,
+                axes: (SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)),
+                corners: [],
+                volume: 0.00048,
+                sampleCount: 100
+            )
+        )
+        XCTAssertEqual(engine.activeObjectID, id)
+        XCTAssertTrue(engine.hasCapture)
+
+        engine.cancelActiveMeasurement()
+
+        XCTAssertNil(engine.activeObjectID)
+        XCTAssertFalse(engine.hasCapture)
+        XCTAssertTrue(engine.measuredObjectIDs.isEmpty)
+        XCTAssertFalse(engine.finalizedObjectIDs.contains(id))
+        XCTAssertNil(engine.focusedObjectID)
+        XCTAssertFalse(engine.isObjectSelectionPending)
+    }
+
+    func testCancellingLeavesAlreadyFinishedObjectsAlone() {
+        let engine = ObjectCaptureEngine()
+        let keptID = UUID()
+        engine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
+        engine.beginObjectMeasurement(id: keptID)
+        engine.updateCapture(
+            id: keptID,
+            object: CapturedObject(
+                dimensions: SIMD3(0.1, 0.08, 0.06),
+                center: .zero,
+                axes: (SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)),
+                corners: [],
+                volume: 0.00048,
+                sampleCount: 100
+            )
+        )
+        engine.updateActiveSupportPlaneAvailability(id: keptID, isAvailable: true)
+        XCTAssertEqual(engine.lockActiveObject(), keptID)
+
+        let discardedID = UUID()
+        engine.requestObjectMaskToggle(at: CGPoint(x: 0.4, y: 0.4))
+        engine.beginObjectMeasurement(id: discardedID)
+        engine.cancelActiveMeasurement()
+
+        XCTAssertEqual(engine.measuredObjectIDs, [keptID])
+        XCTAssertNil(engine.activeObjectID)
+        XCTAssertEqual(engine.focusedObjectID, keptID)
+    }
+
+    func testEditIsOfferedOnlyWhileTheFinishedObjectIsInView() {
+        let engine = ObjectCaptureEngine()
+        let id = UUID()
+        engine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
+        engine.beginObjectMeasurement(id: id)
+        engine.updateCapture(
+            id: id,
+            object: CapturedObject(
+                dimensions: SIMD3(0.1, 0.08, 0.06),
+                center: .zero,
+                axes: (SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)),
+                corners: [],
+                volume: 0.00048,
+                sampleCount: 100
+            )
+        )
+        engine.updateActiveSupportPlaneAvailability(id: id, isAvailable: true)
+        XCTAssertEqual(engine.lockActiveObject(), id)
+
+        // Finished and focused, but no marker is visible, so nothing is being pointed at.
+        XCTAssertTrue(engine.canReactivateFocusedObject)
+        XCTAssertFalse(engine.canEditFocusedObject)
+    }
+
 }

@@ -1,9 +1,11 @@
 import Foundation
 
-/// Conversion for positive decimal values entered in editable measurement fields.
-///
-/// Input is deliberately small and predictable: decimal digits with at most one `.` or `,`.
-/// Grouping, signs, exponents, units and internal whitespace are rejected.
+// Parsing and formatting for the positive decimal fields the operator types into, accepting either
+// a comma or a dot regardless of locale.
+//
+// In:  text.
+// Out: a positive Double, or nil when the text is not one.
+
 nonisolated enum PositiveDecimalText {
     static func parse(_ text: String) -> Double? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -37,7 +39,6 @@ nonisolated enum PositiveDecimalText {
         return value
     }
 
-    /// Produces locale-appropriate editable text without grouping separators.
     static func format(
         _ value: Double,
         locale: Locale = .current,

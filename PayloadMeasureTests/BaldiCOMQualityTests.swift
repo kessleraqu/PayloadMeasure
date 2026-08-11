@@ -3,8 +3,8 @@ import simd
 @testable import PayloadMeasure
 
 final class BaldiCOMQualityTests: XCTestCase {
-    private func options(for mode: BaldiPackingMode) -> BaldiCentreOfMassOptimisation.Options {
-        var options = BaldiCentreOfMassOptimisation.Options()
+    private func options(for mode: BaldiPackingMode) -> BaldiBalancer.Options {
+        var options = BaldiBalancer.Options()
         options.mode = mode
         return options
     }
@@ -13,7 +13,7 @@ final class BaldiCOMQualityTests: XCTestCase {
         let empty = BaldiTestFixtures.solution(placements: [])
 
         XCTAssertEqual(empty.centreOfMassDistanceToIdeal, .infinity)
-        XCTAssertEqual(BaldiCentreOfMassOptimisation.Options().mode, .paper)
+        XCTAssertEqual(BaldiBalancer.Options().mode, .paper)
         XCTAssertEqual(BaldiPackingMode.allCases, [.paper, .centred])
     }
 
@@ -32,11 +32,11 @@ final class BaldiCOMQualityTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let paperPlacements = BaldiCentreOfMassOptimisation.optimise(
+        let paperPlacements = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack
         )
-        let adjustedPlacements = BaldiCentreOfMassOptimisation.optimise(
+        let adjustedPlacements = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack,
             options: options(for: .centred)
@@ -90,7 +90,7 @@ final class BaldiCOMQualityTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let adjusted = BaldiCentreOfMassOptimisation.optimise(
+        let adjusted = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack,
             options: options(for: .centred)
@@ -100,7 +100,7 @@ final class BaldiCOMQualityTests: XCTestCase {
             items: [supportItem, topItem],
             knapsack: knapsack
         )
-        let verification = BaldiGeometryCheck.verify(after, against: problem)
+        let verification = BaldiVerifier.verify(after, against: problem)
 
         XCTAssertLessThan(after.centreOfMassDistanceToIdeal, before.centreOfMassDistanceToIdeal)
         XCTAssertTrue(verification.isValid, verification.violations.joined(separator: "\n"))
@@ -137,7 +137,7 @@ final class BaldiCOMQualityTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let adjusted = BaldiCentreOfMassOptimisation.optimise(
+        let adjusted = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack,
             options: options(for: .centred)
@@ -189,11 +189,11 @@ final class BaldiCOMQualityTests: XCTestCase {
             knapsack: knapsack
         )
 
-        let paperAdjusted = BaldiCentreOfMassOptimisation.optimise(
+        let paperAdjusted = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack
         )
-        let adjusted = BaldiCentreOfMassOptimisation.optimise(
+        let adjusted = BaldiBalancer.optimise(
             placements: before.placements,
             knapsack: knapsack,
             options: options(for: .centred)
@@ -203,7 +203,7 @@ final class BaldiCOMQualityTests: XCTestCase {
             items: [supportItem, heavyItem],
             knapsack: knapsack
         )
-        let verification = BaldiGeometryCheck.verify(after, against: problem)
+        let verification = BaldiVerifier.verify(after, against: problem)
         let relocated = try XCTUnwrap(after.placements.first(where: { $0.id == heavyItem.id }))
         let paperTop = try XCTUnwrap(paperAdjusted.first(where: { $0.id == heavyItem.id }))
 
@@ -246,11 +246,11 @@ final class BaldiCOMQualityTests: XCTestCase {
         )
         let problem = BaldiTestFixtures.problem(items: [item], knapsack: knapsack)
 
-        XCTAssertTrue(BaldiGeometryCheck.verify(offCentre, against: problem).isValid)
-        XCTAssertTrue(BaldiGeometryCheck.verify(centred, against: problem).isValid)
-        XCTAssertFalse(BaldiHeuristic.isBetterFeasible(centred, than: offCentre, mode: .paper))
-        XCTAssertTrue(BaldiHeuristic.isBetterFeasible(centred, than: offCentre, mode: .centred))
-        XCTAssertFalse(BaldiHeuristic.isBetterFeasible(offCentre, than: centred, mode: .centred))
+        XCTAssertTrue(BaldiVerifier.verify(offCentre, against: problem).isValid)
+        XCTAssertTrue(BaldiVerifier.verify(centred, against: problem).isValid)
+        XCTAssertFalse(BaldiSearch.isBetterFeasible(centred, than: offCentre, mode: .paper))
+        XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, mode: .centred))
+        XCTAssertFalse(BaldiSearch.isBetterFeasible(offCentre, than: centred, mode: .centred))
     }
 
     func testLoadedCountRemainsPrimaryOverCOMQuality() {
@@ -294,14 +294,14 @@ final class BaldiCOMQualityTests: XCTestCase {
         XCTAssertGreaterThan(morePackages.centreOfMassDistanceToIdeal, 0)
         for mode in BaldiPackingMode.allCases {
             XCTAssertTrue(
-                BaldiHeuristic.isBetterForSearch(
+                BaldiSearch.isBetterForSearch(
                     morePackages,
                     than: perfectlyCentred,
                     mode: mode
                 )
             )
             XCTAssertTrue(
-                BaldiHeuristic.isBetterFeasible(
+                BaldiSearch.isBetterFeasible(
                     morePackages,
                     than: perfectlyCentred,
                     mode: mode
@@ -314,10 +314,10 @@ final class BaldiCOMQualityTests: XCTestCase {
         let item = BaldiTestFixtures.item(size: SIMD3(10, 10, 10))
         let knapsack = BaldiTestFixtures.knapsack(size: SIMD3(30, 10, 10))
         let problem = BaldiTestFixtures.problem(items: [item], knapsack: knapsack)
-        var options = Baldi3BKPOptions()
+        var options = BaldiOptions()
         options.heuristic.timeLimitSeconds = 1e-6
 
-        let comparison = await Baldi3BKPSolver.solveBoth(problem, options: options)
+        let comparison = await BaldiSolver.solveBoth(problem, options: options)
         let paper = comparison.result(for: .paper)
         let centred = comparison.result(for: .centred)
         let paperPlacement = try XCTUnwrap(paper.solution?.placements.first)

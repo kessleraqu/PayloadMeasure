@@ -1,8 +1,9 @@
-# DEVELOPMENT_NOTES.md
+# Development notes
 
-# PayloadMeasure Development Notes
-
-This file records implementation changes in plain language so the research prototype remains explainable and easy to document later.
+A running record of implementation changes, kept in plain language so the prototype stays
+explainable. It is history, in order — for how the code works *now*, read
+`PayloadMeasure/NOTES.md` (measurement) and `PayloadMeasure/Packing/NOTES.md` (packing), with the
+academic mapping in `PayloadMeasure/Packing/METHODS.md`.
 
 ---
 

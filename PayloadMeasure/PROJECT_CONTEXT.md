@@ -71,7 +71,7 @@ Avoid Unity unless explicitly requested.
 - LiDAR scene depth and scene reconstruction remain runtime capability checked because the RGB-only
   fallback still needs to explain unavailable metric capture on devices without LiDAR.
 - The temporary Xcode 16/iOS 18 compatibility changes and their restoration are recorded in
-  `XCODE16_TEMPORARY_CHANGES.md`.
+  the Xcode 16 compatibility record (removed; see git history).
 
 ---
 
@@ -89,9 +89,9 @@ Current milestone:
 
 ✅ Camera permission (`NSCameraUsageDescription`) configured via build settings (`INFOPLIST_KEY_NSCameraUsageDescription`).
 
-✅ The operator-facing app is scan-only. The former Line/Box picker and manual controls are not
-exposed. Information contains the only selector for two automatic measurement methods: Full 3D and
-Top.
+✅ The operator-facing app is scan-only. The former Line/Box measurement workflow has been removed
+outright — its mode picker, point placement and rendering are gone, not merely hidden. Information
+contains the only selector, between the two automatic methods: Full 3D and Top.
 
 ✅ LiDAR depth-based automatic Scan workflow implemented with live multi-frame accumulation.
 
@@ -105,7 +105,7 @@ both LiDAR and non-LiDAR devices. Up to 15 targets retain distinct colors and id
 
 ✅ The active production path uses Apple's native foreground-instance mask from the exact camera
 frame. Between results, its display overlay follows the current projected AR anchor and camera
-distance; the experimental EdgeTAM and dense optical-flow paths remain bypassed.
+distance.
 
 ✅ On LiDAR hardware, automatic box geometry is fitted only from depth pixels admitted by the
 time-synchronized object mask. Unmasked depth is restricted to support-plane height estimation.
@@ -222,13 +222,14 @@ used by the first selection tap, avoiding first-use Vision/Core Image cache work
 ✅ Selection-point buffers and a pool of shared-mesh box-edge entities are prepared in small idle-time
 batches before the first fit, avoiding a burst of first-box renderer allocation on the main actor.
 
-✅ The retained experimental EdgeTAM adapter and model packages are excluded from the app target so
-they remain available for future research without being compiled or shipped in the production app.
+✅ The experimental EdgeTAM adapter and its Core ML packages have been removed. They were excluded
+from the app target and never compiled or shipped; the approach is still recorded under the
+deferred tracking upgrade below.
 
 ✅ Payload arrangement is implemented in `Packing/`. After measuring, the operator opens Arrange
 payload from the saved-objects panel and gets a load-balanced placement for every measured package
 inside the 20 × 80 × 10 cm payload module: a to-scale plan and side elevation, the resulting centre
-of mass against its target, and a numbered loading order. See `Packing/PACKING_NOTES.md`.
+of mass against its target, and a numbered loading order. See `Packing/NOTES.md` and `Packing/METHODS.md`.
 
 ✅ The arrangement follows Kaluzny & Shaw (2009) with the project chapter's adaptations: axis-aligned
 three-dimensional orientations selected by the optimiser, the module height limit, a weighted
@@ -254,10 +255,10 @@ centre-of-mass movement preserves full support, and an independent final verifie
 containment, rotations, non-overlap, loaded/unloaded membership, support and cargo COM before a
 result is exposed. It returns the highest-cardinality verified feasible packing found within the
 search time; global optimality is not claimed, and failure to find a packing is not reported as a
-proof of infeasibility. `Baldi3BKPModel.swift` remains a clearly labelled Baldi-only reference for
+proof of infeasibility. `Knapsack/KnapsackReferenceModel.swift` remains a clearly labelled reference for
 equations (5)–(20), including the documented Eq. (10) and Eq. (16) corrections. It contains no
 Junqueira support constraint and is not a production hybrid solver. See
-`Packing/Baldi/BALDI_3BKP_NOTES.md` and `Packing/Baldi/BALDI_FIDELITY_AUDIT.md`.
+`Packing/NOTES.md` (code) and `Packing/METHODS.md` (sources, deviations and scope).
 
 ✅ The support-aware result screen is an operator loading guide rather than an algorithm report. A
 top comparison control switches between the two precomputed packings. It presents a tappable 3D
@@ -343,23 +344,24 @@ matures; fixed-class YOLO segmentation is appropriate only with a payload-specif
 
 ---
 
-# Expected Project Structure
+# Project Structure
 
+```
 PayloadMeasure/
-- payloadmeasureapp.swift
-- contentview.swift
-- arcameraview.swift
-- arsessionmanager.swift
-- mesengine.swift
-- mesmode.swift
-- mesoverlayview.swift
-- mespoint.swift
-- objectcapture.swift
-- objectcaptureengine.swift
-- objectmaskprocessor.swift
-- PayloadMeasurement.swift
-- CompatibilityChecker.swift
-- ExportManager.swift
+  PayloadMeasureApp.swift
+  ContentView.swift
+  MeasurementOverlayView.swift
+  NOTES.md                      how the measurement side works
+  PROJECT_CONTEXT.md            this file
+  AR/         ARCameraView, ARSessionManager, AimerState
+  Capture/    ObjectMaskProcessor, ObjectCapture, ObjectCaptureEngine
+  Measurement/  MeasurementWorkflowMode, MeasurementConvergence
+  Packing/    preparation, and the two arrangement methods (own NOTES.md and METHODS.md)
+  Utilities/  PositiveDecimalText
+```
+
+The whole folder is a synchronised Xcode group, so new files need no project-file edit.
+
 
 ---
 

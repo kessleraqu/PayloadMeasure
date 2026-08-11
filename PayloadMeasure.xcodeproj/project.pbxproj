@@ -6,18 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		AC99C67C2FF2B088006EBB3A /* arsessionmanager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */; };
-		AC99C67E2FF2B088006EBB3A /* arcameraview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67D2FF2B088006EBB3A /* arcameraview.swift */; };
-		AC99C6802FF2B08A006EBB3A /* mesoverlayview.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */; };
-		AC99C6842FF2B226006EBB3A /* mespoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6832FF2B226006EBB3A /* mespoint.swift */; };
-		AC99C6862FF2B227006EBB3A /* mesengine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6852FF2B227006EBB3A /* mesengine.swift */; };
-		AC99C6882FF2BA02006EBB3A /* mesmode.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6872FF2BA02006EBB3A /* mesmode.swift */; };
-		AC99C6912FF2C100006EBB3A /* objectcapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6902FF2C100006EBB3A /* objectcapture.swift */; };
-		AC99C6932FF2C100006EBB3A /* objectcaptureengine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */; };
-		AC99C6952FF2C101006EBB3A /* objectmaskprocessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		B1D1000B2FF400000000000B /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -29,16 +17,6 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arsessionmanager.swift; sourceTree = "<group>"; };
-		AC99C67D2FF2B088006EBB3A /* arcameraview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arcameraview.swift; sourceTree = "<group>"; };
-		AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesoverlayview.swift; sourceTree = "<group>"; };
-		AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = DEVELOPMENT_NOTES.md; sourceTree = "<group>"; };
-		AC99C6832FF2B226006EBB3A /* mespoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mespoint.swift; sourceTree = "<group>"; };
-		AC99C6852FF2B227006EBB3A /* mesengine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesengine.swift; sourceTree = "<group>"; };
-		AC99C6872FF2BA02006EBB3A /* mesmode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesmode.swift; sourceTree = "<group>"; };
-		AC99C6902FF2C100006EBB3A /* objectcapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectcapture.swift; sourceTree = "<group>"; };
-		AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectcaptureengine.swift; sourceTree = "<group>"; };
-		AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = objectmaskprocessor.swift; sourceTree = "<group>"; };
 		ACDB56EE2FF2805400508C46 /* PayloadMeasure.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PayloadMeasure.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1D100012FF4000000000001 /* PayloadMeasureTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PayloadMeasureTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -47,16 +25,8 @@
 		AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				EdgeTAMSegmenter.swift,
-				Models/EdgeTAM/edgetam_image_encoder.mlpackage,
-				Models/EdgeTAM/edgetam_mask_decoder.mlpackage,
-				Models/EdgeTAM/edgetam_prompt_encoder.mlpackage,
-				Models/EdgeTAM/LICENSE,
-				Models/EdgeTAM/model_info.json,
-				Models/EdgeTAM/README.md,
-				Packing/Baldi/BALDI_3BKP_NOTES.md,
-				Packing/Baldi/BALDI_FIDELITY_AUDIT.md,
-				Packing/PACKING_NOTES.md,
+				Packing/METHODS.md,
+				Packing/NOTES.md,
 				PROJECT_CONTEXT.md,
 			);
 			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;
@@ -103,16 +73,6 @@
 				ACDB56F02FF2805400508C46 /* PayloadMeasure */,
 				B1D100022FF4000000000002 /* PayloadMeasureTests */,
 				ACDB56EF2FF2805400508C46 /* Products */,
-				AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */,
-				AC99C67D2FF2B088006EBB3A /* arcameraview.swift */,
-				AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */,
-				AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */,
-				AC99C6832FF2B226006EBB3A /* mespoint.swift */,
-				AC99C6852FF2B227006EBB3A /* mesengine.swift */,
-				AC99C6872FF2BA02006EBB3A /* mesmode.swift */,
-				AC99C6902FF2C100006EBB3A /* objectcapture.swift */,
-				AC99C6922FF2C100006EBB3A /* objectcaptureengine.swift */,
-				AC99C6942FF2C101006EBB3A /* objectmaskprocessor.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -234,15 +194,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AC99C67E2FF2B088006EBB3A /* arcameraview.swift in Sources */,
-				AC99C6842FF2B226006EBB3A /* mespoint.swift in Sources */,
-				AC99C6802FF2B08A006EBB3A /* mesoverlayview.swift in Sources */,
-				AC99C6882FF2BA02006EBB3A /* mesmode.swift in Sources */,
-				AC99C6862FF2B227006EBB3A /* mesengine.swift in Sources */,
-				AC99C67C2FF2B088006EBB3A /* arsessionmanager.swift in Sources */,
-				AC99C6912FF2C100006EBB3A /* objectcapture.swift in Sources */,
-				AC99C6932FF2C100006EBB3A /* objectcaptureengine.swift in Sources */,
-				AC99C6952FF2C101006EBB3A /* objectmaskprocessor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

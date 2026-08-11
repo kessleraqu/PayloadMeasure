@@ -3,13 +3,18 @@ import Observation
 import SwiftUI
 import simd
 
-/// Which arrangement method the screen is running.
+// Shared state for the packing screens. Turns locked measurements into packing inputs, runs
+// whichever method is selected off the main actor, and holds the result the views read.
+//
+// In:  the measured objects from ObjectCaptureEngine, the operator's outer-box choices, and the
+//      module and solver settings.
+// Out: observable state — a PackingResult for Balance, a BaldiComparison for the 3D knapsack,
+//      plus a solving flag and a signature so a stale answer is never shown as current.
+//
+// A superseded solve is cancelled rather than left running; the AR session shares the CPU.
+
 enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
-    /// Kaluzny & Shaw (2009) as adapted in the project chapter: load every package on the module
-    /// floor and minimise the deviation of the centre of mass from a target.
     case loadBalanced
-    /// Baldi's three-dimensional knapsack heuristic with a continuous-coordinate evaluation of
-    /// Junqueira's complete vertical-support condition.
     case knapsack3D
 
     var id: String { rawValue }
@@ -21,66 +26,40 @@ enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var citation: String {
-        switch self {
-        case .loadBalanced: "Kaluzny & Shaw (2009), adapted"
-        case .knapsack3D: "Baldi et al. (2012) + Junqueira et al. (2012)"
-        }
-    }
 }
 
-/// Bridges the measured objects into the packing optimisers and holds the arrangement for the UI.
-///
-/// A solve runs off the main actor. It is pure computation on value types with a hard time limit,
-/// so it cannot block the AR session, and a superseded solve is cancelled rather than left to
-/// finish and overwrite a newer one.
 @MainActor
 @Observable
 final class PackingStore {
-    /// Which method to run. Both are kept so they can be compared on the same measurements.
     var approach: PackingApproach = .knapsack3D
-    var baldiOptions = Baldi3BKPOptions()
-    /// The physical outer box selected for each measured object during preparation.
+    var baldiOptions = BaldiOptions()
     private(set) var selectedBoxPresetIDsByObjectID: [UUID: String] = [:]
-    /// Explicit operator decisions to exclude an object because no stocked outer box fits.
-    /// The recorded dimensions bind the decision to that measurement; remeasurement cannot
-    /// silently inherit an old exclusion.
     private var noStockedBoxFitExclusionSizesByObjectID: [UUID: SIMD3<Double>] = [:]
-    /// Central stocked-box catalogue used by the preparation screen and both optimisers.
-    let boxPresets: [PackingBoxPreset] = PackingBoxPreset.standardCatalog
-    /// The Paper-mode placement and the optional centre-refined placement for the same input.
-    /// Publishing them together prevents the result screen from mixing generations.
-    private(set) var baldiComparison: Baldi3BKPComparison?
+    /// Objects that are already boxed, so their measured size is the package size.
+    private(set) var objectsThatAreTheirOwnBox: Set<UUID> = []
+    private(set) var boxPresets: [PackingBoxPreset] = PackingStore.loadBoxPresets()
+    private(set) var baldiComparison: BaldiComparison?
 
-    /// Geometry and mass properties of the payload module, editable in the arrangement settings.
     var module: PayloadModule = .standard
     var options = PackingOptions()
-    /// Clearance applied to every package unless it has its own override, in millimetres.
     var defaultPackageClearance: Double = 5
-    /// Packages the operator marked as "this way up".
     var uprightPackageIDs: Set<UUID> = []
-    /// Restricts the achieved centre of mass to a box around the target, chapter eq. (adapted COM
-    /// envelope). Expressed to the operator as a tolerance rather than absolute bounds.
     var restrictsCentreOfMass = false
     var centreOfMassTolerance = SIMD3<Double>(20, 10, 50)
     var limitsPayloadMass = false
     var maximumPayloadMass: Double = 5
-    /// Uses the paper's own centre-of-mass domain, `L = (W/4, D/4, 0)`, `U = (3W/4, 3D/4, H/2)`.
     var usesStandardDomain = true
-    var domainLower = SIMD3<Double>(200, 50, 0)
-    var domainUpper = SIMD3<Double>(600, 150, 50)
+    var domainLower = SIMD3<Double>(150, 50, 0)
+    var domainUpper = SIMD3<Double>(450, 150, 50)
 
     private(set) var result: PackingResult?
     private(set) var isSolving = false
-    /// Identifies the inputs the current result was produced from, so the sheet can say when the
-    /// arrangement no longer matches what has been measured.
     private(set) var solvedSignature: String?
 
     private var solveTask: Task<Void, Never>?
     private var solveWork: Task<PackingResult, Never>?
-    private var baldiWork: Task<Baldi3BKPComparison, Never>?
+    private var baldiWork: Task<BaldiComparison, Never>?
 
-    /// The module as the optimiser sees it, with the operator's envelope and mass limit folded in.
     var effectiveModule: PayloadModule {
         var configured = module
         configured.centreOfMassEnvelope = restrictsCentreOfMass
@@ -95,12 +74,10 @@ final class PackingStore {
 
     // MARK: - Inputs
 
-    /// Builds optimiser input only from fully prepared packages. Raw measured geometry and a
-    /// placeholder mass are never submitted as a physical package.
     func packages(from engine: ObjectCaptureEngine) -> [PackingItem] {
         engine.measuredObjectIDs.compactMap { id in
             guard preparationState(for: id, in: engine).isSubmittedToOptimizer,
-                  let preset = validSelectedBoxPreset(for: id, in: engine),
+                  let size = packagedSizeMillimetres(for: id, in: engine),
                   let name = trimmedName(for: id, in: engine),
                   let mass = validPackedMass(for: id, in: engine) else {
                 return nil
@@ -108,7 +85,7 @@ final class PackingStore {
             return PackingItem(
                 id: id,
                 name: name,
-                size: preset.outerSizeMillimetres,
+                size: size,
                 massKilograms: mass,
                 horizontalClearance: defaultPackageClearance,
                 keepsUpright: uprightPackageIDs.contains(id)
@@ -116,11 +93,90 @@ final class PackingStore {
         }
     }
 
+    /// What the object occupies once packed: the assigned box outside, or the object itself when it
+    /// is already a box. The single answer both methods and the preparation screen work from.
+    func packagedSizeMillimetres(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> SIMD3<Double>? {
+        if isItsOwnBox(objectID, in: engine) {
+            return measuredSizeMillimetres(for: objectID, in: engine)
+        }
+        return validSelectedBoxPreset(for: objectID, in: engine)?.outerSizeMillimetres
+    }
+
+    func measuredSizeMillimetres(
+        for objectID: UUID,
+        in engine: ObjectCaptureEngine
+    ) -> SIMD3<Double>? {
+        guard let captured = engine.capturedObjectsByID[objectID] else { return nil }
+        let size = measuredSizeMillimetres(captured)
+        return size.allFiniteAndPositive ? size : nil
+    }
+
+    func isItsOwnBox(_ objectID: UUID, in engine: ObjectCaptureEngine) -> Bool {
+        objectsThatAreTheirOwnBox.contains(objectID)
+            && engine.measuredObjectIDs.contains(objectID)
+            && engine.capturedObjectsByID[objectID] != nil
+    }
+
+    func setIsItsOwnBox(_ isOwnBox: Bool, for objectID: UUID, in engine: ObjectCaptureEngine) {
+        guard engine.measuredObjectIDs.contains(objectID) else { return }
+        let changed = isOwnBox
+            ? objectsThatAreTheirOwnBox.insert(objectID).inserted
+            : objectsThatAreTheirOwnBox.remove(objectID) != nil
+        guard changed else { return }
+        if isOwnBox {
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+            noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID)
+        }
+        invalidateResults()
+    }
+
+    // MARK: - Box catalogue
+
+    @discardableResult
+    func addBox(outerSizeMillimetres: SIMD3<Double>) -> PackingBoxPreset? {
+        guard let preset = PackingBoxPreset.sized(outerSizeMillimetres: outerSizeMillimetres),
+              // A box is its size, so the same size twice is the same box.
+              !boxPresets.contains(where: { $0.outerSizeMillimetres == outerSizeMillimetres }) else {
+            return nil
+        }
+        boxPresets.append(preset)
+        persistBoxPresets()
+        invalidateResults()
+        return preset
+    }
+
+    func removeBox(id presetID: String) {
+        guard boxPresets.contains(where: { $0.id == presetID }) else { return }
+        boxPresets.removeAll { $0.id == presetID }
+        for (objectID, selectedID) in selectedBoxPresetIDsByObjectID where selectedID == presetID {
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+        }
+        persistBoxPresets()
+        invalidateResults()
+    }
+
+    private static let boxDefaultsKey = "packing.boxPresets"
+
+    /// Seeded from the default list only when nothing has been stored yet. An empty stored list is a
+    /// decision — the operator deleted everything — not a reason to put the defaults back.
+    private static func loadBoxPresets() -> [PackingBoxPreset] {
+        guard let data = UserDefaults.standard.data(forKey: boxDefaultsKey),
+              let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) else {
+            return PackingBoxPreset.defaultCatalog
+        }
+        return stored
+    }
+
+    private func persistBoxPresets() {
+        guard let data = try? JSONEncoder().encode(boxPresets) else { return }
+        UserDefaults.standard.set(data, forKey: Self.boxDefaultsKey)
+    }
+
     // MARK: - 3BKP inputs
 
-    /// Builds the 3BKP instance. The paper assumes integral knapsack and item sizes, so physical
-    /// package millimetres are rounded: item sizes up and the knapsack down. The discretisation can
-    /// therefore only make packing more conservative, never claim a fit that does not exist.
     func knapsack() -> BaldiKnapsack {
         let size = SIMD3<Int>(
             Int(module.lengthMillimetres.rounded(.down)),
@@ -134,14 +190,12 @@ final class PackingStore {
         )
     }
 
-    /// `L^δ`. Defaults to the paper's instance domain, §6.1.
     func centreOfMassDomainLower(for size: SIMD3<Int>) -> SIMD3<Double> {
         usesStandardDomain
             ? BaldiKnapsack.standardDomain(size: size).lower
             : domainLower
     }
 
-    /// `U^δ`.
     func centreOfMassDomainUpper(for size: SIMD3<Int>) -> SIMD3<Double> {
         usesStandardDomain
             ? BaldiKnapsack.standardDomain(size: size).upper
@@ -151,12 +205,11 @@ final class PackingStore {
     func baldiItems(from engine: ObjectCaptureEngine) -> [BaldiItem] {
         engine.measuredObjectIDs.compactMap { id in
             guard preparationState(for: id, in: engine).isSubmittedToOptimizer,
-                  let preset = validSelectedBoxPreset(for: id, in: engine),
+                  let packageSize = packagedSizeMillimetres(for: id, in: engine),
                   let name = trimmedName(for: id, in: engine),
                   let mass = validPackedMass(for: id, in: engine) else {
                 return nil
             }
-            let packageSize = preset.outerSizeMillimetres
             let size = SIMD3<Int>(
                 Int(packageSize.x.rounded(.up)),
                 Int(packageSize.y.rounded(.up)),
@@ -175,7 +228,6 @@ final class PackingStore {
         BaldiProblem(knapsack: knapsack(), items: baldiItems(from: engine))
     }
 
-    /// Locked measurements that cannot be arranged yet because no weight has been entered.
     func packagesMissingWeight(from engine: ObjectCaptureEngine) -> [UUID] {
         engine.measuredObjectIDs.filter { id in
             guard !isExcludedBecauseNoStockedBoxFits(id, in: engine) else {
@@ -185,15 +237,12 @@ final class PackingStore {
         }
     }
 
-    /// Locked objects that have not either completed physical preparation or been explicitly
-    /// excluded because no stocked box fits.
     func packagesMissingPreparation(from engine: ObjectCaptureEngine) -> [UUID] {
         engine.measuredObjectIDs.filter {
             !preparationState(for: $0, in: engine).isComplete
         }
     }
 
-    /// Central preparation decision used by the workflow, guards and optimiser bridges.
     func preparationState(
         for objectID: UUID,
         in engine: ObjectCaptureEngine
@@ -203,13 +252,18 @@ final class PackingStore {
             return .unavailable
         }
 
-        let fittingPresets = fittingBoxPresets(for: objectID, in: engine)
-        if fittingPresets.isEmpty {
-            return isExcludedBecauseNoStockedBoxFits(objectID, in: engine)
-                ? .excludedBecauseNoStockedBoxFits
-                : .noStockedBoxFits
+        let isOwnBox = isItsOwnBox(objectID, in: engine)
+        if !isOwnBox {
+            if fittingBoxPresets(for: objectID, in: engine).isEmpty {
+                return isExcludedBecauseNoStockedBoxFits(objectID, in: engine)
+                    ? .excludedBecauseNoStockedBoxFits
+                    : .noStockedBoxFits
+            }
+            guard validSelectedBoxPreset(for: objectID, in: engine) != nil else {
+                return .needsFittingBox
+            }
         }
-        guard validSelectedBoxPreset(for: objectID, in: engine) != nil else {
+        guard packagedSizeMillimetres(for: objectID, in: engine) != nil else {
             return .needsFittingBox
         }
         guard trimmedName(for: objectID, in: engine) != nil else {
@@ -218,11 +272,26 @@ final class PackingStore {
         guard validPackedMass(for: objectID, in: engine) != nil else {
             return .needsPackedWeight
         }
-        return .ready
+        return isOwnBox ? .readyAsItsOwnBox : .ready
     }
 
-    /// Marks a locked object as excluded from loading only when no stocked box fits its current
-    /// measurement. This happens before either optimiser sees the package.
+    /// Assigns the smallest fitting box to every object that has not been given one. The operator
+    /// does not choose a box; they are told which one to use.
+    func assignBoxesAutomatically(in engine: ObjectCaptureEngine) {
+        var changed = false
+        for objectID in engine.measuredObjectIDs {
+            guard !isItsOwnBox(objectID, in: engine),
+                  validSelectedBoxPreset(for: objectID, in: engine) == nil,
+                  let recommended = recommendedBoxPreset(for: objectID, in: engine) else {
+                continue
+            }
+            noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID)
+            selectedBoxPresetIDsByObjectID[objectID] = recommended.id
+            changed = true
+        }
+        if changed { invalidateResults() }
+    }
+
     @discardableResult
     func markExcludedBecauseNoStockedBoxFits(
         _ objectID: UUID,
@@ -260,7 +329,6 @@ final class PackingStore {
         return fittingBoxPresets(for: objectID, in: engine).isEmpty
     }
 
-    /// Valid no-fit exclusions, in the same stable order as the captured measurements.
     func objectIDsExcludedBecauseNoStockedBoxFits(
         in engine: ObjectCaptureEngine
     ) -> [UUID] {
@@ -309,7 +377,6 @@ final class PackingStore {
         return selected
     }
 
-    /// Records a stocked box only if that box exists and the measured object can fit inside it.
     @discardableResult
     func selectBoxPreset(
         id presetID: String,
@@ -329,27 +396,19 @@ final class PackingStore {
         return true
     }
 
-    func clearBoxPreset(for objectID: UUID) {
-        guard selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID) != nil else {
-            return
-        }
-        invalidateResults()
-    }
 
-    /// Clears every package-specific store value when a measured object is removed.
     func clearPreparation(for objectID: UUID) {
         let removedPreset = selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID) != nil
         let removedExclusion = noStockedBoxFitExclusionSizesByObjectID
             .removeValue(forKey: objectID) != nil
         let removedUprightPreference = uprightPackageIDs.remove(objectID) != nil
-        guard removedPreset || removedExclusion || removedUprightPreference else {
+        let removedOwnBox = objectsThatAreTheirOwnBox.remove(objectID) != nil
+        guard removedPreset || removedExclusion || removedUprightPreference || removedOwnBox else {
             return
         }
         invalidateResults()
     }
 
-    /// Removes stale package-specific state after deletion or remeasurement. In particular, a
-    /// no-fit exclusion never survives a changed measurement, even if the object is still large.
     func reconcilePreparationState(with engine: ObjectCaptureEngine) {
         let measuredIDs = Set(engine.measuredObjectIDs)
         var changed = false
@@ -379,16 +438,30 @@ final class PackingStore {
             changed = true
         }
 
+        let staleOwnBoxIDs = objectsThatAreTheirOwnBox.subtracting(measuredIDs)
+        if !staleOwnBoxIDs.isEmpty {
+            objectsThatAreTheirOwnBox.subtract(staleOwnBoxIDs)
+            changed = true
+        }
+
         if changed {
             invalidateResults()
         }
     }
 
+    /// Rounded to the micrometre. The measurement arrives as Float metres, so 0.4 m reaches this as
+    /// 400.000006 mm; package sizes are rounded up to whole millimetres, and without this every
+    /// object that is its own box would grow a millimetre on every axis out of nothing.
     private func measuredSizeMillimetres(_ captured: CapturedObject) -> SIMD3<Double> {
-        SIMD3(
+        let raw = SIMD3(
             Double(captured.widthInMeters) * 1000,
             Double(captured.depthInMeters) * 1000,
             Double(captured.heightInMeters) * 1000
+        )
+        return SIMD3(
+            (raw.x * 1000).rounded() / 1000,
+            (raw.y * 1000).rounded() / 1000,
+            (raw.z * 1000).rounded() / 1000
         )
     }
 
@@ -421,7 +494,6 @@ final class PackingStore {
         return Color(red: colour.red, green: colour.green, blue: colour.blue)
     }
 
-    /// True when the measurements or settings have changed since the displayed arrangement.
     func isStale(for packages: [PackingItem]) -> Bool {
         result != nil && solvedSignature != signature(for: packages)
     }
@@ -441,9 +513,6 @@ final class PackingStore {
         let options = options
         let expected = signature(for: packages)
 
-        // The work itself is held separately so cancelling really stops it: cancelling a parent
-        // task does not propagate into a detached one, and the branch-and-bound search polls its
-        // own task's cancellation between nodes.
         let work = Task.detached(priority: .userInitiated) {
             PackingOptimizer.solve(problem, options: options)
         }
@@ -458,7 +527,6 @@ final class PackingStore {
         }
     }
 
-    /// Runs the Paper stopping-rule and centre-refined 3BKP-H modes concurrently.
     func solveBaldi(problem: BaldiProblem) {
         cancel()
         guard !problem.items.isEmpty else {
@@ -472,7 +540,7 @@ final class PackingStore {
         let expected = baldiSignature(for: problem)
 
         let work = Task.detached(priority: .userInitiated) {
-            await Baldi3BKPSolver.solveBoth(problem, options: options)
+            await BaldiSolver.solveBoth(problem, options: options)
         }
         baldiWork = work
 
@@ -485,7 +553,6 @@ final class PackingStore {
         }
     }
 
-    /// True when the measurements or settings have changed since the displayed 3BKP packing.
     func isBaldiStale(for problem: BaldiProblem) -> Bool {
         baldiComparison != nil && solvedSignature != baldiSignature(for: problem)
     }
@@ -542,6 +609,7 @@ final class PackingStore {
         selectedBoxPresetIDsByObjectID.removeAll()
         noStockedBoxFitExclusionSizesByObjectID.removeAll()
         uprightPackageIDs.removeAll()
+        objectsThatAreTheirOwnBox.removeAll()
     }
 
     private func invalidateResults() {
@@ -551,8 +619,6 @@ final class PackingStore {
         solvedSignature = nil
     }
 
-    /// Everything the arrangement depends on. Any change makes the displayed result stale, and the
-    /// result screen uses it as the identity of the work it needs done.
     func signature(for packages: [PackingItem]) -> String {
         let module = effectiveModule
         var parts: [String] = [
