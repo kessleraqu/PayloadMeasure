@@ -1,0 +1,444 @@
+import ARKit
+import RealityKit
+import SwiftUI
+import simd
+
+// The finished packing, placed on a real table at full size so the operator can walk around it while
+// loading.
+//
+// In:  a verified BaldiSolution and the colours the rest of the screens use for each package.
+// Out: on screen only. Tap a surface to put the plan there, tap a package to read its name, step
+//      through the layers one at a time.
+//
+// The container is drawn as a thin open-topped green shell so you can see and reach into it. Layers
+// below the one being loaded stay visible but faint, so the stack reads as a stack without hiding
+// where the next package goes.
+
+struct PackingARView: View {
+    let solution: BaldiSolution
+    let colours: [UUID: Color]
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var model: PackingARModel
+
+    init(solution: BaldiSolution, colours: [UUID: Color]) {
+        self.solution = solution
+        self.colours = colours
+        _model = State(initialValue: PackingARModel(solution: solution, colours: colours))
+    }
+
+    var body: some View {
+        ZStack {
+            PackingARContainer(model: model)
+                .ignoresSafeArea()
+
+            VStack {
+                header
+                Spacer()
+                if model.isPlaced {
+                    controls
+                } else {
+                    placementPrompt
+                }
+            }
+            .padding(16)
+        }
+        .statusBarHidden()
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            Button {
+                dismiss()
+            } label: {
+                Label("Done", systemImage: "chevron.down")
+                    .font(.body.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .frame(height: 44)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.capsule)
+            .accessibilityLabel("Close the three-dimensional view")
+
+            Spacer(minLength: 8)
+
+            if model.isPlaced {
+                Button {
+                    model.unplace()
+                } label: {
+                    Label("Move", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                        .font(.body.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .frame(height: 44)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .accessibilityLabel("Place the module somewhere else")
+            }
+        }
+    }
+
+    private var placementPrompt: some View {
+        Text(model.statusText)
+            .font(.callout.weight(.medium))
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .frame(maxWidth: 420)
+            .glassEffect(.regular, in: .rect(cornerRadius: 18))
+            .padding(.bottom, 28)
+    }
+
+    private var controls: some View {
+        VStack(spacing: 12) {
+            if let name = model.selectedPackageName {
+                Text(name)
+                    .font(.headline)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                    .transition(.opacity)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    model.showPreviousLayer()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 52, height: 50)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .disabled(!model.canShowPreviousLayer)
+                .accessibilityLabel("Previous layer")
+
+                VStack(spacing: 1) {
+                    Text(model.layerTitle)
+                        .font(.subheadline.weight(.semibold))
+                    Text(model.layerDetail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(minWidth: 132)
+                .padding(.vertical, 6)
+
+                Button {
+                    model.showNextLayer()
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 52, height: 50)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .disabled(!model.canShowNextLayer)
+                .accessibilityLabel("Next layer")
+            }
+            .padding(.horizontal, 8)
+            .glassEffect(.regular, in: .capsule)
+
+            Text("Tap a package to read its name.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.bottom, 24)
+        .animation(.snappy(duration: 0.2), value: model.selectedPackageName)
+        .animation(.snappy(duration: 0.2), value: model.visibleLayerIndex)
+    }
+}
+
+// MARK: - State
+
+@MainActor
+@Observable
+final class PackingARModel {
+    let solution: BaldiSolution
+    let colours: [UUID: Color]
+    let layers: [BaldiLoadingLayer]
+
+    private(set) var isPlaced = false
+    private(set) var visibleLayerIndex = 0
+    private(set) var selectedPackageName: String?
+    private(set) var statusText = "Point at the table and tap to put the module down."
+    /// Bumped whenever the AR side must rebuild what it is showing.
+    private(set) var revision = 0
+    /// Bumped when the operator wants to place the module again.
+    private(set) var unplaceRevision = 0
+
+    init(solution: BaldiSolution, colours: [UUID: Color]) {
+        self.solution = solution
+        self.colours = colours
+        self.layers = BaldiLoadingGuide.layers(for: solution)
+    }
+
+    var canShowPreviousLayer: Bool { visibleLayerIndex > 0 }
+    var canShowNextLayer: Bool { visibleLayerIndex + 1 < layers.count }
+
+    var layerTitle: String {
+        layers.isEmpty
+            ? "No layers"
+            : "Layer \(visibleLayerIndex + 1) of \(layers.count)"
+    }
+
+    var layerDetail: String {
+        guard layers.indices.contains(visibleLayerIndex) else { return "" }
+        let count = layers[visibleLayerIndex].placements.count
+        return "\(count) package\(count == 1 ? "" : "s")"
+    }
+
+    func showNextLayer() {
+        guard canShowNextLayer else { return }
+        visibleLayerIndex += 1
+        selectedPackageName = nil
+        revision &+= 1
+    }
+
+    func showPreviousLayer() {
+        guard canShowPreviousLayer else { return }
+        visibleLayerIndex -= 1
+        selectedPackageName = nil
+        revision &+= 1
+    }
+
+    func markPlaced() {
+        guard !isPlaced else { return }
+        isPlaced = true
+        statusText = ""
+    }
+
+    func unplace() {
+        isPlaced = false
+        selectedPackageName = nil
+        statusText = "Point at the table and tap to put the module down."
+        unplaceRevision &+= 1
+    }
+
+    func reportNoSurface() {
+        guard !isPlaced else { return }
+        statusText = "Move the phone slowly across the table until a surface is found, then tap."
+    }
+
+    func select(packageID: UUID?) {
+        guard let packageID,
+              let placement = solution.placements.first(where: { $0.id == packageID }) else {
+            selectedPackageName = nil
+            return
+        }
+        selectedPackageName = placement.name
+    }
+}
+
+// MARK: - AR
+
+private struct PackingARContainer: UIViewRepresentable {
+    let model: PackingARModel
+
+    func makeCoordinator() -> Coordinator { Coordinator(model: model) }
+
+    func makeUIView(context: Context) -> ARView {
+        let view = ARView(frame: .zero, cameraMode: .ar, automaticallyConfigureSession: false)
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.worldAlignment = .gravity
+        configuration.planeDetection = [.horizontal]
+        configuration.environmentTexturing = .none
+        view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: ARView, context: Context) {
+        context.coordinator.sync()
+    }
+
+    static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
+        uiView.session.pause()
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        private let model: PackingARModel
+        private weak var view: ARView?
+        private var anchor: AnchorEntity?
+        private var packageEntities: [UUID: ModelEntity] = [:]
+        private var observedRevision = -1
+        private var observedUnplaceRevision = 0
+        private var searchTimer: Timer?
+
+        /// Millimetres to metres. Everything in the packing is in millimetres.
+        private let scale: Float = 0.001
+
+        init(model: PackingARModel) {
+            self.model = model
+        }
+
+        func attach(to view: ARView) {
+            self.view = view
+            let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
+            view.addGestureRecognizer(tap)
+            searchTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.model.reportNoSurface() }
+            }
+        }
+
+        func detach() {
+            searchTimer?.invalidate()
+            searchTimer = nil
+            view = nil
+        }
+
+        func sync() {
+            if model.unplaceRevision != observedUnplaceRevision {
+                observedUnplaceRevision = model.unplaceRevision
+                anchor?.removeFromParent()
+                anchor = nil
+                packageEntities.removeAll()
+                observedRevision = -1
+                return
+            }
+            guard anchor != nil, model.revision != observedRevision else { return }
+            observedRevision = model.revision
+            refreshLayerVisibility()
+        }
+
+        @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
+            guard let view else { return }
+            let point = recogniser.location(in: view)
+
+            if anchor == nil {
+                place(at: point, in: view)
+                return
+            }
+            // Naming a package: hit-test the rendered boxes.
+            guard let hit = view.entity(at: point) as? ModelEntity,
+                  let match = packageEntities.first(where: { $0.value === hit }) else {
+                model.select(packageID: nil)
+                return
+            }
+            model.select(packageID: match.key)
+        }
+
+        private func place(at point: CGPoint, in view: ARView) {
+            guard let result = view.raycast(
+                from: point,
+                allowing: .estimatedPlane,
+                alignment: .horizontal
+            ).first else {
+                model.reportNoSurface()
+                return
+            }
+            searchTimer?.invalidate()
+            searchTimer = nil
+
+            let placed = AnchorEntity(world: result.worldTransform)
+            view.scene.addAnchor(placed)
+            anchor = placed
+            build(into: placed)
+            observedRevision = model.revision
+            refreshLayerVisibility()
+            model.markPlaced()
+        }
+
+        // MARK: - Content
+
+        private func build(into anchor: AnchorEntity) {
+            let size = SIMD3<Float>(
+                Float(model.solution.knapsack.size.x),
+                Float(model.solution.knapsack.size.y),
+                Float(model.solution.knapsack.size.z)
+            ) * scale
+            addOpenTopShell(size: size, to: anchor)
+
+            for placement in model.solution.placements {
+                let extent = SIMD3<Float>(
+                    Float(placement.size.x),
+                    Float(placement.size.y),
+                    Float(placement.size.z)
+                ) * scale
+                let centre = SIMD3<Float>(
+                    Float(placement.centreOfMass.x),
+                    Float(placement.centreOfMass.z),
+                    Float(placement.centreOfMass.y)
+                ) * scale
+                let colour = UIColor(colours(for: placement.id))
+                let box = ModelEntity(
+                    mesh: .generateBox(size: SIMD3(extent.x, extent.z, extent.y), cornerRadius: 0.002),
+                    materials: [SimpleMaterial(color: colour, isMetallic: false)]
+                )
+                // Packing is z-up, RealityKit is y-up, and the shell is centred on the anchor, so
+                // the horizontal axes are offset by half the container's width and depth.
+                box.position = SIMD3(
+                    centre.x - size.x / 2,
+                    centre.y,
+                    centre.z - size.y / 2
+                )
+                box.generateCollisionShapes(recursive: false)
+                anchor.addChild(box)
+                packageEntities[placement.id] = box
+            }
+        }
+
+        /// Four thin walls and a floor. No lid, so the operator can see and reach in.
+        private func addOpenTopShell(size: SIMD3<Float>, to anchor: AnchorEntity) {
+            let wall: Float = 0.002
+            let green = UIColor.systemGreen.withAlphaComponent(0.55)
+            var material = SimpleMaterial(color: green, isMetallic: false)
+            material.roughness = 0.9
+
+            func panel(_ dimensions: SIMD3<Float>, at position: SIMD3<Float>) {
+                let entity = ModelEntity(
+                    mesh: .generateBox(size: dimensions),
+                    materials: [material]
+                )
+                entity.position = position
+                anchor.addChild(entity)
+            }
+
+            let halfX = size.x / 2
+            let halfY = size.y / 2      // container depth, along the world z axis
+            let height = size.z
+
+            panel(SIMD3(size.x, wall, size.y), at: SIMD3(0, wall / 2, 0))
+            panel(SIMD3(size.x, height, wall), at: SIMD3(0, height / 2, -halfY))
+            panel(SIMD3(size.x, height, wall), at: SIMD3(0, height / 2, halfY))
+            panel(SIMD3(wall, height, size.y), at: SIMD3(-halfX, height / 2, 0))
+            panel(SIMD3(wall, height, size.y), at: SIMD3(halfX, height / 2, 0))
+        }
+
+        /// The layer being loaded is solid; the ones under it stay visible but faint, so the stack
+        /// reads as a stack without hiding where the next package goes. Layers above are hidden —
+        /// they have not been loaded yet.
+        private func refreshLayerVisibility() {
+            for (index, layer) in model.layers.enumerated() {
+                let opacity: Float
+                if index == model.visibleLayerIndex {
+                    opacity = 1
+                } else if index < model.visibleLayerIndex {
+                    opacity = 0.22
+                } else {
+                    opacity = 0
+                }
+                for placement in layer.placements {
+                    guard let entity = packageEntities[placement.id] else { continue }
+                    entity.isEnabled = opacity > 0
+                    var material = SimpleMaterial(
+                        color: UIColor(colours(for: placement.id))
+                            .withAlphaComponent(CGFloat(opacity)),
+                        isMetallic: false
+                    )
+                    material.roughness = 0.85
+                    entity.model?.materials = [material]
+                }
+            }
+        }
+
+        private func colours(for id: UUID) -> Color {
+            model.colours[id] ?? .accentColor
+        }
+    }
+}

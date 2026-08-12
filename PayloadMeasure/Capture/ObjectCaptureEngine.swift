@@ -98,6 +98,9 @@ final class ObjectCaptureEngine {
     private(set) var topMeasurementStable = false
     private(set) var hasDefinitiveSupportPlaneForActiveObject = false
     private(set) var framingGuidance: ObjectFramingGuidance?
+    private var candidateFramingGuidance: ObjectFramingGuidance?
+    private var candidateFramingGuidanceCount = 0
+    private var lastPublishedDetailStatus: MeasurementDetailStatus = .unknown
     private var measurementDetailStatus: MeasurementDetailStatus = .unknown
     private var didEncounterInsufficientFit = false
 
@@ -973,6 +976,13 @@ final class ObjectCaptureEngine {
         return .okay
     }
 
+    /// The apparent size of an object sits near a threshold for much of a scan, and recomputing the
+    /// advice every mask update made it alternate between "move closer" and "move further" frame by
+    /// frame — unusable, and it makes the operator chase it. A new instruction has to agree with
+    /// itself for several consecutive updates before it is published; going quiet is immediate,
+    /// because stale advice is worse than none.
+    private static let framingGuidanceHoldCount = 4
+
     private func refreshFramingGuidance() {
         let updatedGuidance = activeObjectID
             .flatMap { objectMaskDisplayBoundingBoxes[$0] }
@@ -983,8 +993,46 @@ final class ObjectCaptureEngine {
                         measurementDetailStatus == .sufficient
                 )
             }
-        if framingGuidance != updatedGuidance {
+
+        guard updatedGuidance != framingGuidance else {
+            candidateFramingGuidance = nil
+            candidateFramingGuidanceCount = 0
+            lastPublishedDetailStatus = measurementDetailStatus
+            return
+        }
+
+        guard let updatedGuidance else {
+            candidateFramingGuidance = nil
+            candidateFramingGuidanceCount = 0
+            framingGuidance = nil
+            return
+        }
+
+        // Publish at once when there is no advice yet, when the advice is "you are framed", or when
+        // the fit itself has just reported a change in how much detail it has. Only advice that
+        // changed because the object's apparent size re-crossed a threshold has to prove itself —
+        // that is the one that oscillates, because the size sits near a boundary for most of a scan.
+        let detailChanged = measurementDetailStatus != lastPublishedDetailStatus
+        if framingGuidance == nil || updatedGuidance == .okay || detailChanged {
+            candidateFramingGuidance = nil
+            candidateFramingGuidanceCount = 0
+            lastPublishedDetailStatus = measurementDetailStatus
             framingGuidance = updatedGuidance
+            return
+        }
+
+        if candidateFramingGuidance == updatedGuidance {
+            candidateFramingGuidanceCount += 1
+        } else {
+            candidateFramingGuidance = updatedGuidance
+            candidateFramingGuidanceCount = 1
+        }
+
+        if candidateFramingGuidanceCount >= Self.framingGuidanceHoldCount {
+            framingGuidance = updatedGuidance
+            candidateFramingGuidance = nil
+            candidateFramingGuidanceCount = 0
+            lastPublishedDetailStatus = measurementDetailStatus
         }
     }
 

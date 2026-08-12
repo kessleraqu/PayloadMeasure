@@ -13,6 +13,7 @@ struct BaldiResultView: View {
 
     @State private var selectedMode: BaldiPackingMode = .paper
     @State private var selectedLayerIndex: Int?
+    @State private var showsAugmentedView = false
 
     private var result: BaldiResult {
         comparison.result(for: selectedMode)
@@ -26,6 +27,7 @@ struct BaldiResultView: View {
             if let solution = verifiedSolution,
                let verification = result.verification {
                 interactivePacking(solution)
+                placeOnTableButton
                 openingInstruction
                 loadingGuide(solution, verification: verification)
                 if !solution.unloaded.isEmpty {
@@ -37,6 +39,25 @@ struct BaldiResultView: View {
             highlightedPackageID = nil
             selectedLayerIndex = nil
         }
+        .fullScreenCover(isPresented: $showsAugmentedView) {
+            if let solution = verifiedSolution {
+                PackingARView(solution: solution, colours: colours)
+            }
+        }
+    }
+
+    /// Puts the finished plan on the real table at full size. Opens and closes freely; nothing about
+    /// the plan changes while it is open.
+    private var placeOnTableButton: some View {
+        Button {
+            showsAugmentedView = true
+        } label: {
+            Label("Show it on the table", systemImage: "arkit")
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 48)
+        }
+        .buttonStyle(.borderedProminent)
+        .accessibilityHint("Places the module and its packages in the room at full size, one layer at a time.")
     }
 
     // MARK: - Mode and readiness

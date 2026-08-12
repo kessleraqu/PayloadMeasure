@@ -3837,7 +3837,12 @@ struct ARCameraView: UIViewRepresentable {
             timestamp: TimeInterval,
             for id: UUID
         ) -> Float? {
-            guard sessionManager.isSceneReconstructionEnabled,
+            // Raycasts against ARKit's *estimated planes*, which come from plane detection and not
+            // from scene reconstruction. Gating this on the world mesh was always wrong, and became
+            // load-bearing the moment the mesh stopped being built by default: the support-height
+            // fallback silently switched off, so a scan could sit on "waiting for the surface"
+            // indefinitely and lean on the much heavier depth path instead.
+            guard sessionManager.isSceneDepthSupported,
                   let footprint else {
                 return nil
             }

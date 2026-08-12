@@ -48,6 +48,7 @@ other beyond the picker in `ArrangementView` and the matching branch in `Packing
 | `Knapsack/KnapsackReferenceModel.swift` | The source paper's exact model, kept for inspection. Not run by the app. |
 | `Knapsack/KnapsackResultView.swift` | Mode picker, layer-by-layer loading guide. |
 | `Knapsack/KnapsackSceneView.swift` | Rotatable 3D view and flat per-layer footprints. |
+| `PackingARView.swift` | The finished plan placed on a real table at full size, one layer at a time. |
 
 ## Things worth knowing before changing anything
 
@@ -63,6 +64,16 @@ loop polls `Task.isCancelled` between rounds.
 support and centre of mass from the placements alone. If it fails, the solver returns no solution
 rather than a suspect one. The same holds for Balance via `PackingGeometryCheck`.
 
+**The augmented view runs its own AR session.** Presenting the packing workflow already suspends the
+measurement session (`setPackingArrangementPresented`), which releases the camera, so
+`PackingARView` can start a second `ARWorldTrackingConfiguration` of its own. If that suspension is
+ever removed, two sessions will fight over the camera.
+
+**Packing is z-up, RealityKit is y-up.** Every placement crossing into `PackingARView` swaps those
+axes, and the horizontal ones are offset by half the container because the shell is centred on the
+anchor. Getting one of the two wrong puts packages outside the box in a way that still looks
+plausible from some angles.
+
 **Determinism.** The knapsack search is seeded, so the same input always produces the same packing.
 Useful for tests; do not replace the seeded generator with `SystemRandomNumberGenerator`.
 
@@ -74,6 +85,11 @@ the balancing stage can land between millimetres.
 arrives as 400.000006 mm. Rounding a package size up from that adds a millimetre to every axis of
 every object that is its own box. `measuredSizeMillimetres` clears the noise before anything else
 sees it.
+
+**Excluding an object is only for objects that need a box.** An object marked "already a box", or
+given an enforced size, needs no box at all — running it down the "nothing fits, exclude it" path
+throws away the name and weight just entered and leaves it permanently incomplete, which makes the
+plan screen unreachable. Check `isItsOwnBox` and `forcedSize` before ever excluding.
 
 **Boxes are assigned, not chosen.** `assignBoxesAutomatically` gives every object the smallest box
 it fits; the operator is told which one to use. The only override is marking the object

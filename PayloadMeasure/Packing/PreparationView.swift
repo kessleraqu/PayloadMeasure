@@ -564,7 +564,12 @@ private struct PackingPreparationView: View {
         focusedField = nil
         validationMessage = nil
 
-        if store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty {
+        // Only exclude an object that actually needs a box and has none. Marked "already a box" or
+        // given an enforced size, it needs no box at all — excluding it here would throw away the
+        // name and weight just typed and leave it permanently incomplete.
+        let needsNoBox = store.isItsOwnBox(objectID, in: captureEngine)
+            || store.forcedSize(for: objectID, in: captureEngine) != nil
+        if !needsNoBox, store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty {
             guard store.markExcludedBecauseNoStockedBoxFits(
                 objectID,
                 in: captureEngine

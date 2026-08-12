@@ -445,6 +445,62 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertFalse(engine.isNameAvailable("   ", excluding: second))
     }
 
+    func testOwnBoxObjectThatFitsNothingCanStillBeCompleted() {
+        // The regression that made "create plan" bounce back to the first object forever: an object
+        // marked as already a box, which nothing in the catalogue fits, must still be completable.
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.40, 0.30, 0.20))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertTrue(store.fittingBoxPresets(for: objectID, in: engine).isEmpty)
+
+        store.setIsItsOwnBox(true, for: objectID, in: engine)
+        engine.updateName(id: objectID, name: "Crate")
+        engine.updatePackedWeight(id: objectID, weightInGrams: 900)
+
+        XCTAssertEqual(store.preparationState(for: objectID, in: engine), .readyAsItsOwnBox)
+        XCTAssertTrue(
+            store.packagesMissingPreparation(from: engine).isEmpty,
+            "Nothing may still be outstanding, or the plan screen is unreachable."
+        )
+        XCTAssertEqual(store.baldiItems(from: engine).count, 1)
+    }
+
+    func testEnforcedSizeObjectThatFitsNothingCanStillBeCompleted() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.50, 0.40, 0.30))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertTrue(store.fittingBoxPresets(for: objectID, in: engine).isEmpty)
+
+        store.setForcedSize(SIMD3(180, 120, 90), for: objectID, in: engine)
+        engine.updateName(id: objectID, name: "Odd shape")
+        engine.updatePackedWeight(id: objectID, weightInGrams: 250)
+
+        XCTAssertEqual(store.preparationState(for: objectID, in: engine), .readyAsItsOwnBox)
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
+        XCTAssertEqual(store.baldiItems(from: engine).first?.size, SIMD3(180, 120, 90))
+    }
+
+    func testAMixOfBoxedOwnBoxAndExcludedObjectsAllReachCompletion() {
+        let engine = ObjectCaptureEngine()
+        let boxed = lockObject(in: engine, sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let ownBox = lockObject(in: engine, sizeMetres: SIMD3(0.40, 0.30, 0.20))
+        let excluded = lockObject(in: engine, sizeMetres: SIMD3(0.60, 0.50, 0.40))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+
+        engine.updateName(id: boxed, name: "Camera")
+        engine.updatePackedWeight(id: boxed, weightInGrams: 250)
+
+        store.setIsItsOwnBox(true, for: ownBox, in: engine)
+        engine.updateName(id: ownBox, name: "Crate")
+        engine.updatePackedWeight(id: ownBox, weightInGrams: 900)
+
+        XCTAssertTrue(store.markExcludedBecauseNoStockedBoxFits(excluded, in: engine))
+
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
+        XCTAssertEqual(Set(store.baldiItems(from: engine).map(\.id)), [boxed, ownBox])
+    }
+
     private func makeLockedObject(
         sizeMetres: SIMD3<Float>
     ) -> (ObjectCaptureEngine, UUID) {

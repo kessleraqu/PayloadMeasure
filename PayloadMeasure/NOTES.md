@@ -74,6 +74,19 @@ edge. The plane search and the depth search break that tie the same way, so they
 fuzzy mask edge, or LiDAR flying pixels straddling a depth step. A sample is kept only if at least
 three of its four depth-grid neighbours are also admitted and depth-continuous.
 
+**Framing advice is held before it changes.** The object's apparent size sits near a threshold for
+most of a scan, so recomputing "move closer / move further" every mask update made the two trade
+places frame by frame. A directional instruction now has to agree with itself four times before it
+is published. Three things bypass the hold, because none of them can contradict itself: the first
+advice of a scan, reaching "framed correctly", and any change the fit itself reports in how much
+detail it has.
+
+**The support raycast is not gated on the world mesh.** It raycasts against ARKit's *estimated
+planes*, which come from plane detection. It was once guarded by `isSceneReconstructionEnabled`,
+which was harmless only while the mesh happened to be on: once the mesh became on-demand, the whole
+support-height fallback switched itself off and scans sat on "waiting for the surface" while leaning
+on the much heavier depth path. Gate this on depth support, never on reconstruction.
+
 **Each dimension remembers the view that could measure it.** Width and length come from the last
 top-down view, height from the last side view. Without that, a side view — where the background
 leaks into the footprint — would overwrite a good top-down measurement.
