@@ -677,6 +677,17 @@ final class ObjectCaptureEngine {
         objectMaskFeedbackText = "Measurement cancelled. Tap an object to start again."
     }
 
+    /// Two packages with the same name are indistinguishable in a loading plan.
+    func isNameAvailable(_ name: String, excluding id: UUID?) -> Bool {
+        let candidate = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !candidate.isEmpty else { return false }
+        return !objectNamesByID.contains { existingID, existingName in
+            existingID != id
+                && existingName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == candidate
+        }
+    }
+
     func updateName(id: UUID, name: String) {
         guard finalizedObjectIDs.contains(id) else {
             objectMaskFeedbackText = "Only a finished object can have its name updated."

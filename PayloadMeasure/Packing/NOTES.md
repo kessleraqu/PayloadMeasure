@@ -78,8 +78,10 @@ sees it.
 **Boxes are assigned, not chosen.** `assignBoxesAutomatically` gives every object the smallest box
 it fits; the operator is told which one to use. The only override is marking the object
 as being a box already, in which case its measured size is the package size and no preset is
-involved. Both paths converge on `packagedSizeMillimetres`, which is the single answer to "how big
-is this package" that the two methods and the preparation screen all read.
+involved. A third option, an enforced size, overrides both — it exists so a bad measurement does not
+stop a load being planned. All three converge on `packagedSizeMillimetres`, which is the single
+answer to "how big is this package" that the two methods and the preparation screen all read.
+Priority runs enforced size, then own box, then assigned box.
 
 **Scaling in the MILP.** `BalanceModel` divides rows by positive constants and holds positions as
 fractions of the module. Written in raw units the matrix spans about eight orders of magnitude and

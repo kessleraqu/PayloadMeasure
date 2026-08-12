@@ -37,6 +37,8 @@ final class PackingStore {
     private var noStockedBoxFitExclusionSizesByObjectID: [UUID: SIMD3<Double>] = [:]
     /// Objects that are already boxed, so their measured size is the package size.
     private(set) var objectsThatAreTheirOwnBox: Set<UUID> = []
+    /// Sizes typed in by hand, overriding both the measurement and the assigned box.
+    private(set) var forcedSizesByObjectID: [UUID: SIMD3<Double>] = [:]
     private(set) var boxPresets: [PackingBoxPreset] = PackingStore.loadBoxPresets()
     private(set) var baldiComparison: BaldiComparison?
 
@@ -99,6 +101,9 @@ final class PackingStore {
         for objectID: UUID,
         in engine: ObjectCaptureEngine
     ) -> SIMD3<Double>? {
+        if let forced = forcedSize(for: objectID, in: engine) {
+            return forced
+        }
         if isItsOwnBox(objectID, in: engine) {
             return measuredSizeMillimetres(for: objectID, in: engine)
         }
@@ -112,6 +117,30 @@ final class PackingStore {
         guard let captured = engine.capturedObjectsByID[objectID] else { return nil }
         let size = measuredSizeMillimetres(captured)
         return size.allFiniteAndPositive ? size : nil
+    }
+
+    /// A size the operator typed in. Wins over everything else, so a bad measurement does not stop
+    /// the load being planned.
+    func forcedSize(for objectID: UUID, in engine: ObjectCaptureEngine) -> SIMD3<Double>? {
+        guard engine.measuredObjectIDs.contains(objectID),
+              let forced = forcedSizesByObjectID[objectID],
+              forced.allFiniteAndPositive else {
+            return nil
+        }
+        return forced
+    }
+
+    func setForcedSize(_ size: SIMD3<Double>?, for objectID: UUID, in engine: ObjectCaptureEngine) {
+        guard engine.measuredObjectIDs.contains(objectID) else { return }
+        if let size, size.allFiniteAndPositive {
+            guard forcedSizesByObjectID[objectID] != size else { return }
+            forcedSizesByObjectID[objectID] = size
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+            noStockedBoxFitExclusionSizesByObjectID.removeValue(forKey: objectID)
+        } else {
+            guard forcedSizesByObjectID.removeValue(forKey: objectID) != nil else { return }
+        }
+        invalidateResults()
     }
 
     func isItsOwnBox(_ objectID: UUID, in engine: ObjectCaptureEngine) -> Bool {
@@ -252,8 +281,9 @@ final class PackingStore {
             return .unavailable
         }
 
-        let isOwnBox = isItsOwnBox(objectID, in: engine)
-        if !isOwnBox {
+        let needsNoBox = isItsOwnBox(objectID, in: engine)
+            || forcedSize(for: objectID, in: engine) != nil
+        if !needsNoBox {
             if fittingBoxPresets(for: objectID, in: engine).isEmpty {
                 return isExcludedBecauseNoStockedBoxFits(objectID, in: engine)
                     ? .excludedBecauseNoStockedBoxFits
@@ -272,7 +302,7 @@ final class PackingStore {
         guard validPackedMass(for: objectID, in: engine) != nil else {
             return .needsPackedWeight
         }
-        return isOwnBox ? .readyAsItsOwnBox : .ready
+        return needsNoBox ? .readyAsItsOwnBox : .ready
     }
 
     /// Assigns the smallest fitting box to every object that has not been given one. The operator
@@ -281,6 +311,7 @@ final class PackingStore {
         var changed = false
         for objectID in engine.measuredObjectIDs {
             guard !isItsOwnBox(objectID, in: engine),
+                  forcedSize(for: objectID, in: engine) == nil,
                   validSelectedBoxPreset(for: objectID, in: engine) == nil,
                   let recommended = recommendedBoxPreset(for: objectID, in: engine) else {
                 continue
@@ -403,7 +434,9 @@ final class PackingStore {
             .removeValue(forKey: objectID) != nil
         let removedUprightPreference = uprightPackageIDs.remove(objectID) != nil
         let removedOwnBox = objectsThatAreTheirOwnBox.remove(objectID) != nil
-        guard removedPreset || removedExclusion || removedUprightPreference || removedOwnBox else {
+        let removedForcedSize = forcedSizesByObjectID.removeValue(forKey: objectID) != nil
+        guard removedPreset || removedExclusion || removedUprightPreference || removedOwnBox
+            || removedForcedSize else {
             return
         }
         invalidateResults()
@@ -435,6 +468,11 @@ final class PackingStore {
         let staleUprightIDs = uprightPackageIDs.subtracting(measuredIDs)
         if !staleUprightIDs.isEmpty {
             uprightPackageIDs.subtract(staleUprightIDs)
+            changed = true
+        }
+
+        for objectID in Array(forcedSizesByObjectID.keys) where !measuredIDs.contains(objectID) {
+            forcedSizesByObjectID.removeValue(forKey: objectID)
             changed = true
         }
 
@@ -610,6 +648,7 @@ final class PackingStore {
         noStockedBoxFitExclusionSizesByObjectID.removeAll()
         uprightPackageIDs.removeAll()
         objectsThatAreTheirOwnBox.removeAll()
+        forcedSizesByObjectID.removeAll()
     }
 
     private func invalidateResults() {

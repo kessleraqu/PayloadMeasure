@@ -63,6 +63,7 @@ private struct PackingPreparationView: View {
     @State private var drafts: [UUID: Draft] = [:]
     @State private var validationMessage: String?
     @State private var isShowingBoxCatalog = false
+    @State private var forcedSizeDrafts: [UUID: SIMD3<Double>] = [:]
 
     private var objectIDs: [UUID] {
         captureEngine.measuredObjectIDs
@@ -122,6 +123,7 @@ private struct PackingPreparationView: View {
 
     private func preparationContent(for objectID: UUID) -> some View {
         let canPrepare = store.isItsOwnBox(objectID, in: captureEngine)
+            || store.forcedSize(for: objectID, in: captureEngine) != nil
             || !store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
 
         return ScrollView {
@@ -251,12 +253,17 @@ private struct PackingPreparationView: View {
     private func boxCard(for objectID: UUID) -> some View {
         let isOwnBox = store.isItsOwnBox(objectID, in: captureEngine)
         let assigned = store.selectedBoxPreset(for: objectID)
+        let forced = store.forcedSize(for: objectID, in: captureEngine)
 
         VStack(alignment: .leading, spacing: 12) {
             Label("1. Box this object", systemImage: "shippingbox")
                 .font(.headline)
 
-            if isOwnBox {
+            if let forced {
+                Text("Loaded at **\(sizeText(forced))**, the size you entered.")
+                    .font(.subheadline)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if isOwnBox {
                 Text("This object is already a box, so it is loaded exactly as measured. Nothing to pack.")
                     .font(.subheadline)
                     .fixedSize(horizontal: false, vertical: true)
@@ -282,6 +289,27 @@ private struct PackingPreparationView: View {
                 }
             }
             .accessibilityHint("Uses the measured dimensions as the package size, with no outer box.")
+            .disabled(forced != nil)
+
+            Toggle(isOn: forcedSizeBinding(for: objectID)) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enforce box size")
+                        .font(.subheadline.weight(.medium))
+                    Text("Plan around a size you type, when the measurement is wrong.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if forced != nil {
+                HStack(spacing: 8) {
+                    forcedSizeField("L", axis: 0, objectID: objectID)
+                    forcedSizeField("W", axis: 1, objectID: objectID)
+                    forcedSizeField("H", axis: 2, objectID: objectID)
+                    Text("mm").font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -289,6 +317,47 @@ private struct PackingPreparationView: View {
             Color(.secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: 18)
         )
+    }
+
+    private func forcedSizeBinding(for objectID: UUID) -> Binding<Bool> {
+        Binding(
+            get: { store.forcedSize(for: objectID, in: captureEngine) != nil },
+            set: { isForced in
+                if isForced {
+                    let start = forcedSizeDrafts[objectID]
+                        ?? store.measuredSizeMillimetres(for: objectID, in: captureEngine)
+                            .map { SIMD3($0.x.rounded(), $0.y.rounded(), $0.z.rounded()) }
+                        ?? SIMD3(100, 100, 100)
+                    forcedSizeDrafts[objectID] = start
+                    store.setForcedSize(start, for: objectID, in: captureEngine)
+                } else {
+                    store.setForcedSize(nil, for: objectID, in: captureEngine)
+                    store.assignBoxesAutomatically(in: captureEngine)
+                }
+                validationMessage = nil
+            }
+        )
+    }
+
+    private func forcedSizeField(_ title: String, axis: Int, objectID: UUID) -> some View {
+        let binding = Binding<Double>(
+            get: { store.forcedSize(for: objectID, in: captureEngine)?[axis] ?? 100 },
+            set: { new in
+                var size = store.forcedSize(for: objectID, in: captureEngine)
+                    ?? SIMD3(100, 100, 100)
+                size[axis] = min(max(new.rounded(), 1), 999)
+                forcedSizeDrafts[objectID] = size
+                store.setForcedSize(size, for: objectID, in: captureEngine)
+            }
+        )
+        return HStack(spacing: 3) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            TextField(title, value: binding, format: .number.precision(.fractionLength(0)))
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 52)
+                .textFieldStyle(.roundedBorder)
+        }
     }
 
     private func ownBoxBinding(for objectID: UUID) -> Binding<Bool> {
@@ -330,7 +399,18 @@ private struct PackingPreparationView: View {
                 }
             }
 
-            Text("Or add a box big enough from the menu at the top right.")
+            Toggle(isOn: forcedSizeBinding(for: objectID)) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enforce box size")
+                        .font(.subheadline.weight(.medium))
+                    Text("Plan around a size you type instead.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Text("Or enforce a size below, or add a box big enough from the menu at the top right.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -502,6 +582,10 @@ private struct PackingPreparationView: View {
             validationMessage = "Enter a name for this object."
             return
         }
+        guard captureEngine.isNameAvailable(name, excluding: objectID) else {
+            validationMessage = "Another object is already called “\(name)”. Give this one a different name."
+            return
+        }
         guard store.packagedSizeMillimetres(for: objectID, in: captureEngine) != nil else {
             validationMessage = "No box fits this object any more. Add a bigger box, or mark the object as already a box."
             return
@@ -524,10 +608,25 @@ private struct PackingPreparationView: View {
     private func advanceAfterCurrentObject() {
         if currentIndex < objectIDs.count - 1 {
             currentIndex += 1
-        } else if store.packagesMissingPreparation(from: captureEngine).isEmpty {
-            onComplete()
         } else {
-            validationMessage = "Finish the name, box and packed weight for every object before creating the plan."
+            // Assign first: the box list may have changed since an object was last looked at.
+            store.assignBoxesAutomatically(in: captureEngine)
+            let missing = store.packagesMissingPreparation(from: captureEngine)
+            guard let firstMissing = missing.first else {
+                onComplete()
+                return
+            }
+            // Name what is actually missing, and go there, rather than blocking with a message the
+            // operator cannot act on.
+            let names = missing
+                .map { captureEngine.name(for: $0) ?? "an unnamed object" }
+                .joined(separator: ", ")
+            validationMessage = missing.count == 1
+                ? "\(names) still needs a box, a name or a packed weight."
+                : "These still need a box, a name or a packed weight: \(names)."
+            if let index = objectIDs.firstIndex(of: firstMissing) {
+                currentIndex = index
+            }
         }
     }
 

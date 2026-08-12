@@ -34,11 +34,11 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
     let outerSizeMillimetres: SIMD3<Double>
     let usableInnerSizeMillimetres: SIMD3<Double>
 
-    /// Every box has 1 mm walls, so the usable inside is 2 mm smaller on each axis.
-    static let wallThicknessMillimetres: Double = 1
+    /// Box sizes are taken as given: what is written on the box is what fits in it. No wall
+    /// allowance is subtracted, so the usable inside equals the outer size.
+    static let wallThicknessMillimetres: Double = 0
 
-    /// A box is identified by its size, so that is its name. Returns nil for a size that leaves no
-    /// usable space once the walls are taken off.
+    /// A box is identified by its size, so that is its name.
     static func sized(outerSizeMillimetres: SIMD3<Double>) -> PackingBoxPreset? {
         sized(id: identifier(for: outerSizeMillimetres), outerSizeMillimetres: outerSizeMillimetres)
     }
@@ -84,6 +84,8 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         SIMD3<Double>(230, 155, 105),
         SIMD3<Double>(190, 110, 115),
         SIMD3<Double>(95, 95, 160),
+        SIMD3<Double>(35, 22, 215),
+        SIMD3<Double>(100, 65, 140),
     ].compactMap { PackingBoxPreset.sized(id: identifier(for: $0), outerSizeMillimetres: $0) }
 
     /// The size is the identity, so it is also the id.

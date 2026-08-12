@@ -10,7 +10,7 @@ import UIKit
 // Out: a CapturedObject - dimensions, centre, axes and corners - or a reason it could not be fitted.
 //
 // The stages run in order: accumulate points, voxelise, cluster, then fit a box. Full 3D uses a
-// PCA fit over all visible faces; Top uses a convex-hull fit from directly above.
+// convex-hull fit over every visible surface; Top does the same from a single overhead view.
 
 nonisolated struct CapturedObject: Sendable {
     let dimensions: SIMD3<Float>
@@ -172,7 +172,13 @@ nonisolated enum ObjectCapturePipeline {
         }
         let selectedPoints = cluster.pointIndices.map { candidates[$0].position }
         let surfacePoints = cluster.pointIndices.map { candidates[$0].observedPosition }
-        guard let object = ObjectBoundingBox.make(
+        guard let object = OrientedBoundingBox.make(
+            from: cluster.points,
+            enclosing: surfacePoints,
+            up: up,
+            groundHeight: resolvedSupportHeight,
+            minimumEdgeDistance: voxelSize
+        ) ?? ObjectBoundingBox.make(
             from: cluster.points,
             enclosing: surfacePoints,
             up: up,
@@ -237,7 +243,7 @@ nonisolated enum ObjectCapturePipeline {
         }
         let selectedPoints = cluster.pointIndices.map { candidates[$0].position }
         let surfacePoints = cluster.pointIndices.map { candidates[$0].observedPosition }
-        guard let object = PaperTopBoundingBox.make(
+        guard let object = OrientedBoundingBox.make(
             from: cluster.points,
             enclosing: surfacePoints,
             up: up,
@@ -1397,7 +1403,7 @@ nonisolated enum ObjectBoundingBox {
     }
 }
 
-nonisolated enum PaperTopBoundingBox {
+nonisolated enum OrientedBoundingBox {
     private static let maximumOrientationPointCount = 100
     private static let approximateCollinearitySine: Float = 0.01
     private static let geometricEpsilon: Float = 1e-6

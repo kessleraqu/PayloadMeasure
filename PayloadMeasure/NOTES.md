@@ -89,13 +89,26 @@ support plane is a condition the statistics cannot see, so it is checked separat
 containers, mask layers, aimer, every card — in the same frame that presents an alert and cold-starts
 the keyboard was a visible stall. Measurement has already stopped by then, so leaving it up is free.
 
+**The segmentation pipeline is throttled, and its actor is reentrant.** Two things that were wrong
+and are worth not reintroducing. The mask pass used to resubmit the moment the previous one
+finished, driven by a 60 Hz display link, so Vision ran back to back forever and starved ARKit's own
+tracking of CPU — which is what makes ARKit retain frames and drop camera output. There is now a
+floor between passes that also backs off to the last pass's duration. And `ObjectMaskProcessor` is
+an actor, so a cancelled pass sits suspended at its `await` while the next one enters and mutates
+`trackedObjects`; any array index taken before an `await` has to be looked up again afterwards.
+
+**A mask image is only rendered if something will draw it.** The overlay only ever draws the active
+object's mask and the live preview, but the processor used to generate a full mask and a full-frame
+CGImage for every finished object too, every pass, for the engine to throw away. That was the cost
+that grew with each object measured.
+
 **Box edges come from a pool.** Every entity beyond the prepared pool is built synchronously, and
 twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
 when the box first appears.
 
 ## Sources
 
-Top-view box fitting follows Liu, Liu and Zhang, *Estimation of 2D Bounding Box Orientation with
+Box fitting — both Full 3D and Top — follows Liu, Liu and Zhang, *Estimation of 2D Bounding Box Orientation with
 Convex-Hull Points*, IV 2020: downsample to 100 points, Graham-scan hull with approximate
 collinearity at τ = 0.01, every hull-point pair as a candidate direction, and the closeness score of
 Zhang, Xu, Dong and Dolan (IV 2017). Three things are worth stating explicitly.
@@ -111,6 +124,14 @@ from that set throughout, but the paper explicitly omits size — "we focus on e
 orientation accuracy… and omit the size information" — and warns that size is the quantity most
 damaged by missing points. This app is measuring size, and the samples a downsample discards are
 disproportionately the extreme ones. The hull and the candidate-direction search are unchanged.
+
+**Full 3D and Top share the fitter.** Full 3D used to take its orientation from a 2-D PCA about the
+gravity axis, which follows the spread of whichever faces happen to be visible rather than the
+object's edges — badly biased when one side is better sampled than another. Because the world is
+gravity-aligned and the object stands on a horizontal plane, the box has a vertical axis by
+construction, so the 3-D fit reduces to the same 2-D orientation problem Top already solved. Both
+now run the same convex-hull search; they differ only in which points reach it. The PCA fit remains
+as a fallback for a cloud too degenerate to hull.
 
 **Downsampling is seeded reservoir sampling**, so a uniformly random subset, reproducible run to
 run. Liu says "uniformly downsampled" without saying whether that means a random subset or a fixed

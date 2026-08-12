@@ -6,6 +6,11 @@ import UIKit
 // In:  session manager, aimer state and capture engine.
 // Out: on screen only. Operator actions go back through the capture engine.
 
+/// A measured object's id, made presentable by `sheet(item:)`.
+struct IdentifiedObjectID: Identifiable, Hashable {
+    let id: UUID
+}
+
 struct MesOverlayView: View {
     private enum ObjectDetailsContext {
         case finalize(UUID)
@@ -16,6 +21,8 @@ struct MesOverlayView: View {
     let aimerState: AimerState
     let captureEngine: ObjectCaptureEngine
     @Binding var workflowMode: MeasurementWorkflowMode
+    let flow: MeasurementFlow
+    let onFullReset: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
@@ -25,6 +32,8 @@ struct MesOverlayView: View {
     @State private var objectNameText = ""
     @State private var pendingRemovalObjectID: UUID?
     @State private var showsResetConfirmation = false
+    @State private var showsFinishLoadConfirmation = false
+    @State private var packageDetails: IdentifiedObjectID?
     @State private var showsSavedObjects = false
     @State private var pendingWorkflowMode: MeasurementWorkflowMode?
     @State private var showsModeChangeConfirmation = false
@@ -152,6 +161,14 @@ struct MesOverlayView: View {
         .onChange(of: showsPackingWorkflow) { _, isPresented in
             handlePackingWorkflowPresentationChange(isPresented)
         }
+        .sheet(item: $packageDetails) { entry in
+            PackageDetailsSheet(
+                objectID: entry.id,
+                captureEngine: captureEngine,
+                store: packingStore,
+                onRescan: { rescan(entry.id) }
+            )
+        }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
@@ -159,7 +176,7 @@ struct MesOverlayView: View {
         }
         .fullScreenCover(
             isPresented: $showsPackingWorkflow,
-            onDismiss: captureEngine.clearAllSnapshotJPEGData
+            onDismiss: handlePackingWorkflowDismissal
         ) {
             PreparationView(
                 captureEngine: captureEngine,
@@ -211,13 +228,27 @@ struct MesOverlayView: View {
             isPresented: $showsResetConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Reset All", role: .destructive) {
+            Button("Reset everything", role: .destructive) {
                 showsSavedObjects = false
-                captureEngine.reset()
+                onFullReset()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This clears the active object and every saved name, outer-box choice, packed weight, point cloud and measurement.")
+            Text("This clears every measurement, name, box, weight and loading plan, restarts the AR session and returns to the start screen. It cannot be undone.")
+        }
+        .confirmationDialog(
+            "Finished with this load?",
+            isPresented: $showsFinishLoadConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Start a new load", role: .destructive) {
+                onFullReset()
+            }
+            Button("Keep working", role: .cancel) {
+                showsPackingWorkflow = true
+            }
+        } message: {
+            Text("Closing the loading plan clears every measurement and starts again from the beginning. Choose Keep working to go back to the plan.")
         }
         .confirmationDialog(
             "Switch measurement mode?",
@@ -251,6 +282,13 @@ struct MesOverlayView: View {
 
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         sessionManager.setApplicationActive(phase == .active)
+    }
+
+    /// Leaving the loading plan means the load is done. Rather than drop back into a half-used
+    /// session — which is what made the app feel worse afterwards — offer to clear everything.
+    private func handlePackingWorkflowDismissal() {
+        captureEngine.clearAllSnapshotJPEGData()
+        showsFinishLoadConfirmation = true
     }
 
     private func handlePackingWorkflowPresentationChange(_ isPresented: Bool) {
@@ -1006,59 +1044,93 @@ struct MesOverlayView: View {
                     savedObjectsButton
                 }
 
-                HStack(spacing: 8) {
-                    Spacer(minLength: 0)
-                    workflowButtonIfAvailable
-                    if captureEngine.canReset {
-                        resetButton
-                    }
+                ViewThatFits(in: .horizontal) {
+                    accessibilityActionRow(showsTitles: true)
+                    accessibilityActionRow(showsTitles: false)
                 }
             }
         } else {
-            HStack(spacing: 8) {
-                if !finalizedMeasuredObjectIDs.isEmpty {
-                    savedObjectsButton
-                }
-                Spacer(minLength: 0)
-                cancelMeasurementButton
-                workflowButtonIfAvailable
-                if captureEngine.canReset {
-                    resetButton
-                }
+            // Every button here is optional, so the row's width swings a lot. Rather than let it
+            // run off the edge of the phone, drop the labels when the full set will not fit.
+            ViewThatFits(in: .horizontal) {
+                actionRow(showsTitles: true)
+                actionRow(showsTitles: false)
+            }
+        }
+    }
+
+    private func accessibilityActionRow(showsTitles: Bool) -> some View {
+        HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            cancelMeasurementButton(showsTitle: showsTitles)
+            workflowButtonIfAvailable(showsTitle: showsTitles)
+            if captureEngine.canReset {
+                resetButton(showsTitle: showsTitles)
+            }
+        }
+    }
+
+    private func actionRow(showsTitles: Bool) -> some View {
+        HStack(spacing: 8) {
+            if !finalizedMeasuredObjectIDs.isEmpty {
+                savedObjectsButton
+            }
+            Spacer(minLength: 0)
+            cancelMeasurementButton(showsTitle: showsTitles)
+            workflowButtonIfAvailable(showsTitle: showsTitles)
+            if captureEngine.canReset {
+                resetButton(showsTitle: showsTitles)
             }
         }
     }
 
     @ViewBuilder
-    private var workflowButtonIfAvailable: some View {
+    private func workflowButtonIfAvailable(showsTitle: Bool) -> some View {
         if isAutomaticCaptureSupported,
            captureEngine.activeObjectID != nil
-            || captureEngine.canEditFocusedObject {
-            objectWorkflowButton
+            || (flow.tracksFinishedObjects && captureEngine.canEditFocusedObject) {
+            objectWorkflowButton(showsTitle: showsTitle)
         }
+    }
+
+    /// Sized by its content, never by a hard width, so a row of these can shrink instead of being
+    /// clipped by the screen.
+    private func actionLabel(
+        _ title: String,
+        systemImage: String,
+        tint: Color,
+        showsTitle: Bool,
+        isCompact: Bool = false
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .foregroundStyle(tint)
+            if showsTitle {
+                Text(title)
+                    .foregroundStyle(.primary)
+            }
+        }
+        .font((isCompact ? Font.caption : Font.body).weight(.semibold))
+        .lineLimit(1)
+        .padding(.horizontal, showsTitle ? 15 : 0)
+        .frame(
+            minWidth: showsTitle
+                ? (dynamicTypeSize.isAccessibilitySize ? 96 : 74)
+                : (dynamicTypeSize.isAccessibilitySize ? 56 : 48),
+            minHeight: dynamicTypeSize.isAccessibilitySize ? 56 : (isCompact ? 44 : 50)
+        )
+        .contentShape(Capsule())
     }
 
     /// Only offered while a measurement is running, and it discards that measurement outright.
     @ViewBuilder
-    private var cancelMeasurementButton: some View {
+    private func cancelMeasurementButton(showsTitle: Bool) -> some View {
         if isAutomaticCaptureSupported, captureEngine.activeObjectID != nil {
             Button {
                 showsSavedObjects = false
                 captureEngine.cancelActiveMeasurement()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "xmark")
-                        .foregroundStyle(.red)
-                    Text("Cancel")
-                        .foregroundStyle(.primary)
-                }
-                .font(.body.weight(.semibold))
-                .lineLimit(1)
-                .frame(
-                    width: dynamicTypeSize.isAccessibilitySize ? 148 : 104,
-                    height: dynamicTypeSize.isAccessibilitySize ? 56 : 50
-                )
-                .contentShape(Capsule())
+                actionLabel("Cancel", systemImage: "xmark", tint: .red, showsTitle: showsTitle)
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
@@ -1068,7 +1140,7 @@ struct MesOverlayView: View {
     }
 
     @ViewBuilder
-    private var objectWorkflowButton: some View {
+    private func objectWorkflowButton(showsTitle: Bool) -> some View {
         if captureEngine.activeObjectID != nil {
             Button {
                 guard sessionManager.isTrackingReady,
@@ -1078,19 +1150,7 @@ struct MesOverlayView: View {
                 showsSavedObjects = false
                 lockAndPresentDetails()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark")
-                        .foregroundStyle(.green)
-                    Text("Finish")
-                        .foregroundStyle(.primary)
-                }
-                    .font(.body.weight(.semibold))
-                    .lineLimit(1)
-                    .frame(
-                        width: dynamicTypeSize.isAccessibilitySize ? 164 : 116,
-                        height: dynamicTypeSize.isAccessibilitySize ? 56 : 50
-                    )
-                    .contentShape(Capsule())
+                actionLabel("Finish", systemImage: "checkmark", tint: .green, showsTitle: showsTitle)
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
@@ -1111,24 +1171,12 @@ struct MesOverlayView: View {
                         ? "Saves the measurement so you can select another object."
                         : "Keep scanning until a LiDAR box is ready."
             )
-        } else if captureEngine.canEditFocusedObject {
+        } else if flow.tracksFinishedObjects, captureEngine.canEditFocusedObject {
             Button {
                 showsSavedObjects = false
                 captureEngine.reactivateFocusedObject()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "pencil")
-                        .foregroundStyle(.orange)
-                    Text("Edit")
-                        .foregroundStyle(.primary)
-                }
-                    .font(.body.weight(.semibold))
-                    .lineLimit(1)
-                    .frame(
-                        width: dynamicTypeSize.isAccessibilitySize ? 164 : 116,
-                        height: dynamicTypeSize.isAccessibilitySize ? 56 : 50
-                    )
-                    .contentShape(Capsule())
+                actionLabel("Edit", systemImage: "pencil", tint: .orange, showsTitle: showsTitle)
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
@@ -1137,23 +1185,17 @@ struct MesOverlayView: View {
         }
     }
 
-    private var resetButton: some View {
+    private func resetButton(showsTitle: Bool) -> some View {
         Button {
             showsResetConfirmation = true
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "arrow.counterclockwise")
-                    .foregroundStyle(.red)
-                Text("Reset")
-                    .foregroundStyle(.primary)
-            }
-                .font(.caption.weight(.semibold))
-                .lineLimit(1)
-                .frame(
-                    width: dynamicTypeSize.isAccessibilitySize ? 124 : 80,
-                    height: dynamicTypeSize.isAccessibilitySize ? 52 : 44
-                )
-                .contentShape(Capsule())
+            actionLabel(
+                "Reset",
+                systemImage: "arrow.counterclockwise",
+                tint: .red,
+                showsTitle: showsTitle,
+                isCompact: true
+            )
         }
         .buttonStyle(.glass)
         .buttonBorderShape(.capsule)
@@ -1539,9 +1581,22 @@ struct MesOverlayView: View {
             pendingDetailsObjectID = nil
             return
         }
+        pendingDetailsObjectID = nil
+        // Boxing happens per object in this flow, so the full sheet replaces the name-only alert.
+        guard flow != .sequential else {
+            packageDetails = IdentifiedObjectID(id: id)
+            return
+        }
         objectNameText = ""
         objectDetailsContext = .finalize(id)
-        pendingDetailsObjectID = nil
+    }
+
+    /// Puts a finished object back into measurement. The review list and the details sheet both
+    /// use it, so an object can be corrected without being deleted and measured from scratch.
+    private func rescan(_ id: UUID) {
+        showsSavedObjects = false
+        captureEngine.focusFinalizedObject(id: id)
+        captureEngine.reactivateFocusedObject()
     }
 
     private func presentDetailsEditor(for id: UUID) {
@@ -1850,6 +1905,8 @@ struct MesOverlayView: View {
         sessionManager: ARSessionManager(),
         aimerState: AimerState(),
         captureEngine: ObjectCaptureEngine(),
-        workflowMode: .constant(.spatial3D)
+        workflowMode: .constant(.spatial3D),
+        flow: .batch,
+        onFullReset: {}
     )
 }

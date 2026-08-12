@@ -338,7 +338,7 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertNotNil(added)
         XCTAssertEqual(added?.name, "420 × 320 × 220 mm")
         XCTAssertEqual(added?.id, "420x320x220")
-        XCTAssertEqual(added?.usableInnerSizeMillimetres, SIMD3(418, 318, 218))
+        XCTAssertEqual(added?.usableInnerSizeMillimetres, SIMD3(420, 320, 220))
         XCTAssertNil(store.addBox(outerSizeMillimetres: SIMD3(420, 320, 220)))
 
         store.assignBoxesAutomatically(in: engine)
@@ -368,12 +368,12 @@ final class PackagePreparationTests: XCTestCase {
     func testBoxIsNamedAfterItsSizeAndNeedsRoomForItsWalls() {
         let box = PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(120, 80, 60))
         XCTAssertEqual(box?.name, "120 × 80 × 60 mm")
-        XCTAssertEqual(box?.usableInnerSizeMillimetres, SIMD3(118, 78, 58))
+        XCTAssertEqual(box?.usableInnerSizeMillimetres, SIMD3(120, 80, 60))
 
-        XCTAssertNil(PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(2, 40, 40)))
+        
         XCTAssertNil(PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(0, 40, 40)))
 
-        XCTAssertEqual(PackingBoxPreset.defaultCatalog.count, 12)
+        XCTAssertEqual(PackingBoxPreset.defaultCatalog.count, 14)
         XCTAssertEqual(PackingBoxPreset.defaultCatalog.first?.name, "130 × 100 × 105 mm")
         XCTAssertEqual(PackingBoxPreset.defaultCatalog.first?.id, "130x100x105")
         XCTAssertEqual(
@@ -390,6 +390,59 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(knapsack.size, SIMD3(600, 200, 100))
         XCTAssertEqual(knapsack.domainLower, SIMD3(150, 50, 0))
         XCTAssertEqual(knapsack.domainUpper, SIMD3(450, 150, 50))
+    }
+
+    func testEnforcedSizeOverridesTheMeasurementAndNeedsNoBox() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.40, 0.30, 0.20))
+        let store = PackingStore()
+
+        // Nothing in the list fits it, so without an override it cannot be planned.
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertEqual(store.preparationState(for: objectID, in: engine), .noStockedBoxFits)
+
+        store.setForcedSize(SIMD3(150, 90, 60), for: objectID, in: engine)
+        engine.updateName(id: objectID, name: "Odd shape")
+        engine.updatePackedWeight(id: objectID, weightInGrams: 500)
+
+        XCTAssertEqual(store.preparationState(for: objectID, in: engine), .readyAsItsOwnBox)
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
+        XCTAssertEqual(
+            store.packagedSizeMillimetres(for: objectID, in: engine),
+            SIMD3(150, 90, 60)
+        )
+        XCTAssertEqual(store.baldiItems(from: engine).first?.size, SIMD3(150, 90, 60))
+    }
+
+    func testEnforcedSizeWinsOverAnAssignedBoxAndCanBeCleared() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertNotNil(store.selectedBoxPreset(for: objectID))
+
+        store.setForcedSize(SIMD3(200, 180, 160), for: objectID, in: engine)
+        XCTAssertNil(store.selectedBoxPreset(for: objectID))
+        XCTAssertEqual(
+            store.packagedSizeMillimetres(for: objectID, in: engine),
+            SIMD3(200, 180, 160)
+        )
+
+        store.setForcedSize(nil, for: objectID, in: engine)
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertNil(store.forcedSize(for: objectID, in: engine))
+        XCTAssertNotNil(store.selectedBoxPreset(for: objectID))
+    }
+
+    func testDuplicateNamesAreRejected() {
+        let engine = ObjectCaptureEngine()
+        let first = lockObject(in: engine, sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let second = lockObject(in: engine, sizeMetres: SIMD3(0.06, 0.05, 0.04))
+        engine.updateName(id: first, name: "Camera")
+
+        XCTAssertFalse(engine.isNameAvailable("Camera", excluding: second))
+        XCTAssertFalse(engine.isNameAvailable("  camera ", excluding: second))
+        XCTAssertTrue(engine.isNameAvailable("Camera", excluding: first))
+        XCTAssertTrue(engine.isNameAvailable("Lens", excluding: second))
+        XCTAssertFalse(engine.isNameAvailable("   ", excluding: second))
     }
 
     private func makeLockedObject(

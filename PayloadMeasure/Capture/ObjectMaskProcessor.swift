@@ -744,7 +744,17 @@ actor ObjectMaskProcessor {
                     }
                     return result(preview: nil, frame: frame, status: .cancelled)
                 }
+                // A finished object's overlay is never drawn, and building one costs a full mask
+                // plus a full-frame CGImage every cycle. That is the whole reason the scan used to
+                // slow down as objects piled up.
+                let isDrawn = selection.lockID.map { !frame.finalizedObjectIDs.contains($0) } ?? true
+                let needsPointCloud = selection.lockID == effectiveActiveObjectID
+                    && addedTrackerID == nil
+                    && frame.depthSnapshot != nil
+                guard isDrawn || needsPointCloud else { continue }
+
                 let processed = try autoreleasepool {
+                    let layer: ObjectMaskPreviewLayer? = !isDrawn ? nil : try {
                     let pixelBuffer = try observation.generateMask(
                         for: selection.instances
                     )
@@ -754,7 +764,7 @@ actor ObjectMaskProcessor {
                         fillAlpha: selection.fillAlpha,
                         pixelBuffer: pixelBuffer
                     )
-                    let layer = makeDisplayImage(from: [renderedMask], frame: frame).map { image in
+                    return makeDisplayImage(from: [renderedMask], frame: frame).map { image in
                         let trackingReference = renderedMask.lockID.flatMap {
                             displayTrackingReference(
                                 for: $0,
@@ -777,10 +787,9 @@ actor ObjectMaskProcessor {
                             trackingOrientation: frame.orientation
                         )
                     }
+                    }()
                     let cloud: ObjectMaskDepthPointCloud?
-                    if addedTrackerID == nil,
-                       selection.lockID == effectiveActiveObjectID,
-                       frame.depthSnapshot != nil {
+                    if needsPointCloud {
                         let sourceAlignedBuffer = try observation
                             .generateScaledMask(
                                 for: selection.instances,
@@ -949,7 +958,7 @@ actor ObjectMaskProcessor {
         frame: ObjectMaskFrame
     ) async {
         guard let activeObjectID = frame.activeObjectID,
-              let index = trackedObjects.firstIndex(where: {
+              var index = trackedObjects.firstIndex(where: {
                   $0.id == activeObjectID
               }) else {
             return
@@ -985,6 +994,13 @@ actor ObjectMaskProcessor {
         guard !Task.isCancelled else {
             return
         }
+        // This actor is reentrant: a cancelled pass stays suspended here while the next one enters
+        // and can drop tracked objects, so the index from before the await may no longer be valid,
+        // or may now point at a different object. Find it again, or give up.
+        guard let currentIndex = trackedObjects.firstIndex(where: { $0.id == activeObjectID }) else {
+            return
+        }
+        index = currentIndex
         let predictedBox = validatedPrediction(
             trackedObservation?.boundingBox,
             relativeTo: trackedObjects[index].lastGeometry.boundingBox

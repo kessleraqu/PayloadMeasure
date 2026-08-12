@@ -101,6 +101,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var isSceneDepthEnabled = false
     private(set) var isSceneReconstructionSupported = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
     private(set) var isSceneReconstructionEnabled = false
+    private var wantsSceneMesh = false
     private(set) var hasDetectedHorizontalPlane = false
     private(set) var hasDetectedVerticalPlane = false
     private(set) var hasReceivedSceneDepth = false
@@ -210,7 +211,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
-        configuration.planeDetection = [.horizontal, .vertical]
+        // Objects rest on horizontal surfaces, the coaching goal is a horizontal plane, and every
+        // consumer filters vertical planes out. Detecting them was pure cost.
+        configuration.planeDetection = [.horizontal]
         configuration.environmentTexturing = .none
 
         if isSceneDepthSupported {
@@ -220,7 +223,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             isSceneDepthEnabled = false
         }
 
-        if isSceneReconstructionSupported {
+        // The world mesh grows for as long as the session runs and is never cheap to maintain, and
+        // the only thing that reads it is the mesh/occlusion toggle, which is off by default. Build
+        // it on request rather than always.
+        if isSceneReconstructionSupported, wantsSceneMesh {
             configuration.sceneReconstruction = .mesh
             isSceneReconstructionEnabled = true
         } else {
@@ -234,6 +240,18 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         } else {
             startWhenCameraIsAuthorized(session, configuration: configuration)
         }
+    }
+
+    /// Turning the mesh on re-runs the session with scene reconstruction. Tracking and anchors are
+    /// kept, so the scan is not disturbed.
+    func setSceneMeshEnabled(_ isEnabled: Bool) {
+        guard isSceneReconstructionSupported, wantsSceneMesh != isEnabled else { return }
+        wantsSceneMesh = isEnabled
+        guard let activeSession, let activeConfiguration else { return }
+        activeConfiguration.sceneReconstruction = isEnabled ? .mesh : []
+        isSceneReconstructionEnabled = isEnabled
+        guard !isTrackingSuspended else { return }
+        run(activeSession, configuration: activeConfiguration)
     }
 
     func detach(_ session: ARSession) {

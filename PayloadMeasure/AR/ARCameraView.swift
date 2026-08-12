@@ -261,6 +261,8 @@ struct ARCameraView: UIViewRepresentable {
         private var consecutiveLiveMaskMisses = 0
         private var objectMaskTask: Task<Void, Never>?
         private var objectMaskTaskGeneration = 0
+        private var lastObjectMaskFinishedAt: CFTimeInterval = 0
+        private var lastObjectMaskDuration: CFTimeInterval = 0
         private var lastObjectMaskSubmittedFrameTimestamp: TimeInterval =
             -.greatestFiniteMagnitude
         private var objectMaskDisplayTask: Task<Void, Never>?
@@ -623,6 +625,7 @@ struct ARCameraView: UIViewRepresentable {
 
             if captureEngine.isMeshVisible != observedMeshVisible {
                 observedMeshVisible = captureEngine.isMeshVisible
+                sessionManager.setSceneMeshEnabled(observedMeshVisible)
                 updateMeshVisibility()
             }
 
@@ -685,6 +688,17 @@ struct ARCameraView: UIViewRepresentable {
                     for: request.id,
                     isCommitting: true
                 )
+                // Redraw it solid now that it is finished, releasing its dash entities.
+                if let finishedObject = captureEngine.capturedObjectsByID[request.id] {
+                    renderCapturedBoxSpans(
+                        captureBoxLineSpans(
+                            for: finishedObject,
+                            objectID: request.id,
+                            cameraPosition: .zero
+                        ),
+                        for: request.id
+                    )
+                }
                 selectionPointsByObject.removeValue(forKey: request.id)
                 updateSelectionVisualization()
                 objectMaskDisplayTask?.cancel()
@@ -1259,8 +1273,21 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
+        /// Segmentation is resubmitted the instant the previous pass finishes, which pins the neural
+        /// engine and starves ARKit's own tracking of the CPU. Hold a floor between passes, and back
+        /// off further on a device where a pass is slow, so the pipeline never takes more than about
+        /// half the time. A pending selection is urgent and gets the fastest cadence.
+        private var objectMaskInterval: CFTimeInterval {
+            let floor: CFTimeInterval = pendingObjectMaskToggleRequest != nil
+                ? 1.0 / 20
+                : captureEngine.activeObjectID != nil ? 1.0 / 12 : 1.0 / 6
+            return max(floor, lastObjectMaskDuration)
+        }
+
         private func updateObjectMaskPreview(in arView: ARView) {
-            guard                   objectMaskTask == nil,
+            let now = CACurrentMediaTime()
+            guard objectMaskTask == nil,
+                  now - lastObjectMaskFinishedAt >= objectMaskInterval,
                   arView.window != nil,
                   arView.bounds.width > 0,
                   arView.bounds.height > 0,
@@ -1270,6 +1297,7 @@ struct ARCameraView: UIViewRepresentable {
                   frame.timestamp > lastObjectMaskSubmittedFrameTimestamp else {
                 return
             }
+            let submittedAt = now
 
             let orientation = cameraImageOrientation(in: arView)
             let viewportSize = arView.bounds.size
@@ -1333,6 +1361,8 @@ struct ARCameraView: UIViewRepresentable {
                     return
                 }
 
+                self.lastObjectMaskDuration = CACurrentMediaTime() - submittedAt
+                self.lastObjectMaskFinishedAt = CACurrentMediaTime()
                 self.objectMaskTask = nil
                 guard self.captureEngine.resetRevision
                         == submittedResetRevision else {
@@ -3021,6 +3051,15 @@ struct ARCameraView: UIViewRepresentable {
             guard object.corners.count == 8 else {
                 return []
             }
+            // Dashed rear edges are a live-scan affordance, and each dash is its own entity. A
+            // finished box keeps its entities for the rest of the session, so 12 solid edges rather
+            // than up to 60 dashes is the difference between a scene that stays fast and one that
+            // gains hundreds of draw calls per object measured.
+            guard !captureEngine.finalizedObjectIDs.contains(objectID) else {
+                return Self.captureBoxEdges.map {
+                    (start: object.corners[$0.0], end: object.corners[$0.1])
+                }
+            }
             let rearEdges = captureBoxRearEdges(
                 for: object,
                 objectID: objectID,
@@ -3193,8 +3232,14 @@ struct ARCameraView: UIViewRepresentable {
             }
             if entities.count > renderableSpans.count {
                 for index in renderableSpans.count..<entities.count {
-                    entities[index].isEnabled = false
+                    let surplus = entities[index]
+                    surplus.isEnabled = false
+                    surplus.removeFromParent()
+                    if captureBoxEntityPool.count < Self.preparedCaptureBoxEntityCount {
+                        captureBoxEntityPool.append(surplus)
+                    }
                 }
+                entities.removeSubrange(renderableSpans.count..<entities.count)
             }
             captureEntitiesByObject[objectID] = entities
             captureBoxActiveSpanCountsByObject[objectID] = renderableSpans.count

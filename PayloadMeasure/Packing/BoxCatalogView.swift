@@ -27,7 +27,18 @@ struct BoxCatalogView: View {
                             .foregroundStyle(.secondary)
                     }
                     ForEach(store.boxPresets) { preset in
-                        row(preset)
+                        HStack {
+                            Text(preset.name)
+                                .monospacedDigit()
+                            Spacer(minLength: 0)
+                            Button(role: .destructive) {
+                                store.removeBox(id: preset.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Delete the \(preset.name) box")
+                        }
                     }
                     .onDelete { offsets in
                         for id in offsets.map({ store.boxPresets[$0].id }) {
@@ -37,16 +48,13 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("Boxes")
                 } footer: {
-                    Text("Swipe a box to delete it. An object fits a box when it fits the usable inside in any of the six orientations, and the system always assigns the smallest box that fits.")
+                    Text("Tap the bin, or swipe, to delete a box. An object fits when it fits inside in any of the six orientations, and the system always assigns the smallest box that fits.")
                 }
 
                 Section {
                     millimetres("Length", value: $length)
                     millimetres("Width", value: $width)
                     millimetres("Height", value: $height)
-
-                    LabeledContent("Usable inside", value: innerDescription)
-                        .foregroundStyle(.secondary)
 
                     Button("Add box", action: add)
                         .disabled(!canAdd)
@@ -59,7 +67,7 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("New box")
                 } footer: {
-                    Text("These are outer dimensions, and they are the box's name. Every box is assumed to have 1 mm walls, so 2 mm comes off each axis.")
+                    Text("The size is the box's name, and it is taken as the space available inside. Nothing is subtracted for walls.")
                 }
             }
             .navigationTitle("Boxes")
@@ -80,11 +88,6 @@ struct BoxCatalogView: View {
         outerSize - SIMD3(repeating: 2 * PackingBoxPreset.wallThicknessMillimetres)
     }
 
-    private var innerDescription: String {
-        guard innerSize.allFiniteAndPositive else { return "Too small for 1 mm walls" }
-        return PackingBoxPreset.sizeName(innerSize)
-    }
-
     private var isDuplicate: Bool {
         store.boxPresets.contains { $0.outerSizeMillimetres == outerSize }
     }
@@ -103,16 +106,6 @@ struct BoxCatalogView: View {
         message = nil
     }
 
-    private func row(_ preset: PackingBoxPreset) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(preset.name)
-                .monospacedDigit()
-            Text("\(PackingBoxPreset.sizeName(preset.usableInnerSizeMillimetres)) inside")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .combine)
-    }
 
     private func millimetres(
         _ title: String,
