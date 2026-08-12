@@ -7,7 +7,10 @@ import SwiftUI
 // Out: the chosen MeasurementFlow. Shown again only after a full reset or a relaunch.
 
 struct StartView: View {
+    let warmup: AppWarmup
     let onSelect: (MeasurementFlow) -> Void
+
+    @State private var pendingFlow: MeasurementFlow?
 
     var body: some View {
         ZStack {
@@ -31,7 +34,7 @@ struct StartView: View {
                 VStack(spacing: 12) {
                     ForEach(MeasurementFlow.allCases) { flow in
                         Button {
-                            onSelect(flow)
+                            choose(flow)
                         } label: {
                             HStack(alignment: .top, spacing: 13) {
                                 Image(systemName: flow.systemImage)
@@ -63,14 +66,47 @@ struct StartView: View {
                     }
                 }
 
-                Text("You can switch by resetting.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                // Only shown when there is genuinely something left to wait for.
+                if !warmup.isReady {
+                    VStack(spacing: 7) {
+                        ProgressView(value: warmup.progress)
+                            .progressViewStyle(.linear)
+                            .frame(maxWidth: 260)
+                        Text(
+                            pendingFlow == nil
+                                ? "Preparing camera and object detection…"
+                                : "Starting as soon as this finishes…"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
+                    .transition(.opacity)
+                } else {
+                    Text("You can switch by resetting.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
 
                 Spacer(minLength: 0)
             }
             .padding(24)
             .frame(maxWidth: 520)
         }
+        .animation(.snappy(duration: 0.2), value: warmup.isReady)
+        .onAppear(perform: warmup.start)
+        .onChange(of: warmup.isReady) { _, ready in
+            if ready, let pendingFlow {
+                onSelect(pendingFlow)
+            }
+        }
+    }
+
+    /// Tapping before the frameworks are loaded queues the choice rather than freezing on it.
+    private func choose(_ flow: MeasurementFlow) {
+        guard warmup.isReady else {
+            pendingFlow = flow
+            return
+        }
+        onSelect(flow)
     }
 }

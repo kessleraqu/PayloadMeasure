@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var captureEngine = ObjectCaptureEngine()
     @State private var flow: MeasurementFlow?
     @State private var sessionToken = 0
+    @State private var warmup = AppWarmup()
 
     var body: some View {
         if let flow {
@@ -37,7 +38,7 @@ struct ContentView: View {
             }
             .id(sessionToken)
         } else {
-            StartView { chosen in
+            StartView(warmup: warmup) { chosen in
                 flow = chosen
             }
         }
