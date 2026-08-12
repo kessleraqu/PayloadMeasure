@@ -1403,9 +1403,21 @@ nonisolated enum ObjectBoundingBox {
     }
 }
 
+// The bounding-box fitter. The two halves are kept apart on purpose:
+//
+//   `bestOrientation`  is Liu, Liu and Zhang's Algorithm 2 with Zhang's closeness criterion, and
+//                      nothing else. It answers only "which way is the box turned", which is all
+//                      the paper claims to answer.
+//   `make`             is this application: it takes that orientation and builds a measured box
+//                      from it — extents from the full cloud, height from the support plane, longer
+//                      horizontal side named width. None of that is from the paper.
 nonisolated enum OrientedBoundingBox {
-    private static let maximumOrientationPointCount = 100
-    private static let approximateCollinearitySine: Float = 0.01
+    /// N_max in Algorithm 2. Liu's largest tested value, where the reported average error is
+    /// under 1°.
+    static let maximumOrientationPointCount = 100
+    /// τ. Liu's own recommendation: "produces almost the same results as using accurate
+    /// convex-hull points".
+    static let approximateCollinearitySine: Float = 0.01
     private static let geometricEpsilon: Float = 1e-6
 
     private struct RectangleFit {
@@ -1438,25 +1450,19 @@ nonisolated enum OrientedBoundingBox {
         let stablePoints2D = points.map {
             SIMD2<Float>(simd_dot($0, basis.first), simd_dot($0, basis.second))
         }
-        let orientationPoints = uniformDownsample(
-            stablePoints2D,
-            maximumCount: maximumOrientationPointCount
-        )
-        let hull = convexHull(
-            orientationPoints,
-            collinearitySine: approximateCollinearitySine
-        )
-        guard hull.count >= 3,
-              let direction = bestDirection(
-                hull: hull,
-                points: orientationPoints,
-                minimumEdgeDistance: max(minimumEdgeDistance, geometricEpsilon)
-              ) else {
+
+        // --- Liu Algorithm 2 ends here. Everything below is this application. ---
+        guard let direction = bestOrientation(
+            of: stablePoints2D,
+            minimumEdgeDistance: max(minimumEdgeDistance, geometricEpsilon)
+        ) else {
             return nil
         }
 
-        // Orientation comes from the downsample, as the paper specifies. The extents come from every
-        // point: the paper omits size deliberately, and the samples it drops are the extreme ones.
+        // Extents come from every point, not the sample Liu works from. Liu states it "omit[s] the
+        // size information" and warns size is what missing points damage most; a downsample discards
+        // disproportionately the extreme points, which are exactly the ones that set the extents.
+        // Application-specific extension; it cannot affect the orientation chosen above.
         guard var fit = rectangleFit(points: stablePoints2D, axis: direction) else {
             return nil
         }
@@ -1520,6 +1526,24 @@ nonisolated enum OrientedBoundingBox {
         )
     }
 
+    /// Liu, Liu and Zhang, Algorithm 2, with Zhang's closeness as the criterion. Returns the best
+    /// candidate direction as a unit vector rather than an angle — algebraically the same as their
+    /// `atan2`, and it avoids a wrap at ±π.
+    static func bestOrientation(
+        of points2D: [SIMD2<Float>],
+        minimumEdgeDistance: Float
+    ) -> SIMD2<Float>? {
+        guard points2D.count >= 3 else { return nil }
+        let sample = uniformDownsample(points2D, maximumCount: maximumOrientationPointCount)
+        let hull = convexHull(sample, collinearitySine: approximateCollinearitySine)
+        guard hull.count >= 3 else { return nil }
+        return bestDirection(
+            hull: hull,
+            points: sample,
+            minimumEdgeDistance: max(minimumEdgeDistance, geometricEpsilon)
+        )
+    }
+
     private static func horizontalBasis(
         up: SIMD3<Float>
     ) -> (first: SIMD3<Float>, second: SIMD3<Float>)? {
@@ -1534,6 +1558,9 @@ nonisolated enum OrientedBoundingBox {
         return (first, simd_normalize(simd_cross(up, first)))
     }
 
+    /// Liu says "uniformly downsampled" without saying how. Reservoir sampling gives a uniformly
+    /// random subset and is seeded so a scan reproduces; the choice of method is an implementation
+    /// detail.
     private static func uniformDownsample(
         _ points: [SIMD2<Float>],
         maximumCount: Int
@@ -1651,6 +1678,13 @@ nonisolated enum OrientedBoundingBox {
         return bestAxis
     }
 
+    /// Zhang, Xu, Dong and Dolan's closeness criterion, reference [15] of Liu. β = Σ 1/max(min(d₁,
+    /// d₂), d₀), taken over the side of each axis with the smaller squared residual.
+    ///
+    /// Note the comparison direction. Liu's Algorithm 2 initialises `S = INT_MAX` and keeps
+    /// `Scur < S`, i.e. minimises. This implementation maximises, because the criterion it cites is
+    /// defined and used by Zhang as a maximisation objective — β grows as the points hug the
+    /// rectangle. The two papers disagree; this follows the one that defines the criterion.
     private static func closenessScore(
         points: [SIMD2<Float>],
         axis: SIMD2<Float>,

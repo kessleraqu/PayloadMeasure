@@ -861,7 +861,7 @@ struct MesOverlayView: View {
                 .toggleStyle(.switch)
                 .accessibilityHint("Finishes the measurement and asks for a name as soon as it reaches its precision target.")
 
-                Text("Finishes once every dimension holds to ±5 mm or 1% over its last 24 fits — a 95% confidence interval that tight, and no remaining drift. Each dimension must also have been seen from a viewpoint that can measure it, over a surface ARKit has confirmed.")
+                Text("Finishes when a 95% confidence interval over the last 24 fits is no wider than 5 mm, or 1% of the dimension for anything larger than 500 mm — whichever is the looser of the two — and the interval is no longer drifting. Every dimension must clear it, must have been seen from a viewpoint that can measure it, and must sit over a surface ARKit has confirmed.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

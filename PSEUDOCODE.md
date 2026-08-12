@@ -1,12 +1,17 @@
-# Pseudocode, papers against this implementation
+# Pseudocode: the papers against this implementation
 
-Every algorithm in this project that comes from a paper, written twice: as the paper prints it, then
-as the code runs it, with the differences named. Two algorithms qualify — the 3D knapsack packing
-and the 2D bounding-box orientation. The load-balancing MILP is not here because it is a model
-rather than an algorithm; its equation-by-equation mapping is the table in
-`PayloadMeasure/Packing/METHODS.md`.
+Every algorithm in this project that comes from a paper, written twice — as the paper states it,
+then as the code runs it — followed by the differences between them. The point of the document is
+that a reader can tell, for any line of the implementation, which of three categories it falls in:
 
-Sources:
+1. **from the cited paper**,
+2. **an adaptation** required by this application or by combining two papers,
+3. **the centred extension**, which is in no paper at all (Part 4).
+
+Attribution here is deliberately cautious. "Direct implementation of eq. (X)" means the equation was
+checked against the PDF. Where a claim could not be checked, it says so.
+
+## Sources
 
 - **[B]** M. M. Baldi, G. Perboli, R. Tadei, "The three-dimensional knapsack problem with balancing
   constraints", *Applied Mathematics and Computation* 218 (2012) 9802–9818.
@@ -17,346 +22,380 @@ Sources:
   Points", *IEEE Intelligent Vehicles Symposium*, 2020.
 - **[Z]** X. Zhang, W. Xu, C. Dong, J. M. Dolan, "Efficient L-shape fitting for vehicle detection
   using laser scanners", *IEEE Intelligent Vehicles Symposium*, 2017. Reference [15] of [L], and the
-  definition of `closeness`.
+  source of the `closeness` criterion.
+
+**Equation numbers.** All [B] numbers below were re-checked against the PDF: (1) total profit,
+(2) centre of mass, (3) standard deviation, (4) unbalancing index, (5)–(20) the MIP model,
+(21) residual-space fit, (22)–(23) clustering, (24) merit function, (25)–(29) centre-of-mass
+relocation. [J] numbers: (9)–(11) vertical stability, (12)–(13) horizontal stability, (14) load
+bearing.
+
+## Two application-wide input choices
+
+These are set by the application, not by [B], and they affect several sections below.
+
+- **p_i = 1 for every package.** The objective here is to load as many packages as possible, so all
+  profits are equal. [B]'s own benchmarks use p_i = 200 + w·d·h. Consequences: P in eq. (1) is the
+  loaded-package count, and the sorting criteria that key on profit (§1.4) lose their discriminating
+  power.
+- **Each package's own centre of mass is its geometric centre**, so γ_ir = extent/2 in eq. (29).
+  This matches [B]'s benchmark generator, which places r_CMi at {w/2, d/2, h/2}, but is narrower
+  than [B]'s general formulation, which allows any γ.
 
 ---
 
-# Part 1 — Packing
+# Part 1 — Baldi packing
 
-## 1.1 The outer loop, 3BKP-H
+## 1.1 Outer search, 3BKP-H
 
-### As printed, [B] §5 and Fig. 6
+### Paper — [B] §5, main-step list and Fig. 6
 
 ```
-BS ← PCH()                                  // initial solution
-InitialiseScores(BS)
-while not StoppingConditions:
-    order ← items sorted by score, descending
-    CS    ← EP-BPH(order)
-    if non-improving iterations limit reached:
-        LongTermScoreReinitialisation()
+BS ← PCH()                                     // initial solution, §5.1
+InitialiseScores(BS)                           // §5.3.1
+while not StoppingConditions:                  // §5.3.4: 5 s
+    sort items by score, descending
+    CS ← EP-BPH(sorted items)
+    if non-improving iteration limit reached:
+        LongTermScoreReinitialisation()        // §5.3.3
     else:
-        ScoreUpdate(CS)
-    if CS better than BS:  BS ← CS          // "better" = merit F, eq. (24)
-    ParameterUpdate()
+        ScoreUpdate(CS)                        // §5.3.2
+    if F(CS) > F(BS): BS ← CS                  // F = P − αU, eq. (24)
+    ParameterUpdate()                          // §5.3.3 rule, run here per the step list
 return BS
 ```
 
-### As implemented, `BaldiSearch.solve`
+### Implementation — `BaldiSearch.solve`
 
 ```
-(searchBest, bestFeasible) ← ConstructInitialSolution()   // PCH, all six criteria
+(searchBest, bestFeasible) ← ConstructInitialSolution()   // PCH over all six criteria
 scores ← InitialiseScores(items, loadedIn: searchBest)
 while now < deadline and not cancelled:
-    order ← items sorted by score, descending, index breaking ties
+    order ← items by score descending, index breaking ties
     CS    ← Balance(EP-BPH(order))
-    record loaded/unloaded counts for every item
-    if nonImproving ≥ 1000:
-        LongTermScoreReinitialisation()
-        ParameterUpdate()                                 // ← moved here
-        nonImproving ← 0
-    else:
-        ScoreUpdate(CS)
-    if BetterForSearch(CS, searchBest):  searchBest ← CS ; nonImproving ← 0
-    else:                                nonImproving ← nonImproving + 1
-    if Feasible(CS) and BetterFeasible(CS, bestFeasible):  bestFeasible ← CS
-return bestFeasible or empty                              // ← never an unverified packing
+    record loaded / not-loaded counts for every item
+    if nonImproving ≥ 1000: LongTermScoreReinitialisation(); nonImproving ← 0
+    else:                   ScoreUpdate(CS)
+    if merit(CS) > merit(searchBest): searchBest ← CS; nonImproving ← 0
+    else:                             nonImproving += 1
+    if Feasible(CS) and betterFeasible(CS): bestFeasible ← CS      // safety wrapper only
+    ParameterUpdate()
+return bestFeasible or empty
 ```
 
-| Difference | Why |
-| --- | --- |
-| `ParameterUpdate` runs at reinitialisation, not every pass | §5.3.3 states the α = 2α / β = 2β rule as part of reinitialisation; Fig. 6 draws it per pass. Run per pass, both steps double from 0.1 and hit their cap within four rounds, so the paper's adaptation never happens. |
-| Stopping condition is a wall clock plus cancellation | §5.3.4 gives 5 s. Cancellation is added so the solve can be abandoned when the operator leaves the screen. |
-| Two incumbents are tracked | The paper's `BS` may be infeasible; the screen must never show one. `searchBest` drives the search exactly as `BS` does, `bestFeasible` is what is returned. |
-| Reinitialisation triggers on non-improving rounds | §5.3.4 says "every 1000 iterations", Fig. 6 says "Non Improving Iter. Limit". |
-| Ties in the sort broken by index | The paper leaves ties undefined. Every profit is 1 here, so ties are common and determinism matters. |
+with
 
-`BetterForSearch` is the paper's merit function F = P − αU (eq. 24) with α = 0, so F = P, followed by
-tie-breaks the paper does not have: full support, then balance, then — in `centred` mode only —
-closeness to the domain centre. `BetterFeasible` compares only count and, in `centred` mode,
-closeness.
+```
+merit(S) = |loaded(S)| − α · Û(S)          Û = U / halfDiagonal(knapsack)
+```
 
-## 1.2 The constructive heuristic, EP-BPH
+### Differences
 
-### As printed, [B] §5.1
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **U is normalised** by the knapsack half-diagonal before entering eq. (24). | Adaptation forced by p_i = 1. With [B]'s six-figure profits, raw millimetre U is a rounding error beside P; with P a package count it would swamp it entirely. Normalised, the penalty is < 1, so it orders equal-count packings and can never outvote a package. Pinned by `testMeritPenaltyCanOrderEqualCountsButNeverOutvotesAPackage`. |
+| 2 | **α in eq. (24) is the adaptive α of §5.3.** [B] reuses the symbol for the merit penalty and the score-decrease step, and §5.2 says "for setting the α values see Section 5.3", which is the only value the paper offers. | Interpretation of an ambiguity in [B]. |
+| 3 | **Two incumbents are tracked.** `searchBest` is BS and is driven purely by eq. (24); `bestFeasible` is what is returned. | Application safety wrapper. BS in [B] may be infeasible — §5.3.3 branches on exactly that — but a packing that is unbalanced or unsupported must never reach the screen. It does not influence which packings the search builds or keeps. |
+| 4 | **Stopping is a wall clock plus a cancellation check.** | §5.3.4 gives 5 s; cancellation is added so a solve can be abandoned when the operator leaves the screen. |
+| 5 | **Reinitialisation triggers on 1000 non-improving rounds.** | §5.3.4 says "every 1000 iterations"; Fig. 6 labels the branch "Non Improving Iter. Limit". The two disagree; this follows the figure. |
+| 6 | **Ties in the score sort break by item index.** | Implementation detail. [B] leaves ties undefined, and with p_i = 1 they are common; determinism matters for reproducibility. |
+| 7 | **A balancing pass runs on every constructed solution.** | [B] §5.2 is a separate procedure and the paper does not state where in the loop it runs. Running it per iteration is an interpretation. |
+
+## 1.2 Constructive heuristic, EP-BPH
+
+### Paper — [B] §5.1
 
 ```
 order items by the sorting criterion
 for each item in order:
     for each rotation r:
-        find the EP e of the best bin minimising
-            f = (RSˣₑ − wⱼ) + (RSʸₑ − dⱼ) + (RSᶻₑ − hⱼ)      // eq. (21)
-        checking for overlap, since RS is only an estimate
+        find the EP of the best bin minimising
+            f = (RSˣₑ − wⱼ) + (RSʸₑ − dⱼ) + (RSᶻₑ − hⱼ)          // eq. (21)
+        checking overlap, since RS only estimates the free volume
     if such an EP exists: place the item there
-    else if bins < maximum: open a new bin                  // maximum = 1 for the 3BKP
+    else if bins < maximum: open a new bin                       // maximum = 1 for the 3BKP
     else: discard the item
 ```
 
-### As implemented, `BaldiConstruction.pack`
+### Implementation — `BaldiConstruction.pack`
 
 ```
-packing ← empty, extreme points ← { origin, RS = container }
+packing ← empty; extreme points ← { origin, RS = container }
 for each item in order:
-    best ← none, bestScore ← +∞
+    best ← none; bestScore ← +∞
     for each extreme point e, for each of the six rotations r:
         body ← r(size of item)
-        if RSₑ < body on any axis: skip                     // eq. (21) gate
-        if not CanPlace(item, r, e): skip                   // ← inside, clear, AND supported
+        if RSₑ < body on any axis:  skip
+        if not CanPlace(item, r, e): skip
         score ← (RSˣₑ − bodyˣ) + (RSʸₑ − bodyʸ) + (RSᶻₑ − bodyᶻ)
         if score < bestScore: best ← (e, r)
     if best exists: Place(item, best) else: discard(item)
-return packing
+
+CanPlace = inside the container
+         ∧ no overlap with any placed package
+         ∧ bottom face fully supported            ← the only added condition
 ```
 
-`Place` removes the used point, generates the new extreme points, then prunes and recomputes every
-residual space.
+### Differences
 
-| Difference | Why |
-| --- | --- |
-| `CanPlace` also requires full bottom-face support | [J] eq. (11) with α = 1. This is the whole reason the second paper is in the project. |
-| One bin, never opened | The 3BKP has a single container; [B] says so explicitly. |
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **`CanPlace` additionally requires full bottom-face support.** | The Junqueira condition, Part 2. This is the single intended addition to the construction. |
+| 2 | One bin, never opened. | Not a difference: [B] states the 3BKP has one container. |
 
-Everything else is eq. (21) verbatim, including minimising the plain sum of the three slacks rather
-than any weighted or squared variant, and re-checking overlap because RS only estimates the free
-volume.
+Eq. (21) is implemented as the plain sum of the three slacks, minimised, with the residual-space
+gate and the separate overlap re-check the paper describes. No centre-of-mass or distance preference
+enters the construction.
 
 ## 1.3 Extreme points
 
-### As printed, [B] §5, after Crainic et al. [7]
+### Paper — [B] §5, following Crainic et al. [7]
 
 > The new EPs are generated by projecting the points with coordinates (xⱼ + wⱼ, yⱼ, zⱼ),
 > (xⱼ, yⱼ + dⱼ, zⱼ), and (xⱼ, yⱼ, zⱼ + hⱼ) on the orthogonal axes of the knapsack.
 
-### As implemented, `BaldiPacking.appendGeneratedPoints`
+The Residual Space of a new EP is the distance along each axis to the bin side, updated whenever an
+item is added.
+
+### Implementation — `BaldiPacking.appendGeneratedPoints`, `residualSpace`
 
 ```
 for (corner, axes) in [ ((xⱼ+wⱼ, yⱼ, zⱼ), {y,z}),
                         ((xⱼ, yⱼ+dⱼ, zⱼ), {x,z}),
                         ((xⱼ, yⱼ, zⱼ+hⱼ), {x,y}) ]:
     for axis in axes:
-        p ← corner with p[axis] ← the highest face below it, or 0
-        add p as a new extreme point
-prune: drop points outside the container, buried inside an item, or duplicated
-RS(p)[axis] ← distance from p to the nearest item face ahead of it on that axis, or the wall
+        p ← corner, with p[axis] slid to the highest face below it, or 0
+        add p
+prune:  drop points outside the container, buried inside a package, or duplicated
+RS(p)[axis] ← distance from p to the nearest package face ahead of it on that axis, else the wall
 ```
 
-No difference. Six points per placement, each projected onto the two axes it does not extend along.
+### Differences
+
+This **follows the extreme-point construction [B] uses**; it is not claimed to be line-for-line
+identical to Crainic et al., which is a separate paper not re-derived here. Six points per placement,
+each projected onto the two axes it does not extend along, matches [B]'s sentence exactly. The
+pruning of buried and duplicate points, the tolerances, and the recomputation of every RS after each
+placement are **implementation details** — [B] describes the concept and refers to [7] for the
+mechanics.
 
 ## 1.4 Sorting and clustering
 
-### As printed, [B] §5.1, eqs. (22)–(23)
+### Paper — [B] §5.1, eqs. (22)–(23)
 
 ```
-Aᵢ(θ) = [ Aₘᵢₙ + (i−1)(Aₘₐₓ − Aₘᵢₙ)θ/100 ,  Aₘᵢₙ + i(Aₘₐₓ − Aₘᵢₙ)θ/100 ]     // (22)
-Aᵢ(θ) = [ (i−1)·W·D·θ/100 , i·W·D·θ/100 ]    for the knapsack basis area    // (23)
+Aᵢ(θ) = [ Aₘᵢₙ + (i−1)(Aₘₐₓ − Aₘᵢₙ)θ/100 , Aₘᵢₙ + i(Aₘₐₓ − Aₘᵢₙ)θ/100 ]      // (22)
+Aᵢ(θ) = [ (i−1)·W·D·θ/100 , i·W·D·θ/100 ]   for the knapsack basis area       // (23)
 n_c   = ⌈100/θ⌉
 
-six criteria:  a-sw, a-p, sw-a, sw-p, p-sw, p-a
-               (cluster by the first attribute, sort by the second)
+six criteria: a-sw, a-p, sw-a, sw-p, p-sw, p-a   (cluster by the first, sort by the second)
 ```
 
-### As implemented, `BaldiSorting`
+### Implementation — `BaldiSorting`
 
 ```
 θ ← 20, so n_c = 5
-if the clustered attribute is area:  Aₘᵢₙ ← 0, Aₘₐₓ ← W·D          // eq. (23)
-else:                                Aₘᵢₙ, Aₘₐₓ ← range over the items   // eq. (22)
+if the clustered attribute is area: Aₘᵢₙ ← 0, Aₘₐₓ ← W·D                      // eq. (23)
+else:                               Aₘᵢₙ, Aₘₐₓ ← range over the items          // eq. (22)
 cluster(v) ← clamp( ⌈(v − Aₘᵢₙ)/width⌉ , 1, n_c )
 sort by cluster descending, then by the sorted attribute descending, then by index
 ```
 
-Only θ differs, and only because [B] defines it without ever giving it a value.
+### Differences
 
-## 1.5 Centre-of-mass optimisation
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **θ = 20.** | Implementation parameter. [B] defines θ ∈ [1,100] and never gives it a value. |
+| 2 | The profit-keyed criteria (a-p, sw-p, p-sw, p-a) degenerate. | Consequence of p_i = 1, not a code change. All six criteria are still run; four of them collapse onto fewer distinct orderings. |
 
-### As printed, [B] §5.2, eqs. (25)–(29)
+## 1.5 Centre-of-mass balancing — paper mode
+
+### Paper — [B] §5.2, eqs. (25)–(29)
 
 ```
-repeat until: packing is balanced, or no item can move, or max iterations:
-    r_CM ← Σⱼ m_j r_CMⱼ / M                                     // eq. (2)
-    for each item i:
-        r′_CMᵢ ← r_CMᵢ + (r′_CM − r_CM)·M/mᵢ                    // eq. (28)
-        r′ᵢ    ← (r′¹_CMᵢ − γ¹ᵢᵣ, r′²_CMᵢ − γ²ᵢᵣ, r′³_CMᵢ − γ³ᵢᵣ) // eq. (29)
+repeat until: the packing is balanced,
+              or no item can move,
+              or a maximum number of iterations is reached:
+    r_CM ← Σⱼ m_j r_CMⱼ / M                                        // eq. (2)
+    for each item i, one after another:
+        r′_CMᵢ ← r_CMᵢ + (r′_CM − r_CM)·M/mᵢ                        // eq. (28)
+        r′ᵢ    ← (r′¹_CMᵢ − γ¹ᵢᵣ, r′²_CMᵢ − γ²ᵢᵣ, r′³_CMᵢ − γ³ᵢᵣ)     // eq. (29)
         Dᵢ ← positions where i can move without overlapping anything or the bin
         if Dᵢ = ∅:        i cannot move
         elif r′ᵢ ∈ Dᵢ:    move i to r′ᵢ
         else:             move i to r″ᵢ, the point best approximating r′ᵢ on each axis
-compact every item along z towards the (x,y) plane          // gravity
+compact every item along z towards the (x,y) plane                  // gravity
 ```
 
-### As implemented, `BaldiBalancer.optimise`
+### Implementation — `BaldiBalancer.optimise`, paper mode
 
 ```
 best ← placements
 for iteration in 1...50:
-    if mode = paper and r_CM ∈ [L,U]: break
+    if r_CM ∈ [L,U]: break
     moved ← false
-    for each item i, heaviest first:
-        r_CM ← Σⱼ m_j r_CMⱼ / M                                 // eq. (2)
-        if mode = paper and r_CM ∈ [L,U]: break
-        r′_CMᵢ ← r_CMᵢ + (target − r_CM)·M/mᵢ                    // eq. (28)
-        r′ᵢ    ← r′_CMᵢ − extentᵢ/2                              // eq. (29), γ = extent/2
-        Dᵢ     ← mode = paper ? free-slide box around i : whole container
-        r″ᵢ    ← clamp(r′ᵢ, Dᵢ)                                  // "best approximates on each axis"
+    for each item i in packing order:
+        r_CM ← Σⱼ m_j r_CMⱼ / M                                     // eq. (2)
+        if r_CM ∈ [L,U]: break
+        r′_CMᵢ ← r_CMᵢ + (target − r_CM)·M/mᵢ                        // eq. (28)
+        r′ᵢ    ← r′_CMᵢ − extentᵢ/2                                  // eq. (29), γ = extent/2
+        Dᵢ     ← free-slide box around i, bounded by its neighbours
+        r″ᵢ    ← clamp(r′ᵢ, Dᵢ)                                      // "best approximates on each axis"
 
-        if Move(i → r″ᵢ) keeps the packing valid and balanced:   // ← the paper's move, taken as-is
-            apply it; moved ← true; record if best; continue
+        if Move(i → r″ᵢ) leaves the packing valid:                   // no improvement test
+            apply; moved ← true; record if best; continue
 
-        // reached only when full support rejects r″ᵢ
-        candidates ← r″ᵢ, then r″ᵢ at each resting height, then single-axis moves
-                     (centred mode also adds a capped grid of neighbours' face coordinates)
-        pick the candidate that strictly reduces |r_CM − target| and keeps the packing valid
-        if one exists: apply it; moved ← true; record if best
+        ── below here is not [B]; reached only when support rejects r″ᵢ ──
+        candidates ← r″ᵢ at each height something could rest on
+        pick the one that strictly reduces |r_CM − target| and leaves the packing valid
+        if one exists: apply; moved ← true; record if best
     if not moved: break
 return best
+
+Valid = inside the container ∧ no overlap ∧ every package fully supported
 ```
 
-`Valid` means: inside the container, no overlap, and **every** package fully supported.
+### Differences
 
-| Difference | Why |
-| --- | --- |
-| No gravity compaction | Full support forbids the mid-air placements gravity exists to repair, and compacting afterwards would move mass and undo the balance just achieved. |
-| A candidate list when `r″ᵢ` is rejected | Only reached when support blocks the prescribed point, which cannot happen in [B] because [B] has no support rule. Without it the added constraint would block most moves and the load would never balance. |
-| Returns the best arrangement seen | Once clamping and support force partial moves, a run of them can end worse than it started. Balanced beats unbalanced, then closeness to target. Measured over 40 instances it changes nothing; it removes a possibility. |
-| Heaviest first | [B] says only "one item after another". A heavy item needs the shortest move to shift the centre of mass. |
-| 50 iterations | [B] names a maximum-iteration stopping condition and never values it. |
-| `centred` mode does not stop at feasibility | This is the third method, described in Part 3. |
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **Every move must additionally leave the whole packing fully supported.** | The unavoidable consequence of combining [B] with [J]. §5.2 has no support condition. |
+| 2 | **A fallback candidate set when `r″ᵢ` is unsupported**: the same point at each available resting height, and nothing else. | Required by difference 1. Without it, the added constraint would block most moves and the load would never balance. Deliberately minimal; the larger neighbourhood belongs to Part 4. |
+| 3 | **No gravity compaction.** | Not an omission: under α = 1 full support it is provably a no-op. A package off the floor rests on top faces that cover its bottom face completely, so it cannot descend — any drop breaks overlap or support. `testGravityCompactionIsVacuousUnderFullSupport` verifies this. §5.2's compaction exists to repair the mid-air placements [B]'s model allows and this one forbids. |
+| 4 | **The best arrangement seen is returned, not the last.** | Implementation safeguard. [B]'s move is exact by construction; once clamping and support can force partial moves, a run of them could end worse than it started. It changes which arrangement is returned, never which moves are attempted. |
+| 5 | **Items are taken in packing order.** | §5.2 says only "one item after another". Neutral and deterministic. Heaviest-first is a Part 4 choice and is not used here. |
+| 6 | **50 iterations.** | Implementation parameter. §5.2 names the stopping condition and never values it. |
+| 7 | **γ = extent/2.** | Application assumption; see the input choices above. |
 
-## 1.6 Scoring
+## 1.6 Scores and parameters
 
-### As printed, [B] §5.3
-
-```
-Initialisation:   sᵢ ← k·pᵢ if i is in the initial solution, else pᵢ         k = 3
-
-Update:           k ← argmin over loaded i of  μᵢ = (1 + f l ᵢ)·pᵢ/(wᵢdᵢhᵢ)
-                  sₖ ← (1 − α)·sₖ
-                  l ← argmax over unloaded i of θᵢ = pᵢ/(wᵢdᵢhᵢ·(1 + f u ᵢ))
-                  s_l ← (1 + β)·s_l
-                  swap sₖ and s_l
-
-Reinitialisation: sᵢ ← as in Initialisation, against the best solution so far
-                  swap a fixed number of randomly chosen score pairs
-
-Parameters:       α = β = 0.1
-                  best infeasible          → α ← 2α, β ← 2β
-                  best feasible and CoM in the central half of the domain → α ← α/2, β ← β/2
-                  otherwise unchanged
-                  reinitialise every 1000 iterations; pairs = 5% of the items; stop after 5 s
-```
-
-### As implemented
-
-Identical, with two bounds and one clarification:
-
-- steps are held in `(0, 0.9]`, because the paper doubles them without bound and a score of
-  `(1 − α)·s` with α > 1 would go negative;
-- the random pair selection uses a seeded generator, so a run reproduces;
-- `f l ᵢ` and `f u ᵢ` count the rounds the item has been loaded and not loaded, incremented before the
-  update, as the paper describes.
-
-Note that every package here has profit 1, so μᵢ and θᵢ reduce to functions of volume and history
-alone. That is a property of the input, not a change to the rule.
-
-## 1.7 Vertical support
-
-### As printed, [J] eqs. (10)–(11)
+### Paper — [B] §5.3
 
 ```
-for every box j at (x′,y′,z′) with z′ ≠ 0:
+§5.3.1  Initialisation:   sᵢ ← k·pᵢ if i is in the initial solution, else pᵢ,   k = 3
 
-    Σ over boxes i with z′ − hᵢ ≥ 0
-      Σ over x ∈ Xᵢ with x′ − lᵢ + 1 ≤ x ≤ x′ + lⱼ − 1
-        Σ over y ∈ Yᵢ with y′ − wᵢ + 1 ≤ y ≤ y′ + wⱼ − 1
-            L⁽¹⁾ᵢⱼ · W⁽¹⁾ᵢⱼ · aᵢ,x,y,(z′−hᵢ)   ≥   αⱼ · lⱼ · wⱼ · aⱼ,x′,y′,z′
+§5.3.2  Update:           k ← argmin over loaded i of  μᵢ = (1 + f l ᵢ)·pᵢ/(wᵢdᵢhᵢ)
+                          sₖ ← (1 − α)·sₖ,        α ∈ (0,1)
+                          l ← argmax over unloaded i of θᵢ = pᵢ/(wᵢdᵢhᵢ·(1 + f u ᵢ))
+                          s_l ← (1 + β)·s_l,      β ∈ (0,1)
+                          swap sₖ and s_l; leave every other score unchanged
 
-    L⁽¹⁾ᵢⱼ = min(x + lᵢ, x′ + lⱼ) − max(x, x′)
-    W⁽¹⁾ᵢⱼ = min(y + wᵢ, y′ + wⱼ) − max(y, y′)
+§5.3.3  Reinitialisation: rescore as in §5.3.1 against the best solution so far,
+                          then swap a fixed number of randomly chosen score pairs
+                          best infeasible                        → α = 2α,   β = 2β
+                          best feasible ∧ CoM in central half    → α = α/2,  β = β/2
+                          otherwise                              → unchanged
+
+§5.3.4  α = β = 0.1; reinitialise every 1000 iterations; pairs = 5% of items; stop after 5 s
 ```
 
-A box at z′ = 0 is always stable. Valid on reduced normal-pattern sets only when αⱼ = 1.
+### Implementation
 
-### As implemented, `BaldiVerticalSupport.report`
+Direct implementation of all four subsections, with:
 
-```
-required ← extentˣ_j · extentʸ_j
-if |z_j| ≤ tol:  return fully supported by the floor       // the z′ ≠ 0 exemption
-
-rectangles ← []
-for every placement i ≠ j with |top_z(i) − z_j| ≤ tol:     // in contact
-    L ← min(maxˣᵢ, maxˣⱼ) − max(xᵢ, xⱼ)                    // L⁽¹⁾ᵢⱼ
-    W ← min(maxʸᵢ, maxʸⱼ) − max(yᵢ, yⱼ)                    // W⁽¹⁾ᵢⱼ
-    if L > tol and W > tol: rectangles.append((L, W) rectangle)
-
-supported ← UnionArea(rectangles)                          // ← union, not sum
-return supported + tol ≥ required                          // αⱼ = 1
-```
-
-| Difference | Why |
-| --- | --- |
-| α fixed to 1 | Complete support. [J] notes eq. (11) is only valid on reduced sets at α = 1, so this is the unconditionally sound case. |
-| Union, not sum | Equal under non-overlap, so nothing is lost, but the union cannot double-count where a tolerance makes two supporters appear to share a strip. |
-| Continuous coordinates, no `X`, `Y`, `Z` grids | [B]'s heuristic produces continuous positions; there is no discrete set to sum over. [J]'s exclusion of the back and right edges of a top face is a grid artefact with no continuous counterpart. |
-| Load bearing (14) and horizontal stability (12)–(13) not implemented | Out of scope; stated in `METHODS.md`. |
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **α and β are clamped to stay inside (0,1).** | Implementation detail enforcing the interval §5.3.2 requires. Unbounded doubling from 0.1 leaves it on the fourth consecutive infeasible round, after which (1 − α)·s turns a score negative. |
+| 2 | **Seeded random generator** for the reinitialisation pair swaps. | Implementation detail; "randomly selected", made reproducible. |
+| 3 | `ParameterUpdate` runs once per search iteration. | Not a difference. §5.3.3 states the *rule*; the §5 step list and Fig. 6 both place the *call* at the end of every iteration. |
+| 4 | β adapts alongside α. | Not a difference, and worth stating because it looks like one: §5.3.3 says "α = 2α and β = 2β" and "α = α/2 and β = β/2" explicitly. |
 
 ---
 
-# Part 2 — 2D bounding box
+# Part 2 — Junqueira vertical support
 
-## 2.1 Convex hull
+## Paper — [J] eqs. (9)–(11)
 
-### As printed, [L] Algorithm 1
-
-```
-ConvexHull(P):
-    P₀ ← lowest(P)                        // leftmost if tied
-    P  ← sort by polar angle about P₀
-    m ← 1
-    for i ← 1 to n:                       // collapse collinear runs, keep the farthest
-        while i < n−1 and ‖sin ∠P₀PᵢPᵢ₊₁‖ ≤ τ:  i ← i+1
-        Pₘ ← Pᵢ ;  m ← m+1
-    if m < 3: return ∅
-    push P₀, P₁, P₂
-    for i ← 3 to m:
-        while |stack| ≥ 2 and sin ∠(next_top, top, Pᵢ) ≤ τ:  pop
-        push Pᵢ
-    return stack
-```
-
-### As implemented, `PaperTopBoundingBox.convexHull`
+For every box j placed at (x′, y′, z′) with z′ ≠ 0:
 
 ```
-pivot ← min by y, then by x
-sorted ← points sorted by atan2 about pivot, ties by distance ascending
-polar ← []
-i ← 0
-while i < |sorted|:
-    farthest ← sorted[i]
-    j ← i+1
-    while j < |sorted| and ApproximatelyCollinear(pivot, sorted[i], sorted[j], τ):
-        if |sorted[j] − pivot| ≥ |farthest − pivot|:  farthest ← sorted[j]
-        j ← j+1
-    polar.append(farthest);  i ← j
-if |polar| < 2: return ∅                                  // pivot + 2 = the paper's m < 3
-stack ← [pivot, polar[0], polar[1]]
-for p in polar[2...]:
-    while |stack| ≥ 2 and TurnSine(stack[−2], stack[−1], p) ≤ τ:  pop
-    stack.append(p)
-return |stack| ≥ 3 ? stack : ∅
+Σ over boxes i with z′ − hᵢ ≥ 0
+  Σ over x ∈ Xᵢ with x′ − lᵢ + 1 ≤ x ≤ x′ + lⱼ − 1
+    Σ over y ∈ Yᵢ with y′ − wᵢ + 1 ≤ y ≤ y′ + wⱼ − 1
+        L⁽¹⁾ᵢⱼ · W⁽¹⁾ᵢⱼ · aᵢ,x,y,(z′−hᵢ)   ≥   αⱼ · lⱼ · wⱼ · aⱼ,x′,y′,z′
 
-τ = 0.01
+L⁽¹⁾ᵢⱼ = min(x + lᵢ, x′ + lⱼ) − max(x, x′)
+W⁽¹⁾ᵢⱼ = min(y + wᵢ, y′ + wⱼ) − max(y, y′)
 ```
 
-| Difference | Why |
-| --- | --- |
-| A collinear run is measured against its first point, not the previous one | Identical at τ = 0. Above it, anchoring stops the run from drifting off the ray it started on. |
+A box at z′ = 0 is always vertically stable. [J] notes that with the reduced normal-pattern sets
+(1)–(3), eqs. (10)–(11) are valid only for α = 1.
 
-τ = 0.01 is [L]'s own recommended value: "it produces almost the same results as using accurate
-convex-hull points".
+## Implementation — `BaldiVerticalSupport.report`
 
-## 2.2 Orientation search
+```
+required ← extentˣ_j · extentʸ_j
+if |z_j| ≤ tol:  return fully supported            // the z′ ≠ 0 exemption
 
-### As printed, [L] Algorithm 2
+rectangles ← []
+for every placement i ≠ j whose top face is at z_j, within tol:
+    L ← min(maxˣᵢ, maxˣⱼ) − max(xᵢ, xⱼ)             // L⁽¹⁾ᵢⱼ
+    W ← min(maxʸᵢ, maxʸⱼ) − max(yᵢ, yⱼ)             // W⁽¹⁾ᵢⱼ
+    if L > tol and W > tol: append the (L × W) rectangle
+supported ← UnionArea(rectangles)
+return supported + tol ≥ required                  // αⱼ = 1
+```
+
+## Differences
+
+This is **a continuous-coordinate geometric implementation of the vertical-support condition of [J]
+with α = 1**. It is not an implementation of [J]'s MILP, and should not be described as one.
+
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **Continuous coordinates, no X, Y, Z normal-pattern sets and no `a_ixyz` variables.** | [B]'s heuristic produces continuous positions; there is no discrete grid to sum over. The contact rectangles L⁽¹⁾ and W⁽¹⁾ are computed directly from the placements. |
+| 2 | **The contact areas are unioned, not summed.** | Under the non-overlap constraints the two are equal, so nothing is lost. The union additionally cannot double-count a strip that two supporters appear to share because of a tolerance. |
+| 3 | **α_j = 1 for every package**, fixed rather than a parameter. | Application choice: complete support. It is also the case in which [J] states eq. (11) is unconditionally sound. |
+| 4 | [J] excludes the back and right-hand edges of a top face. | No continuous counterpart; a grid artefact of the discrete formulation. |
+| 5 | **Load bearing (14) and horizontal stability (12)–(13) are not implemented.** | Out of scope, stated in `METHODS.md`. |
+
+---
+
+# Part 3 — Liu / Zhang 2D bounding box
+
+Three contributors, kept separate because they are three different sources:
+
+| Contributor | What it provides | Where |
+| --- | --- | --- |
+| **[L] Liu, Liu & Zhang** | Convex-hull extraction by Graham scan, the approximate-collinearity threshold τ, downsampling to N_max, and the candidate directions taken from every pair of hull points | §3.1, §3.2 |
+| **[Z] Zhang, Xu, Dong & Dolan** | The scoring criterion itself — `closeness` — which [L] cites as its reference [15] and does not define | §3.3 |
+| **This application** | Final extents from the full point cloud, height from the support plane, and the width/length naming | §3.4 |
+
+[L] answers one question: which way is the object turned. §3.4 is where the papers stop and the
+application starts.
+
+## 3.1 Convex hull
+
+### Paper — [L] Algorithm 1
+
+```
+P₀ ← lowest(P)                                 // leftmost if tied
+P  ← sort by polar angle about P₀
+m ← 1
+for i ← 1 to n:                                // collapse collinear runs, keep the farthest
+    while i < n−1 and ‖sin ∠P₀PᵢPᵢ₊₁‖ ≤ τ:  i ← i+1
+    Pₘ ← Pᵢ ;  m ← m+1
+if m < 3: return ∅
+push P₀, P₁, P₂
+for i ← 3 to m:
+    while |stack| ≥ 2 and sin ∠(next_top, top, Pᵢ) ≤ τ:  pop
+    push Pᵢ
+return stack
+```
+
+### Implementation — `OrientedBoundingBox.convexHull`
+
+Same structure, with τ = 0.01, [L]'s own recommended value.
+
+### Differences
+
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | A collinear run is measured against the run's **first** point, not the previous one. | Implementation detail. Identical at τ = 0; above it, anchoring stops the run drifting off the ray it started on. |
+
+## 3.2 Orientation search
+
+### Paper — [L] Algorithm 2
 
 ```
 S ← INT_MAX
@@ -370,7 +409,34 @@ for i ← 0 to |C|−1:
         if Scur < S:  θ, length, width ← θcur, lcur, wcur
 ```
 
-### And `closeness`, as printed in [Z]
+### Implementation — `OrientedBoundingBox.bestOrientation`
+
+```
+sample ← ReservoirDownsample(points, N_max = 100)
+hull   ← ConvexHull(sample, τ = 0.01)
+if |hull| < 3: return nil
+bestScore ← −∞
+for i ← 0 to |hull|−2:
+    for j ← i+1 to |hull|−1:
+        axis  ← normalise(hull[j] − hull[i])
+        score ← Closeness(sample, axis, d₀)
+        if score > bestScore: bestScore ← score; bestAxis ← axis
+return bestAxis
+```
+
+### Differences
+
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **The criterion is maximised, not minimised.** | [L]'s printed optimisation direction (`S = INT_MAX`, keep `Scur < S`, "a smaller closeness means a better orientation") conflicts with the definition and original use of the referenced closeness criterion of [Z], which increases as the points lie closer to the rectangle edges and which [Z] explicitly treats as a maximisation objective. The implementation follows [Z]'s maximisation convention. |
+| 2 | **Reservoir sampling**, seeded. | [L] says "uniformly downsampled" without specifying a method. Reservoir sampling gives a uniformly random subset; seeding makes a scan reproducible. Implementation choice. |
+| 3 | Direction vectors instead of `atan2`. | Implementation detail; algebraically the same, and it avoids a wrap at ±π. |
+| 4 | N_max = 100. | [L]'s largest tested value, where the reported average error is under 1°. |
+| 5 | Only θ is returned; `lcur`, `wcur` are not. | See §3.4 — the size is computed differently by the application. |
+
+## 3.3 Zhang's closeness
+
+### Paper — [Z]
 
 ```
 C₁ ← X cos θ + Y sin θ ;  C₂ ← −X sin θ + Y cos θ
@@ -378,77 +444,180 @@ D₁ ← argmin( ‖max C₁ − C₁‖ , ‖C₁ − min C₁‖ )
 D₂ ← argmin( ‖max C₂ − C₂‖ , ‖C₂ − min C₂‖ )
 β ← 0
 for each pair (d₁, d₂):  β ← β + 1 / max( min(d₁, d₂), d₀ )
-return β                                     // the search takes the argmax of β
+return β                                        // the search takes the argmax
 ```
 
-### As implemented, `PaperTopBoundingBox.make`
+### Implementation — `OrientedBoundingBox.closenessScore`
+
+Term for term: the same squared-norm side selection, the same `1/max(min(d₁,d₂), d₀)` accumulation,
+`d₀` supplied as `minimumEdgeDistance`.
+
+### Differences
+
+None identified against [Z]. Where [L] and [Z] disagree on the direction of optimisation, see §3.2,
+difference 1.
+
+## 3.4 Final extents and height — application only
+
+**Not from [L] or [Z].** [L] states explicitly that it "focus[es] on evaluating the orientation
+accuracy … and omit[s] the size information", and warns that size is the quantity most damaged by
+missing points. This application is measuring size, so it takes the orientation from the paper and
+builds the box itself.
 
 ```
-all2D  ← every object point projected onto the support plane
-sample ← ReservoirDownsample(all2D, 100)
-hull   ← ConvexHull(sample, τ = 0.01)
-if |hull| < 3: return nil
-
-bestScore ← −∞
-for i ← 0 to |hull|−2:
-    for j ← i+1 to |hull|−1:
-        axis ← normalise(hull[j] − hull[i])          // the direction, not the angle
-        score ← Closeness(sample, axis, d₀)
-        if score > bestScore:  bestScore ← score; bestAxis ← axis     // ← argmax
-
-fit ← min/max projection of ALL2D onto (bestAxis, bestAxis⊥)          // ← full cloud
-if depth > width: swap the two axes so width is the longer side
-height ← max projection of every point onto the up axis − ground height
+axis   ← bestOrientation(all 2D points)               // Part 3.2, the paper's answer
+fit    ← min/max projection of ALL points onto (axis, axis⊥)
+if depth > width: swap, so the longer horizontal side is called width
+height ← max projection of every point onto the up axis − support-plane height
 ```
 
-`Closeness` is [Z] term for term: the same squared-norm side selection, the same
-`1/max(min(d₁,d₂), d₀)` accumulation, `d₀` supplied as `minimumEdgeDistance`.
-
-| Difference | Why |
-| --- | --- |
-| **Maximise, not minimise** | [Z]'s β is larger the better the points hug the rectangle, and [Z]'s own search takes the argmax. [L]'s `S = INT_MAX` / `Scur < S` would select the worst-fitting orientation. The comparison in Algorithm 2 is a misprint. |
-| Extents from the full cloud, orientation from the sample | [L] states it omits size and warns size is what missing points damage most. A downsample discards disproportionately the extreme points, which are exactly the ones that set the extents. The orientation search is untouched. |
-| Reservoir sampling, seeded | [L] says "uniformly downsampled" without specifying random subset or fixed stride. Seeding makes a scan reproducible. |
-| Direction vectors instead of `atan2` | Algebraically identical and avoids a wrap at ±π. |
-| Longer side named width | An app convention. [L] does not evaluate size at all. |
-| `N_max` = 100 | [L]'s upper tested value, where average error is under 1°. |
+| # | Element | Category |
+| --- | --- | --- |
+| 1 | Extents from the **full** cloud while orientation uses the sample. | Application extension. A downsample discards disproportionately the extreme points, which are exactly the ones that set the extents. It cannot affect the orientation, which is computed first and from the sample only. |
+| 2 | Height from the support plane to the highest point. | Application; [L] is purely 2D. |
+| 3 | Longer horizontal side named "width". | Application naming convention. |
+| 4 | Full 3D and Top modes share this fitter. | Application. The world is gravity-aligned and the object rests on a horizontal plane, so the box has a vertical axis by construction and the 3D fit reduces to the same 2D problem. A PCA fit remains as a fallback for a cloud too degenerate to hull. |
 
 ---
 
-# Part 3 — `centred`, the third method
+# Part 4 — The centred extension
 
-`centred` is not in either paper. It is [B] §5.2 with the stopping rule relaxed, offered next to the
-faithful `paper` mode so the two can be compared on the same measurements.
+**This method is not contained in [B], [J], [L] or [Z].** It is an extension introduced in this
+project and must not be presented as any paper's algorithm.
 
-[B] treats balance as a **feasibility** condition: the centre of mass must lie in `[L, U]`, and
-§5.2's first stopping condition is "the packing is balanced". The moment it is inside the domain,
-the procedure is finished — anywhere inside is as good as anywhere else. That is `paper` mode, and
-it is why its mean distance from the domain centre is around 100 mm on a container a few hundred
-millimetres across: it stops at the boundary it was asked to reach.
+## Why it exists
 
-`centred` treats balance as an **objective**. Four changes, all in `BaldiBalancer` and the two
-comparison functions:
+[B] treats balance as a feasibility condition. Entering the admissible centre-of-mass region
+satisfies that condition and, by §5.2's first stopping condition, ends the relocation procedure.
+[B]'s overall heuristic does still care about balance beyond feasibility — the unbalancing index
+appears in the merit function, eq. (24) — but the *relocation* stops at the region boundary. The
+centred extension differs by explicitly continuing relocation towards the centre of the region after
+feasibility has already been achieved.
 
-| | `paper` | `centred` |
+For a drone module the admissible region is a tolerance, not a target; margin inside it is what
+absorbs flight loads and error in the measured masses.
+
+## Modifications relative to the paper implementation
+
+Everything not listed is shared: the same construction, the same six sorting criteria, the same
+scoring and parameter adaptation, the same full-support rule, the same verifier, the same
+50-iteration cap.
+
+| | Paper mode | `centred` |
 | --- | --- | --- |
-| Stop when the centre of mass enters `[L, U]` | yes, §5.2's first condition | no, keeps going |
-| Domain `Dᵢ` for a move | the free-slide box bounded by the item's immediate neighbours, [B]'s own construction | the whole container minus the item's extent |
-| Candidates when the prescribed point is unsupported | that point at each resting height, then single-axis moves | the same, plus a distance-ordered grid built from the neighbouring faces, capped at 48 |
-| Distance to the domain centre as a tie-break between equal-count packings | no | yes, in both `isBetterForSearch` and `isBetterFeasible` |
+| Stop relocating when the centre of mass enters [L, U] | yes, §5.2's first condition | no, keeps going |
+| Ranking of solutions | eq. (24), F = P − αÛ | package count, then distance from the centre of [L, U] |
+| Movement domain Dᵢ | the free-slide box bounded by the item's neighbours, [B]'s own construction | the whole container minus the item's extent |
+| Candidates when the prescribed point is unsupported | that point at each resting height | the same, plus a distance-ordered grid built from neighbouring faces, capped at 48 |
+| Relocation order | packing order | heaviest first |
 
-Everything else is shared: the same construction, the same six sorting criteria, the same scoring,
-the same full-support rule, the same verifier, the same 50-iteration cap and heaviest-first order.
+## Measured effect
 
-The practical difference, measured over 40 random 8-package instances at 0.35 s each:
+40 random 8-package instances, 0.35 s each:
 
-| | packages loaded | balanced | mean distance from domain centre |
+| | packages loaded | balanced | mean distance from the region centre |
 | --- | --- | --- | --- |
-| `paper` | 317 / 320 | 40 / 40 | 103 mm |
-| `centred` | 315 / 320 | 40 / 40 | 4 mm |
+| paper | 317 / 320 | 40 / 40 | 103 mm |
+| centred | 315 / 320 | 40 / 40 | 4 mm |
 
-So `centred` costs about 0.6% of the load and puts the centre of mass roughly 25× closer to the
-middle of its allowed region. Both satisfy [B]'s constraint; `centred` satisfies it with margin. For
-a drone module, where the domain is a tolerance rather than a target, that margin is what absorbs
-flight loads and any error in the measured masses — which is the reason the mode exists.
+Both satisfy [B]'s balancing constraint. `centred` satisfies it with margin, at a cost of about 0.6%
+of the load.
 
-`paper` is the mode to cite. `centred` is the mode to fly.
+---
+
+# Part 5 — When a measurement is finished
+
+The rule that decides a scan has settled. Included here because it is the other place in the project
+where a statistical procedure could be mistaken for a cited method.
+
+## The condition, exactly
+
+Over the sliding window of the last **N = 24** observations of one dimension:
+
+```
+x̄ₙ = (1/n) Σ xᵢ
+sₙ = √( Σ(xᵢ − x̄ₙ)² / (n − 1) )              Bessel-corrected sample standard deviation
+hₙ = t₀.₉₇₅,ₙ₋₁ · sₙ / √n                     95% two-sided confidence-interval half-width
+δₙ = | mean(second half of window) − mean(first half) |
+dₙ = max(5 mm, 1% · |x̄ₙ|) / 2                 one combined tolerance, halved because hₙ is one side
+```
+
+The scan finishes when, for width, depth **and** height simultaneously:
+
+```
+n ≥ 24    ∧    hₙ ≤ dₙ    ∧    δₙ ≤ dₙ    ∧    a support plane exists beneath the object
+```
+
+Second exit: if at least 4 observations exist and none has arrived for 2.5 s, the measurement
+finishes anyway, on the grounds that no further waiting can tighten it.
+
+`dₙ` is a single threshold, not two alternative tests. The relative term governs dimensions above
+500 mm; the 5 mm floor governs everything smaller, so a 100 mm object is never asked for the 1 mm
+precision it could not reach.
+
+## What is literature-derived and what is not
+
+| Element | Status |
+| --- | --- |
+| The stopping **form** `hₙ ≤ dₙ` — sample until the interval is narrow enough, with n not fixed in advance | The fixed-width sequential principle of **Chow & Robbins (1965)**. The only element with a literature source. |
+| Sliding window of 24 instead of an accumulating sample | Project-defined, **and the reason the citation cannot stand as "the method"** |
+| N = 24 | Project-defined |
+| 95% level | Project-defined |
+| Student-t finite-sample quantile in place of a normal quantile | Project-defined implementation choice |
+| 5 mm floor, 1% relative term | Project-defined |
+| The drift test `δₙ ≤ dₙ` | Project-defined; no counterpart in Chow & Robbins |
+| The 2.5 s stale-evidence exit | Project-defined safeguard |
+| Requiring a support plane | Project-defined; a physical precondition the statistics cannot see |
+
+## Why this is not the Chow–Robbins procedure
+
+Chow & Robbins accumulate every observation. That is what makes `hₙ → 0` almost surely and gives the
+procedure its asymptotic guarantee on coverage and width. Here the estimator runs over a **fixed
+24-frame window**, so `hₙ` does not shrink with time; it measures how consistent the most recent 24
+fits are with each other.
+
+The window is deliberate rather than a shortcut. The quantity being estimated genuinely moves as new
+faces of the object come into view — a side view that finally reveals the true height changes the
+mean being estimated — so an accumulating sample would average across a changing quantity and break
+the fixed-mean assumption more seriously than the window breaks independence.
+
+A second, smaller caveat: consecutive LiDAR frames of a stationary object from a nearly stationary
+viewpoint are **positively correlated**, so `sₙ/√n` understates the true uncertainty of the mean.
+The window bounds how far that error can compound but does not remove it.
+
+The description used throughout the code and notes is therefore: *a windowed precision criterion
+that borrows the fixed-width sequential stopping form of Chow & Robbins, with project-defined
+thresholds and two additional conditions.* They may be cited as the origin of the stopping form;
+they must not be cited as the implemented method, and none of 24, 95%, 5 mm or 1% may be attributed
+to them.
+
+---
+
+# What is tested
+
+`BaldiPaperFidelityTests` pins the claims above that could otherwise drift:
+
+| Test | Protects |
+| --- | --- |
+| `testMeritIsProfitMinusAlphaTimesUnbalancingIndex` | eq. (24) |
+| `testMeritPenaltyCanOrderEqualCountsButNeverOutvotesAPackage` | the normalisation of U is a tie-break, not a re-weighting |
+| `testAnUnbalancedPackingMayBeTheSearchIncumbent` | BS may be infeasible, as §5.3.3 presupposes |
+| `testBothAlphaAndBetaAdaptTogetherAsTheParagraphStates` | §5.3.3 verbatim |
+| `testParametersStayInsideTheOpenUnitIntervalTheScoreUpdateRequires` | the §5.3.2 interval |
+| `testGravityCompactionIsVacuousUnderFullSupport` | the claim in Part 1.5, difference 3 |
+| `testPaperBalancingUsesPackingOrderAndCentredUsesHeaviestFirst` | Part 1.5, difference 5, and Part 4 separation |
+| `testEveryReturnedPackingPassesTheIndependentVerifier` | overlap, boundary, balance and support of every result |
+| `testClosenessIsMaximisedSoTheChosenAxisHugsTheRectangle` | Part 3.2, difference 1 |
+| `testFullCloudExtentsDoNotChangeTheOrientationChosen` | Part 3.4, element 1 |
+
+`MeasurementConvergenceRuleTests` pins Part 5:
+
+| Test | Protects |
+| --- | --- |
+| `testToleranceIsHalfOfMaxOfFloorAndRelativeTerm` | dₙ is one combined threshold, halved |
+| `testWindowSlidesAndTheMinimumBlocksAnEarlyFinish` | 24 is both a window and a minimum, and not a cap |
+| `testNoisyMeasurementsDoNotFinishAndTheirHalfWidthIsReported` | the precision test really is hₙ |
+| `testASteadyRampIsRejectedEvenWhenTheIntervalIsTight` | δₙ is a separate condition |
+| `testOneUnsettledDimensionBlocksTheWholeMeasurement` | all three dimensions must clear it |
+| `testWithoutASupportPlaneNothingFinishes` | the physical precondition |
+| `testStaleEvidenceFinishesTheScanWithoutThePrecisionTest` | the second exit, and that it is a safeguard |

@@ -210,6 +210,28 @@ nonisolated struct BaldiSolution: Sendable {
         return (total / Double(loadedCount)).squareRoot()
     }
 
+    /// U from eq. (4) rescaled by the knapsack's half-diagonal, so it is dimensionless and cannot
+    /// exceed 1. Needed only because this application fixes p_i = 1: Baldi's benchmark profits run
+    /// to six figures, so raw millimetre U is negligible beside P, whereas here it would swamp a
+    /// package count. Normalised, the penalty stays below 1 and orders equal-count packings without
+    /// ever outvoting a package. Application-specific scaling, not part of eq. (24).
+    var normalisedUnbalancingIndex: Double {
+        let extent = SIMD3<Double>(
+            Double(knapsack.size.x),
+            Double(knapsack.size.y),
+            Double(knapsack.size.z)
+        )
+        let halfDiagonal = simd_length(extent) / 2
+        guard halfDiagonal > 0, unbalancingIndex.isFinite else { return 0 }
+        return min(unbalancingIndex / halfDiagonal, 1)
+    }
+
+    /// Baldi eq. (24): F = P − αU. P is eq. (1), which with p_i = 1 is the loaded-package count.
+    func merit(alpha: Double) -> Double {
+        guard loadedCount > 0 else { return 0 }
+        return profit - alpha * normalisedUnbalancingIndex
+    }
+
     var isBalanced: Bool {
         loadedCount > 0 && knapsack.containsCentreOfMass(centreOfMass)
     }

@@ -83,13 +83,14 @@ origin at the bottom-left-back corner, container in the first octant.
 | Rotated dimensions | retained |
 | Cargo centre of mass, eq. (2) | retained |
 | Hard centre-of-mass domain `[L, U]` | retained as feasibility |
-| Unbalancing index, eqs. (3)–(4) | computed and shown on the result screen; the search does not use it |
+| Unbalancing index, eqs. (3)–(4) | computed, shown on the result screen, and used by the merit function |
 | Extreme Points and Residual Space, §5.1 | retained |
 | EP-BPH and its best-fit rule, eq. (21) | retained, with support added to the candidate gate |
 | Clustering, eqs. (22)–(23), and the six criteria | retained |
 | PCH opening solution | retained |
 | Centre-of-mass adjustment, eqs. (25)–(29) | retained; see the three departures below |
-| Scoring, §5.3.1–§5.3.4, and the Fig. 6 loop | retained |
+| Scoring, §5.3.1–§5.3.4, and the Fig. 6 loop | retained, including the per-iteration parameter update |
+| Merit function, eq. (24) | retained, with U normalised — see below |
 
 Default domain is the paper's own instance setting: `L = (W/4, D/4, 0)`, `U = (3W/4, 3D/4, H/2)`.
 
@@ -99,9 +100,11 @@ Default domain is the paper's own instance setting: `L = (W/4, D/4, 0)`, `U = (3
   no measured or editable package value.
 - **Geometric-centre package mass.** Each package's centre of mass is the middle of its box, which
   matches the paper's benchmark generator but is narrower than its general formulation.
-- **Merit coefficient zero.** The paper's `F = P − αU` reduces to `F = P`. Domain membership is
-  separately mandatory. Distance from the domain centre breaks ties only between verified packings
-  that load the same number of packages; it cannot override the count objective.
+- **Normalised unbalancing index.** `F = P − αU` is used as written, with α the adaptive parameter
+  of §5.3 — the only value the paper offers, since §5.2 defers to it. U is divided by the container
+  half-diagonal first. With the paper's six-figure profits raw U is negligible beside P; with P a
+  package count it would swamp it. Normalised, the penalty stays below 1, so it orders equal-count
+  packings and can never cost a package.
 - **One rigid container.** Packages are rigid, supporting packages are assumed strong enough, and
   restraint against horizontal sliding is assumed.
 
@@ -137,10 +140,10 @@ independent verifier, so no package ever floats.
 
 All three follow from making support a hard constraint, which Baldi's §5.2 does not have.
 
-**Gravity is replaced, not omitted.** §5.2 ends by compacting every item along z towards the floor,
-which is Baldi's repair for the mid-air placements his model permits. Full support forbids those
-placements in the first place, so there is nothing to repair, and compacting afterwards would move
-mass and undo the balance the procedure had just achieved.
+**Gravity compaction is vacuous, not dropped.** §5.2 ends by compacting every item along z towards
+the floor — Baldi's repair for the mid-air placements his model permits. Under complete support a
+package off the floor rests on top faces covering its whole bottom face, so it cannot descend at
+all: any drop breaks overlap or support. The step is provably a no-op here, and a test says so.
 
 **A fallback when the prescribed move is unsupported.** The move §5.2 prescribes — eq. (28), then
 eq. (29), then clamped into `D_i` — is attempted first and taken whenever the packing stays valid,
@@ -175,11 +178,11 @@ immediately below (15).
 | Symbol | Value used | Why |
 | --- | --- | --- |
 | `M` | `S^δ` per dimension | Smallest value that cannot cut off a feasible point. |
-| `α` in `F = P − αU` | 0 | §5.2 defers to §5.3, which only sets the scoring `α`. The symbol is reused for two different parameters and this one is never given. |
+| `α` in `F = P − αU` | the adaptive `α` of §5.3 | The symbol is reused for the merit penalty and the score step. §5.2 says "for setting the α values see Section 5.3", which is the only value on offer. |
 | `θ`, cluster width | 20 %, five buckets | Defined but never valued. |
 | Ideal point `r⁰` | centre of `[L, U]` | The only choice symmetric in the constraint. |
 | Balancing iteration cap | 50 | Named as a stopping condition, never valued. |
-| Balancing order | heaviest first | Not fixed. A heavy package needs the shortest move to shift the centre of mass. |
+| Balancing order | packing order | §5.2 says only "one item after another", so paper mode stays neutral. Heaviest-first belongs to the centred extension. |
 | Reinitialisation trigger | 1000 non-improving rounds | §5.3.4 says "every 1000 iterations"; Fig. 6 labels the box "Non Improving Iter. Limit". |
 | When the score steps adapt | at reinitialisation | §5.3.3 states the α = 2α / β = 2β rule as part of reinitialisation; Fig. 6 draws Parameter Update on every pass. The prose wins: run per pass, both steps double from 0.1 to the cap within four rounds and stay there, so the adaptation the paper describes would never happen. |
 | Score step bounds | held in `(0, 0.9]` | The update doubles them; unbounded doubling would make a score negative. |
@@ -191,7 +194,8 @@ reinitialisation, a 5 s stopping time, six rotations, and the instance domain.
 ## What this is not
 
 - Not a 1-to-1 implementation of either paper. It is Baldi's heuristic, specialised as above, with
-  Junqueira's support condition evaluated on continuous coordinates.
+  Junqueira's vertical-support condition evaluated geometrically on continuous coordinates at α = 1.
+  `../PSEUDOCODE.md` sets the two side by side and lists every difference.
 - Not an exact solver, and not a proof of optimality. The result is the best **verified feasible**
   packing found in the search time.
 - Not a proof of infeasibility when nothing is found — only that nothing was found in the time given.

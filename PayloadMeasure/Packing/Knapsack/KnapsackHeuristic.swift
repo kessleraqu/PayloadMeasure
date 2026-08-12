@@ -348,14 +348,20 @@ nonisolated enum BaldiConstruction {
 
 // MARK: - Balancing
 
-/// Nudges packages, one at a time, to bring the cargo centre of mass towards the middle of its
-/// domain. Paper mode stops the moment the centre of mass is inside and only considers positions
-/// reachable past the immediate neighbours; centred mode keeps going and will relocate a package
-/// anywhere legal. Every proposed arrangement is revalidated whole, because moving a low package
+/// Baldi §5.2, eqs. (25)–(29). Moves one package at a time so the cargo centre of mass travels
+/// towards the target, revalidating the whole arrangement each time because moving a low package
 /// can strand the ones above it.
+///
+/// Gravity compaction, the last sentence of §5.2, is deliberately absent and is *not* simply
+/// dropped. It exists to repair the mid-air placements Baldi's model permits. Here every accepted
+/// arrangement already satisfies full bottom-face support, which means each package off the floor
+/// rests on top faces that cover it completely — so no package has anywhere to descend to, and
+/// compaction is provably a no-op. `testGravityCompactionIsVacuousUnderFullSupport` pins that down.
 nonisolated enum BaldiBalancer {
     nonisolated struct Options: Sendable, Equatable {
         var mode: BaldiPackingMode = .paper
+        /// §5.2 names "a maximum number of iterations has been reached" as a stopping condition but
+        /// never values it. 50 is an implementation parameter.
         var maximumIterations = 50
 
         init() {}
@@ -395,8 +401,11 @@ nonisolated enum BaldiBalancer {
                knapsack.containsCentreOfMass(centreOfMass(of: current)) { break }
             var movedAnything = false
 
-            // Heaviest first: a heavy package needs the shortest move to shift the centre of mass.
-            let order = current.indices.sorted { current[$0].mass > current[$1].mass }
+            // §5.2 says only "it moves one item after another". Paper mode therefore takes them in
+            // packing order — neutral and deterministic. Heaviest-first is a centred-mode choice.
+            let order: [Int] = options.mode == .centred
+                ? current.indices.sorted { current[$0].mass > current[$1].mass }
+                : Array(current.indices)
 
             for index in order {
                 let centre = centreOfMass(of: current)
@@ -442,7 +451,7 @@ nonisolated enum BaldiBalancer {
                 let candidates: [SIMD3<Double>]
                 switch options.mode {
                 case .paper:
-                    candidates = localCandidateOrigins(for: index, desired: clamped, in: current, domain: domain)
+                    candidates = supportedFallbackOrigins(for: index, desired: clamped, in: current, domain: domain)
                 case .centred:
                     candidates = centredCandidateOrigins(for: index, desired: clamped, in: current, domain: domain)
                 }
@@ -622,26 +631,25 @@ nonisolated enum BaldiBalancer {
         return result
     }
 
-    private static func localCandidateOrigins(
+    /// Reached only when the support rule rejects §5.2's own destination, which cannot happen in
+    /// Baldi because Baldi has no support rule. Kept deliberately minimal: the same point at each
+    /// height something could rest on, and nothing else. The larger neighbourhood belongs to the
+    /// centred extension.
+    private static func supportedFallbackOrigins(
         for index: Int,
         desired: SIMD3<Double>,
         in placements: [BaldiPlacement],
         domain: CandidateDomain
     ) -> [SIMD3<Double>] {
         let original = placements[index].origin
-        var candidates: [SIMD3<Double>] = [desired]
+        var candidates: [SIMD3<Double>] = []
 
-        let supportHeights = [0.0] + placements.indices
+        let restingHeights = [0.0] + placements.indices
             .filter { $0 != index }
             .map { placements[$0].maximum.z }
-        for height in supportHeights where height >= domain.lower.z && height <= domain.upper.z {
+        for height in restingHeights where height >= domain.lower.z && height <= domain.upper.z {
             var candidate = desired
             candidate.z = height
-            candidates.append(candidate)
-        }
-        for axis in 0..<3 {
-            var candidate = original
-            candidate[axis] = desired[axis]
             candidates.append(candidate)
         }
 
@@ -774,7 +782,10 @@ nonisolated struct BaldiSearchOptions: Sendable, Equatable {
     var timeLimitSeconds: Double = 5
     /// How hard a score is pushed down when a loaded package looks like a poor use of space, and up
     /// when an unloaded one looks promising. Both adapt as the search runs.
+    /// Baldi §5.3.2 α and §5.3.4's initial value. Also the penalty in eq. (24): the paper reuses the
+    /// symbol for both and §5.2 points at §5.3 for its value.
     var scoreDecrease: Double = 0.1
+    /// Baldi §5.3.2 β.
     var scoreIncrease: Double = 0.1
     /// Packages loaded by the opening solution start with this multiple of the base score.
     var loadedScoreFactor: Double = 3
@@ -828,13 +839,23 @@ nonisolated enum BaldiSearch {
             )
             let packed = balance(BaldiConstruction.pack(order: order, knapsack: problem.knapsack), options: options)
             if bestForSearch == nil
-                || isBetterForSearch(packed, than: bestForSearch!, mode: options.centreOfMass.mode) {
+                || isBetterForSearch(
+                    packed,
+                    than: bestForSearch!,
+                    alpha: options.scoreDecrease,
+                    mode: options.centreOfMass.mode
+                ) {
                 bestForSearch = packed
                 bestCriterion = criterion
             }
             if isFeasible(packed) {
                 if let incumbent = bestFeasible {
-                    if isBetterFeasible(packed, than: incumbent, mode: options.centreOfMass.mode) {
+                    if isBetterFeasible(
+                        packed,
+                        than: incumbent,
+                        alpha: options.scoreDecrease,
+                        mode: options.centreOfMass.mode
+                    ) {
                         bestFeasible = packed
                     }
                 } else {
@@ -897,14 +918,6 @@ nonisolated enum BaldiSearch {
                     options: options,
                     generator: &generator
                 )
-                // §5.3.3 states the step-size rule as part of reinitialisation, so it belongs here
-                // rather than on every pass. Per pass the steps would saturate within four rounds.
-                parameterUpdate(
-                    best: searchBest,
-                    knapsack: problem.knapsack,
-                    decrease: &scoreDecrease,
-                    increase: &scoreIncrease
-                )
                 reinitialisations += 1
                 nonImproving = 0
             } else {
@@ -919,7 +932,12 @@ nonisolated enum BaldiSearch {
                 )
             }
 
-            if isBetterForSearch(current, than: searchBest, mode: options.centreOfMass.mode) {
+            if isBetterForSearch(
+                current,
+                than: searchBest,
+                alpha: scoreDecrease,
+                mode: options.centreOfMass.mode
+            ) {
                 searchBest = current
                 nonImproving = 0
             } else {
@@ -928,7 +946,12 @@ nonisolated enum BaldiSearch {
 
             if isFeasible(current) {
                 if let incumbent = bestFeasible {
-                    if isBetterFeasible(current, than: incumbent, mode: options.centreOfMass.mode) {
+                    if isBetterFeasible(
+                        current,
+                        than: incumbent,
+                        alpha: scoreDecrease,
+                        mode: options.centreOfMass.mode
+                    ) {
                         bestFeasible = current
                         improvements += 1
                     }
@@ -937,6 +960,14 @@ nonisolated enum BaldiSearch {
                     improvements += 1
                 }
             }
+
+            // Last step of the §5 loop, and the position Fig. 6 draws it in: every iteration.
+            parameterUpdate(
+                best: searchBest,
+                knapsack: problem.knapsack,
+                decrease: &scoreDecrease,
+                increase: &scoreIncrease
+            )
         }
 
         let elapsed = clock.now - startedAt
@@ -954,33 +985,47 @@ nonisolated enum BaldiSearch {
         )
     }
 
-    /// Ranking used while searching. Count first, then support and balance, then how central the
-    /// load is — but only in centred mode.
+    /// "If CS is better than BS" from the §5 step list. Paper mode is eq. (24) and nothing else, so
+    /// an unbalanced packing can be the incumbent — which is what §5.3.3's "if the best solution is
+    /// unfeasible" branch presupposes. Centred adds its own objective; see the extension note.
     static func isBetterForSearch(
         _ candidate: BaldiSolution,
         than incumbent: BaldiSolution,
+        alpha: Double,
         mode: BaldiPackingMode = .paper
     ) -> Bool {
-        if candidate.loadedCount != incumbent.loadedCount {
-            return candidate.loadedCount > incumbent.loadedCount
+        if mode == .centred {
+            if candidate.loadedCount != incumbent.loadedCount {
+                return candidate.loadedCount > incumbent.loadedCount
+            }
+            return isCloserToIdeal(candidate, than: incumbent)
         }
-        if candidate.isFullySupported != incumbent.isFullySupported { return candidate.isFullySupported }
-        if candidate.isBalanced != incumbent.isBalanced { return candidate.isBalanced }
-        return mode == .centred && isCloserToIdeal(candidate, than: incumbent)
+        let candidateMerit = candidate.merit(alpha: alpha)
+        let incumbentMerit = incumbent.merit(alpha: alpha)
+        guard candidateMerit.isFinite, incumbentMerit.isFinite else { return candidateMerit.isFinite }
+        // Strictly greater, with a floor so a tie cannot flip on floating-point noise.
+        return candidateMerit > incumbentMerit + 1e-12
     }
 
-    /// Ranking used for the result actually shown, which is always already feasible.
+    /// Application-level safety wrapper, not part of Baldi. BS above may be infeasible, but the
+    /// screen must never be shown a packing that is not balanced and fully supported, so the
+    /// feasible incumbent is tracked separately and is what gets returned. It never influences
+    /// which packings the search builds or keeps.
     static func isBetterFeasible(
         _ candidate: BaldiSolution,
         than incumbent: BaldiSolution,
+        alpha: Double,
         mode: BaldiPackingMode = .paper
     ) -> Bool {
         guard isFeasible(candidate) else { return false }
         guard isFeasible(incumbent) else { return true }
-        if candidate.loadedCount != incumbent.loadedCount {
-            return candidate.loadedCount > incumbent.loadedCount
+        if mode == .centred {
+            if candidate.loadedCount != incumbent.loadedCount {
+                return candidate.loadedCount > incumbent.loadedCount
+            }
+            return isCloserToIdeal(candidate, than: incumbent)
         }
-        return mode == .centred && isCloserToIdeal(candidate, than: incumbent)
+        return candidate.merit(alpha: alpha) > incumbent.merit(alpha: alpha) + 1e-12
     }
 
     private static func balance(
@@ -1064,8 +1109,14 @@ nonisolated enum BaldiSearch {
         }
     }
 
-    /// Widens the score steps while the best packing is still unbalanced, narrows them once it is
-    /// comfortably inside the domain. Held below one so a score can never go negative.
+    /// §5.3.3, third paragraph, verbatim: "If the best solution found so far is unfeasible, α = 2α
+    /// and β = 2β. If the best solution is feasible, α = α/2 and β = β/2, if the center of mass lies
+    /// into the central half of its feasibility domain, while they are unchanged otherwise." Both
+    /// parameters do move together — that is the paper's rule, not an assumption made here.
+    ///
+    /// The clamp is an implementation detail: §5.3.2 requires α, β ∈ (0,1), and unbounded doubling
+    /// from 0.1 leaves that interval on the fourth infeasible round, at which point (1 − α)·s would
+    /// turn a score negative.
     private static func parameterUpdate(
         best: BaldiSolution,
         knapsack: BaldiKnapsack,
@@ -1092,6 +1143,16 @@ nonisolated enum BaldiSearch {
             decrease = max(1e-4, decrease / 2)
             increase = max(1e-4, increase / 2)
         }
+    }
+
+    /// Exposed so the tests can pin §5.3.3's rule directly.
+    static func parameterUpdateForTesting(
+        best: BaldiSolution,
+        knapsack: BaldiKnapsack,
+        decrease: inout Double,
+        increase: inout Double
+    ) {
+        parameterUpdate(best: best, knapsack: knapsack, decrease: &decrease, increase: &increase)
     }
 
     private static func isCloserToIdeal(_ candidate: BaldiSolution, than incumbent: BaldiSolution) -> Bool {

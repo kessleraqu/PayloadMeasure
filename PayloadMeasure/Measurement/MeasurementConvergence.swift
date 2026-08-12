@@ -1,10 +1,37 @@
 import Foundation
 
-// Decides when a measurement has settled enough to offer an automatic lock.
+// Decides when a measurement has settled enough to offer an automatic finish.
 //
 // In:  raw per-axis observations from each fit, with timestamps, plus what the current viewpoint
 //      can actually see.
 // Out: a convergence state with progress for the HUD, and whether the stopping rule has fired.
+//
+// THE RULE, exactly. Over the sliding window of the last N = 24 observations of one dimension:
+//
+//     x̄ₙ = (1/n) Σ xᵢ
+//     sₙ = √( Σ(xᵢ − x̄ₙ)² / (n − 1) )                       Bessel-corrected sample s.d.
+//     hₙ = t₀.₉₇₅,ₙ₋₁ · sₙ / √n                              95% two-sided CI half-width
+//     δₙ = | mean(second half of window) − mean(first half) |
+//     dₙ = max(5 mm, 1% · |x̄ₙ|) / 2                          half of the declared interval width
+//
+// and the scan finishes when, for width, depth AND height simultaneously:
+//
+//     n ≥ 24            ∧   hₙ ≤ dₙ            ∧   δₙ ≤ dₙ            ∧   a support plane exists
+//
+// There is a second exit: if no new observation has arrived for 2.5 s and at least 4 exist, the
+// measurement finishes on the grounds that no further waiting can tighten it.
+//
+// PROVENANCE. Only the middle condition, hₙ ≤ dₙ, has a literature source: it is the fixed-width
+// sequential stopping form of Chow and Robbins (1965). It is *not* their procedure. They accumulate
+// every sample, which is what drives hₙ → 0 and gives the method its guarantee; this uses a fixed
+// 24-frame window, over which hₙ does not shrink with time but instead measures how consistent the
+// last 24 fits are. The window is deliberate — the quantity being estimated genuinely moves as new
+// faces of the object come into view, so a growing sample would average across a changing mean —
+// but it means the guarantee does not carry over. Chow and Robbins are the origin of the stopping
+// form, not of the rule implemented here.
+//
+// Everything else is project-defined: N = 24, the 95% level, the Student-t finite-sample quantile,
+// the 5 mm / 1% tolerance, the drift test δₙ, and the 2.5 s timeout.
 
 nonisolated enum MeasurementAxis: Int, CaseIterable, Sendable {
     case width
@@ -143,19 +170,25 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
 
 nonisolated struct MeasurementConvergenceMonitor: Sendable {
     struct Configuration: Sendable {
+        /// Length of the sliding window, and also the minimum before the rule may fire. Both are
+        /// project-defined engineering choices, not values from any paper.
         var windowSize = 24
         var minimumSampleCount = 24
+        /// Below this the second exit is not offered at all.
         var pilotSampleCount = 4
+        /// No new observation for this long means the estimator can no longer change.
         var evidenceTimeout: TimeInterval = 2.5
-        var declaredAbsoluteToleranceInMeters: Float = 0.005
-        var declaredRelativeTolerance: Float = 0.01
 
-        var absoluteToleranceInMeters: Float {
-            declaredAbsoluteToleranceInMeters / 2
-        }
+        /// Declared as the **total width** of the confidence interval, which is how it reads to an
+        /// operator: "this dimension is known to within 5 mm". The half-width tolerance the rule
+        /// actually tests against is half of it, because hₙ is one side of the interval.
+        var intervalWidthFloorInMeters: Float = 0.005
+        var intervalWidthRelative: Float = 0.01
 
-        var relativeTolerance: Float {
-            declaredRelativeTolerance / 2
+        /// dₙ = max(floor, relative · |x̄ₙ|) / 2. One combined tolerance, never two alternative
+        /// tests: the relative term governs large dimensions, the floor governs small ones.
+        func halfWidthTolerance(forMean mean: Float) -> Float {
+            max(intervalWidthFloorInMeters, intervalWidthRelative * abs(mean)) / 2
         }
 
         static let `default` = Configuration()
@@ -340,7 +373,7 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
                 plateauRatio: 0,
                 halfWidth: .infinity,
                 drift: .infinity,
-                tolerance: configuration.absoluteToleranceInMeters,
+                tolerance: configuration.halfWidthTolerance(forMean: 0),
                 projectedRemaining: configuration.minimumSampleCount - values.count,
                 sampleCount: values.count
             )
@@ -355,10 +388,7 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         let standardDeviation = (sumOfSquares / Float(count - 1)).squareRoot()
         let quantile = Float(Self.tQuantile95(degreesOfFreedom: count - 1))
         let halfWidth = quantile * standardDeviation / Float(count).squareRoot()
-        let tolerance = max(
-            configuration.absoluteToleranceInMeters,
-            configuration.relativeTolerance * abs(mean)
-        )
+        let tolerance = configuration.halfWidthTolerance(forMean: mean)
 
         let precisionRatio = halfWidth <= 0 ? 1 : min(Double(tolerance / halfWidth), 1)
         let drift = meanShift(for: values)

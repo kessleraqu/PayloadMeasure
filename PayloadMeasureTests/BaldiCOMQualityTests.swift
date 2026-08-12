@@ -248,9 +248,14 @@ final class BaldiCOMQualityTests: XCTestCase {
 
         XCTAssertTrue(BaldiVerifier.verify(offCentre, against: problem).isValid)
         XCTAssertTrue(BaldiVerifier.verify(centred, against: problem).isValid)
-        XCTAssertFalse(BaldiSearch.isBetterFeasible(centred, than: offCentre, mode: .paper))
-        XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, mode: .centred))
-        XCTAssertFalse(BaldiSearch.isBetterFeasible(offCentre, than: centred, mode: .centred))
+        // Paper mode now ranks by eq. (24), F = P − αU, so at equal package count the better
+        // balanced packing wins there too. What still separates the modes is that centred keeps
+        // relocating after the centre of mass is already inside the admissible region, and ranks by
+        // distance to that region's centre rather than by U.
+        XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0.1, mode: .paper))
+        XCTAssertFalse(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0, mode: .paper))
+        XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0.1, mode: .centred))
+        XCTAssertFalse(BaldiSearch.isBetterFeasible(offCentre, than: centred, alpha: 0.1, mode: .centred))
     }
 
     func testLoadedCountRemainsPrimaryOverCOMQuality() {
@@ -297,6 +302,7 @@ final class BaldiCOMQualityTests: XCTestCase {
                 BaldiSearch.isBetterForSearch(
                     morePackages,
                     than: perfectlyCentred,
+                    alpha: 0.9,
                     mode: mode
                 )
             )
@@ -304,6 +310,7 @@ final class BaldiCOMQualityTests: XCTestCase {
                 BaldiSearch.isBetterFeasible(
                     morePackages,
                     than: perfectlyCentred,
+                    alpha: 0.9,
                     mode: mode
                 )
             )

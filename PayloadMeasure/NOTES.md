@@ -78,12 +78,22 @@ three of its four depth-grid neighbours are also admitted and depth-continuous.
 top-down view, height from the last side view. Without that, a side view — where the background
 leaks into the footprint — would overwrite a good top-down measurement.
 
-**The automatic lock is a sequential stopping rule**, not a timer. The scan republishes a fit many
-times a second, so "is it done?" is a sequential estimation problem. Progress is the fraction of the
-rule satisfied, taken as the minimum over its conditions, so the bar shows the limiting one. A stop
-is only allowed on a full window: both tests sharpen as samples accumulate, and the plateau test
-compares two halves, so short halves are blind to the slow drift it exists to catch. Having a real
-support plane is a condition the statistics cannot see, so it is checked separately.
+**The automatic finish is a windowed precision rule, not a timer.** The exact condition is written
+out at the top of `Measurement/MeasurementConvergence.swift`, and `../PSEUDOCODE.md` Part 5 sets it
+against the literature. In short: over the last 24 fits of each dimension, the 95% confidence
+interval must be no wider than max(5 mm, 1% of the dimension), the two halves of that window must
+agree to the same tolerance, and a support plane must exist.
+
+Be careful with the attribution here. The precision test has the shape of Chow and Robbins' (1965)
+fixed-width sequential rule, hₙ ≤ dₙ, but it is computed over a **sliding 24-frame window** rather
+than an accumulating sample, so hₙ does not shrink towards zero and their guarantee does not
+transfer. The window is the right engineering choice — the quantity being estimated really does move
+as new faces come into view — but it means the rule should be described as a windowed precision
+criterion that borrows the stopping form, not as the Chow–Robbins method. Every threshold in it
+(24, 95%, 5 mm, 1%, the drift test, the 2.5 s timeout) is project-defined.
+
+Progress is the fraction of the rule satisfied, taken as the minimum over its conditions, so the bar
+shows the limiting one.
 
 **The overlay is not torn down for the details sheet.** Rebuilding the whole hierarchy — glass
 containers, mask layers, aimer, every card — in the same frame that presents an alert and cold-starts
