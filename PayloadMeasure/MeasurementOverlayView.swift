@@ -52,69 +52,17 @@ struct MesOverlayView: View {
         !sessionManager.isCoachingActive
     }
 
+    // The three layers are deliberately AnyView. `body`'s static type is the nesting of every
+    // modifier and branch underneath it, and this screen had grown enough that the Swift runtime
+    // overflowed the stack just walking that type in SubstGenericParametersFromMetadata — a crash
+    // with a shallow call stack and frame 0 inside the runtime, not recursion in our code. It only
+    // showed on device: the simulator's main thread has an 8 MB stack against 1 MB on iOS. AnyView
+    // puts a boundary in the type tree at each layer, which is what keeps it walkable.
     var body: some View {
         ZStack {
-            if showsLiveOverlay {
-                objectMaskPreview
-                objectMaskMarkers
-                if !showsPanel {
-                    aimer
-                }
-                levellingPrompt
-            }
-
-            if showsLiveOverlay {
-                VStack {
-                    GlassEffectContainer(spacing: 14) {
-                        topHUD
-                    }
-                    .frame(maxWidth: .infinity, alignment: .top)
-                    .padding(.top, 16)
-                    .padding(.horizontal, 16)
-
-                    Spacer()
-                }
-            }
-
-            if showsLiveOverlay, !showsPanel {
-                VStack {
-                    Spacer()
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        bottomStatusCard
-                            .transition(
-                                .opacity.combined(
-                                    with: .move(edge: .bottom)
-                                )
-                            )
-
-                        if showsSavedObjects,
-                           !finalizedMeasuredObjectIDs.isEmpty {
-                            savedObjectsPanel
-                                .transition(
-                                    .opacity.combined(
-                                        with: .scale(scale: 0.96, anchor: .bottom)
-                                    )
-                                )
-                        }
-
-                        if !finalizedMeasuredObjectIDs.isEmpty
-                            || captureEngine.activeObjectID != nil {
-                            bottomActionRow
-                        }
-
-                        measureButton
-
-                        HStack {
-                            scanQuickVisualControls
-                            Spacer(minLength: 0)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 32)
-                }
-            }
+            liveContentLayer
+            topLayer
+            bottomLayer
         }
         .overlay {
             if !hasDismissedTutorial {
@@ -307,6 +255,73 @@ struct MesOverlayView: View {
 
     private func handlePackingWorkflowPresentationChange(_ isPresented: Bool) {
         sessionManager.setPackingArrangementPresented(isPresented)
+    }
+
+    /// Camera-space content: masks, markers, the aimer and the levelling prompt.
+    private var liveContentLayer: AnyView {
+        guard showsLiveOverlay else { return AnyView(EmptyView()) }
+        return AnyView(
+            ZStack {
+                objectMaskPreview
+                objectMaskMarkers
+                if !showsPanel {
+                    aimer
+                }
+                levellingPrompt
+            }
+        )
+    }
+
+    private var topLayer: AnyView {
+        guard showsLiveOverlay else { return AnyView(EmptyView()) }
+        return AnyView(
+            VStack {
+                GlassEffectContainer(spacing: 14) {
+                    topHUD
+                }
+                .frame(maxWidth: .infinity, alignment: .top)
+                .padding(.top, 16)
+                .padding(.horizontal, 16)
+
+                Spacer()
+            }
+        )
+    }
+
+    private var bottomLayer: AnyView {
+        guard showsLiveOverlay, !showsPanel else { return AnyView(EmptyView()) }
+        return AnyView(
+            VStack {
+                Spacer()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    bottomStatusCard
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+
+                    if showsSavedObjects, !finalizedMeasuredObjectIDs.isEmpty {
+                        savedObjectsPanel
+                            .transition(
+                                .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))
+                            )
+                    }
+
+                    if !finalizedMeasuredObjectIDs.isEmpty
+                        || captureEngine.activeObjectID != nil {
+                        bottomActionRow
+                    }
+
+                    measureButton
+
+                    HStack {
+                        scanQuickVisualControls
+                        Spacer(minLength: 0)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 32)
+            }
+        )
     }
 
     // MARK: - Top HUD
@@ -570,17 +585,14 @@ struct MesOverlayView: View {
         if convergence.isActive {
             let progress = min(max(convergence.progress, 0), 1)
             let percent = Int((progress * 100).rounded())
+            // No GeometryReader here. It is greedy in both axes, and inside this flexible stack it
+            // formed a layout cycle that overflowed the stack the moment a measurement went active
+            // on device. ProgressView sizes itself from the proposal instead.
             HStack(spacing: 10) {
-                GeometryReader { proxy in
-                    ZStack(alignment: .leading) {
-                        Capsule()
-                            .fill(.white.opacity(0.22))
-                        Capsule()
-                            .fill(autoLockTint)
-                            .frame(width: max(0, proxy.size.width * progress))
-                    }
-                }
-                .frame(height: 8)
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .tint(autoLockTint)
+                    .frame(height: 8)
 
                 Text("\(percent)%")
                     .font(.subheadline.weight(.bold))
