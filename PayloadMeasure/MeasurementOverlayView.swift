@@ -42,6 +42,7 @@ struct MesOverlayView: View {
     @State private var lockFeedback = UINotificationFeedbackGenerator()
     @State private var packingStore = PackingStore()
     @State private var showsPackingWorkflow = false
+    @State private var hasDismissedTutorial = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -57,9 +58,9 @@ struct MesOverlayView: View {
                 objectMaskPreview
                 objectMaskMarkers
                 if !showsPanel {
-                    objectMaskInteractionLayer
                     aimer
                 }
+                levellingPrompt
             }
 
             if showsLiveOverlay {
@@ -98,9 +99,11 @@ struct MesOverlayView: View {
                         }
 
                         if !finalizedMeasuredObjectIDs.isEmpty
-                            || captureEngine.canReset {
+                            || captureEngine.activeObjectID != nil {
                             bottomActionRow
                         }
+
+                        measureButton
 
                         HStack {
                             scanQuickVisualControls
@@ -113,6 +116,17 @@ struct MesOverlayView: View {
                 }
             }
         }
+        .overlay {
+            if !hasDismissedTutorial {
+                MeasurementTutorialView(
+                    isEnvironmentReady: !isPreparingToMeasure
+                ) {
+                    hasDismissedTutorial = true
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(.snappy(duration: 0.25), value: hasDismissedTutorial)
         .animation(.snappy(duration: 0.22), value: showsPanel)
         .animation(.snappy(duration: 0.22), value: showsSavedObjects)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
@@ -311,8 +325,8 @@ struct MesOverlayView: View {
                     showsPanel = true
                 } label: {
                     Image(systemName: "info")
-                        .font(.system(size: 16, weight: .semibold))
-                        .frame(width: 38, height: 38)
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 28, height: 28)
                         .contentShape(Circle())
                 }
                 .buttonStyle(.glass)
@@ -320,6 +334,28 @@ struct MesOverlayView: View {
                 .foregroundStyle(.primary)
                 .accessibilityLabel("Show information")
             }
+        }
+    }
+
+    /// Controls that are not part of the measuring flow itself.
+    @ViewBuilder
+    private var testingControls: some View {
+        if captureEngine.activeObjectID != nil || captureEngine.canReset {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Controls")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if captureEngine.activeObjectID != nil {
+                        objectWorkflowButton(showsTitle: true)
+                    }
+                    if captureEngine.canReset {
+                        resetButton(showsTitle: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(.bottom, 4)
         }
     }
 
@@ -802,6 +838,10 @@ struct MesOverlayView: View {
     private var infoPanel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+            // Finish and Reset live here rather than on the camera: neither is part of measuring,
+            // and Reset in particular is destructive enough that it should take a deliberate look.
+            testingControls
+
             HStack(spacing: 10) {
                 Circle()
                     .fill(environmentStatusColor)
@@ -1064,9 +1104,6 @@ struct MesOverlayView: View {
             Spacer(minLength: 0)
             cancelMeasurementButton(showsTitle: showsTitles)
             workflowButtonIfAvailable(showsTitle: showsTitles)
-            if captureEngine.canReset {
-                resetButton(showsTitle: showsTitles)
-            }
         }
     }
 
@@ -1078,9 +1115,86 @@ struct MesOverlayView: View {
             Spacer(minLength: 0)
             cancelMeasurementButton(showsTitle: showsTitles)
             workflowButtonIfAvailable(showsTitle: showsTitles)
-            if captureEngine.canReset {
-                resetButton(showsTitle: showsTitles)
+        }
+    }
+
+    /// The one thing the operator presses to start measuring. It replaces tapping the object: the
+    /// aimer already says what is being pointed at, so a button is unambiguous and does not fight
+    /// the drag gestures. Blue invites; the grey Remeasure says "you can, but you should not need
+    /// to". It is hidden entirely until the phone is level, because a tilted measurement is bad.
+    @ViewBuilder
+    private var measureButton: some View {
+        if isAutomaticCaptureSupported,
+           captureEngine.activeObjectID == nil,
+           !showsPanel,
+           captureEngine.isTopViewAligned {
+            let isRemeasure = captureEngine.canEditFocusedObject
+            Button {
+                showsSavedObjects = false
+                if isRemeasure {
+                    captureEngine.reactivateFocusedObject()
+                } else {
+                    captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
+                }
+            } label: {
+                Text(isRemeasure ? "Remeasure" : "Measure")
+                    .font(.headline)
+                    .foregroundStyle(isRemeasure ? Color.secondary : Color.white)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .background(
+                        isRemeasure ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(Color.accentColor),
+                        in: Capsule()
+                    )
+                    .overlay {
+                        if isRemeasure {
+                            Capsule().stroke(Color.secondary.opacity(0.35), lineWidth: 1)
+                        }
+                    }
+                    .contentShape(Capsule())
             }
+            .buttonStyle(.plain)
+            .disabled(captureEngine.isObjectSelectionPending || !measurementCanStart)
+            .opacity(measurementCanStart ? 1 : 0.5)
+            .accessibilityLabel(isRemeasure ? "Remeasure this object" : "Measure the object in the centre")
+            .accessibilityHint(
+                isRemeasure
+                    ? "Measures the finished object you are pointing at again."
+                    : "Measures whatever the centre of the screen is pointing at."
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        }
+    }
+
+    private var measurementCanStart: Bool {
+        sessionManager.isTrackingReady
+            && sessionManager.isObjectTrackingEnvironmentReady
+            && captureEngine.hasCompletedObjectRecognitionWarmup
+    }
+
+    /// Shown while the phone is not level enough to measure. Nothing else appears until it is.
+    @ViewBuilder
+    private var levellingPrompt: some View {
+        if isAutomaticCaptureSupported,
+           captureEngine.activeObjectID == nil,
+           !showsPanel,
+           !captureEngine.isTopViewAligned {
+            VStack(spacing: 10) {
+                Image(systemName: "iphone.gen3.radiowaves.left.and.right")
+                    .font(.system(size: 34, weight: .light))
+                    .symbolEffect(.pulse)
+                Text("Hold the phone flat over the object")
+                    .font(.headline)
+                if let degrees = captureEngine.topViewDeviationDegrees {
+                    Text("\(degrees)° to go")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 18)
+            .glassEffect(.regular, in: .rect(cornerRadius: 22))
+            .transition(.opacity.combined(with: .scale(scale: 0.94)))
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -1130,7 +1244,12 @@ struct MesOverlayView: View {
                 showsSavedObjects = false
                 captureEngine.cancelActiveMeasurement()
             } label: {
-                actionLabel("Cancel", systemImage: "xmark", tint: .red, showsTitle: showsTitle)
+                actionLabel(
+                    "Cancel measurement",
+                    systemImage: "xmark",
+                    tint: .red,
+                    showsTitle: showsTitle
+                )
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.capsule)
@@ -1617,7 +1736,16 @@ struct MesOverlayView: View {
         objectNameText = ""
     }
 
+    /// Backing out of the name prompt cancels the measurement it belongs to. Finishing commits the
+    /// dimensions before the prompt appears, so without this the object would be kept unnamed and
+    /// the operator would have no obvious way to be rid of it. Editing an existing object is
+    /// different — there Cancel means "leave the name as it was".
     private func cancelObjectDetailsEntry() {
+        if case .finalize(let id) = objectDetailsContext,
+           captureEngine.finalizedObjectIDs.contains(id) {
+            packingStore.clearPreparation(for: id)
+            captureEngine.removeFinalizedObject(id: id)
+        }
         objectDetailsContext = nil
         objectNameText = ""
     }

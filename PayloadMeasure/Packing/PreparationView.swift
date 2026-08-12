@@ -77,7 +77,9 @@ private struct PackingPreparationView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if let currentObjectID {
+                if !isReady {
+                    waitingState
+                } else if let currentObjectID {
                     preparationContent(for: currentObjectID)
                 } else {
                     emptyState
@@ -126,8 +128,11 @@ private struct PackingPreparationView: View {
             || store.forcedSize(for: objectID, in: captureEngine) != nil
             || !store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
 
+        // Sized to fit an iPhone 13 without scrolling: the photo is a thumbnail beside the name
+        // rather than a banner above it, and every card carries one line of guidance at most. The
+        // ScrollView stays only so accessibility text sizes still reach the bottom.
         return ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 10) {
                 progressHeader
                 objectCard(for: objectID, allowsNameEditing: canPrepare)
 
@@ -145,7 +150,8 @@ private struct PackingPreparationView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(20)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
         }
         .scrollDismissesKeyboard(.interactively)
         .id(objectID)
@@ -175,13 +181,16 @@ private struct PackingPreparationView: View {
         for objectID: UUID,
         allowsNameEditing: Bool
     ) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             objectVisual(for: objectID)
+                .frame(width: 78, height: 78)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
 
+            VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .center, spacing: 9) {
                 Circle()
                     .fill(objectColour(for: objectID))
-                    .frame(width: 13, height: 13)
+                    .frame(width: 11, height: 11)
                     .accessibilityHidden(true)
 
                 if allowsNameEditing {
@@ -203,12 +212,13 @@ private struct PackingPreparationView: View {
 
             if let measured = store.measuredSizeMillimetres(for: objectID, in: captureEngine) {
                 Label("Measured \(sizeText(measured))", systemImage: "ruler")
-                    .font(.footnote.monospacedDigit())
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Measured size \(sizeText(measured))")
             }
+            }
         }
-        .padding(14)
+        .padding(12)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
         .overlay {
             RoundedRectangle(cornerRadius: 18)
@@ -229,21 +239,15 @@ private struct PackingPreparationView: View {
                     .scaledToFit()
                     .padding(4)
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 150)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Photo of \(displayName(for: objectID))")
         } else {
             ZStack {
                 objectColour(for: objectID).opacity(0.16)
                 Image(systemName: "shippingbox.fill")
-                    .font(.system(size: 54, weight: .medium))
+                    .font(.system(size: 30, weight: .medium))
                     .foregroundStyle(objectColour(for: objectID))
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 130)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("No photo available for \(displayName(for: objectID))")
         }
@@ -255,7 +259,7 @@ private struct PackingPreparationView: View {
         let assigned = store.selectedBoxPreset(for: objectID)
         let forced = store.forcedSize(for: objectID, in: captureEngine)
 
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 9) {
             Label("1. Box this object", systemImage: "shippingbox")
                 .font(.headline)
 
@@ -431,7 +435,7 @@ private struct PackingPreparationView: View {
     private func weightCard(for objectID: UUID) -> some View {
         let packageName = displayName(for: objectID)
 
-        return VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 9) {
             Label("2. Pack and weigh", systemImage: "scalemass")
                 .font(.headline)
 
@@ -456,12 +460,8 @@ private struct PackingPreparationView: View {
                     .accessibilityHidden(true)
             }
 
-            Text("Weigh the complete sealed package. The loading plan uses this total in grams.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(16)
+        .padding(13)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
     }
 
@@ -497,6 +497,46 @@ private struct PackingPreparationView: View {
                     ? "Checks every prepared package, then opens the loading plan."
                     : "Saves this box and packed weight, then shows the next object."
         )
+    }
+
+    /// Everything here depends on a finished measurement, so nothing is editable until the objects
+    /// have actually arrived. Showing the fields greyed out invites typing into them; showing this
+    /// instead says plainly that there is nothing to do yet.
+    private var isReady: Bool {
+        !captureEngine.measuredObjectIDs.isEmpty
+            && !captureEngine.isObjectSelectionPending
+            && captureEngine.activeObjectID == nil
+    }
+
+    private var waitingState: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Getting your objects ready")
+                .font(.headline)
+            Text(waitingDetail)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Back") { dismiss() }
+                .buttonStyle(.bordered)
+                .padding(.top, 4)
+        }
+        .padding(32)
+        .frame(maxWidth: 420)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var waitingDetail: String {
+        if captureEngine.activeObjectID != nil {
+            return "One object is still being measured. Finish or cancel it first."
+        }
+        if captureEngine.isObjectSelectionPending {
+            return "An object is still being selected."
+        }
+        return "No measured objects yet. Measure at least one before preparing packages."
     }
 
     private var emptyState: some View {

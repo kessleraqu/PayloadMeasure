@@ -14,6 +14,7 @@ struct BaldiResultView: View {
     @State private var selectedMode: BaldiPackingMode = .paper
     @State private var selectedLayerIndex: Int?
     @State private var showsAugmentedView = false
+    @State private var showsDetails = false
 
     private var result: BaldiResult {
         comparison.result(for: selectedMode)
@@ -21,11 +22,9 @@ struct BaldiResultView: View {
 
     var body: some View {
         Group {
-            modeControl
-            readySummary
-
             if let solution = verifiedSolution,
                let verification = result.verification {
+                headline(solution)
                 interactivePacking(solution)
                 placeOnTableButton
                 openingInstruction
@@ -33,17 +32,85 @@ struct BaldiResultView: View {
                 if !solution.unloaded.isEmpty {
                     unloadedWarning(solution)
                 }
+            } else {
+                modeControl
+                readySummary
             }
+        }
+        .sheet(isPresented: $showsDetails) {
+            detailsSheet
         }
         .onChange(of: selectedMode) { _, _ in
             highlightedPackageID = nil
             selectedLayerIndex = nil
+            // Picking the other algorithm is a decision, so get out of the way and show its result.
+            showsDetails = false
         }
         .fullScreenCover(isPresented: $showsAugmentedView) {
             if let solution = verifiedSolution {
                 PackingARView(solution: solution, colours: colours)
             }
         }
+    }
+
+    /// Deliberately the whole of the top of the screen: a count, a warning if one is needed, and the
+    /// way into everything else. Settings, the algorithm switch, the balance figures and the package
+    /// list all live behind the info button so the 3D view and the room button stay above the fold.
+    private func headline(_ solution: BaldiSolution) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(solution.loadedCount) package\(solution.loadedCount == 1 ? "" : "s") loaded")
+                    .font(.title3.weight(.semibold))
+                if !solution.unloaded.isEmpty {
+                    Text("\(solution.unloaded.count) did not fit")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer(minLength: 0)
+            Button {
+                showsDetails = true
+            } label: {
+                Image(systemName: "info")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.circle)
+            .accessibilityLabel("Packing details and options")
+        }
+    }
+
+    /// Everything that used to crowd the result screen.
+    private var detailsSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    modeControl
+                    readySummary
+                    if let solution = verifiedSolution,
+                       let verification = result.verification {
+                        openingInstruction
+                        loadingGuide(solution, verification: verification)
+                        if !solution.unloaded.isEmpty {
+                            unloadedWarning(solution)
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Packing details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showsDetails = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 
     /// Puts the finished plan on the real table at full size. Opens and closes freely; nothing about
@@ -139,9 +206,9 @@ struct BaldiResultView: View {
 
     private func interactivePacking(_ solution: BaldiSolution) -> some View {
         card {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("1. Inspect the load")
-                    .font(.headline)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Tap a package to see which one it is")
+                    .font(.subheadline.weight(.semibold))
                 BaldiPlanView(
                     solution: solution,
                     colours: colours,
@@ -150,20 +217,9 @@ struct BaldiResultView: View {
                 )
                 .id(selectedMode)
 
-                Label(
-                    "Tap a package to reveal its name. Drag to rotate; pinch to zoom.",
-                    systemImage: "hand.tap"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 12) {
-                    compactKey(colour: .orange, text: "cargo balance")
-                    compactKey(colour: .purple, text: "target")
-                    compactKey(colour: .green, text: "allowed region")
-                }
-                .font(.caption2)
+                Text("Drag to rotate, pinch to zoom.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -187,12 +243,6 @@ struct BaldiResultView: View {
     private static let openingInstructionText =
         "The shaded side is the box opening. The dark line runs the length of the box, its longest side, parallel to that opening. Turn the physical package until both match before loading."
 
-    private func compactKey(colour: Color, text: String) -> some View {
-        HStack(spacing: 4) {
-            Circle().fill(colour).frame(width: 7, height: 7)
-            Text(text).foregroundStyle(.secondary)
-        }
-    }
 
     // MARK: - Sequential loading
 

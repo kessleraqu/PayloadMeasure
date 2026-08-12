@@ -95,7 +95,7 @@ struct BaldiPlanView: View {
                 selectedLayerIndex: selectedLayerIndex,
                 cameraResetToken: cameraResetToken
             )
-            .frame(height: 320)
+            .frame(height: 380)
             .clipShape(.rect(cornerRadius: 14))
         }
         .overlay(alignment: .topTrailing) {
@@ -714,6 +714,7 @@ private enum SceneBuilder {
             height: height,
             depth: depth,
             centre: node.simdPosition,
+            colour: colour,
             opacity: max(0.16, presentation.opacity),
             thickness: metrics.edgeThickness,
             to: root
@@ -742,6 +743,20 @@ private enum SceneBuilder {
             metrics: metrics,
             opacity: max(0.5, presentation.opacity),
             to: root
+        )
+    }
+
+    /// A darker tone of the same hue, so the marker still reads as part of its package.
+    private static func darkened(_ colour: UIColor, by amount: CGFloat) -> UIColor {
+        var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+        guard colour.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha) else {
+            return colour
+        }
+        return UIColor(
+            hue: hue,
+            saturation: min(1, saturation + amount * 0.25),
+            brightness: max(0.06, brightness * (1 - amount)),
+            alpha: alpha
         )
     }
 
@@ -780,12 +795,21 @@ private enum SceneBuilder {
         root.addChildNode(textNode)
     }
 
+    /// Every package is a box with a tongue that opens, and that opening runs along the length —
+    /// the longest side. The operator has to line the real box up with it, so it is drawn on both
+    /// mirrored length edges of the top face, never just one: whichever way round the box is picked
+    /// up, one of the two is facing them.
+    ///
+    /// Three tones of the package's own colour: the top face slightly darker, a band along each
+    /// opening edge darker still, and the edge line darkest. Keeping it in the package's own hue
+    /// means the colour still identifies the package.
     private static func addOpeningMarker(
         for placement: BaldiPlacement,
         width: CGFloat,
         height: CGFloat,
         depth: CGFloat,
         centre: SIMD3<Float>,
+        colour: UIColor,
         opacity: CGFloat,
         thickness: CGFloat,
         to root: SCNNode
@@ -796,7 +820,7 @@ private enum SceneBuilder {
         let topCentre = centre + SIMD3(0, Float(height) / 2 + surfaceOffset, 0)
         let bar = Float(max(0.02, thickness * 1.1))
 
-        func plate(size: SIMD3<Float>, at position: SIMD3<Float>, shade: CGFloat) {
+        func plate(size: SIMD3<Float>, at position: SIMD3<Float>, tone: CGFloat) {
             guard size.min() > 0 else { return }
             let box = SCNBox(
                 width: CGFloat(size.x),
@@ -805,7 +829,7 @@ private enum SceneBuilder {
                 chamferRadius: 0
             )
             box.firstMaterial = material(
-                colour: UIColor.black.withAlphaComponent(shade),
+                colour: darkened(colour, by: tone),
                 opacity: opacity,
                 lightingModel: .constant
             )
@@ -816,36 +840,49 @@ private enum SceneBuilder {
             root.addChildNode(node)
         }
 
-        // Length vertical: no opening side faces up, so mark the length on the front instead.
+        // Length vertical: no opening edge lies on the top face, so mark it on the front instead.
         guard axis != 2 else {
             plate(
                 size: SIMD3(bar, Float(height) * 0.82, bar),
                 at: centre + SIMD3(0, 0, Float(depth) / 2 + surfaceOffset),
-                shade: 0.82
+                tone: 0.55
             )
             return
         }
 
         let along = axis == 0
-        let bandDepth = Float(along ? depth : width) * 0.3
-        // The opening side, shaded.
+        let lengthSpan = Float(along ? width : depth)
+        let acrossSpan = Float(along ? depth : width)
+        let bandDepth = acrossSpan * 0.26
+
+        // The whole top face, a shade darker: this is the face the opening is on.
         plate(
             size: along
-                ? SIMD3(Float(width), bar * 0.6, bandDepth)
-                : SIMD3(bandDepth, bar * 0.6, Float(depth)),
-            at: topCentre + (along
-                ? SIMD3(0, 0, -(Float(depth) - bandDepth) / 2)
-                : SIMD3(-(Float(width) - bandDepth) / 2, 0, 0)),
-            shade: 0.34
-        )
-        // The length, ruled darker straight across the middle.
-        plate(
-            size: along
-                ? SIMD3(Float(width) * 0.94, bar, bar)
-                : SIMD3(bar, bar, Float(depth) * 0.94),
+                ? SIMD3(lengthSpan, bar * 0.45, acrossSpan)
+                : SIMD3(acrossSpan, bar * 0.45, lengthSpan),
             at: topCentre,
-            shade: 0.82
+            tone: 0.18
         )
+
+        // Both mirrored length edges: a darker band, and the opening line darker still on top of it.
+        for side in [Float(-1), Float(1)] {
+            let bandOffset = (acrossSpan - bandDepth) / 2 * side
+            let edgeOffset = (acrossSpan - bar) / 2 * side
+            plate(
+                size: along
+                    ? SIMD3(lengthSpan, bar * 0.7, bandDepth)
+                    : SIMD3(bandDepth, bar * 0.7, lengthSpan),
+                at: topCentre + (along ? SIMD3(0, 0, bandOffset) : SIMD3(bandOffset, 0, 0)),
+                tone: 0.38
+            )
+            plate(
+                size: along
+                    ? SIMD3(lengthSpan * 0.96, bar, bar)
+                    : SIMD3(bar, bar, lengthSpan * 0.96),
+                at: topCentre + (along ? SIMD3(0, 0, edgeOffset) : SIMD3(edgeOffset, 0, 0)),
+                tone: 0.62
+            )
+        }
     }
 
     private static func addBoxEdges(

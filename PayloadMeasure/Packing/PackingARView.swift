@@ -380,13 +380,68 @@ private struct PackingARContainer: UIViewRepresentable {
                 box.generateCollisionShapes(recursive: false)
                 anchor.addChild(box)
                 packageEntities[placement.id] = box
+                addOpeningEdges(for: placement, on: box, extent: extent, colour: colour)
             }
+        }
+
+        /// The opening runs along the package's length, and the operator has to line the real box up
+        /// with it. Drawn on both mirrored length edges of the top face, in a darker tone of the
+        /// package's own colour, so whichever way the box is picked up one of them faces them.
+        private func addOpeningEdges(
+            for placement: BaldiPlacement,
+            on box: ModelEntity,
+            extent: SIMD3<Float>,
+            colour: UIColor
+        ) {
+            let axis = BaldiOpeningMarker.containerAxis(for: placement)
+            guard axis != 2 else { return }
+            let along = axis == 0
+            let lengthSpan = along ? extent.x : extent.y
+            let acrossSpan = along ? extent.y : extent.x
+            let bar = max(0.0015, min(lengthSpan, acrossSpan) * 0.05)
+            guard lengthSpan > 0, acrossSpan > bar else { return }
+
+            var material = SimpleMaterial(
+                color: darkened(colour, by: 0.55).withAlphaComponent(0.85),
+                isMetallic: false
+            )
+            material.roughness = 0.9
+            let top = extent.z / 2 + bar / 2
+
+            for side in [Float(-1), Float(1)] {
+                let offset = (acrossSpan - bar) / 2 * side
+                let line = ModelEntity(
+                    mesh: .generateBox(
+                        size: along
+                            ? SIMD3(lengthSpan * 0.96, bar, bar)
+                            : SIMD3(bar, bar, lengthSpan * 0.96)
+                    ),
+                    materials: [material]
+                )
+                line.position = along
+                    ? SIMD3(0, top, offset)
+                    : SIMD3(offset, top, 0)
+                box.addChild(line)
+            }
+        }
+
+        private func darkened(_ colour: UIColor, by amount: CGFloat) -> UIColor {
+            var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+            guard colour.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha) else {
+                return colour
+            }
+            return UIColor(
+                hue: hue,
+                saturation: min(1, saturation + amount * 0.25),
+                brightness: max(0.06, brightness * (1 - amount)),
+                alpha: alpha
+            )
         }
 
         /// Four thin walls and a floor. No lid, so the operator can see and reach in.
         private func addOpenTopShell(size: SIMD3<Float>, to anchor: AnchorEntity) {
             let wall: Float = 0.002
-            let green = UIColor.systemGreen.withAlphaComponent(0.55)
+            let green = UIColor.systemGreen.withAlphaComponent(0.3)
             var material = SimpleMaterial(color: green, isMetallic: false)
             material.roughness = 0.9
 
@@ -416,10 +471,12 @@ private struct PackingARContainer: UIViewRepresentable {
         private func refreshLayerVisibility() {
             for (index, layer) in model.layers.enumerated() {
                 let opacity: Float
+                // Deliberately see-through: the operator puts the real box down on top of the
+                // rendered one, so a solid model would hide exactly what they are aiming at.
                 if index == model.visibleLayerIndex {
-                    opacity = 1
+                    opacity = 0.42
                 } else if index < model.visibleLayerIndex {
-                    opacity = 0.22
+                    opacity = 0.12
                 } else {
                     opacity = 0
                 }
