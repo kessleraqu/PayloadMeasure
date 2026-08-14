@@ -13,6 +13,7 @@ import SwiftUI
 struct StudySetupView: View {
     let warmup: AppWarmup
     let store: StudyStore
+    let accuracy: AccuracyStore
 
     @State private var name = ""
     @State private var date = Date()
@@ -20,6 +21,7 @@ struct StudySetupView: View {
     @State private var firstBox: StudyBox = .big
     @State private var includesPractice = true
     @State private var showsArchive = false
+    @State private var showsAccuracy = false
 
     var body: some View {
         NavigationStack {
@@ -80,11 +82,24 @@ struct StudySetupView: View {
                         showsArchive = true
                     }
                 }
+
+                Section {
+                    Button {
+                        showsAccuracy = true
+                    } label: {
+                        Label("Accuracy test", systemImage: "ruler")
+                    }
+                } footer: {
+                    Text("Nothing to do with a participant: measure the same objects over and over, type in their real sizes, and see how far out the app is.")
+                }
             }
             .navigationTitle("New study run")
             .onAppear(perform: warmup.start)
             .sheet(isPresented: $showsArchive) {
                 StudyArchiveView(store: store)
+            }
+            .fullScreenCover(isPresented: $showsAccuracy) {
+                AccuracySiteView(store: accuracy)
             }
         }
     }

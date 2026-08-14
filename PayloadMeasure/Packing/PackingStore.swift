@@ -491,16 +491,7 @@ final class PackingStore {
     /// 400.000006 mm; package sizes are rounded up to whole millimetres, and without this every
     /// object that is its own box would grow a millimetre on every axis out of nothing.
     private func measuredSizeMillimetres(_ captured: CapturedObject) -> SIMD3<Double> {
-        let raw = SIMD3(
-            Double(captured.widthInMeters) * 1000,
-            Double(captured.depthInMeters) * 1000,
-            Double(captured.heightInMeters) * 1000
-        )
-        return SIMD3(
-            (raw.x * 1000).rounded() / 1000,
-            (raw.y * 1000).rounded() / 1000,
-            (raw.z * 1000).rounded() / 1000
-        )
+        captured.sizeMillimetres
     }
 
     private func trimmedName(

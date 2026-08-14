@@ -24,6 +24,23 @@ nonisolated struct CapturedObject: Sendable {
     var depthInMeters: Float { dimensions.y }
     var heightInMeters: Float { dimensions.z }
 
+    /// The measured size in millimetres, rounded to the micrometre first. Without that rounding a
+    /// 0.4 m edge arrives as 400.000006 mm and anything that later takes a ceiling gains a whole
+    /// millimetre. Defined here so the packing side and the accuracy test cannot disagree about what
+    /// "the measured size" is.
+    var sizeMillimetres: SIMD3<Double> {
+        let raw = SIMD3(
+            Double(widthInMeters) * 1000,
+            Double(depthInMeters) * 1000,
+            Double(heightInMeters) * 1000
+        )
+        return SIMD3(
+            (raw.x * 1000).rounded() / 1000,
+            (raw.y * 1000).rounded() / 1000,
+            (raw.z * 1000).rounded() / 1000
+        )
+    }
+
     func contains(_ point: SIMD3<Float>, tolerance: Float = 0) -> Bool {
         let relative = point - center
         return abs(simd_dot(relative, axes.width)) <= dimensions.x / 2 + tolerance

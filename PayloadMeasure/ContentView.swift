@@ -15,6 +15,9 @@ struct ContentView: View {
     @State private var sessionToken = 0
     @State private var warmup = AppWarmup()
     @State private var study = StudyStore()
+    /// Owned here rather than by the setup screen, so an accuracy test survives that screen being
+    /// rebuilt and can be left and returned to.
+    @State private var accuracy = AccuracyStore()
 
     var body: some View {
         if let run = study.activeRun, study.hasFinishedAllBoxes {
@@ -44,7 +47,7 @@ struct ContentView: View {
             }
             .id(sessionToken)
         } else {
-            StudySetupView(warmup: warmup, store: study)
+            StudySetupView(warmup: warmup, store: study, accuracy: accuracy)
         }
     }
 

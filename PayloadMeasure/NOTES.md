@@ -129,6 +129,21 @@ that grew with each object measured.
 twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
 when the box first appears.
 
+**The accuracy test compares sorted side lengths, not axes.** A reading and its reference are both
+sorted largest first before being compared. The app cannot know which side the operator thought of as
+the width, and it can come out differently from one round to the next depending on how the object was
+approached, so pairing raw axes would report a rotation as an error. Sorted comparison measures what
+is being asked — whether the three side lengths are right. The raw triple is stored as recorded, so
+this can be redone differently later.
+
+**The accuracy test has its own session and engine, and throws each object away.** It does not go
+through `MesOverlayView`: that view is already at the body-type-complexity ceiling, and the test needs
+none of the naming, boxing or packing around it. Each reading finalises the object, reads its size and
+then removes it, so the scene never accumulates and the tenth reading is as quick as the first.
+`AccuracyStore` is owned by `ContentView` rather than the setup screen, so a test survives that screen
+being rebuilt and can be left and resumed — the only removal anywhere in the app is
+`undoLastReading`, deliberately limited to the reading just taken.
+
 **Reset and "this payload is done" are two different closures, deliberately.** `MesOverlayView` takes
 both `onFullReset` and `onPayloadFinished`. They were one closure, which meant the Reset button
 advanced the study to the next box — and once the practice payload existed, it also let a participant
