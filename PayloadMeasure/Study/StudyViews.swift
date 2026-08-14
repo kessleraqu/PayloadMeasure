@@ -18,6 +18,7 @@ struct StudySetupView: View {
     @State private var date = Date()
     @State private var flow: MeasurementFlow = .sequential
     @State private var firstBox: StudyBox = .big
+    @State private var includesPractice = true
     @State private var showsArchive = false
 
     var body: some View {
@@ -58,6 +59,12 @@ struct StudySetupView: View {
                 }
 
                 Section {
+                    Toggle("Practice run first", isOn: $includesPractice)
+                } footer: {
+                    Text(practiceFooter)
+                }
+
+                Section {
                     // Starts immediately rather than waiting on the warmup. The measuring screen
                     // shows the live camera with instructions while the rest finishes loading, which
                     // is more useful than a spinner on a form.
@@ -82,8 +89,26 @@ struct StudySetupView: View {
         }
     }
 
+    private var practiceFooter: String {
+        guard includesPractice else {
+            return "The participant goes straight into the first payload box."
+        }
+        let size = StudyStore.practiceModuleSizeMillimetres
+        let centimetres = String(
+            format: "%.0f × %.0f × %.0f cm",
+            size.x / 10, size.y / 10, size.z / 10
+        )
+        return "The participant measures and loads a practice payload of \(centimetres) first, to learn the app. Nothing from it is recorded. The study proper starts from the arrangement screen, behind the password."
+    }
+
     private func start() {
-        store.startRun(participantName: name, studyDate: date, flow: flow, firstBox: firstBox)
+        store.startRun(
+            participantName: name,
+            studyDate: date,
+            flow: flow,
+            firstBox: firstBox,
+            includesPractice: includesPractice
+        )
     }
 }
 

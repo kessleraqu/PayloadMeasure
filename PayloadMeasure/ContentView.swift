@@ -21,7 +21,7 @@ struct ContentView: View {
             NavigationStack {
                 StudyResultsView(run: run, store: study, onRestart: restartForNextParticipant)
             }
-        } else if let flow = study.flow, study.currentBox != nil {
+        } else if let flow = study.flow, study.hasActiveSession {
             ZStack {
                 ARCameraView(
                     sessionManager: sessionManager,
@@ -38,7 +38,8 @@ struct ContentView: View {
                     workflowMode: $workflowMode,
                     flow: flow,
                     study: study,
-                    onFullReset: startNextBox
+                    onFullReset: restartCurrentPayload,
+                    onPayloadFinished: startNextBox
                 )
             }
             .id(sessionToken)
@@ -47,12 +48,23 @@ struct ContentView: View {
         }
     }
 
-    /// Between boxes: the measurements belong to the box just finished, so the capture session is
-    /// cleared and the view hierarchy rebuilt, exactly as a full reset does.
+    /// Reset: throw away everything measured and start this same payload over. The study does not
+    /// move on, so a participant cannot reach the next box — or leave the practice payload — without
+    /// the operator entering the password.
+    private func restartCurrentPayload() {
+        captureEngine.reset()
+        sessionToken &+= 1
+    }
+
+    /// Between payloads: the measurements belong to the one just finished, so the capture session is
+    /// cleared and the view hierarchy rebuilt, exactly as a full reset does. The practice payload
+    /// leaves by the same door — it just leads to the first box instead of the second.
     private func startNextBox() {
         captureEngine.reset()
         sessionToken &+= 1
-        if study.isOnLastBox {
+        if study.isPractice {
+            study.startRealStudy()
+        } else if study.isOnLastBox {
             study.finishRun()
         } else {
             study.advanceToNextBox()

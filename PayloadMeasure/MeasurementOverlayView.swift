@@ -23,8 +23,11 @@ struct MesOverlayView: View {
     @Binding var workflowMode: MeasurementWorkflowMode
     let flow: MeasurementFlow
     let study: StudyStore
-    /// Called when this payload box is finished, so the run can move on.
+    /// Clears everything and starts this same payload again. Does not move the study on: pressing
+    /// Reset must never take a participant to the next box, and must never skip the password.
     let onFullReset: () -> Void
+    /// Called from inside the loading plan, behind the study password, when this payload is done.
+    let onPayloadFinished: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
@@ -108,11 +111,11 @@ struct MesOverlayView: View {
         }
         .onAppear {
             handleAppearance()
-            // The module the plan is built for is the study's current payload box.
-            if let box = study.currentBox {
-                packingStore.module.lengthMillimetres = box.sizeMillimetres.x
-                packingStore.module.widthMillimetres = box.sizeMillimetres.y
-                packingStore.module.heightMillimetres = box.sizeMillimetres.z
+            // The module the plan is built for: the study's current payload box, or the practice one.
+            if let size = study.activeModuleSizeMillimetres {
+                packingStore.module.lengthMillimetres = size.x
+                packingStore.module.widthMillimetres = size.y
+                packingStore.module.heightMillimetres = size.z
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -146,7 +149,7 @@ struct MesOverlayView: View {
                 captureEngine: captureEngine,
                 store: packingStore,
                 study: study,
-                onBoxFinished: onFullReset
+                onBoxFinished: onPayloadFinished
             )
         }
         .alert(
@@ -341,6 +344,16 @@ struct MesOverlayView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
         } else {
             HStack(alignment: .top, spacing: 10) {
+                if study.isPractice {
+                    // Nothing here is recorded, and it should be impossible to be confused about
+                    // which payload the participant is on.
+                    Label("Practice", systemImage: "graduationcap.fill")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 11)
+                        .frame(height: 28)
+                        .glassEffect(.regular, in: .capsule)
+                }
+
                 Spacer(minLength: 8)
 
                 Button {
@@ -2107,6 +2120,7 @@ struct MesOverlayView: View {
         workflowMode: .constant(.spatial3D),
         flow: .batch,
         study: StudyStore(),
-        onFullReset: {}
+        onFullReset: {},
+        onPayloadFinished: {}
     )
 }

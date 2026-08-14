@@ -30,25 +30,35 @@ struct ArrangementView: View {
         store.packagesMissingPreparation(from: captureEngine)
     }
 
-    /// The only way out of a participant's box, and it is behind a password so they cannot end their
-    /// own run by pressing something. Records the box before moving on.
+    /// The only way out of a participant's payload, and it is behind a password so they cannot end
+    /// their own run by pressing something. Records the box before moving on — except after the
+    /// practice payload, which is never recorded.
     @ViewBuilder
     private var nextBoxButton: some View {
         if store.baldiComparison != nil || store.result != nil {
             Button {
-                recordCurrentBox()
+                if !study.isPractice {
+                    recordCurrentBox()
+                }
                 showsNextBoxPassword = true
             } label: {
-                Label(
-                    study.isOnLastBox ? "Finish the study" : "Next box",
-                    systemImage: study.isOnLastBox ? "checkmark.seal" : "arrow.right.circle"
-                )
-                .font(.headline)
-                .frame(maxWidth: .infinity, minHeight: 50)
+                Label(nextStepTitle, systemImage: nextStepIcon)
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 50)
             }
             .buttonStyle(.borderedProminent)
             .accessibilityHint("Asks for the study password, then moves the participant on.")
         }
+    }
+
+    private var nextStepTitle: String {
+        if study.isPractice { return "Start real measurement" }
+        return study.isOnLastBox ? "Finish the study" : "Next box"
+    }
+
+    private var nextStepIcon: String {
+        if study.isPractice { return "play.circle" }
+        return study.isOnLastBox ? "checkmark.seal" : "arrow.right.circle"
     }
 
     /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
@@ -137,7 +147,7 @@ struct ArrangementView: View {
                 .padding(20)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("Payload arrangement")
+            .navigationTitle(study.isPractice ? "Practice arrangement" : "Payload arrangement")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -198,15 +208,27 @@ struct ArrangementView: View {
 
     private var studyPasswordSheet: some View {
         StudyPasswordSheet(
-            title: study.isOnLastBox ? "Finish the study" : "Next payload box",
-            message: study.isOnLastBox
-                ? "Closes the second box and opens the study data."
-                : "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box").",
+            title: passwordSheetTitle,
+            message: passwordSheetMessage,
             password: StudyStore.nextBoxPassword,
-            confirmTitle: study.isOnLastBox ? "Finish" : "Next box"
+            confirmTitle: study.isPractice ? "Start" : (study.isOnLastBox ? "Finish" : "Next box")
         ) {
             onBoxFinished()
         }
+    }
+
+    private var passwordSheetTitle: String {
+        if study.isPractice { return "Start the real measurement" }
+        return study.isOnLastBox ? "Finish the study" : "Next payload box"
+    }
+
+    private var passwordSheetMessage: String {
+        if study.isPractice {
+            return "Clears the practice payload, none of which is recorded, and starts the study on the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
+        }
+        return study.isOnLastBox
+            ? "Closes the second box and opens the study data."
+            : "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box")."
     }
 
     private var approachPicker: some View {

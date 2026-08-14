@@ -129,6 +129,19 @@ that grew with each object measured.
 twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
 when the box first appears.
 
+**Reset and "this payload is done" are two different closures, deliberately.** `MesOverlayView` takes
+both `onFullReset` and `onPayloadFinished`. They were one closure, which meant the Reset button
+advanced the study to the next box — and once the practice payload existed, it also let a participant
+leave practice and start the recorded study without the operator's password. Reset now clears the
+measurements and starts the *same* payload again. The only way forward is the button inside the
+loading plan, behind `StudyStore.nextBoxPassword`.
+
+**The practice payload is not recorded, and that is enforced in one place.** `StudyStore.currentBox`
+returns nil while `isPractice`, and every write path — `endCurrentPhase`, `recordCurrentBox`,
+`storePhoto` — resolves the box before writing anything, so they all become no-ops on their own. No
+box result is created until the practice ends, so the first box's `startedAt` is when the study really
+began. The run's report carries a `Practice` line, because nothing else records that it happened.
+
 **Each screen clocks its own study phase.** `StudyStore` only starts the measuring phase itself. The
 other two are started by the screens that are that phase: `PreparationView`'s preparation stage
 starts `.pack`, its arrangement stage starts `.payload`, and in the one-by-one method the package

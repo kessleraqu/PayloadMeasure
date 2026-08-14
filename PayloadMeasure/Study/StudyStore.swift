@@ -26,8 +26,17 @@ final class StudyStore {
 
     /// Index into `activeRun.boxOrder`.
     private(set) var currentBoxIndex = 0
+    /// True while the participant is on the practice payload, before the study proper.
+    private(set) var isPractice = false
     private var phaseStartedAt: Date?
     private var currentPhase: StudyPhase?
+
+    /// The practice payload is the same size as the small module, so the participant has met the
+    /// screens and the AR view before anything is measured for real. Deliberately derived rather than
+    /// written out again, so the two cannot drift apart.
+    static var practiceModuleSizeMillimetres: SIMD3<Double> {
+        StudyBox.small.sizeMillimetres
+    }
 
     init() {
         saved = Self.loadAll()
@@ -35,9 +44,23 @@ final class StudyStore {
 
     // MARK: - Current position
 
+    /// Nil during the practice run, which is why nothing measured there is ever recorded: every write
+    /// path resolves the box first and gives up when there is none.
     var currentBox: StudyBox? {
-        guard let activeRun, activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
+        guard !isPractice,
+              let activeRun,
+              activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
+    }
+
+    /// Whether the measuring screens should be up at all: a box, or the practice payload.
+    var hasActiveSession: Bool {
+        activeRun != nil && (isPractice || currentBox != nil)
+    }
+
+    /// The module the plan is built for.
+    var activeModuleSizeMillimetres: SIMD3<Double>? {
+        isPractice ? Self.practiceModuleSizeMillimetres : currentBox?.sizeMillimetres
     }
 
     var isOnLastBox: Bool {
@@ -59,7 +82,8 @@ final class StudyStore {
         participantName: String,
         studyDate: Date,
         flow: MeasurementFlow,
-        firstBox: StudyBox
+        firstBox: StudyBox,
+        includesPractice: Bool
     ) {
         var run = StudyRun(
             id: UUID(),
@@ -69,9 +93,36 @@ final class StudyStore {
             flow: flow.rawValue,
             firstBox: firstBox
         )
-        run.boxes = [StudyBoxResult(box: firstBox, startedAt: Date())]
+        run.includedPracticeRun = includesPractice
         activeRun = run
         currentBoxIndex = 0
+        isPractice = includesPractice
+        persistActiveRun()
+        if includesPractice {
+            // No box result yet. The first one is opened when the practice ends, so its start time is
+            // when the study actually began rather than when the participant started playing.
+            beginPhase(.measure)
+        } else {
+            openFirstBox()
+        }
+    }
+
+    /// The practice payload is done. Everything measured on it is dropped and the study begins.
+    func startRealStudy() {
+        guard isPractice else { return }
+        endCurrentPhase()
+        isPractice = false
+        openFirstBox()
+    }
+
+    private func openFirstBox() {
+        guard var run = activeRun else { return }
+        isPractice = false
+        currentBoxIndex = 0
+        if run.result(for: run.firstBox) == nil {
+            run.boxes.append(StudyBoxResult(box: run.firstBox, startedAt: Date()))
+        }
+        activeRun = run
         persistActiveRun()
         beginPhase(.measure)
     }
@@ -116,6 +167,7 @@ final class StudyStore {
         endCurrentPhase()
         activeRun = nil
         currentBoxIndex = 0
+        isPractice = false
         lastExportURL = nil
         exportMessage = nil
     }
@@ -182,7 +234,7 @@ final class StudyStore {
     /// Writes one object's photo into the run folder and returns the file name to store with it.
     @discardableResult
     func storePhoto(_ data: Data, objectID: UUID) -> String? {
-        guard let run = activeRun else { return nil }
+        guard !isPractice, let run = activeRun else { return nil }
         let name = "\(objectID.uuidString).jpg"
         let folder = Self.photosFolder(runID: run.id)
         do {

@@ -20,7 +20,8 @@ final class OverlayBodyComplexityTests: XCTestCase {
             workflowMode: .constant(.spatial3D),
             flow: .batch,
             study: StudyStore(),
-            onFullReset: {}
+            onFullReset: {},
+            onPayloadFinished: {}
         )
         let name = String(reflecting: type(of: view.body))
         print("MesOverlayView.body type length: \(name.count)")
