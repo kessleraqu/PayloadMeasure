@@ -11,6 +11,8 @@ import UIKit
 struct PreparationView: View {
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
+    let study: StudyStore
+    let onBoxFinished: () -> Void
 
     @State private var stage: Stage = .preparation
 
@@ -31,13 +33,20 @@ struct PreparationView: View {
                 }
             }
             .transition(.opacity)
+            // The two stages are the study's last two timed phases, so each one clocks itself in.
+            // Phases accumulate, so going back and forth adds to the right total instead of
+            // overwriting it.
+            .onAppear { study.beginPhase(.pack) }
 
         case .arrangement:
             ArrangementView(
                 captureEngine: captureEngine,
-                store: store
+                store: store,
+                study: study,
+                onBoxFinished: onBoxFinished
             )
             .transition(.opacity)
+            .onAppear { study.beginPhase(.payload) }
         }
     }
 }

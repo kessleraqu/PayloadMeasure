@@ -19,6 +19,7 @@ final class OverlayBodyComplexityTests: XCTestCase {
             captureEngine: ObjectCaptureEngine(),
             workflowMode: .constant(.spatial3D),
             flow: .batch,
+            study: StudyStore(),
             onFullReset: {}
         )
         let name = String(reflecting: type(of: view.body))

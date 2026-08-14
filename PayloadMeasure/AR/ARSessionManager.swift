@@ -193,6 +193,15 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         activeSession = session
         session.delegate = self
         isCoachingActive = false
+
+        // A rebuilt view hierarchy means no packing sheet is on screen any more. That suspension
+        // reason is owned by a SwiftUI presentation, so if the view that set it is destroyed without
+        // the sheet being dismissed — exactly what happens when the study moves from one payload box
+        // to the next — nothing ever clears it. The session then stays paused forever and the HUD
+        // sits on "understanding environment" that never completes. Application inactivity is not
+        // cleared here: that one reflects real app state, not a presentation.
+        suspensionReasons.remove(.packingArrangement)
+        isTrackingSuspended = !suspensionReasons.isEmpty
         frameEpoch &+= 1
         trackingStatus = .starting
         hasDetectedHorizontalPlane = false

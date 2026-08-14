@@ -34,6 +34,15 @@ struct PackingARView: View {
 
             VStack {
                 header
+                if let warning = model.cameraWarning {
+                    Text(warning)
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
+                        .padding(.top, 8)
+                        .transition(.opacity)
+                }
                 Spacer()
                 if model.isPlaced {
                     controls
@@ -44,6 +53,7 @@ struct PackingARView: View {
             .padding(16)
         }
         .statusBarHidden()
+        .animation(.easeInOut(duration: 0.2), value: model.cameraWarning)
     }
 
     private var header: some View {
@@ -142,9 +152,17 @@ struct PackingARView: View {
             .padding(.horizontal, 8)
             .glassEffect(.regular, in: .capsule)
 
-            Text("Tap a package to read its name.")
+            Text("Tap a package to read its name. Drag or twist to turn the module.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            if model.turnDegrees > 0.5 {
+                Text(String(format: "Turned %.0f°", model.turnDegrees))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
         }
         .padding(.bottom, 24)
         .animation(.snappy(duration: 0.2), value: model.selectedPackageName)
@@ -165,6 +183,10 @@ final class PackingARModel {
     private(set) var visibleLayerIndex = 0
     private(set) var selectedPackageName: String?
     private(set) var statusText = "Point at the table and tap to put the module down."
+    /// How far the module has been turned about the vertical, 0 to 360, for the readout.
+    private(set) var turnDegrees: Double = 0
+    /// Set while the camera is being taken back from whatever else grabbed it.
+    private(set) var cameraWarning: String?
     /// Bumped whenever the AR side must rebuild what it is showing.
     private(set) var revision = 0
     /// Bumped when the operator wants to place the module again.
@@ -214,6 +236,7 @@ final class PackingARModel {
     func unplace() {
         isPlaced = false
         selectedPackageName = nil
+        turnDegrees = 0
         statusText = "Point at the table and tap to put the module down."
         unplaceRevision &+= 1
     }
@@ -221,6 +244,24 @@ final class PackingARModel {
     func reportNoSurface() {
         guard !isPlaced else { return }
         statusText = "Move the phone slowly across the table until a surface is found, then tap."
+    }
+
+    /// Whole degrees, and only when they change: this is called for every touch move, and the
+    /// readout it feeds cannot show anything finer anyway.
+    func reportTurn(radians: Float) {
+        var degrees = (Double(radians) * 180 / .pi).rounded().truncatingRemainder(dividingBy: 360)
+        if degrees < 0 { degrees += 360 }
+        guard degrees != turnDegrees else { return }
+        turnDegrees = degrees
+    }
+
+    func reportCameraRestarting() {
+        cameraWarning = "Getting the camera back…"
+    }
+
+    func clearCameraWarning() {
+        guard cameraWarning != nil else { return }
+        cameraWarning = nil
     }
 
     func select(packageID: UUID?) {
@@ -242,11 +283,11 @@ private struct PackingARContainer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> ARView {
         let view = ARView(frame: .zero, cameraMode: .ar, automaticallyConfigureSession: false)
-        let configuration = ARWorldTrackingConfiguration()
-        configuration.worldAlignment = .gravity
-        configuration.planeDetection = [.horizontal]
-        configuration.environmentTexturing = .none
-        view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        view.session.delegate = context.coordinator
+        view.session.run(
+            Coordinator.makeConfiguration(),
+            options: [.resetTracking, .removeExistingAnchors]
+        )
         context.coordinator.attach(to: view)
         return view
     }
@@ -256,19 +297,29 @@ private struct PackingARContainer: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
+        uiView.session.delegate = nil
         uiView.session.pause()
         coordinator.detach()
     }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, ARSessionDelegate {
         private let model: PackingARModel
         private weak var view: ARView?
         private var anchor: AnchorEntity?
+        /// Child of the anchor. Everything is built into this so it can be turned without disturbing
+        /// the anchor's alignment with the real surface.
+        private var contentRoot: Entity?
         private var packageEntities: [UUID: ModelEntity] = [:]
         private var observedRevision = -1
         private var observedUnplaceRevision = 0
         private var searchTimer: Timer?
+        private var watchdogTimer: Timer?
+        private var lastFrameTime: TimeInterval = 0
+        private var lastFrameTimestamp: TimeInterval = 0
+        private var restartsRemaining = 4
+        private var turn: Float = 0
+        private var turnAtGestureStart: Float = 0
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
         private let scale: Float = 0.001
@@ -277,33 +328,174 @@ private struct PackingARContainer: UIViewRepresentable {
             self.model = model
         }
 
+        static func makeConfiguration() -> ARWorldTrackingConfiguration {
+            let configuration = ARWorldTrackingConfiguration()
+            configuration.worldAlignment = .gravity
+            configuration.planeDetection = [.horizontal]
+            configuration.environmentTexturing = .none
+            return configuration
+        }
+
         func attach(to view: ARView) {
             self.view = view
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
             view.addGestureRecognizer(tap)
+
+            // Turning the module: drag with one finger, or twist with two. Both do the same thing,
+            // because neither is obvious on its own and the operator is usually holding the phone
+            // with one hand and a box with the other.
+            let drag = UIPanGestureRecognizer(target: self, action: #selector(handleDrag))
+            drag.maximumNumberOfTouches = 1
+            view.addGestureRecognizer(drag)
+            let twist = UIRotationGestureRecognizer(target: self, action: #selector(handleTwist))
+            view.addGestureRecognizer(twist)
+
             searchTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.model.reportNoSurface() }
+                Task { @MainActor [weak self] in self?.model.reportNoSurface() }
+            }
+            lastFrameTime = CACurrentMediaTime()
+            watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.checkForStalledCamera() }
             }
         }
 
         func detach() {
             searchTimer?.invalidate()
             searchTimer = nil
+            watchdogTimer?.invalidate()
+            watchdogTimer = nil
             view = nil
+        }
+
+        // MARK: - Keeping the camera alive
+
+        nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+            Task { @MainActor [weak self] in
+                self?.restartSession(resettingTracking: true)
+            }
+        }
+
+        nonisolated func sessionWasInterrupted(_ session: ARSession) {
+            Task { @MainActor [weak self] in
+                self?.model.reportCameraRestarting()
+            }
+        }
+
+        nonisolated func sessionInterruptionEnded(_ session: ARSession) {
+            Task { @MainActor [weak self] in
+                self?.restartSession(resettingTracking: false)
+            }
+        }
+
+        /// Only one ARKit session can hold the camera. If anything else takes it — the measuring
+        /// session waking up behind this screen, a phone call, the app going away and coming back —
+        /// this one simply stops being given frames and the picture sits there frozen, with no error
+        /// and no interruption callback to react to. So the session's own frame clock is read once a
+        /// second, and if it has stopped moving the session is told to run again.
+        ///
+        /// Once a second, from the session itself: no per-frame delegate work, which at sixty frames
+        /// a second would cost more than the problem it is watching for.
+        private func checkForStalledCamera() {
+            guard let view, restartsRemaining > 0 else { return }
+            let now = CACurrentMediaTime()
+            guard let timestamp = view.session.currentFrame?.timestamp else { return }
+
+            if timestamp != lastFrameTimestamp {
+                lastFrameTimestamp = timestamp
+                lastFrameTime = now
+                restartsRemaining = 4
+                model.clearCameraWarning()
+                return
+            }
+            guard now - lastFrameTime > 2 else { return }
+            restartsRemaining -= 1
+            model.reportCameraRestarting()
+            // No reset: the placed module and the tracked world are kept if the session comes back.
+            view.session.run(Self.makeConfiguration())
+            lastFrameTime = now
+        }
+
+        private func restartSession(resettingTracking: Bool) {
+            guard let view else { return }
+            if resettingTracking {
+                clearPlacement()
+                model.unplace()
+            }
+            view.session.run(
+                Self.makeConfiguration(),
+                options: resettingTracking ? [.resetTracking, .removeExistingAnchors] : []
+            )
+            lastFrameTime = CACurrentMediaTime()
+            lastFrameTimestamp = 0
+        }
+
+        // MARK: - Turning the module
+
+        @objc private func handleDrag(_ recogniser: UIPanGestureRecognizer) {
+            guard let view, contentRoot != nil, view.bounds.width > 0 else { return }
+            let width = Float(view.bounds.width)
+            switch recogniser.state {
+            case .began:
+                turnAtGestureStart = turn
+            case .changed, .ended:
+                // The full width of the screen is half a turn: enough to line the module up with a
+                // table edge without the model spinning away from under the finger.
+                let travel = Float(recogniser.translation(in: view).x) / width
+                apply(turn: turnAtGestureStart - travel * .pi, settling: recogniser.state == .ended)
+            default:
+                break
+            }
+        }
+
+        @objc private func handleTwist(_ recogniser: UIRotationGestureRecognizer) {
+            guard contentRoot != nil else { return }
+            switch recogniser.state {
+            case .began:
+                turnAtGestureStart = turn
+            case .changed, .ended:
+                apply(
+                    turn: turnAtGestureStart - Float(recogniser.rotation),
+                    settling: recogniser.state == .ended
+                )
+            default:
+                break
+            }
+        }
+
+        /// Lets go on a right angle when it is nearly there. The module is being lined up with a real
+        /// table, and square is almost always what was meant.
+        private func apply(turn newTurn: Float, settling: Bool) {
+            var value = newTurn
+            if settling {
+                let quarter = Float.pi / 2
+                let nearest = (value / quarter).rounded() * quarter
+                if abs(value - nearest) < 0.09 {
+                    value = nearest
+                }
+            }
+            turn = value
+            contentRoot?.orientation = simd_quatf(angle: value, axis: SIMD3(0, 1, 0))
+            model.reportTurn(radians: value)
         }
 
         func sync() {
             if model.unplaceRevision != observedUnplaceRevision {
                 observedUnplaceRevision = model.unplaceRevision
-                anchor?.removeFromParent()
-                anchor = nil
-                packageEntities.removeAll()
-                observedRevision = -1
+                clearPlacement()
                 return
             }
             guard anchor != nil, model.revision != observedRevision else { return }
             observedRevision = model.revision
             refreshLayerVisibility()
+        }
+
+        private func clearPlacement() {
+            anchor?.removeFromParent()
+            anchor = nil
+            contentRoot = nil
+            packageEntities.removeAll()
+            observedRevision = -1
+            turn = 0
         }
 
         @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
@@ -336,9 +528,13 @@ private struct PackingARContainer: UIViewRepresentable {
             searchTimer = nil
 
             let placed = AnchorEntity(world: result.worldTransform)
+            let content = Entity()
+            placed.addChild(content)
             view.scene.addAnchor(placed)
             anchor = placed
-            build(into: placed)
+            contentRoot = content
+            turn = 0
+            build(into: content)
             observedRevision = model.revision
             refreshLayerVisibility()
             model.markPlaced()
@@ -346,7 +542,7 @@ private struct PackingARContainer: UIViewRepresentable {
 
         // MARK: - Content
 
-        private func build(into anchor: AnchorEntity) {
+        private func build(into anchor: Entity) {
             let size = SIMD3<Float>(
                 Float(model.solution.knapsack.size.x),
                 Float(model.solution.knapsack.size.y),
@@ -439,7 +635,7 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         /// Four thin walls and a floor. No lid, so the operator can see and reach in.
-        private func addOpenTopShell(size: SIMD3<Float>, to anchor: AnchorEntity) {
+        private func addOpenTopShell(size: SIMD3<Float>, to anchor: Entity) {
             let wall: Float = 0.002
             let green = UIColor.systemGreen.withAlphaComponent(0.3)
             var material = SimpleMaterial(color: green, isMetallic: false)

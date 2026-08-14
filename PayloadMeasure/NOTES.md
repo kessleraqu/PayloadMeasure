@@ -129,6 +129,41 @@ that grew with each object measured.
 twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
 when the box first appears.
 
+**Each screen clocks its own study phase.** `StudyStore` only starts the measuring phase itself. The
+other two are started by the screens that are that phase: `PreparationView`'s preparation stage
+starts `.pack`, its arrangement stage starts `.payload`, and in the one-by-one method the package
+details sheet starts `.pack` on appear and hands the clock back to `.measure` on dismiss. Starting
+`.pack` from the packing sheet's presentation instead — which is what it used to do — could not tell
+boxing apart from loading, and nothing started `.payload` at all, so two of the three timings were
+always blank in the app and in the report.
+
+**Finished objects keep their point cloud but stop drawing it.** The cyan selection points and the
+marker dot are both suppressed once an object is finished: its box is already drawn, so they were
+clutter, and the point budget is split evenly between objects, so keeping finished ones made the
+object actually being measured sparser with every object saved. The data stays, because a remeasure
+merges into it and the marker is how the app knows a saved object is on screen.
+
+**The room view watches its own frame clock.** Only one ARKit session can hold the camera, and the
+loser is not told: it simply stops being handed frames, with no error and no interruption callback,
+so the picture freezes. `PackingARView` therefore reads `session.currentFrame?.timestamp` once a
+second and re-runs its configuration — without resetting tracking, so the placed module survives —
+if the timestamp has not moved for two seconds. Once a second from the session, not per frame from a
+delegate: at sixty frames a second the watchdog would cost more than the freeze it watches for.
+
+**Reports are saved through the system's save panel.** `ShareLink` alone was not enough; the ask was
+a file on the device. `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` also expose the
+app's Documents folder as Files › On My iPhone › PayloadMeasure, so every run can be collected
+without the app's help. Neither the app nor the Files folder has any delete path.
+
+**`UIFileSharingEnabled` needs the partial `Info.plist` at the project root**, not a build setting.
+Xcode honours only a fixed list of `INFOPLIST_KEY_*` settings and silently drops the rest, so
+`INFOPLIST_KEY_UIFileSharingEnabled = YES` built without complaint and produced an app with the key
+missing — while `INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace` beside it worked. The target keeps
+`GENERATE_INFOPLIST_FILE = YES` and points `INFOPLIST_FILE` at that file, so the generated keys are
+merged into it. The file is outside `PayloadMeasure/` because that folder is a synchronised group and
+a plist inside it would also be copied into the bundle as a resource. If a plist key ever seems to be
+ignored, check the built `PayloadMeasure.app/Info.plist` rather than the build setting.
+
 ## Sources
 
 Box fitting — both Full 3D and Top — follows Liu, Liu and Zhang, *Estimation of 2D Bounding Box Orientation with

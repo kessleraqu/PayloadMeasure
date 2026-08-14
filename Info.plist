@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Only what the build settings cannot express. GENERATE_INFOPLIST_FILE stays on, so everything
+    declared as an INFOPLIST_KEY_* setting is merged into this file at build time.
+
+    UIFileSharingEnabled is here because Xcode ignores INFOPLIST_KEY_UIFileSharingEnabled — it
+    honours only a fixed set of those keys, and this is not one of them. It has to be set for the
+    study reports in Documents to be reachable from Files › On My iPhone › PayloadMeasure. It is
+    deliberately kept outside the PayloadMeasure/ folder, which is a synchronised group: a plist in
+    there would also be copied into the bundle as a resource.
+-->
+<plist version="1.0">
+<dict>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+</dict>
+</plist>

@@ -4196,11 +4196,19 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
+        /// Points for objects still being worked on, thinned to a fixed budget.
+        ///
+        /// Finished objects are left out on purpose. Their box is already drawn, so the cloud only
+        /// added clutter — and because the budget is split evenly between objects, keeping them
+        /// meant the live object's cloud got sparser with every object saved, which read as the
+        /// points appearing at random.
         private func displayedSelectionPoints() -> [SIMD3<Float>] {
+            let finalized = captureEngine.finalizedObjectIDs
             let pointGroups = selectionPointsByObject.keys
                 .sorted { $0.uuidString < $1.uuidString }
                 .compactMap { id -> [SIMD3<Float>]? in
-                    guard let points = selectionPointsByObject[id],
+                    guard !finalized.contains(id),
+                          let points = selectionPointsByObject[id],
                           !points.isEmpty else {
                         return nil
                     }

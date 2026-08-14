@@ -1,10 +1,10 @@
 import SwiftUI
 
-// Root view. Picks a working method, then puts the HUD over the AR camera and owns the objects both
-// of them share.
+// Root view. Runs a user study: set the participant up, measure and pack the first payload box,
+// then the second, then show the data.
 //
-// A full reset drops back to the start screen and rebuilds the whole hierarchy, so every piece of
-// per-session state — including the packing store the HUD owns — is genuinely thrown away.
+// The study owns the flow now — the method and the box order come from StudySetupView rather than
+// being picked ad hoc, so a session cannot start without being recorded.
 
 struct ContentView: View {
     @AppStorage("measurementWorkflowMode")
@@ -12,12 +12,16 @@ struct ContentView: View {
     @State private var sessionManager = ARSessionManager()
     @State private var aimerState = AimerState()
     @State private var captureEngine = ObjectCaptureEngine()
-    @State private var flow: MeasurementFlow?
     @State private var sessionToken = 0
     @State private var warmup = AppWarmup()
+    @State private var study = StudyStore()
 
     var body: some View {
-        if let flow {
+        if let run = study.activeRun, study.hasFinishedAllBoxes {
+            NavigationStack {
+                StudyResultsView(run: run, store: study, onRestart: restartForNextParticipant)
+            }
+        } else if let flow = study.flow, study.currentBox != nil {
             ZStack {
                 ARCameraView(
                     sessionManager: sessionManager,
@@ -33,21 +37,33 @@ struct ContentView: View {
                     captureEngine: captureEngine,
                     workflowMode: $workflowMode,
                     flow: flow,
-                    onFullReset: fullReset
+                    study: study,
+                    onFullReset: startNextBox
                 )
             }
             .id(sessionToken)
         } else {
-            StartView(warmup: warmup) { chosen in
-                flow = chosen
-            }
+            StudySetupView(warmup: warmup, store: study)
         }
     }
 
-    private func fullReset() {
+    /// Between boxes: the measurements belong to the box just finished, so the capture session is
+    /// cleared and the view hierarchy rebuilt, exactly as a full reset does.
+    private func startNextBox() {
         captureEngine.reset()
         sessionToken &+= 1
-        flow = nil
+        if study.isOnLastBox {
+            study.finishRun()
+        } else {
+            study.advanceToNextBox()
+        }
+    }
+
+    /// From the results screen. Keeps every saved run; only clears the screen.
+    private func restartForNextParticipant() {
+        captureEngine.reset()
+        sessionToken &+= 1
+        study.clearActiveRun()
     }
 }
 

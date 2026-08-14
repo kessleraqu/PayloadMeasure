@@ -22,6 +22,8 @@ struct MesOverlayView: View {
     let captureEngine: ObjectCaptureEngine
     @Binding var workflowMode: MeasurementWorkflowMode
     let flow: MeasurementFlow
+    let study: StudyStore
+    /// Called when this payload box is finished, so the run can move on.
     let onFullReset: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -42,7 +44,6 @@ struct MesOverlayView: View {
     @State private var lockFeedback = UINotificationFeedbackGenerator()
     @State private var packingStore = PackingStore()
     @State private var showsPackingWorkflow = false
-    @State private var hasDismissedTutorial = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -64,17 +65,6 @@ struct MesOverlayView: View {
             topLayer
             bottomLayer
         }
-        .overlay {
-            if !hasDismissedTutorial {
-                MeasurementTutorialView(
-                    isEnvironmentReady: !isPreparingToMeasure
-                ) {
-                    hasDismissedTutorial = true
-                }
-                .transition(.opacity)
-            }
-        }
-        .animation(.snappy(duration: 0.25), value: hasDismissedTutorial)
         .animation(.snappy(duration: 0.22), value: showsPanel)
         .animation(.snappy(duration: 0.22), value: showsSavedObjects)
         .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
@@ -116,7 +106,15 @@ struct MesOverlayView: View {
                 lockFeedback.prepare()
             }
         }
-        .onAppear(perform: handleAppearance)
+        .onAppear {
+            handleAppearance()
+            // The module the plan is built for is the study's current payload box.
+            if let box = study.currentBox {
+                packingStore.module.lengthMillimetres = box.sizeMillimetres.x
+                packingStore.module.widthMillimetres = box.sizeMillimetres.y
+                packingStore.module.heightMillimetres = box.sizeMillimetres.z
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
         }
@@ -130,6 +128,10 @@ struct MesOverlayView: View {
                 store: packingStore,
                 onRescan: { rescan(entry.id) }
             )
+            // In the one-by-one method this sheet *is* the boxing and weighing step, so it is timed
+            // as such and the clock goes back to measuring when it closes.
+            .onAppear { study.beginPhase(.pack) }
+            .onDisappear { study.beginPhase(.measure) }
         }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
@@ -142,7 +144,9 @@ struct MesOverlayView: View {
         ) {
             PreparationView(
                 captureEngine: captureEngine,
-                store: packingStore
+                store: packingStore,
+                study: study,
+                onBoxFinished: onFullReset
             )
         }
         .alert(
@@ -249,11 +253,14 @@ struct MesOverlayView: View {
     /// Leaving the loading plan means the load is done. Rather than drop back into a half-used
     /// session — which is what made the app feel worse afterwards — offer to clear everything.
     private func handlePackingWorkflowDismissal() {
-        captureEngine.clearAllSnapshotJPEGData()
-        showsFinishLoadConfirmation = true
+        // Back to measuring for the same box. Moving on is done from inside the plan, behind a
+        // password, so closing the sheet by accident cannot end a participant's box.
+        study.beginPhase(.measure)
     }
 
     private func handlePackingWorkflowPresentationChange(_ isPresented: Bool) {
+        // The phase is started by PreparationView's own stages rather than here, so that boxing and
+        // loading the payload are timed separately.
         sessionManager.setPackingArrangementPresented(isPresented)
     }
 
@@ -267,6 +274,7 @@ struct MesOverlayView: View {
                 if !showsPanel {
                     aimer
                 }
+                preparingPrompt
                 levellingPrompt
             }
         )
@@ -395,12 +403,21 @@ struct MesOverlayView: View {
         }
     }
 
+    /// Only objects still being worked on. A finished object already has its box drawn in the scene,
+    /// and a dot on top of it just adds clutter — the engine still keeps the marker, because that is
+    /// how it knows whether a saved object is on screen and can be remeasured.
+    private var liveObjectMaskMarkers: [ObjectMaskMarker] {
+        captureEngine.objectMaskMarkers.filter {
+            !captureEngine.finalizedObjectIDs.contains($0.id)
+        }
+    }
+
     @ViewBuilder
     private var objectMaskMarkers: some View {
         if captureEngine.showsObjectMaskMarkers,
-           !captureEngine.objectMaskMarkers.isEmpty {
+           !liveObjectMaskMarkers.isEmpty {
             GeometryReader { proxy in
-                ForEach(captureEngine.objectMaskMarkers) { marker in
+                ForEach(liveObjectMaskMarkers) { marker in
                     let color = Color(
                         red: marker.color.red,
                         green: marker.color.green,
@@ -457,8 +474,7 @@ struct MesOverlayView: View {
                 )
             }
 
-            framingGuidanceLine
-            autoLockProgress
+            measuringProgress
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)
@@ -488,10 +504,7 @@ struct MesOverlayView: View {
     private var faceCoverageAccessibilityLabel: String {
         let top = captureEngine.footprintSatisfied ? "captured" : "still needed"
         let side = captureEngine.heightSatisfied ? "captured" : "still needed"
-        let framing = captureEngine.framingGuidance.map {
-            " \(framingGuidanceText(for: $0))."
-        } ?? ""
-        return "\(captureEngine.primaryText). Top view \(top). Side view \(side).\(framing)"
+        return "\(captureEngine.primaryText). Top view \(top). Side view \(side). \(measuringTitle)"
     }
 
     private var topCaptureGuide: some View {
@@ -524,8 +537,7 @@ struct MesOverlayView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            framingGuidanceLine
-            autoLockProgress
+            measuringProgress
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)
@@ -533,95 +545,106 @@ struct MesOverlayView: View {
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 
+    /// How far along the measurement is, and what to do about it, as one thing instead of two.
+    ///
+    /// It used to be a thin bar with a percentage beside it and a separate "move closer" chip
+    /// underneath. Two rows, both easy to miss, often saying the same thing. This is a ring with the
+    /// percentage in the middle and a single instruction next to it, and it is the only place the
+    /// distance advice appears.
     @ViewBuilder
-    private var framingGuidanceLine: some View {
-        if captureEngine.activeObjectID != nil,
-           let guidance = captureEngine.framingGuidance {
-            Label(
-                framingGuidanceText(for: guidance),
-                systemImage: framingGuidanceSystemImage(for: guidance)
-            )
-            .font(.footnote.weight(.bold))
-            .foregroundStyle(framingGuidanceColor(for: guidance))
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                framingGuidanceColor(for: guidance).opacity(0.16),
-                in: RoundedRectangle(cornerRadius: 9)
-            )
-        }
-    }
-
-    private func framingGuidanceText(for guidance: ObjectFramingGuidance) -> String {
-        switch guidance {
-        case .moveCloser:
-            "Move the phone closer"
-        case .moveFarther:
-            "Move the phone farther away"
-        case .okay:
-            "Distance looks good"
-        }
-    }
-
-    private func framingGuidanceSystemImage(for guidance: ObjectFramingGuidance) -> String {
-        switch guidance {
-        case .moveCloser:
-            "arrow.down.right.and.arrow.up.left"
-        case .moveFarther:
-            "arrow.up.left.and.arrow.down.right"
-        case .okay:
-            "checkmark.circle.fill"
-        }
-    }
-
-    private func framingGuidanceColor(for guidance: ObjectFramingGuidance) -> Color {
-        guidance == .okay ? .green : .orange
-    }
-
-    @ViewBuilder
-    private var autoLockProgress: some View {
+    private var measuringProgress: some View {
         let convergence = captureEngine.convergence
-        if convergence.isActive {
-            let progress = min(max(convergence.progress, 0), 1)
-            let percent = Int((progress * 100).rounded())
-            // No GeometryReader here. It is greedy in both axes, and inside this flexible stack it
-            // formed a layout cycle that overflowed the stack the moment a measurement went active
-            // on device. ProgressView sizes itself from the proposal instead.
-            HStack(spacing: 10) {
-                ProgressView(value: progress)
-                    .progressViewStyle(.linear)
-                    .tint(autoLockTint)
-                    .frame(height: 8)
+        if convergence.isActive || measuringGuidance != nil {
+            HStack(spacing: 14) {
+                progressRing(convergence.isActive ? convergence.progress : nil)
 
-                Text("\(percent)%")
-                    .font(.subheadline.weight(.bold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(measuringTitle)
+                        .font(.system(.headline, design: .rounded).weight(.bold))
+                        .foregroundStyle(measuringColor)
+                    Text(measuringAdvice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+            .animation(.easeInOut(duration: 0.2), value: measuringTitle)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(measuringTitle)
+            .accessibilityValue(measuringAdvice)
+        }
+    }
+
+    /// Nil hides the number, which is what happens before there is anything to be a percentage of.
+    private func progressRing(_ progress: Double?) -> some View {
+        let clamped = min(max(progress ?? 0, 0), 1)
+        return ZStack {
+            Circle()
+                .stroke(.white.opacity(0.22), lineWidth: 7)
+            Circle()
+                .trim(from: 0, to: max(clamped, 0.001))
+                .stroke(
+                    measuringColor,
+                    style: StrokeStyle(lineWidth: 7, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+                .animation(.easeOut(duration: 0.25), value: clamped)
+            if progress != nil {
+                Text("\(Int((clamped * 100).rounded()))")
+                    .font(.system(.subheadline, design: .rounded).weight(.bold))
                     .monospacedDigit()
                     .foregroundStyle(.white)
-                    .shadow(radius: 1)
-                    .frame(minWidth: 44, alignment: .trailing)
+            } else {
+                Image(systemName: measuringIcon)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(measuringColor)
             }
-            .frame(height: 20)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(autoLockHeadline)
-            .accessibilityValue("\(percent) percent. \(convergence.detail)")
+        }
+        .frame(width: 52, height: 52)
+    }
+
+    /// Distance advice, but only once a measurement is under way — before that the object is not
+    /// being tracked and any advice would be guesswork.
+    private var measuringGuidance: ObjectFramingGuidance? {
+        guard captureEngine.activeObjectID != nil else { return nil }
+        return captureEngine.framingGuidance
+    }
+
+    private var measuringTitle: String {
+        switch measuringGuidance {
+        case .moveCloser: "Move closer"
+        case .moveFarther: "Move back"
+        default: captureEngine.convergence.isConverged ? "Size settled" : "Hold steady"
         }
     }
 
-    private var autoLockHeadline: String {
-        if !captureEngine.isAutomaticLockEnabled {
-            return "Measurement quality"
+    private var measuringAdvice: String {
+        switch measuringGuidance {
+        case .moveCloser: "Bring the phone nearer the object."
+        case .moveFarther: "Pull the phone back a little."
+        default:
+            captureEngine.convergence.isConverged
+                ? "The reading has stopped changing. You can finish."
+                : "Keep the object in view while the size settles."
         }
-        if captureEngine.isAutomaticLockDisarmedForActiveObject {
-            return "Automatic finish dismissed"
-        }
-        return captureEngine.convergence.headline
     }
 
+    private var measuringIcon: String {
+        switch measuringGuidance {
+        case .moveCloser: "arrow.down.right.and.arrow.up.left"
+        case .moveFarther: "arrow.up.left.and.arrow.down.right"
+        default: captureEngine.convergence.isConverged ? "checkmark" : "dot.viewfinder"
+        }
+    }
 
-    /// High contrast against the camera feed, which can be any colour at all.
-    private var autoLockTint: Color {
-        captureEngine.convergence.isConverged ? .green : .white
+    private var measuringColor: Color {
+        switch measuringGuidance {
+        case .moveCloser, .moveFarther: .orange
+        default: captureEngine.convergence.isConverged ? .green : .white
+        }
     }
 
     private var topGuideColor: Color {
@@ -1183,12 +1206,48 @@ struct MesOverlayView: View {
             && captureEngine.hasCompletedObjectRecognitionWarmup
     }
 
+    /// Shown over the live camera until the environment is ready. The camera is deliberately visible
+    /// behind it: the instruction is something to do *with* the camera, and watching the scene move
+    /// is what tells the operator the phone is actually working.
+    @ViewBuilder
+    private var preparingPrompt: some View {
+        if isPreparingToMeasure, !showsPanel {
+            VStack(spacing: 12) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("Getting ready")
+                    .font(.headline)
+                Text(preparingInstruction)
+                    .font(.subheadline)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Measuring unlocks by itself when this finishes.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 18)
+            .frame(maxWidth: 330)
+            .glassEffect(.regular, in: .rect(cornerRadius: 22))
+            .transition(.opacity)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var preparingInstruction: String {
+        if !sessionManager.isObjectTrackingEnvironmentReady {
+            return "Point the phone at the table and move it slowly from side to side, so it can find the surface the objects are standing on."
+        }
+        return "Object detection is warming up. Keep the objects in view."
+    }
+
     /// Shown while the phone is not level enough to measure. Nothing else appears until it is.
     @ViewBuilder
     private var levellingPrompt: some View {
         if isAutomaticCaptureSupported,
            captureEngine.activeObjectID == nil,
            !showsPanel,
+           !isPreparingToMeasure,
            !captureEngine.isTopViewAligned {
             VStack(spacing: 10) {
                 Image(systemName: "iphone.gen3.radiowaves.left.and.right")
@@ -2047,6 +2106,7 @@ struct MesOverlayView: View {
         captureEngine: ObjectCaptureEngine(),
         workflowMode: .constant(.spatial3D),
         flow: .batch,
+        study: StudyStore(),
         onFullReset: {}
     )
 }

@@ -11,8 +11,11 @@ import simd
 struct ArrangementView: View {
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
+    let study: StudyStore
+    let onBoxFinished: () -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @State private var showsNextBoxPassword = false
     @State private var highlightedPackageID: UUID?
     @State private var showsSettings = false
     @State private var showsDiagnostics = false
@@ -27,11 +30,76 @@ struct ArrangementView: View {
         store.packagesMissingPreparation(from: captureEngine)
     }
 
+    /// The only way out of a participant's box, and it is behind a password so they cannot end their
+    /// own run by pressing something. Records the box before moving on.
+    @ViewBuilder
+    private var nextBoxButton: some View {
+        if store.baldiComparison != nil || store.result != nil {
+            Button {
+                recordCurrentBox()
+                showsNextBoxPassword = true
+            } label: {
+                Label(
+                    study.isOnLastBox ? "Finish the study" : "Next box",
+                    systemImage: study.isOnLastBox ? "checkmark.seal" : "arrow.right.circle"
+                )
+                .font(.headline)
+                .frame(maxWidth: .infinity, minHeight: 50)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityHint("Asks for the study password, then moves the participant on.")
+        }
+    }
+
+    /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
+    /// where each package ended up.
+    private func recordCurrentBox() {
+        let solution = store.baldiComparison?.paper.solution
+        let loadedIDs = solution?.placements.map(\.id) ?? []
+        var records: [StudyObjectRecord] = []
+
+        for id in captureEngine.measuredObjectIDs {
+            let measured = store.measuredSizeMillimetres(for: id, in: captureEngine)
+            let packaged = store.packagedSizeMillimetres(for: id, in: captureEngine)
+            let placement = solution?.placements.first { $0.id == id }
+            var photoName: String?
+            if let data = captureEngine.snapshotJPEGData(for: id) {
+                photoName = study.storePhoto(data, objectID: id)
+            }
+            records.append(
+                StudyObjectRecord(
+                    id: id,
+                    name: captureEngine.name(for: id) ?? "Unnamed",
+                    measuredSizeMillimetres: measured.map { [$0.x, $0.y, $0.z] } ?? [],
+                    packagedSizeMillimetres: packaged.map { [$0.x, $0.y, $0.z] } ?? [],
+                    assignedBoxName: store.selectedBoxPreset(for: id)?.name,
+                    isOwnBox: store.isItsOwnBox(id, in: captureEngine),
+                    hasEnforcedSize: store.forcedSize(for: id, in: captureEngine) != nil,
+                    massKilograms: captureEngine.weightInKilograms(for: id),
+                    photoFileName: photoName,
+                    placementOriginMillimetres: placement.map {
+                        [$0.origin.x, $0.origin.y, $0.origin.z]
+                    }
+                )
+            )
+        }
+
+        study.recordCurrentBox(
+            objects: records,
+            loadedObjectIDs: loadedIDs,
+            unloadedObjectNames: solution?.unloaded.map(\.name) ?? [],
+            packingMode: store.approach == .knapsack3D ? "3D knapsack (paper)" : "Balance",
+            centreOfMass: solution?.centreOfMass,
+            unbalancingIndex: solution?.unbalancingIndex
+        )
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     approachPicker
+                    nextBoxButton
 
                     if captureEngine.measuredObjectIDs.isEmpty {
                         emptyCard
@@ -110,6 +178,7 @@ struct ArrangementView: View {
             }
             .onDisappear { store.cancel() }
         }
+        .sheet(isPresented: $showsNextBoxPassword) { studyPasswordSheet }
     }
 
     private var solveTrigger: String {
@@ -124,6 +193,19 @@ struct ArrangementView: View {
             return "balance|" + store.signature(for: packages)
         case .knapsack3D:
             return "knapsack|" + store.baldiSignature(for: baldiProblem)
+        }
+    }
+
+    private var studyPasswordSheet: some View {
+        StudyPasswordSheet(
+            title: study.isOnLastBox ? "Finish the study" : "Next payload box",
+            message: study.isOnLastBox
+                ? "Closes the second box and opens the study data."
+                : "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box").",
+            password: StudyStore.nextBoxPassword,
+            confirmTitle: study.isOnLastBox ? "Finish" : "Next box"
+        ) {
+            onBoxFinished()
         }
     }
 
