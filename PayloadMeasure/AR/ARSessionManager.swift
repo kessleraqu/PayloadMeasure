@@ -2,6 +2,7 @@ import ARKit
 import AVFoundation
 import CoreVideo
 import Observation
+import simd
 
 // Owns the ARKit session: configuration, capability checks, interruption handling and suspension.
 //
@@ -345,6 +346,23 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             configuration: activeConfiguration,
             options: [.resetTracking, .removeExistingAnchors]
         )
+    }
+
+    /// Accuracy protocols deliberately make consecutive readings independent. These helpers expose
+    /// only the two pieces the protocol needs without handing a SwiftUI screen ownership of ARSession.
+    func restartTracking() {
+        guard let activeSession else { return }
+        restartTracking(activeSession)
+    }
+
+    func cameraDistanceMetres(to worldPosition: SIMD3<Float>) -> Double? {
+        guard let frame = activeSession?.currentFrame,
+              case .normal = frame.camera.trackingState else {
+            return nil
+        }
+        let column = frame.camera.transform.columns.3
+        let cameraPosition = SIMD3<Float>(column.x, column.y, column.z)
+        return Double(simd_distance(cameraPosition, worldPosition))
     }
 
     private func startWhenCameraIsAuthorized(

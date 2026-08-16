@@ -22,6 +22,7 @@ nonisolated struct PackingARPresentation: Identifiable, Sendable {
 struct BaldiResultView: View {
     let comparison: BaldiComparison
     let colours: [UUID: Color]
+    var allowsRoomScaleAR = true
     @Binding var highlightedPackageID: UUID?
 
     @State private var selectedMode: BaldiPackingMode = .paper
@@ -42,7 +43,9 @@ struct BaldiResultView: View {
                let verification = result.verification {
                 headline(solution)
                 interactivePacking(solution)
-                placeOnTableButton
+                if allowsRoomScaleAR {
+                    placeOnTableButton
+                }
                 openingInstruction
                 loadingGuide(solution, verification: verification)
                 if !solution.unloaded.isEmpty {

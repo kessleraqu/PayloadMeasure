@@ -199,6 +199,33 @@ then removes it, so the scene never accumulates and the tenth reading is as quic
 being rebuilt and can be left and resumed — the only removal anywhere in the app is
 `undoLastReading`, deliberately limited to the reading just taken.
 
+**Framing accuracy is a separate controlled protocol, not another guessed distance rule.** It uses
+one object at five square sizes (20, 35, 50, 65 and 80% of the shorter AR viewport dimension), with
+five repeated rounds by default. Alternate rounds reverse the order to reduce drift with time. A
+successful reading stores the requested and actual fill, the complete normalized mask box, renderer
+size, camera-to-object-centre distance and measured dimensions. A save is rejected outside ±5
+percentage points of its assigned frame. An unmeasurable level is recorded as a failed attempt rather
+than silently skipped. After every success or failure, both `ObjectCaptureEngine` and ARKit tracking
+are reset, including masks and anchors. The true dimensions are entered once afterwards; the report
+compares sorted sides at each framing level and deliberately does not manufacture an automatic
+threshold without a declared acceptance criterion and validation objects.
+
+**AR and manual input are study conditions; preparation and optimisation are shared.** A new study
+can run AR then manual, manual then AR, AR only, or manual only. Dual-condition runs map the selected
+first input to the selected first payload box and the other input to the other box; the existing
+130802 gate moves directly between them without returning to setup. Single-condition runs use only
+the selected payload, which makes them useful for recovery or isolated testing. Runs created before
+this design remain two-box AR runs through optional migration fields in `StudyRun`.
+
+Manual entry creates a finalized, axis-aligned `CapturedObject` from the typed name and three ruler
+dimensions. It stores no image and has no AR session, but intentionally enters the same
+`ObjectCaptureEngine` collection as an AR result. `PreparationView`, automatic outer-box assignment,
+packed-weight validation, both optimizers, loading layers and study reporting therefore stay common
+between conditions. Manual-inclusive runs are fixed to measure-all → prepare-and-weigh-all → arrange.
+The virtual rotatable plan remains available, while `BaldiResultView` hides room-scale “Show it on the
+table” whenever `allowsRoomScaleAR` is false. Success, timing, object dimensions and placement are
+recorded per payload together with its `StudyInputMode`.
+
 **Reset and "this payload is done" are two different closures, deliberately.** `MesOverlayView` takes
 both `onFullReset` and `onPayloadFinished`. They were one closure, which meant the Reset button
 advanced the study to the next box — and once the practice payload existed, it also let a participant

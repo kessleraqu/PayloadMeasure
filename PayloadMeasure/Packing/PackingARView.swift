@@ -22,8 +22,8 @@ nonisolated enum PackingARVisualGeometry {
         )
     }
 
-    /// Keeps a translucent face behind the edge bars and away from a neighbouring package's face.
-    static func fillInset(for outlineThickness: Float) -> Float {
+    /// Keeps each translucent face behind the edge bars and away from a neighbouring package's face.
+    static func faceInset(for outlineThickness: Float) -> Float {
         packageInset(for: outlineThickness) + max(0.00035, outlineThickness * 0.15)
     }
 
@@ -367,7 +367,7 @@ private struct PackingARContainer: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, ARSessionDelegate {
+    final class Coordinator: NSObject, ARSessionDelegate, UIGestureRecognizerDelegate {
         /// Normally immutable for one presentation. It is still updated from `updateUIView` so a
         /// coordinator can never keep driving an old model if SwiftUI reconciles more aggressively
         /// than expected. The presentation ID above should make this a defensive path only.
@@ -383,11 +383,11 @@ private struct PackingARContainer: UIViewRepresentable {
         /// the anchor's alignment with the real surface.
         private var contentRoot: Entity?
         private var packageEntities: [UUID: ModelEntity] = [:]
-        /// The fill is inset from both the exact collision volume and the opaque outline. This keeps
+        /// Each face is inset from both the exact collision volume and the opaque outline. This keeps
         /// touching packages from sharing transparent faces while still giving each target a clear,
         /// lightly coloured volume.
         private enum PackageVisualRole {
-            case fill
+            case face
             case outline
             case lengthMarker
         }
@@ -399,11 +399,15 @@ private struct PackingARContainer: UIViewRepresentable {
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var turn: Float = 0
-        /// Suppresses the tap that ends a drag, so sliding the module does not also select a package.
-        private var isDragging = false
         /// Where the module sat relative to the first raycast hit of the current drag.
         private var dragOffset: SIMD2<Float>?
         private var turnAtGestureStart: Float = 0
+        private var twoFingerTurnAtStart: Float = 0
+        private var twistIsActive = false
+        private var suppressTwoFingerPanUntilEnd = false
+        /// The table height chosen at placement. Later drag raycasts must stay on this surface instead
+        /// of jumping to a floor or another horizontal plane under the finger.
+        private var placementSurfaceHeight: Float?
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
         private let scale: Float = 0.001
@@ -473,11 +477,28 @@ private struct PackingARContainer: UIViewRepresentable {
             // One finger slides the module across the support plane; twisting with two fingers turns
             // it about the vertical axis.
             let drag = UIPanGestureRecognizer(target: self, action: #selector(handleDrag))
+            drag.minimumNumberOfTouches = 1
             drag.maximumNumberOfTouches = 1
+            drag.delegate = self
             view.addGestureRecognizer(drag)
             let twist = UIRotationGestureRecognizer(target: self, action: #selector(handleTwist))
+            twist.delegate = self
             view.addGestureRecognizer(twist)
-            installedGestureRecognizers = [tap, drag, twist]
+            // Some users move two fingers as a pair without producing enough angular delta for
+            // UIRotationGestureRecognizer to begin. Treat that horizontal two-finger motion as yaw
+            // too, while a real twist remains the primary gesture.
+            let twoFingerTurn = UIPanGestureRecognizer(
+                target: self,
+                action: #selector(handleTwoFingerTurn)
+            )
+            twoFingerTurn.minimumNumberOfTouches = 2
+            twoFingerTurn.maximumNumberOfTouches = 2
+            twoFingerTurn.delegate = self
+            view.addGestureRecognizer(twoFingerTurn)
+            tap.require(toFail: drag)
+            tap.require(toFail: twist)
+            tap.require(toFail: twoFingerTurn)
+            installedGestureRecognizers = [tap, drag, twist, twoFingerTurn]
 
             // Twice a second, is there a surface under the middle of the screen? One raycast, and it is
             // what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
@@ -490,14 +511,38 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            // A one-finger pan may already be considering the first touch when the second finger
+            // lands. Let the rotation recognizer take over instead of losing that two-finger twist.
+            let pair = [gestureRecognizer, otherGestureRecognizer]
+            return pair.contains { $0 is UIRotationGestureRecognizer }
+                && pair.contains { $0 is UIPanGestureRecognizer }
+        }
+
+        /// Uses only geometry from a plane ARKit has actually detected. Estimated planes can be the
+        /// floor behind a table and were the reason a placement could appear underneath the surface.
+        private func stableSurfaceHit(
+            at point: CGPoint,
+            in view: ARView,
+            matchingHeight expectedHeight: Float? = nil
+        ) -> ARRaycastResult? {
+            view.raycast(
+                from: point,
+                allowing: .existingPlaneGeometry,
+                alignment: .horizontal
+            ).first { result in
+                guard let expectedHeight else { return true }
+                return abs(result.worldTransform.columns.3.y - expectedHeight) <= 0.025
+            }
+        }
+
         private func probeForSurface() {
             guard ownsSharedView, let view, !model.isPlaced else { return }
             let centre = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
-            let found = !view.raycast(
-                from: centre,
-                allowing: .estimatedPlane,
-                alignment: .horizontal
-            ).isEmpty
+            let found = stableSurfaceHit(at: centre, in: view) != nil
             model.reportSurface(found: found)
         }
 
@@ -604,15 +649,20 @@ private struct PackingARContainer: UIViewRepresentable {
             guard ownsSharedView, let view, let anchor, contentRoot != nil else { return }
             switch recogniser.state {
             case .began:
-                isDragging = true
+                guard recogniser.numberOfTouches == 1, !twistIsActive else { return }
                 dragOffset = nil
             case .changed:
+                guard recogniser.numberOfTouches == 1,
+                      !twistIsActive,
+                      let placementSurfaceHeight else {
+                    return
+                }
                 let point = recogniser.location(in: view)
-                guard let result = view.raycast(
-                    from: point,
-                    allowing: .estimatedPlane,
-                    alignment: .horizontal
-                ).first else {
+                guard let result = stableSurfaceHit(
+                    at: point,
+                    in: view,
+                    matchingHeight: placementSurfaceHeight
+                ) else {
                     return
                 }
                 // Move by how far the finger has moved, not to where it is. Setting the position to the
@@ -631,14 +681,26 @@ private struct PackingARContainer: UIViewRepresentable {
                     )
                 }
                 let offset = dragOffset ?? .zero
-                transform.translation = SIMD3(
+                let requested = SIMD2<Float>(
                     hit.x + offset.x,
-                    transform.translation.y,
                     hit.z + offset.y
+                )
+                let current = SIMD2<Float>(
+                    transform.translation.x,
+                    transform.translation.z
+                )
+                let delta = requested - current
+                // Reject a discontinuous raycast jump. Normal dragging advances in small increments;
+                // a distant result means ARKit switched planes or briefly lost the table geometry.
+                guard simd_length(delta) <= 0.12 else { return }
+                transform.translation = SIMD3(
+                    requested.x,
+                    placementSurfaceHeight,
+                    requested.y
                 )
                 anchor.transform = transform
             case .ended, .cancelled, .failed:
-                isDragging = false
+                dragOffset = nil
             default:
                 break
             }
@@ -648,12 +710,46 @@ private struct PackingARContainer: UIViewRepresentable {
             guard ownsSharedView, contentRoot != nil else { return }
             switch recogniser.state {
             case .began:
+                twistIsActive = true
+                suppressTwoFingerPanUntilEnd = true
+                dragOffset = nil
                 turnAtGestureStart = turn
             case .changed, .ended:
                 apply(
                     turn: turnAtGestureStart - Float(recogniser.rotation),
                     settling: recogniser.state == .ended
                 )
+                if recogniser.state == .ended {
+                    twistIsActive = false
+                }
+            case .cancelled, .failed:
+                twistIsActive = false
+            default:
+                break
+            }
+        }
+
+        /// Reliable fallback for a two-finger turn when the fingers travel together rather than
+        /// describing a clear twist. Eight milliradians per screen point keeps it controllable.
+        @objc private func handleTwoFingerTurn(_ recogniser: UIPanGestureRecognizer) {
+            guard ownsSharedView, contentRoot != nil else { return }
+            switch recogniser.state {
+            case .began:
+                twoFingerTurnAtStart = turn
+            case .changed, .ended:
+                guard !twistIsActive, !suppressTwoFingerPanUntilEnd else {
+                    if recogniser.state == .ended {
+                        suppressTwoFingerPanUntilEnd = false
+                    }
+                    return
+                }
+                let horizontal = Float(recogniser.translation(in: view).x)
+                apply(
+                    turn: twoFingerTurnAtStart - horizontal * 0.008,
+                    settling: recogniser.state == .ended
+                )
+            case .cancelled, .failed:
+                suppressTwoFingerPanUntilEnd = false
             default:
                 break
             }
@@ -715,6 +811,9 @@ private struct PackingARContainer: UIViewRepresentable {
             visualsByPackage.removeAll()
             observedRevision = -1
             turn = 0
+            twistIsActive = false
+            suppressTwoFingerPanUntilEnd = false
+            placementSurfaceHeight = nil
         }
 
         @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
@@ -735,23 +834,25 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         private func place(at point: CGPoint, in view: ARView) {
-            guard let result = view.raycast(
-                from: point,
-                allowing: .estimatedPlane,
-                alignment: .horizontal
-            ).first else {
+            guard let result = stableSurfaceHit(at: point, in: view) else {
                 model.reportNoSurface()
                 return
             }
             searchTimer?.invalidate()
             searchTimer = nil
 
-            let placed = AnchorEntity(world: result.worldTransform)
+            // Raycast orientation can carry a small tilt or arbitrary yaw. The module is meant to sit
+            // level and gets its yaw only from the two-finger gesture, so anchor it with translation
+            // alone in the gravity-aligned world frame.
+            var stableTransform = matrix_identity_float4x4
+            stableTransform.columns.3 = result.worldTransform.columns.3
+            let placed = AnchorEntity(world: stableTransform)
             let content = Entity()
             placed.addChild(content)
             view.scene.addAnchor(placed)
             anchor = placed
             contentRoot = content
+            placementSurfaceHeight = result.worldTransform.columns.3.y
             turn = 0
             build(into: content)
             observedRevision = model.revision
@@ -806,29 +907,50 @@ private struct PackingARContainer: UIViewRepresentable {
                 )
                 anchor.addChild(box)
                 packageEntities[placement.id] = box
-                addPackageFill(size: boxSize, colour: colour, on: box, id: placement.id)
+                addPackageFaces(size: boxSize, colour: colour, on: box, id: placement.id)
                 addPackageOutline(size: boxSize, colour: colour, on: box, id: placement.id)
                 addFaceMarkings(for: placement, on: box, extent: extent, colour: colour, id: placement.id)
             }
         }
 
-        /// A low-opacity solid behind the frame makes the target read as a box while leaving the real
-        /// module and the packages already loaded visible through it.
-        private func addPackageFill(
+        /// Six separate low-opacity panels leave the interior genuinely clear. The previous closed
+        /// transparent cuboid accumulated front and back faces until the package looked fully yellow.
+        private func addPackageFaces(
             size: SIMD3<Float>,
             colour: UIColor,
             on box: ModelEntity,
             id: UUID
         ) {
             let thickness = Self.outlineThickness(for: size)
-            let inset = PackingARVisualGeometry.fillInset(for: thickness)
-            let visibleSize = PackingARVisualGeometry.insetFrameSize(size, by: inset)
-            let fill = ModelEntity(
-                mesh: .generateBox(size: visibleSize),
-                materials: [Self.translucentMaterial(colour, opacity: 0.24)]
-            )
-            box.addChild(fill)
-            visualsByPackage[id, default: []].append((fill, .fill))
+            let inset = PackingARVisualGeometry.faceInset(for: thickness)
+            let inner = PackingARVisualGeometry.insetFrameSize(size, by: inset)
+            let panelThickness: Float = 0.0002
+
+            func addPanel(size panelSize: SIMD3<Float>, position: SIMD3<Float>) {
+                let panel = ModelEntity(
+                    mesh: .generateBox(size: panelSize),
+                    materials: [Self.unlitMaterial(colour)]
+                )
+                panel.position = position
+                panel.components.set(OpacityComponent(opacity: 0.10))
+                box.addChild(panel)
+                visualsByPackage[id, default: []].append((panel, .face))
+            }
+
+            for sign in [Float(-1), Float(1)] {
+                addPanel(
+                    size: SIMD3(panelThickness, inner.y, inner.z),
+                    position: SIMD3(sign * inner.x / 2, 0, 0)
+                )
+                addPanel(
+                    size: SIMD3(inner.x, panelThickness, inner.z),
+                    position: SIMD3(0, sign * inner.y / 2, 0)
+                )
+                addPanel(
+                    size: SIMD3(inner.x, inner.y, panelThickness),
+                    position: SIMD3(0, 0, sign * inner.z / 2)
+                )
+            }
         }
 
         /// Twelve solid bars keep the edges legible around the translucent filled target.
@@ -976,16 +1098,6 @@ private struct PackingARContainer: UIViewRepresentable {
             )
         }
 
-        private static func translucentMaterial(
-            _ colour: UIColor,
-            opacity: CGFloat
-        ) -> UnlitMaterial {
-            UnlitMaterial(
-                color: colour.withAlphaComponent(min(max(opacity, 0), 1)),
-                applyPostProcessToneMap: false
-            )
-        }
-
         private static func outlineThickness(for size: SIMD3<Float>) -> Float {
             max(0.0015, min(0.004, min(size.x, min(size.y, size.z)) * 0.035))
         }
@@ -1067,13 +1179,11 @@ private struct PackingARContainer: UIViewRepresentable {
                     for visual in visualsByPackage[placement.id] ?? [] {
                         let visualColour: UIColor
                         switch visual.role {
-                        case .fill:
-                            visual.entity.model?.materials = [
-                                Self.translucentMaterial(
-                                    outlineColour,
-                                    opacity: isCurrent ? 0.24 : 0.10
-                                )
-                            ]
+                        case .face:
+                            visual.entity.model?.materials = [Self.unlitMaterial(outlineColour)]
+                            visual.entity.components.set(
+                                OpacityComponent(opacity: isCurrent ? 0.10 : 0.04)
+                            )
                             continue
                         case .outline:
                             visualColour = outlineColour

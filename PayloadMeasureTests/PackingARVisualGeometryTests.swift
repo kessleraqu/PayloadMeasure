@@ -59,12 +59,12 @@ final class PackingARVisualGeometryTests: XCTestCase {
             accuracy: 0.000_001
         )
         XCTAssertEqual(
-            PackingARVisualGeometry.fillInset(for: 0.0001),
+            PackingARVisualGeometry.faceInset(for: 0.0001),
             0.00070,
             accuracy: 0.000_001
         )
         XCTAssertEqual(
-            PackingARVisualGeometry.fillInset(for: 0.010),
+            PackingARVisualGeometry.faceInset(for: 0.010),
             0.00225,
             accuracy: 0.000_001
         )

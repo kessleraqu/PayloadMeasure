@@ -14,14 +14,18 @@ struct StudySetupView: View {
     let warmup: AppWarmup
     let store: StudyStore
     let accuracy: AccuracyStore
+    let framingAccuracy: FramingAccuracyStore
 
     @State private var name = ""
     @State private var date = Date()
     @State private var flow: MeasurementFlow = .batch
     @State private var firstBox: StudyBox = .big
+    @State private var inputPlan: StudyInputPlan = .both
+    @State private var firstInputMode: StudyInputMode = .augmentedReality
     @State private var includesPractice = true
     @State private var showsArchive = false
     @State private var showsAccuracy = false
+    @State private var showsFramingAccuracy = false
     @State private var editedCatalogue: StudyBox?
     @State private var duplicateRun: StudyRun?
     @State private var showsOverwritePassword = false
@@ -38,17 +42,43 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    Picker("Method", selection: $flow) {
-                        ForEach(MeasurementFlow.allCases) { option in
-                            Text(option.title).tag(option)
+                    if inputPlan.includesManual {
+                        Label("Measure all, then prepare all", systemImage: "square.grid.2x2")
+                    } else {
+                        Picker("Method", selection: $flow) {
+                            ForEach(MeasurementFlow.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                        .pickerStyle(.inline)
+                        .labelsHidden()
+                    }
+                } header: {
+                    Text("Object workflow")
+                } footer: {
+                    Text(inputPlan.includesManual
+                        ? "Manual-inclusive studies use the same controlled sequence in both conditions: enter or measure every object, then prepare and weigh every package, then optimise."
+                        : flow.detail)
+                }
+
+                Section {
+                    Picker("Conditions", selection: $inputPlan) {
+                        ForEach(StudyInputPlan.allCases) { plan in
+                            Text(plan.title).tag(plan)
                         }
                     }
-                    .pickerStyle(.inline)
-                    .labelsHidden()
+
+                    if inputPlan == .both {
+                        Picker("First condition", selection: $firstInputMode) {
+                            ForEach(StudyInputMode.allCases) { mode in
+                                Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                            }
+                        }
+                    }
                 } header: {
-                    Text("Method")
+                    Text("Measurement input")
                 } footer: {
-                    Text(flow.detail)
+                    Text(inputScheduleFooter)
                 }
 
                 Section {
@@ -60,9 +90,11 @@ struct StudySetupView: View {
                     .pickerStyle(.inline)
                     .labelsHidden()
                 } header: {
-                    Text("Which payload box first")
+                    Text(inputPlan == .both ? "Which payload box first" : "Which payload box")
                 } footer: {
-                    Text("The participant fills both. This only sets the order, which should be counterbalanced across participants. Second: \(firstBox.other.shortTitle).")
+                    Text(inputPlan == .both
+                        ? "The participant fills both. Counterbalance the first box across participants. Second: \(firstBox.other.shortTitle)."
+                        : "The standalone condition uses only the selected payload box. This is intended for testing, recovery, or a deliberately single-condition run.")
                 }
 
                 Section {
@@ -118,17 +150,28 @@ struct StudySetupView: View {
                     } label: {
                         Label("Accuracy test", systemImage: "ruler")
                     }
+                    Button {
+                        showsFramingAccuracy = true
+                    } label: {
+                        Label("Distance and framing test", systemImage: "viewfinder")
+                    }
                 } footer: {
-                    Text("Nothing to do with a participant: measure the same objects over and over, type in their real sizes, and see how far out the app is.")
+                    Text("Independent tools: compare Top and 3D measurements, or measure one object inside five framing boxes to calibrate distance guidance.")
                 }
             }
             .navigationTitle("New study run")
             .onAppear(perform: warmup.start)
+            .onChange(of: inputPlan) { _, plan in
+                if plan.includesManual { flow = .batch }
+            }
             .sheet(isPresented: $showsArchive) {
                 StudyArchiveView(store: store)
             }
             .fullScreenCover(isPresented: $showsAccuracy) {
                 AccuracySiteView(store: accuracy)
+            }
+            .fullScreenCover(isPresented: $showsFramingAccuracy) {
+                FramingAccuracySiteView(store: framingAccuracy)
             }
             .sheet(item: $editedCatalogue) { payload in
                 BoxCatalogView(catalogue: catalogue(for: payload))
@@ -202,7 +245,23 @@ struct StudySetupView: View {
             format: "%.0f × %.0f × %.0f cm",
             size.x / 10, size.y / 10, size.z / 10
         )
-        return "The participant measures and loads a practice payload of \(centimetres) first, to learn the app. Nothing from it is recorded. The study proper starts from the arrangement screen, behind the password."
+        return "The participant uses \(resolvedFirstInputMode.title.lowercased()) to measure and load a practice payload of \(centimetres) first. Nothing from it is recorded. The study proper starts from the arrangement screen, behind the password."
+    }
+
+    private var resolvedFirstInputMode: StudyInputMode {
+        switch inputPlan {
+        case .both: firstInputMode
+        case .arOnly: .augmentedReality
+        case .manualOnly: .manual
+        }
+    }
+
+    private var inputScheduleFooter: String {
+        let modes = inputPlan.modes(first: resolvedFirstInputMode)
+        if inputPlan == .both {
+            return "\(firstBox.shortTitle): \(modes[0].title). \(firstBox.other.shortTitle): \(modes[1].title). Password 130802 is required before the second condition."
+        }
+        return "One standalone payload: \(firstBox.shortTitle) with \(modes[0].title). Password 130802 is required to finish."
     }
 
     private func start() {
@@ -211,7 +270,9 @@ struct StudySetupView: View {
             studyDate: date,
             flow: flow,
             firstBox: firstBox,
-            includesPractice: includesPractice
+            includesPractice: includesPractice,
+            inputPlan: inputPlan,
+            firstInputMode: resolvedFirstInputMode
         )
     }
 }
@@ -340,7 +401,7 @@ struct StudyResultsView: View {
             Text(StudyRun.displayDateFormatter.string(from: run.studyDate))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            Text("\(methodTitle) · \(run.boxOrder.map(\.shortTitle).joined(separator: " then "))")
+            Text("\(methodTitle) · \(run.inputModeOrder.map(\.shortTitle).joined(separator: " then ")) · \(run.boxOrder.map(\.shortTitle).joined(separator: " then "))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -355,6 +416,13 @@ struct StudyResultsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(result.box.title)
                 .font(.headline)
+
+            Label(
+                (result.inputMode ?? run.inputMode(for: result.box)).title,
+                systemImage: (result.inputMode ?? run.inputMode(for: result.box)).systemImage
+            )
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
 
             HStack(alignment: .top, spacing: 14) {
                 ForEach(StudyPhase.allCases, id: \.self) { phase in
@@ -592,7 +660,8 @@ struct StudyArchiveView: View {
 
     private func summary(for run: StudyRun) -> String {
         run.isComplete
-            ? "Both boxes · " + StudyRun.durationText(run.totalSeconds)
+            ? (run.boxOrder.count == 2 ? "Both boxes" : run.boxOrder[0].shortTitle)
+                + " · " + StudyRun.durationText(run.totalSeconds)
             : "Incomplete"
     }
 }

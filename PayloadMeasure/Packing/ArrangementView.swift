@@ -12,6 +12,7 @@ struct ArrangementView: View {
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
     let study: StudyStore
+    var allowsRoomScaleAR = true
     let onBoxFinished: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -53,12 +54,14 @@ struct ArrangementView: View {
 
     private var nextStepTitle: String {
         if study.isPractice { return "Start real measurement" }
-        return study.isOnLastBox ? "Finish the study" : "Next box"
+        if study.isOnLastBox { return "Finish the study" }
+        return study.switchesInputModeAfterCurrentBox ? "Next condition" : "Next box"
     }
 
     private var nextStepIcon: String {
         if study.isPractice { return "play.circle" }
-        return study.isOnLastBox ? "checkmark.seal" : "arrow.right.circle"
+        if study.isOnLastBox { return "checkmark.seal" }
+        return study.switchesInputModeAfterCurrentBox ? "arrow.left.arrow.right.circle" : "arrow.right.circle"
     }
 
     /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
@@ -136,6 +139,7 @@ struct ArrangementView: View {
                                 BaldiResultView(
                                     comparison: comparison,
                                     colours: colourMap,
+                                    allowsRoomScaleAR: allowsRoomScaleAR,
                                     highlightedPackageID: $highlightedPackageID
                                 )
                             } else {
@@ -147,7 +151,11 @@ struct ArrangementView: View {
                 .padding(20)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle(study.isPractice ? "Practice arrangement" : "Payload arrangement")
+            .navigationTitle(
+                study.isPractice
+                    ? "Practice arrangement"
+                    : "\(study.currentInputMode.shortTitle) arrangement"
+            )
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -211,7 +219,11 @@ struct ArrangementView: View {
             title: passwordSheetTitle,
             message: passwordSheetMessage,
             password: StudyStore.nextBoxPassword,
-            confirmTitle: study.isPractice ? "Start" : (study.isOnLastBox ? "Finish" : "Next box")
+            confirmTitle: study.isPractice
+                ? "Start"
+                : study.isOnLastBox
+                    ? "Finish"
+                    : study.switchesInputModeAfterCurrentBox ? "Next condition" : "Next box"
         ) {
             onBoxFinished()
         }
@@ -219,16 +231,21 @@ struct ArrangementView: View {
 
     private var passwordSheetTitle: String {
         if study.isPractice { return "Start the real measurement" }
-        return study.isOnLastBox ? "Finish the study" : "Next payload box"
+        if study.isOnLastBox { return "Finish the study" }
+        return study.switchesInputModeAfterCurrentBox ? "Start the next condition" : "Next payload box"
     }
 
     private var passwordSheetMessage: String {
         if study.isPractice {
             return "Clears the practice payload, none of which is recorded, and starts the study on the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
         }
-        return study.isOnLastBox
-            ? "Closes the second box and opens the study data."
-            : "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box")."
+        if study.isOnLastBox {
+            return "Closes the second box and opens the study data."
+        }
+        if let nextMode = study.nextInputMode, study.switchesInputModeAfterCurrentBox {
+            return "Closes this payload and starts \(nextMode.title.lowercased()) on the \(study.currentBox?.other.shortTitle ?? "next box"), without returning to setup."
+        }
+        return "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box")."
     }
 
     private var approachPicker: some View {

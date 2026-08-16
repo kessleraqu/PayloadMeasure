@@ -61,6 +61,9 @@ final class ObjectCaptureEngine {
     private(set) var visibleObjectMaskCount = 0
     private(set) var objectMaskMarkers: [ObjectMaskMarker] = []
     private(set) var objectMaskDisplayBoundingBoxes: [UUID: CGRect] = [:]
+    /// Bounds of the AR viewport that produced the normalized boxes. Accuracy calibration needs the
+    /// real renderer size, not the safe-area size of a SwiftUI overlay.
+    private(set) var objectMaskViewportSize: CGSize = .zero
     private(set) var objectMaskFeedbackText: String?
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var objectWorkflowRequest: ObjectWorkflowRequest?
@@ -435,7 +438,15 @@ final class ObjectCaptureEngine {
         refreshFramingGuidance()
     }
 
-    func updateObjectMaskDisplayBoundingBoxes(_ boundingBoxes: [UUID: CGRect]) {
+    func updateObjectMaskDisplayBoundingBoxes(
+        _ boundingBoxes: [UUID: CGRect],
+        viewportSize: CGSize? = nil
+    ) {
+        if let viewportSize,
+           viewportSize.width > 0,
+           viewportSize.height > 0 {
+            objectMaskViewportSize = viewportSize
+        }
         let activeBoundingBoxes = boundingBoxes.filter {
             !finalizedObjectIDs.contains($0.key)
         }
@@ -757,6 +768,109 @@ final class ObjectCaptureEngine {
         objectMaskFeedbackText = "Object name and weight updated."
     }
 
+    // MARK: - Manual study input
+
+    /// Creates the same finalized measurement record that AR capture would create, but from ruler or
+    /// calliper dimensions. Packing consumes `CapturedObject` dimensions only, so keeping one shared
+    /// representation makes every later screen and optimizer identical across study conditions.
+    @discardableResult
+    func addManualMeasurement(
+        name: String,
+        sizeMillimetres: SIMD3<Double>
+    ) -> UUID? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isNameAvailable(trimmed, excluding: nil),
+              let object = Self.manualCapturedObject(sizeMillimetres: sizeMillimetres) else {
+            return nil
+        }
+        let id = UUID()
+        captureOrder.append(id)
+        capturedObjectsByID[id] = object
+        finalizedObjectIDs.insert(id)
+        objectNamesByID[id] = trimmed
+        objectColorsByID[id] = Self.manualPalette[(captureOrder.count - 1) % Self.manualPalette.count]
+        focusedCaptureID = id
+        statusText = finalizedObjectIDs.count == 1
+            ? "1 object entered manually."
+            : "\(finalizedObjectIDs.count) objects entered manually."
+        objectMaskFeedbackText = statusText
+        return id
+    }
+
+    @discardableResult
+    func updateManualMeasurement(
+        id: UUID,
+        name: String,
+        sizeMillimetres: SIMD3<Double>
+    ) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard finalizedObjectIDs.contains(id),
+              capturedObjectsByID[id] != nil,
+              isNameAvailable(trimmed, excluding: id),
+              let object = Self.manualCapturedObject(sizeMillimetres: sizeMillimetres) else {
+            return false
+        }
+        capturedObjectsByID[id] = object
+        objectNamesByID[id] = trimmed
+        focusedCaptureID = id
+        statusText = "Manual dimensions updated."
+        objectMaskFeedbackText = statusText
+        return true
+    }
+
+    private static func manualCapturedObject(
+        sizeMillimetres: SIMD3<Double>
+    ) -> CapturedObject? {
+        guard sizeMillimetres.x.isFinite,
+              sizeMillimetres.y.isFinite,
+              sizeMillimetres.z.isFinite,
+              sizeMillimetres.x > 0,
+              sizeMillimetres.y > 0,
+              sizeMillimetres.z > 0 else {
+            return nil
+        }
+        let dimensions = SIMD3<Float>(
+            Float(sizeMillimetres.x / 1_000),
+            Float(sizeMillimetres.y / 1_000),
+            Float(sizeMillimetres.z / 1_000)
+        )
+        guard dimensions.x.isFinite,
+              dimensions.y.isFinite,
+              dimensions.z.isFinite,
+              dimensions.x > 0,
+              dimensions.y > 0,
+              dimensions.z > 0 else {
+            return nil
+        }
+        let half = dimensions / 2
+        let corners = [-half.x, half.x].flatMap { x in
+            [-half.y, half.y].flatMap { y in
+                [-half.z, half.z].map { z in SIMD3<Float>(x, y, z) }
+            }
+        }
+        return CapturedObject(
+            dimensions: dimensions,
+            center: .zero,
+            axes: (
+                width: SIMD3<Float>(1, 0, 0),
+                depth: SIMD3<Float>(0, 1, 0),
+                height: SIMD3<Float>(0, 0, 1)
+            ),
+            corners: corners,
+            volume: dimensions.x * dimensions.y * dimensions.z,
+            sampleCount: 0
+        )
+    }
+
+    private static let manualPalette: [ObjectMaskDisplayColor] = [
+        ObjectMaskDisplayColor(red: 0.20, green: 0.75, blue: 1.00),
+        ObjectMaskDisplayColor(red: 1.00, green: 0.55, blue: 0.18),
+        ObjectMaskDisplayColor(red: 0.35, green: 0.85, blue: 0.48),
+        ObjectMaskDisplayColor(red: 0.72, green: 0.45, blue: 1.00),
+        ObjectMaskDisplayColor(red: 1.00, green: 0.35, blue: 0.45),
+        ObjectMaskDisplayColor(red: 0.15, green: 0.82, blue: 0.78)
+    ]
+
     func removeFinalizedObject(id: UUID) {
         guard finalizedObjectIDs.contains(id) else {
             return
@@ -899,6 +1013,7 @@ final class ObjectCaptureEngine {
         lockedMaskLayerOrder.removeAll()
         liveMaskLayer = nil
         objectMaskDisplayBoundingBoxes.removeAll()
+        objectMaskViewportSize = .zero
         framingGuidance = nil
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
@@ -1139,6 +1254,7 @@ final class ObjectCaptureEngine {
         lockedMaskLayerOrder.removeAll()
         liveMaskLayer = nil
         objectMaskDisplayBoundingBoxes.removeAll()
+        objectMaskViewportSize = .zero
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
         lockedObjectMaskCount = 0
         visibleObjectMaskCount = 0

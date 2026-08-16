@@ -124,14 +124,19 @@ The Balance path has no automated tests. It is exercised through the UI only.
 
 ## How a package is drawn
 
-Each package is a lightly translucent, inset solid with an opaque coloured edge frame and an
-invisible full-size collision volume. A
+Each package has six lightly translucent, inset face panels with an opaque coloured edge frame and
+an invisible full-size collision volume. A
 centred dark line appears on both true l × w faces and always runs parallel to the package's measured
 length axis. `BaldiOpeningMarker.faceAxes` performs that mapping for all six rotations, and both the
 menu and room-scale views use it.
 
 The wireframe and marker are inset 0.35–0.75 mm inside the exact package bounds. Collision and packing
 dimensions remain exact; the visual inset only prevents touching packages from drawing coplanar edges
-or putting a marker inside their neighbour. Completed layers are desaturated rather than made
-transparent. This keeps the camera visible without sending overlapping cuboids through RealityKit's
-unstable transparent render pass.
+or putting a marker inside their neighbour. Face panels use RealityKit opacity components (10% on the
+active layer and 4% on completed layers); edge frames stay opaque, with completed edges desaturated.
+Separate panels avoid the stacked front/back transparency that made a closed cuboid appear solid.
+
+Room-scale placement accepts only detected horizontal plane geometry, not estimated planes. The
+placed table height is retained for every drag, and raycast results more than 25 mm from that height
+or discontinuous moves over 120 mm are ignored. The initial anchor uses translation only in the
+gravity-aligned world so raycast tilt and arbitrary plane yaw cannot lean or turn the module.

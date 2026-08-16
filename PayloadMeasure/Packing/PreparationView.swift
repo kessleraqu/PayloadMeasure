@@ -12,6 +12,7 @@ struct PreparationView: View {
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
     let study: StudyStore
+    var allowsRoomScaleAR = true
     let onBoxFinished: () -> Void
 
     @State private var stage: Stage = .preparation
@@ -43,6 +44,7 @@ struct PreparationView: View {
                 captureEngine: captureEngine,
                 store: store,
                 study: study,
+                allowsRoomScaleAR: allowsRoomScaleAR,
                 onBoxFinished: onBoxFinished
             )
             .transition(.opacity)
@@ -118,10 +120,22 @@ private struct PackingPreparationView: View {
                     .accessibilityHint("Review the boxes, add a size, or delete one.")
                 }
 
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        focusedField = nil
+                if focusedField == .weight,
+                   let currentObjectID {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button {
+                            saveAndAdvance(objectID: currentObjectID)
+                        } label: {
+                            Label(
+                                nextActionTitle(for: currentObjectID),
+                                systemImage: currentIndex == objectIDs.count - 1
+                                    ? "square.grid.3x3.square"
+                                    : "arrow.right"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityHint("Saves the weight and continues without first closing the keyboard.")
                     }
                 }
             }
@@ -485,7 +499,7 @@ private struct PackingPreparationView: View {
             saveAndAdvance(objectID: objectID)
         } label: {
             HStack {
-                Text(isLastObject ? "Create loading plan" : hasNoFittingBox ? "Continue" : "Next object")
+                Text(nextActionTitle(for: objectID))
                 Spacer()
                 Image(systemName: isLastObject ? "square.grid.3x3.square" : "arrow.right")
             }
@@ -506,6 +520,15 @@ private struct PackingPreparationView: View {
                     ? "Checks every prepared package, then opens the loading plan."
                     : "Saves this box and packed weight, then shows the next object."
         )
+    }
+
+    private func nextActionTitle(for objectID: UUID) -> String {
+        if currentIndex == objectIDs.count - 1 {
+            return "Create loading plan"
+        }
+        return store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
+            ? "Continue"
+            : "Next object"
     }
 
     /// Everything here depends on a finished measurement, so nothing is editable until the objects

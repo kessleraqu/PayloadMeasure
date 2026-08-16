@@ -22,6 +22,7 @@ struct ContentView: View {
     /// Owned here rather than by the setup screen, so an accuracy test survives that screen being
     /// rebuilt and can be left and returned to.
     @State private var accuracy = AccuracyStore()
+    @State private var framingAccuracy = FramingAccuracyStore()
 
     var body: some View {
         Group {
@@ -30,38 +31,54 @@ struct ContentView: View {
                     StudyResultsView(run: run, store: study, onRestart: restartForNextParticipant)
                 }
             } else if let flow = study.flow, study.hasActiveSession {
-                ZStack {
-                    // Pausing is not enough here: a paused ARView keeps its RealityKit renderer and
-                    // last camera texture alive underneath the full-screen packing workflow. Remove
-                    // it completely so the shared renderer has exactly one SwiftUI owner at a time.
-                    if !sessionManager.isPackingArrangementPresented {
-                        ARCameraView(
-                            sessionManager: sessionManager,
-                            aimerState: aimerState,
+                Group {
+                    if study.currentInputMode == .manual {
+                        ManualMeasurementView(
                             captureEngine: captureEngine,
-                            workflowMode: workflowMode,
-                            sharedViewHost: sharedARViewHost
+                            study: study,
+                            onFullReset: restartCurrentPayload,
+                            onPayloadFinished: startNextBox,
+                            onRunCancelled: cancelRun
                         )
-                        .ignoresSafeArea()
                     } else {
-                        Color.black.ignoresSafeArea()
-                    }
+                        ZStack {
+                            // Pausing is not enough here: a paused ARView keeps its RealityKit
+                            // renderer and last camera texture alive under the packing workflow.
+                            if !sessionManager.isPackingArrangementPresented {
+                                ARCameraView(
+                                    sessionManager: sessionManager,
+                                    aimerState: aimerState,
+                                    captureEngine: captureEngine,
+                                    workflowMode: workflowMode,
+                                    sharedViewHost: sharedARViewHost
+                                )
+                                .ignoresSafeArea()
+                            } else {
+                                Color.black.ignoresSafeArea()
+                            }
 
-                    MesOverlayView(
-                        sessionManager: sessionManager,
-                        aimerState: aimerState,
-                        captureEngine: captureEngine,
-                        workflowMode: $workflowMode,
-                        flow: flow,
-                        study: study,
-                        onFullReset: restartCurrentPayload,
-                        onPayloadFinished: startNextBox,
-                        onRunCancelled: cancelRun
-                    )
+                            MesOverlayView(
+                                sessionManager: sessionManager,
+                                aimerState: aimerState,
+                                captureEngine: captureEngine,
+                                workflowMode: $workflowMode,
+                                flow: flow,
+                                study: study,
+                                onFullReset: restartCurrentPayload,
+                                onPayloadFinished: startNextBox,
+                                onRunCancelled: cancelRun
+                            )
+                        }
+                    }
                 }
                 .id(sessionToken)
             } else {
-                StudySetupView(warmup: warmup, store: study, accuracy: accuracy)
+                StudySetupView(
+                    warmup: warmup,
+                    store: study,
+                    accuracy: accuracy,
+                    framingAccuracy: framingAccuracy
+                )
             }
         }
         .environment(\.sharedARViewHost, sharedARViewHost)

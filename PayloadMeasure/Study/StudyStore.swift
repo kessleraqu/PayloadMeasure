@@ -17,7 +17,7 @@ import simd
 @MainActor
 @Observable
 final class StudyStore {
-    /// Gate for moving to the second box.
+    /// Gate for moving to the second condition, finishing a standalone condition, or cancelling.
     static let nextBoxPassword = "130802"
     /// Gate for restarting the app from the results screen, and for opening the results screen.
     static let restartPassword = "13820485"
@@ -71,6 +71,30 @@ final class StudyStore {
         return currentBoxIndex >= activeRun.boxOrder.count - 1
     }
 
+    /// Practice uses the first condition so the participant learns the interface they will see
+    /// first. Recorded boxes resolve their condition from the two-box schedule.
+    var currentInputMode: StudyInputMode {
+        guard let activeRun else { return .augmentedReality }
+        if isPractice { return activeRun.resolvedFirstInputMode }
+        guard activeRun.inputModeOrder.indices.contains(currentBoxIndex) else {
+            return .augmentedReality
+        }
+        return activeRun.inputModeOrder[currentBoxIndex]
+    }
+
+    var nextInputMode: StudyInputMode? {
+        guard let activeRun,
+              !isPractice,
+              activeRun.inputModeOrder.indices.contains(currentBoxIndex + 1) else {
+            return nil
+        }
+        return activeRun.inputModeOrder[currentBoxIndex + 1]
+    }
+
+    var switchesInputModeAfterCurrentBox: Bool {
+        nextInputMode.map { $0 != currentInputMode } ?? false
+    }
+
     var hasFinishedAllBoxes: Bool {
         activeRun?.isComplete ?? false
     }
@@ -86,7 +110,9 @@ final class StudyStore {
         studyDate: Date,
         flow: MeasurementFlow,
         firstBox: StudyBox,
-        includesPractice: Bool
+        includesPractice: Bool,
+        inputPlan: StudyInputPlan? = nil,
+        firstInputMode: StudyInputMode = .augmentedReality
     ) {
         var run = StudyRun(
             id: UUID(),
@@ -97,6 +123,10 @@ final class StudyStore {
             firstBox: firstBox
         )
         run.includedPracticeRun = includesPractice
+        run.inputPlan = inputPlan
+        run.firstInputMode = inputPlan == .arOnly
+            ? .augmentedReality
+            : inputPlan == .manualOnly ? .manual : inputPlan == .both ? firstInputMode : nil
         activeRun = run
         currentBoxIndex = 0
         isPractice = includesPractice
@@ -123,7 +153,13 @@ final class StudyStore {
         isPractice = false
         currentBoxIndex = 0
         if run.result(for: run.firstBox) == nil {
-            run.boxes.append(StudyBoxResult(box: run.firstBox, startedAt: Date()))
+            run.boxes.append(
+                StudyBoxResult(
+                    box: run.firstBox,
+                    startedAt: Date(),
+                    inputMode: run.inputMode(for: run.firstBox)
+                )
+            )
         }
         activeRun = run
         persistActiveRun()
@@ -142,7 +178,13 @@ final class StudyStore {
         currentBoxIndex += 1
         let next = run.boxOrder[currentBoxIndex]
         if run.result(for: next) == nil {
-            run.boxes.append(StudyBoxResult(box: next, startedAt: Date()))
+            run.boxes.append(
+                StudyBoxResult(
+                    box: next,
+                    startedAt: Date(),
+                    inputMode: run.inputMode(for: next)
+                )
+            )
         }
         activeRun = run
         persistActiveRun()
@@ -262,6 +304,7 @@ final class StudyStore {
               var run = activeRun,
               let index = run.boxes.firstIndex(where: { $0.box == box }) else { return }
         run.boxes[index].objects = objects
+        run.boxes[index].inputMode = currentInputMode
         run.boxes[index].loadedObjectIDs = loadedObjectIDs
         run.boxes[index].unloadedObjectNames = unloadedObjectNames
         run.boxes[index].packingMode = packingMode

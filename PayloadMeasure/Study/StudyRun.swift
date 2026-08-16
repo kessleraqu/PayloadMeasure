@@ -11,8 +11,8 @@ import simd
 // A run is written as soon as it is created and rewritten after every change, so a crash mid-study
 // loses at most the box in progress.
 
-/// The two payload modules a participant fills. Both are asked for; the order is randomised per
-/// participant by the person running the study.
+/// The two payload modules available to a study. Dual-condition runs use both; a standalone
+/// AR-only or manual-only recovery run uses the selected first module only.
 enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     case big
     case small
@@ -41,6 +41,66 @@ enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 
     var other: StudyBox { self == .big ? .small : .big }
+}
+
+/// How object dimensions enter the otherwise identical preparation and optimisation workflow.
+enum StudyInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case augmentedReality
+    case manual
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .augmentedReality: "AR measurement"
+        case .manual: "Manual measurement"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .augmentedReality: "AR"
+        case .manual: "No AR"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .augmentedReality: "arkit"
+        case .manual: "square.and.pencil"
+        }
+    }
+
+    var other: StudyInputMode {
+        self == .augmentedReality ? .manual : .augmentedReality
+    }
+}
+
+/// Whether the participant completes both input conditions or one condition on both payload boxes.
+enum StudyInputPlan: String, Codable, CaseIterable, Identifiable, Sendable {
+    case both
+    case arOnly
+    case manualOnly
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .both: "AR and no AR"
+        case .arOnly: "AR only"
+        case .manualOnly: "No AR only"
+        }
+    }
+
+    var includesManual: Bool { self != .arOnly }
+
+    func modes(first: StudyInputMode) -> [StudyInputMode] {
+        switch self {
+        case .both: [first, first.other]
+        case .arOnly: [.augmentedReality]
+        case .manualOnly: [.manual]
+        }
+    }
 }
 
 /// The three timed phases of one box.
@@ -89,6 +149,8 @@ struct StudyObjectRecord: Codable, Identifiable, Sendable {
 struct StudyBoxResult: Codable, Identifiable, Sendable {
     var box: StudyBox
     var startedAt: Date
+    /// Optional so study files made before the manual condition existed remain decodable.
+    var inputMode: StudyInputMode? = nil
     var completedAt: Date?
     var phaseSeconds: [String: Double] = [:]
     var objects: [StudyObjectRecord] = []
@@ -118,18 +180,39 @@ struct StudyRun: Codable, Identifiable, Sendable {
     var flow: String
     var firstBox: StudyBox
     var boxes: [StudyBoxResult] = []
+    /// Optional migration fields. Legacy runs were AR-only.
+    var inputPlan: StudyInputPlan? = nil
+    var firstInputMode: StudyInputMode? = nil
     /// Whether the participant had a practice payload first. Optional so runs recorded before the
     /// practice run existed still decode; those read as unknown rather than as "no".
     var includedPracticeRun: Bool?
 
     var isComplete: Bool {
-        StudyBox.allCases.allSatisfy { box in
+        boxOrder.allSatisfy { box in
             boxes.first(where: { $0.box == box })?.completedAt != nil
         }
     }
 
     var boxOrder: [StudyBox] {
-        [firstBox, firstBox.other]
+        // Nil is a legacy run, recorded when every participant always completed both boxes with AR.
+        inputPlan == nil || inputPlan == .both ? [firstBox, firstBox.other] : [firstBox]
+    }
+
+    var resolvedInputPlan: StudyInputPlan { inputPlan ?? .arOnly }
+    var resolvedFirstInputMode: StudyInputMode { firstInputMode ?? .augmentedReality }
+
+    var inputModeOrder: [StudyInputMode] {
+        guard let inputPlan else {
+            return Array(repeating: .augmentedReality, count: boxOrder.count)
+        }
+        return inputPlan.modes(first: resolvedFirstInputMode)
+    }
+
+    func inputMode(for box: StudyBox) -> StudyInputMode {
+        guard let index = boxOrder.firstIndex(of: box), inputModeOrder.indices.contains(index) else {
+            return .augmentedReality
+        }
+        return inputModeOrder[index]
     }
 
     func result(for box: StudyBox) -> StudyBoxResult? {
@@ -193,6 +276,7 @@ extension StudyRun {
         lines.append("Study date  : \(Self.displayDateFormatter.string(from: studyDate))")
         lines.append("Recorded    : \(Self.displayDateFormatter.string(from: createdAt))")
         lines.append("Method      : \(flow)")
+        lines.append("Input tools : \(inputModeOrder.map(\.title).joined(separator: " then "))")
         lines.append("Box order   : \(boxOrder.map(\.shortTitle).joined(separator: " then "))")
         lines.append("Practice    : \(practiceText)")
         lines.append("Run id      : \(id.uuidString)")
@@ -208,6 +292,7 @@ extension StudyRun {
             lines.append("\(box.shortTitle)  (\(box.title))")
             lines.append("-------------------------------------------------------------")
             lines.append("Started   : \(Self.displayDateFormatter.string(from: result.startedAt))")
+            lines.append("Input     : \((result.inputMode ?? inputMode(for: box)).title)")
             if let completedAt = result.completedAt {
                 lines.append("Completed : \(Self.displayDateFormatter.string(from: completedAt))")
             } else {

@@ -1809,7 +1809,8 @@ struct ARCameraView: UIViewRepresentable {
                     }
                 }
                 self.captureEngine.updateObjectMaskDisplayBoundingBoxes(
-                    applicableBoundingBoxes
+                    applicableBoundingBoxes,
+                    viewportSize: arView.bounds.size
                 )
             }
         }
