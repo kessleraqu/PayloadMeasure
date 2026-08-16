@@ -11,8 +11,8 @@ import simd
 // A run is written as soon as it is created and rewritten after every change, so a crash mid-study
 // loses at most the box in progress.
 
-/// The two payload modules available to a study. Dual-condition runs use both; a standalone
-/// AR-only or manual-only recovery run uses the selected first module only.
+/// The two payload modules available to a study. New runs use the selected module only. The `other`
+/// relationship remains for decoding study files made by the earlier two-box workflow.
 enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     case big
     case small
@@ -76,7 +76,8 @@ enum StudyInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// Whether the participant completes both input conditions or one condition on both payload boxes.
+/// The selected measurement condition. `both` remains decodable for study files made before the
+/// conditions were split into independent runs; the current setup screen creates only single modes.
 enum StudyInputPlan: String, Codable, CaseIterable, Identifiable, Sendable {
     case both
     case arOnly
@@ -263,7 +264,14 @@ extension StudyRun {
             .filter { !$0.isEmpty }
             .joined(separator: "-")
         let stamp = Self.fileDateFormatter.string(from: studyDate)
-        return "payloadmeasure-\(safeName.isEmpty ? "participant" : safeName)-\(stamp).txt"
+        let conditionSuffix: String
+        switch inputPlan {
+        case .arOnly: conditionSuffix = "-ar"
+        case .manualOnly: conditionSuffix = "-no-ar"
+        case .both: conditionSuffix = "-ar-and-no-ar"
+        case nil: conditionSuffix = ""
+        }
+        return "payloadmeasure-\(safeName.isEmpty ? "participant" : safeName)\(conditionSuffix)-\(stamp).txt"
     }
 
     /// The whole run as plain text. Written automatically when the run completes and re-writable on

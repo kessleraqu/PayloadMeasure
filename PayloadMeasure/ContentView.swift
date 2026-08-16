@@ -1,7 +1,7 @@
 import SwiftUI
 
-// Root view. Runs a user study: set the participant up, measure and pack the first payload box,
-// then the second, then show the data.
+// Root view. Runs one selected study condition, then returns to setup so the administrator can
+// configure the other condition separately.
 //
 // The study owns the flow now — the method and the box order come from StudySetupView rather than
 // being picked ad hoc, so a session cannot start without being recorded.
@@ -26,7 +26,11 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if let run = study.activeRun, study.hasFinishedAllBoxes {
+            if study.isAwaitingParticipantStart {
+                StudyParticipantStartView {
+                    study.beginParticipantSession()
+                }
+            } else if let run = study.activeRun, study.hasFinishedAllBoxes {
                 NavigationStack {
                     StudyResultsView(run: run, store: study, onRestart: restartForNextParticipant)
                 }
@@ -94,9 +98,9 @@ struct ContentView: View {
         sessionToken &+= 1
     }
 
-    /// Between payloads: the measurements belong to the one just finished, so the capture session is
-    /// cleared and the view hierarchy rebuilt, exactly as a full reset does. The practice payload
-    /// leaves by the same door — it just leads to the first box instead of the second.
+    /// At a payload boundary the measurements belong to the one just finished, so the capture
+    /// session is cleared and the view hierarchy rebuilt. Practice leads into the real payload;
+    /// finishing the selected condition returns to administrator setup.
     private func startNextBox() {
         // The presenting overlay is replaced as part of this transition, so do not wait for its
         // onDismiss callback to return camera ownership. Clear it before constructing the next box.
@@ -108,6 +112,7 @@ struct ContentView: View {
             study.startRealStudy()
         } else if study.isOnLastBox {
             study.finishRun()
+            study.returnToSetupAfterCompletion()
         } else {
             study.advanceToNextBox()
         }

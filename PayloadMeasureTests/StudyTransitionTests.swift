@@ -64,6 +64,9 @@ final class StudyTransitionTests: XCTestCase {
             firstBox: .small,
             includesPractice: false
         )
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertNil(store.currentBox)
+        store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .small)
         XCTAssertFalse(store.isOnLastBox)
 
@@ -92,6 +95,9 @@ final class StudyTransitionTests: XCTestCase {
         )
 
         XCTAssertTrue(store.isPractice)
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertFalse(store.hasActiveSession, "The admin handoff must not start the workflow or timer.")
+        store.beginParticipantSession()
         XCTAssertTrue(store.hasActiveSession, "The measuring screens have to be up during practice.")
         XCTAssertNil(store.currentBox, "There is no study box yet.")
         XCTAssertEqual(
@@ -144,6 +150,9 @@ final class StudyTransitionTests: XCTestCase {
         )
 
         XCTAssertFalse(store.isPractice)
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertNil(store.currentBox, "The payload must stay closed until the participant taps Start.")
+        store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .small)
         XCTAssertEqual(store.activeRun?.boxes.count, 1)
         XCTAssertEqual(store.activeRun?.includedPracticeRun, false)
@@ -161,6 +170,7 @@ final class StudyTransitionTests: XCTestCase {
             firstBox: .big,
             includesPractice: false
         )
+        store.beginParticipantSession()
 
         for _ in 0..<2 {
             // What the screens do: measure, then the preparation stage, then the arrangement.

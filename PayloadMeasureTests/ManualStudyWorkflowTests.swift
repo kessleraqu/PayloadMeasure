@@ -4,42 +4,50 @@ import simd
 
 @MainActor
 final class ManualStudyWorkflowTests: XCTestCase {
-    func testBothConditionOrdersFollowTheTwoPayloadBoxes() {
-        let manualFirst = StudyStore()
-        manualFirst.startRun(
-            participantName: "manual-first",
+    func testARAndManualAreSeparateSingleConditionRuns() {
+        let participant = "separate-\(UUID().uuidString)"
+        let store = StudyStore()
+        store.startRun(
+            participantName: participant,
             studyDate: Date(),
             flow: .batch,
             firstBox: .big,
             includesPractice: false,
-            inputPlan: .both,
+            inputPlan: .manualOnly,
             firstInputMode: .manual
         )
-        XCTAssertEqual(manualFirst.currentBox, .big)
-        XCTAssertEqual(manualFirst.currentInputMode, .manual)
-        XCTAssertEqual(manualFirst.nextInputMode, .augmentedReality)
-        XCTAssertTrue(manualFirst.switchesInputModeAfterCurrentBox)
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .big)
+        XCTAssertEqual(store.currentInputMode, .manual)
+        XCTAssertNil(store.nextInputMode)
+        XCTAssertTrue(store.isOnLastBox)
         XCTAssertEqual(StudyStore.nextBoxPassword, "130802")
-        let runID = manualFirst.activeRun?.id
+        store.finishRun()
+        store.returnToSetupAfterCompletion()
+        XCTAssertNil(store.activeRun, "Finishing returns to setup instead of opening another condition.")
+        XCTAssertNotNil(store.savedRun(named: participant, inputMode: .manual))
+        XCTAssertNil(
+            store.savedRun(named: participant, inputMode: .augmentedReality),
+            "The first condition must not block setup for the same participant's other condition."
+        )
 
-        manualFirst.advanceToNextBox()
-        XCTAssertEqual(manualFirst.activeRun?.id, runID, "The second condition stays inside the same study run.")
-        XCTAssertEqual(manualFirst.currentBox, .small)
-        XCTAssertEqual(manualFirst.currentInputMode, .augmentedReality)
-
-        let arFirst = StudyStore()
-        arFirst.startRun(
-            participantName: "ar-first",
+        store.startRun(
+            participantName: participant,
             studyDate: Date(),
             flow: .batch,
             firstBox: .small,
             includesPractice: false,
-            inputPlan: .both,
+            inputPlan: .arOnly,
             firstInputMode: .augmentedReality
         )
-        XCTAssertEqual(arFirst.currentInputMode, .augmentedReality)
-        arFirst.advanceToNextBox()
-        XCTAssertEqual(arFirst.currentInputMode, .manual)
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .small)
+        XCTAssertEqual(store.currentInputMode, .augmentedReality)
+        XCTAssertTrue(store.isOnLastBox)
+        store.finishRun()
+        XCTAssertNotNil(store.savedRun(named: participant, inputMode: .manual))
+        XCTAssertNotNil(store.savedRun(named: participant, inputMode: .augmentedReality))
     }
 
     func testSingleConditionPlansUseOneStandalonePayload() {
@@ -58,6 +66,9 @@ final class ManualStudyWorkflowTests: XCTestCase {
                 inputPlan: plan,
                 firstInputMode: expected.other
             )
+            XCTAssertTrue(store.isAwaitingParticipantStart)
+            XCTAssertFalse(store.hasActiveSession)
+            store.beginParticipantSession()
             XCTAssertEqual(store.currentInputMode, expected)
             XCTAssertNil(store.nextInputMode)
             XCTAssertFalse(store.switchesInputModeAfterCurrentBox)
@@ -76,13 +87,14 @@ final class ManualStudyWorkflowTests: XCTestCase {
             flow: .batch,
             firstBox: .small,
             includesPractice: true,
-            inputPlan: .both,
+            inputPlan: .manualOnly,
             firstInputMode: .manual
         )
         XCTAssertTrue(store.isPractice)
         XCTAssertEqual(store.currentInputMode, .manual)
         XCTAssertTrue(store.activeRun?.boxes.isEmpty == true)
 
+        store.beginParticipantSession()
         store.startRealStudy()
         XCTAssertEqual(store.currentInputMode, .manual)
         XCTAssertEqual(store.activeRun?.boxes.first?.inputMode, .manual)
@@ -141,7 +153,7 @@ final class ManualStudyWorkflowTests: XCTestCase {
         )
     }
 
-    func testReportRecordsTheToolUsedForEachPayload() throws {
+    func testReportAndFilenameRecordTheSelectedStandaloneCondition() throws {
         let store = StudyStore()
         store.startRun(
             participantName: "report",
@@ -149,15 +161,17 @@ final class ManualStudyWorkflowTests: XCTestCase {
             flow: .batch,
             firstBox: .big,
             includesPractice: false,
-            inputPlan: .both,
+            inputPlan: .manualOnly,
             firstInputMode: .manual
         )
-        store.advanceToNextBox()
+        store.beginParticipantSession()
         store.finishRun()
-        let report = try XCTUnwrap(store.activeRun).reportText()
-        XCTAssertTrue(report.contains("Input tools : Manual measurement then AR measurement"))
+        let run = try XCTUnwrap(store.activeRun)
+        let report = run.reportText()
+        XCTAssertTrue(report.contains("Input tools : Manual measurement"))
         XCTAssertTrue(report.contains("Input     : Manual measurement"))
-        XCTAssertTrue(report.contains("Input     : AR measurement"))
+        XCTAssertFalse(report.contains("Input     : AR measurement"))
+        XCTAssertTrue(run.reportFileName.contains("-no-ar-"))
     }
 
     func testLegacyRunsRemainTwoBoxARStudies() throws {

@@ -18,10 +18,8 @@ struct StudySetupView: View {
 
     @State private var name = ""
     @State private var date = Date()
-    @State private var flow: MeasurementFlow = .batch
     @State private var firstBox: StudyBox = .big
-    @State private var inputPlan: StudyInputPlan = .both
-    @State private var firstInputMode: StudyInputMode = .augmentedReality
+    @State private var inputMode: StudyInputMode = .augmentedReality
     @State private var includesPractice = true
     @State private var showsArchive = false
     @State private var showsAccuracy = false
@@ -42,43 +40,25 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    if inputPlan.includesManual {
-                        Label("Measure all, then prepare all", systemImage: "square.grid.2x2")
-                    } else {
-                        Picker("Method", selection: $flow) {
-                            ForEach(MeasurementFlow.allCases) { option in
-                                Text(option.title).tag(option)
-                            }
-                        }
-                        .pickerStyle(.inline)
-                        .labelsHidden()
-                    }
+                    Label("Measure all, then prepare and weigh all", systemImage: "square.grid.2x2")
                 } header: {
                     Text("Object workflow")
                 } footer: {
-                    Text(inputPlan.includesManual
-                        ? "Manual-inclusive studies use the same controlled sequence in both conditions: enter or measure every object, then prepare and weigh every package, then optimise."
-                        : flow.detail)
+                    Text("Every condition follows the same controlled sequence: measure or enter every object, prepare and weigh every package, then optimise the placement.")
                 }
 
                 Section {
-                    Picker("Conditions", selection: $inputPlan) {
-                        ForEach(StudyInputPlan.allCases) { plan in
-                            Text(plan.title).tag(plan)
+                    Picker("Condition", selection: $inputMode) {
+                        ForEach(StudyInputMode.allCases) { mode in
+                            Label(mode.title, systemImage: mode.systemImage).tag(mode)
                         }
                     }
-
-                    if inputPlan == .both {
-                        Picker("First condition", selection: $firstInputMode) {
-                            ForEach(StudyInputMode.allCases) { mode in
-                                Label(mode.title, systemImage: mode.systemImage).tag(mode)
-                            }
-                        }
-                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
                 } header: {
-                    Text("Measurement input")
+                    Text("Condition for this run")
                 } footer: {
-                    Text(inputScheduleFooter)
+                    Text("Select one condition only. When it finishes, the app returns here so you can configure the other condition as a separate run.")
                 }
 
                 Section {
@@ -90,11 +70,9 @@ struct StudySetupView: View {
                     .pickerStyle(.inline)
                     .labelsHidden()
                 } header: {
-                    Text(inputPlan == .both ? "Which payload box first" : "Which payload box")
+                    Text("Which payload box")
                 } footer: {
-                    Text(inputPlan == .both
-                        ? "The participant fills both. Counterbalance the first box across participants. Second: \(firstBox.other.shortTitle)."
-                        : "The standalone condition uses only the selected payload box. This is intended for testing, recovery, or a deliberately single-condition run.")
+                    Text("Only the selected payload is used in this run. Select the other payload when setting up the participant's other condition.")
                 }
 
                 Section {
@@ -104,14 +82,13 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    // Starts immediately rather than waiting on the warmup. The measuring screen
-                    // shows the live camera with instructions while the rest finishes loading, which
-                    // is more useful than a spinner on a form.
+                    // Stages the run, then replaces this administrator form with the neutral
+                    // participant handoff. Timing and the workflow start only after that Start tap.
                     Button {
                         // A repeated participant name almost always means the operator has typed the
                         // wrong one, so it is refused rather than quietly making a second run that is
                         // indistinguishable from the first in the archive.
-                        if let existing = store.savedRun(named: name) {
+                        if let existing = store.savedRun(named: name, inputMode: inputMode) {
                             duplicateRun = existing
                         } else {
                             start()
@@ -161,9 +138,6 @@ struct StudySetupView: View {
             }
             .navigationTitle("New study run")
             .onAppear(perform: warmup.start)
-            .onChange(of: inputPlan) { _, plan in
-                if plan.includesManual { flow = .batch }
-            }
             .sheet(isPresented: $showsArchive) {
                 StudyArchiveView(store: store)
             }
@@ -180,7 +154,7 @@ struct StudySetupView: View {
                 Button("Cancel", role: .cancel) { duplicateRun = nil }
                 Button("Overwrite", role: .destructive) { showsOverwritePassword = true }
             } message: {
-                Text("A run for \(duplicateRun?.participantName ?? "this participant") was recorded on \(duplicateRun.map { StudyRun.displayDateFormatter.string(from: $0.studyDate) } ?? ""). Overwriting deletes it and everything in it.")
+                Text("A \(inputMode.title) run for \(duplicateRun?.participantName ?? "this participant") was recorded on \(duplicateRun.map { StudyRun.displayDateFormatter.string(from: $0.studyDate) } ?? ""). Overwriting deletes it and everything in it. The participant's other condition is not affected.")
             }
             .sheet(isPresented: $showsOverwritePassword) {
                 StudyPasswordSheet(
@@ -245,35 +219,41 @@ struct StudySetupView: View {
             format: "%.0f × %.0f × %.0f cm",
             size.x / 10, size.y / 10, size.z / 10
         )
-        return "The participant uses \(resolvedFirstInputMode.title.lowercased()) to measure and load a practice payload of \(centimetres) first. Nothing from it is recorded. The study proper starts from the arrangement screen, behind the password."
-    }
-
-    private var resolvedFirstInputMode: StudyInputMode {
-        switch inputPlan {
-        case .both: firstInputMode
-        case .arOnly: .augmentedReality
-        case .manualOnly: .manual
-        }
-    }
-
-    private var inputScheduleFooter: String {
-        let modes = inputPlan.modes(first: resolvedFirstInputMode)
-        if inputPlan == .both {
-            return "\(firstBox.shortTitle): \(modes[0].title). \(firstBox.other.shortTitle): \(modes[1].title). Password 130802 is required before the second condition."
-        }
-        return "One standalone payload: \(firstBox.shortTitle) with \(modes[0].title). Password 130802 is required to finish."
+        return "The participant uses \(inputMode.title.lowercased()) for a practice payload of \(centimetres) first. Nothing from it is recorded. The same selected condition is then used for the study payload."
     }
 
     private func start() {
         store.startRun(
             participantName: name,
             studyDate: date,
-            flow: flow,
+            flow: .batch,
             firstBox: firstBox,
             includesPractice: includesPractice,
-            inputPlan: inputPlan,
-            firstInputMode: resolvedFirstInputMode
+            inputPlan: inputMode == .augmentedReality ? .arOnly : .manualOnly,
+            firstInputMode: inputMode
         )
+    }
+}
+
+// MARK: - Participant handoff
+
+/// A deliberately neutral screen between the administrator's setup and the timed study. The
+/// participant sees no names, condition controls, payload choices, or saved study data.
+struct StudyParticipantStartView: View {
+    let onStart: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.white.ignoresSafeArea()
+
+            Button("Start", action: onStart)
+                .font(.title2.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.horizontal, 48)
+                .accessibilityHint("Starts the study and its timer")
+        }
+        .preferredColorScheme(.light)
     }
 }
 
@@ -660,7 +640,9 @@ struct StudyArchiveView: View {
 
     private func summary(for run: StudyRun) -> String {
         run.isComplete
-            ? (run.boxOrder.count == 2 ? "Both boxes" : run.boxOrder[0].shortTitle)
+            ? run.inputModeOrder.map(\.shortTitle).joined(separator: " then ")
+                + " · "
+                + (run.boxOrder.count == 2 ? "Both boxes" : run.boxOrder[0].shortTitle)
                 + " · " + StudyRun.durationText(run.totalSeconds)
             : "Incomplete"
     }

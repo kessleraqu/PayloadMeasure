@@ -240,7 +240,7 @@ struct ArrangementView: View {
             return "Clears the practice payload, none of which is recorded, and starts the study on the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
         }
         if study.isOnLastBox {
-            return "Closes the second box and opens the study data."
+            return "Saves this condition and returns to the main setup screen. The other condition can then be configured separately."
         }
         if let nextMode = study.nextInputMode, study.switchesInputModeAfterCurrentBox {
             return "Closes this payload and starts \(nextMode.title.lowercased()) on the \(study.currentBox?.other.shortTitle ?? "next box"), without returning to setup."

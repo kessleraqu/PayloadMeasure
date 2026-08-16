@@ -425,6 +425,7 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertTrue(store.isPractice)
         XCTAssertEqual(store.catalogueOwner, .small)
 
+        store.beginParticipantSession()
         store.startRealStudy()
         XCTAssertEqual(store.catalogueOwner, .big, "Once the study starts it follows the actual box.")
         store.advanceToNextBox()

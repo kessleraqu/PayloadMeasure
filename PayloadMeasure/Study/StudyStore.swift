@@ -31,6 +31,9 @@ final class StudyStore {
     private(set) var currentBoxIndex = 0
     /// True while the participant is on the practice payload, before the study proper.
     private(set) var isPractice = false
+    /// True after the administrator has configured the run but before the participant taps the
+    /// neutral Start screen. No study timer or measuring workflow is active in this state.
+    private(set) var isAwaitingParticipantStart = false
     private var phaseStartedAt: Date?
     private var currentPhase: StudyPhase?
 
@@ -58,7 +61,7 @@ final class StudyStore {
 
     /// Whether the measuring screens should be up at all: a box, or the practice payload.
     var hasActiveSession: Bool {
-        activeRun != nil && (isPractice || currentBox != nil)
+        activeRun != nil && !isAwaitingParticipantStart && (isPractice || currentBox != nil)
     }
 
     /// The module the plan is built for.
@@ -130,8 +133,19 @@ final class StudyStore {
         activeRun = run
         currentBoxIndex = 0
         isPractice = includesPractice
+        isAwaitingParticipantStart = true
         persistActiveRun()
-        if includesPractice {
+    }
+
+    /// Leaves the administrator-free handoff screen and starts the selected workflow. This is the
+    /// exact point at which the first timer starts.
+    func beginParticipantSession() {
+        guard var run = activeRun, isAwaitingParticipantStart else { return }
+        run.createdAt = Date()
+        activeRun = run
+        isAwaitingParticipantStart = false
+        persistActiveRun()
+        if isPractice {
             // No box result yet. The first one is opened when the practice ends, so its start time is
             // when the study actually began rather than when the participant started playing.
             beginPhase(.measure)
@@ -207,12 +221,28 @@ final class StudyStore {
         exportReport(for: run)
     }
 
+    /// Dismisses a completed condition back to administrator setup while preserving the saved run
+    /// and its exported report. The other condition is deliberately not started automatically.
+    func returnToSetupAfterCompletion() {
+        guard activeRun?.isComplete == true else { return }
+        activeRun = nil
+        currentBoxIndex = 0
+        isPractice = false
+        isAwaitingParticipantStart = false
+        currentPhase = nil
+        phaseStartedAt = nil
+    }
+
     /// Whether a saved run already uses this participant name. Compared case- and space-insensitively,
     /// because "P01" and "p01 " are the same participant to everyone except a string comparison.
-    func savedRun(named name: String) -> StudyRun? {
+    func savedRun(named name: String, inputMode: StudyInputMode? = nil) -> StudyRun? {
         let wanted = Self.comparableName(name)
         guard !wanted.isEmpty else { return nil }
-        return saved.first { Self.comparableName($0.participantName) == wanted }
+        return saved.first { run in
+            guard Self.comparableName(run.participantName) == wanted else { return false }
+            guard let inputMode else { return true }
+            return run.inputModeOrder.contains(inputMode)
+        }
     }
 
     private static func comparableName(_ name: String) -> String {
@@ -232,6 +262,9 @@ final class StudyStore {
             activeRun = nil
             currentBoxIndex = 0
             isPractice = false
+            isAwaitingParticipantStart = false
+            currentPhase = nil
+            phaseStartedAt = nil
         }
         try? FileManager.default.removeItem(at: Self.runFolder(runID: runID))
         // exportReport also leaves a copy at the top of the folder, named after the participant rather
@@ -250,6 +283,7 @@ final class StudyStore {
         activeRun = nil
         currentBoxIndex = 0
         isPractice = false
+        isAwaitingParticipantStart = false
         lastExportURL = nil
         exportMessage = nil
     }
