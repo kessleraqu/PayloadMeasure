@@ -373,13 +373,62 @@ final class PackagePreparationTests: XCTestCase {
         
         XCTAssertNil(PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(0, 40, 40)))
 
-        XCTAssertEqual(PackingBoxPreset.defaultCatalog.count, 14)
-        XCTAssertEqual(PackingBoxPreset.defaultCatalog.first?.name, "130 × 100 × 105 mm")
-        XCTAssertEqual(PackingBoxPreset.defaultCatalog.first?.id, "130x100x105")
+    }
+
+    /// The two payloads are stocked differently, so a shared list would offer the small module boxes
+    /// that cannot go in it. These are the sizes the study uses; nothing else may be in the list.
+    func testEachPayloadHasItsOwnBoxesAndNoOthers() {
+        let big = PackingBoxPreset.defaultCatalog(for: .big)
+        let small = PackingBoxPreset.defaultCatalog(for: .small)
+
         XCTAssertEqual(
-            Set(PackingBoxPreset.defaultCatalog.map(\.id)).count,
-            PackingBoxPreset.defaultCatalog.count
+            big.map(\.id),
+            ["75x75x230", "95x95x160", "100x95x85", "130x100x105"]
         )
+        XCTAssertEqual(
+            small.map(\.id),
+            ["35x22x115", "100x75x90", "120x90x40"]
+        )
+        XCTAssertEqual(Set(big.map(\.id)).count, big.count)
+        XCTAssertEqual(Set(small.map(\.id)).count, small.count)
+        XCTAssertTrue(
+            Set(big.map(\.id)).isDisjoint(with: Set(small.map(\.id))),
+            "The two lists share no box, so neither can be mistaken for the other."
+        )
+
+        // Every box has to physically go into its own module in some orientation, or it could never
+        // be used.
+        for (payload, presets) in [(StudyBox.big, big), (StudyBox.small, small)] {
+            let module = payload.sizeMillimetres
+            for preset in presets {
+                let fits = PackingBoxPreset
+                    .sized(outerSizeMillimetres: module)?
+                    .fits(objectSizeMillimetres: preset.outerSizeMillimetres) ?? false
+                XCTAssertTrue(
+                    fits,
+                    "\(preset.name) cannot fit inside the \(payload.shortTitle) at all."
+                )
+            }
+        }
+    }
+
+    /// The practice payload is the small module's stand-in, so it must offer the same boxes.
+    func testThePracticePayloadUsesTheSmallModulesBoxes() {
+        let store = StudyStore()
+        store.startRun(
+            participantName: "boxes",
+            studyDate: Date(),
+            flow: .batch,
+            firstBox: .big,
+            includesPractice: true
+        )
+        XCTAssertTrue(store.isPractice)
+        XCTAssertEqual(store.catalogueOwner, .small)
+
+        store.startRealStudy()
+        XCTAssertEqual(store.catalogueOwner, .big, "Once the study starts it follows the actual box.")
+        store.advanceToNextBox()
+        XCTAssertEqual(store.catalogueOwner, .small)
     }
 
     func testStandardCentreOfMassDomainMatchesThePaper() {

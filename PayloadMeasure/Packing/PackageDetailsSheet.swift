@@ -103,7 +103,7 @@ struct PackageDetailsSheet: View {
                 }
             }
             .sheet(isPresented: $isShowingBoxes, onDismiss: reassign) {
-                BoxCatalogView(store: store)
+                BoxCatalogView(catalogue: store.boxes) { store.reloadBoxes() }
             }
         }
         .onAppear(perform: load)

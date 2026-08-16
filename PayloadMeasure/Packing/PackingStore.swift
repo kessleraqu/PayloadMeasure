@@ -39,7 +39,11 @@ final class PackingStore {
     private(set) var objectsThatAreTheirOwnBox: Set<UUID> = []
     /// Sizes typed in by hand, overriding both the measurement and the assigned box.
     private(set) var forcedSizesByObjectID: [UUID: SIMD3<Double>] = [:]
-    private(set) var boxPresets: [PackingBoxPreset] = PackingStore.loadBoxPresets()
+    /// The boxes for the payload being planned. Held by BoxCatalogue so that the setup screen and the
+    /// measuring screens edit one list per payload rather than a copy each.
+    let boxes = BoxCatalogue()
+
+    var boxPresets: [PackingBoxPreset] { boxes.presets }
     private(set) var baldiComparison: BaldiComparison?
 
     var module: PayloadModule = .standard
@@ -164,44 +168,45 @@ final class PackingStore {
 
     // MARK: - Box catalogue
 
+    /// Which payload is being planned. Switching it swaps in that payload's boxes and drops any
+    /// assignment made from the previous list.
+    func setPayload(_ payload: StudyBox) {
+        guard payload != boxes.payload else {
+            boxes.reload()
+            return
+        }
+        boxes.setPayload(payload)
+        selectedBoxPresetIDsByObjectID.removeAll()
+        invalidateResults()
+    }
+
+    /// Picks up edits made elsewhere — the setup screen writes to the same per-payload list.
+    func reloadBoxes() {
+        boxes.reload()
+        dropAssignmentsWithoutABox()
+        invalidateResults()
+    }
+
     @discardableResult
     func addBox(outerSizeMillimetres: SIMD3<Double>) -> PackingBoxPreset? {
-        guard let preset = PackingBoxPreset.sized(outerSizeMillimetres: outerSizeMillimetres),
-              // A box is its size, so the same size twice is the same box.
-              !boxPresets.contains(where: { $0.outerSizeMillimetres == outerSizeMillimetres }) else {
-            return nil
-        }
-        boxPresets.append(preset)
-        persistBoxPresets()
+        guard let preset = boxes.add(outerSizeMillimetres: outerSizeMillimetres) else { return nil }
         invalidateResults()
         return preset
     }
 
     func removeBox(id presetID: String) {
         guard boxPresets.contains(where: { $0.id == presetID }) else { return }
-        boxPresets.removeAll { $0.id == presetID }
-        for (objectID, selectedID) in selectedBoxPresetIDsByObjectID where selectedID == presetID {
-            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
-        }
-        persistBoxPresets()
+        boxes.remove(id: presetID)
+        dropAssignmentsWithoutABox()
         invalidateResults()
     }
 
-    private static let boxDefaultsKey = "packing.boxPresets"
-
-    /// Seeded from the default list only when nothing has been stored yet. An empty stored list is a
-    /// decision — the operator deleted everything — not a reason to put the defaults back.
-    private static func loadBoxPresets() -> [PackingBoxPreset] {
-        guard let data = UserDefaults.standard.data(forKey: boxDefaultsKey),
-              let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) else {
-            return PackingBoxPreset.defaultCatalog
+    private func dropAssignmentsWithoutABox() {
+        let available = Set(boxPresets.map(\.id))
+        for (objectID, selectedID) in selectedBoxPresetIDsByObjectID
+        where !available.contains(selectedID) {
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
         }
-        return stored
-    }
-
-    private func persistBoxPresets() {
-        guard let data = try? JSONEncoder().encode(boxPresets) else { return }
-        UserDefaults.standard.set(data, forKey: Self.boxDefaultsKey)
     }
 
     // MARK: - 3BKP inputs

@@ -140,6 +140,7 @@ nonisolated enum ObjectCapturePipeline {
     static let supportExclusionMargin: Float = 0.025
     private static let supportRingWidth: Float = 0.22
 
+
     static func capture(
         objectPoints: [AccumulatedDepthPoint],
         supportPoints: [SIMD3<Float>],

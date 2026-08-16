@@ -288,6 +288,8 @@ struct ARCameraView: UIViewRepresentable {
         private var observedObjectWorkflowRequestRevision = 0
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
+        /// Whether the scene graph is currently being drawn. See handleEngineRevisionChange.
+        private var isSceneContentEnabled = true
         private var observedShowsBoundingBoxes = true
         private var observedFrameEpoch = 0
 
@@ -588,6 +590,25 @@ struct ARCameraView: UIViewRepresentable {
 
         private func handleEngineRevisionChange() {
             synchronizeRealtimeProcessing()
+
+            // Put the scene down while the session is suspended. Pausing the session stops the camera
+            // but leaves this ARView drawing every box, every dashed edge, the point cloud and the
+            // world mesh on each frame against a frozen image — and while the packing screens are up
+            // the room view has a second ARView rendering on top of it. Two RealityKit renderers, the
+            // heavier of them drawing something nobody can see, and by the second payload this scene
+            // is at its largest.
+            //
+            // RealityKit has no equivalent of SceneKit's `isPaused`, so what is switched off is the
+            // content: only the top-level anchors, so each entity keeps its own visibility for when it
+            // comes back. Set before the guard below, which returns as soon as the session is
+            // suspended.
+            if let arView, isSceneContentEnabled == sessionManager.isTrackingSuspended {
+                isSceneContentEnabled = !sessionManager.isTrackingSuspended
+                for anchor in arView.scene.anchors {
+                    (anchor as? Entity)?.isEnabled = isSceneContentEnabled
+                }
+            }
+
             guard !sessionManager.isTrackingSuspended else {
                 return
             }
@@ -3534,13 +3555,10 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
                 if let stored = capturedHeightByObject[id] {
-                    let height = stabilize(stored, candidateHeight)
-                    capturedHeightByObject[id] = height.value
-                    heightStableTicks[id] = height.stable
+                    heightStableTicks[id] = stabilize(stored, candidateHeight).stable
                         ? (heightStableTicks[id, default: 0] + 1)
                         : 0
                 } else {
-                    capturedHeightByObject[id] = candidateHeight
                     heightStableTicks[id] = 0
                 }
                 if (heightStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
@@ -3549,6 +3567,25 @@ struct ARCameraView: UIViewRepresentable {
             case .other:
                 break
             }
+
+            // The drawn height always follows the current fit, whichever way the phone is pointing.
+            //
+            // It used to be seeded from the very first frame and then updated only while the view was
+            // classified `.side`. Hover over an object — which is `.topDown`, or the gap between the
+            // two — and the height stayed at whatever that first frame guessed, while the point cloud
+            // filled in and settled to the real extent underneath it. That is the top of the box
+            // hanging above the dots.
+            //
+            // Nothing here is gated, because nothing needs to be: the height is the highest point
+            // above the support plane, and how high a point is does not depend on where it was seen
+            // from. The footprint gating stays exactly as it was, and for the opposite reason — a
+            // footprint measured from an oblique view really is foreshortened. The two coverage
+            // counters and the observations fed to the stopping rule are untouched, so what the app
+            // asks of the operator has not changed; only the box it draws has stopped going stale.
+            let previousHeight = capturedHeightByObject[id]
+            capturedHeightByObject[id] = previousHeight
+                .map { stabilize($0, candidateHeight).value }
+                ?? candidateHeight
 
             if isActive {
                 captureEngine.updateScanGuidance(
@@ -4222,14 +4259,21 @@ struct ARCameraView: UIViewRepresentable {
             let baseQuota = limit / pointGroups.count
             let extraQuota = limit % pointGroups.count
             return pointGroups.enumerated().flatMap { index, points in
-                let quota = max(baseQuota + (index < extraQuota ? 1 : 0), 1)
-                guard points.count > quota else {
-                    return points
-                }
-                let stride = Double(points.count) / Double(quota)
-                return (0..<quota).map { sampleIndex in
-                    points[min(Int(Double(sampleIndex) * stride), points.count - 1)]
-                }
+                stableDisplaySubset(
+                    points,
+                    limit: max(baseQuota + (index < extraQuota ? 1 : 0), 1)
+                )
+            }
+        }
+
+        /// Which points to draw. See SelectionPointDisplay for why this is not a stride.
+        private func stableDisplaySubset(
+            _ points: [SIMD3<Float>],
+            limit: Int
+        ) -> [SIMD3<Float>] {
+            SelectionPointDisplay.subset(points, limit: limit) { point in
+                let key = selectionVoxelKey(for: point)
+                return SelectionPointDisplay.hash(x: key.x, y: key.y, z: key.z)
             }
         }
 

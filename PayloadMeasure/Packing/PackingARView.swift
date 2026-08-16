@@ -77,7 +77,7 @@ struct PackingARView: View {
                 Button {
                     model.unplace()
                 } label: {
-                    Label("Move", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                    Label("Place again", systemImage: "hand.tap")
                         .font(.body.weight(.semibold))
                         .padding(.horizontal, 14)
                         .frame(height: 44)
@@ -88,6 +88,41 @@ struct PackingARView: View {
                 .accessibilityLabel("Place the module somewhere else")
             }
         }
+    }
+
+    /// Quarter turns either way, and the current angle between them. Twisting two fingers on a phone
+    /// held in one hand is awkward, and lining the module up with a table edge is nearly always a
+    /// right angle away.
+    private var turnControls: some View {
+        HStack(spacing: 10) {
+            turnButton("rotate.left", radians: -.pi / 2, label: "Turn a quarter left")
+
+            Text(String(format: "%.0f°", model.turnDegrees))
+                .font(.subheadline.monospacedDigit().weight(.semibold))
+                .frame(minWidth: 54)
+
+            turnButton("rotate.right", radians: .pi / 2, label: "Turn a quarter right")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private func turnButton(
+        _ icon: String,
+        radians: Float,
+        label: String
+    ) -> some View {
+        Button {
+            model.requestTurn(by: radians)
+        } label: {
+            Image(systemName: icon)
+                .font(.body.weight(.semibold))
+                .frame(width: 46, height: 40)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 
     private var placementPrompt: some View {
@@ -152,17 +187,12 @@ struct PackingARView: View {
             .padding(.horizontal, 8)
             .glassEffect(.regular, in: .capsule)
 
-            Text("Tap a package to read its name. Drag or twist to turn the module.")
+            turnControls
+
+            Text("Drag to slide it, twist to turn it. Tap a package to read its name.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-
-            if model.turnDegrees > 0.5 {
-                Text(String(format: "Turned %.0f°", model.turnDegrees))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
-            }
         }
         .padding(.bottom, 24)
         .animation(.snappy(duration: 0.2), value: model.selectedPackageName)
@@ -191,6 +221,9 @@ final class PackingARModel {
     private(set) var revision = 0
     /// Bumped when the operator wants to place the module again.
     private(set) var unplaceRevision = 0
+    /// Bumped by the turn buttons; the delta is in radians about the vertical.
+    private(set) var turnRequestRevision = 0
+    private(set) var requestedTurnDelta: Float = 0
 
     init(solution: BaldiSolution, colours: [UUID: Color]) {
         self.solution = solution
@@ -248,6 +281,13 @@ final class PackingARModel {
 
     /// Whole degrees, and only when they change: this is called for every touch move, and the
     /// readout it feeds cannot show anything finer anyway.
+    /// A turn asked for by the buttons. The AR side owns the actual rotation, so this is a request it
+    /// picks up on the next sync rather than a value applied here.
+    func requestTurn(by radians: Float) {
+        requestedTurnDelta = radians
+        turnRequestRevision &+= 1
+    }
+
     func reportTurn(radians: Float) {
         var degrees = (Double(radians) * 180 / .pi).rounded().truncatingRemainder(dividingBy: 360)
         if degrees < 0 { degrees += 360 }
@@ -313,12 +353,15 @@ private struct PackingARContainer: UIViewRepresentable {
         private var packageEntities: [UUID: ModelEntity] = [:]
         private var observedRevision = -1
         private var observedUnplaceRevision = 0
+        private var observedTurnRequestRevision = 0
         private var searchTimer: Timer?
         private var watchdogTimer: Timer?
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var restartsRemaining = 4
         private var turn: Float = 0
+        /// Suppresses the tap that ends a drag, so sliding the module does not also select a package.
+        private var isDragging = false
         private var turnAtGestureStart: Float = 0
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
@@ -431,20 +474,40 @@ private struct PackingARContainer: UIViewRepresentable {
 
         // MARK: - Turning the module
 
+        /// One finger slides the module across the surface, which is what everyone tries first and
+        /// what every other AR app does. It used to turn it, which meant the module spun when you
+        /// tried to nudge it and there was no way to move it at all short of putting it down again.
         @objc private func handleDrag(_ recogniser: UIPanGestureRecognizer) {
-            guard let view, contentRoot != nil, view.bounds.width > 0 else { return }
-            let width = Float(view.bounds.width)
+            guard let view, let anchor, contentRoot != nil else { return }
             switch recogniser.state {
             case .began:
-                turnAtGestureStart = turn
-            case .changed, .ended:
-                // The full width of the screen is half a turn: enough to line the module up with a
-                // table edge without the model spinning away from under the finger.
-                let travel = Float(recogniser.translation(in: view).x) / width
-                apply(turn: turnAtGestureStart - travel * .pi, settling: recogniser.state == .ended)
+                isDragging = true
+            case .changed:
+                let point = recogniser.location(in: view)
+                guard let result = view.raycast(
+                    from: point,
+                    allowing: .estimatedPlane,
+                    alignment: .horizontal
+                ).first else {
+                    return
+                }
+                // Only the position follows the finger. Taking the raycast's whole transform would
+                // also take the plane's own rotation and undo whatever turn has been dialled in.
+                var transform = anchor.transform
+                transform.translation = Transform(matrix: result.worldTransform).translation
+                anchor.transform = transform
+            case .ended, .cancelled, .failed:
+                isDragging = false
             default:
                 break
             }
+        }
+
+        /// A quarter turn at a time, for the operator who wants the module square to the table rather
+        /// than approximately square. Twisting is still there for anything in between.
+        func nudgeTurn(by radians: Float) {
+            guard contentRoot != nil else { return }
+            apply(turn: turn + radians, settling: true)
         }
 
         @objc private func handleTwist(_ recogniser: UIRotationGestureRecognizer) {
@@ -479,6 +542,10 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         func sync() {
+            if model.turnRequestRevision != observedTurnRequestRevision {
+                observedTurnRequestRevision = model.turnRequestRevision
+                nudgeTurn(by: model.requestedTurnDelta)
+            }
             if model.unplaceRevision != observedUnplaceRevision {
                 observedUnplaceRevision = model.unplaceRevision
                 clearPlacement()

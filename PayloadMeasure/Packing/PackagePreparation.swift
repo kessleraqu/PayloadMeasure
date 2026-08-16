@@ -71,22 +71,29 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
 
     /// What the list starts as. Everything in it can be deleted, so this is only ever a starting
     /// point; once the operator edits the list, theirs is the one that counts.
-    static let defaultCatalog: [PackingBoxPreset] = [
-        SIMD3<Double>(130, 100, 105),
-        SIMD3<Double>(105, 100, 90),
-        SIMD3<Double>(75, 75, 230),
-        SIMD3<Double>(70, 70, 220),
-        SIMD3<Double>(80, 75, 265),
-        SIMD3<Double>(120, 90, 95),
-        SIMD3<Double>(120, 90, 40),
-        SIMD3<Double>(100, 95, 85),
-        SIMD3<Double>(100, 75, 90),
-        SIMD3<Double>(230, 155, 105),
-        SIMD3<Double>(190, 110, 115),
-        SIMD3<Double>(95, 95, 160),
-        SIMD3<Double>(35, 22, 215),
-        SIMD3<Double>(100, 65, 140),
-    ].compactMap { PackingBoxPreset.sized(id: identifier(for: $0), outerSizeMillimetres: $0) }
+    /// The boxes available for one payload module. The two modules carry different boxes, and the
+    /// practice payload uses the small module's, being the same size — see `catalogueOwner`.
+    static func defaultCatalog(for payload: StudyBox) -> [PackingBoxPreset] {
+        let sizes: [SIMD3<Double>]
+        switch payload {
+        case .big:
+            sizes = [
+                SIMD3(75, 75, 230),
+                SIMD3(95, 95, 160),
+                SIMD3(100, 95, 85),
+                SIMD3(130, 100, 105),
+            ]
+        case .small:
+            sizes = [
+                SIMD3(35, 22, 115),
+                SIMD3(100, 75, 90),
+                SIMD3(120, 90, 40),
+            ]
+        }
+        return sizes.compactMap {
+            PackingBoxPreset.sized(id: identifier(for: $0), outerSizeMillimetres: $0)
+        }
+    }
 
     /// The size is the identity, so it is also the id.
     static func identifier(for size: SIMD3<Double>) -> String {
@@ -117,7 +124,7 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
 nonisolated enum PackingBoxCatalog {
     static func fittingPresets(
         for objectSizeMillimetres: SIMD3<Double>,
-        in catalog: [PackingBoxPreset] = PackingBoxPreset.defaultCatalog
+        in catalog: [PackingBoxPreset]
     ) -> [PackingBoxPreset] {
         catalog.enumerated()
             .filter { $0.element.fits(objectSizeMillimetres: objectSizeMillimetres) }
@@ -132,7 +139,7 @@ nonisolated enum PackingBoxCatalog {
 
     static func recommendedPreset(
         for objectSizeMillimetres: SIMD3<Double>,
-        in catalog: [PackingBoxPreset] = PackingBoxPreset.defaultCatalog
+        in catalog: [PackingBoxPreset]
     ) -> PackingBoxPreset? {
         fittingPresets(for: objectSizeMillimetres, in: catalog).first
     }

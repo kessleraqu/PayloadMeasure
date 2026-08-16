@@ -17,11 +17,14 @@ struct StudySetupView: View {
 
     @State private var name = ""
     @State private var date = Date()
-    @State private var flow: MeasurementFlow = .sequential
+    @State private var flow: MeasurementFlow = .batch
     @State private var firstBox: StudyBox = .big
     @State private var includesPractice = true
     @State private var showsArchive = false
     @State private var showsAccuracy = false
+    @State private var editedCatalogue: StudyBox?
+    /// One per payload, kept for the life of this screen so the lists redraw as they are edited.
+    @State private var catalogues: [StudyBox: BoxCatalogue] = [:]
 
     var body: some View {
         NavigationStack {
@@ -85,6 +88,23 @@ struct StudySetupView: View {
 
                 Section {
                     Button {
+                        editedCatalogue = StudyBox.big
+                    } label: {
+                        boxRow(for: .big)
+                    }
+                    Button {
+                        editedCatalogue = StudyBox.small
+                    } label: {
+                        boxRow(for: .small)
+                    }
+                } header: {
+                    Text("Package boxes")
+                } footer: {
+                    Text("Each payload has its own boxes. The practice payload uses the small one's, being the same size.")
+                }
+
+                Section {
+                    Button {
                         showsAccuracy = true
                     } label: {
                         Label("Accuracy test", systemImage: "ruler")
@@ -101,6 +121,39 @@ struct StudySetupView: View {
             .fullScreenCover(isPresented: $showsAccuracy) {
                 AccuracySiteView(store: accuracy)
             }
+            .sheet(item: $editedCatalogue) { payload in
+                BoxCatalogView(catalogue: catalogue(for: payload))
+            }
+        }
+    }
+
+    private func catalogue(for payload: StudyBox) -> BoxCatalogue {
+        if let existing = catalogues[payload] { return existing }
+        let created = BoxCatalogue(payload: payload)
+        catalogues[payload] = created
+        return created
+    }
+
+    private func boxRow(for payload: StudyBox) -> some View {
+        let presets = catalogue(for: payload).presets
+        return HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(payload.shortTitle)
+                    .font(.body)
+                Text(presets.isEmpty
+                    ? "No boxes"
+                    : presets.map(\.name).joined(separator: ", "))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+            Spacer(minLength: 8)
+            Text("\(presets.count)")
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
         }
     }
 

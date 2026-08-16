@@ -1,15 +1,21 @@
 import SwiftUI
 import simd
 
-// The outer boxes the system chooses from, and the form for adding more.
+// The outer boxes the system chooses from for one payload, and the form for adding more.
 //
-// In:  PackingStore.
+// In:  a BoxCatalogue, which is per payload.
 // Out: on screen only. A box is identified by its size, so a size is all there is to enter. The
 //      list survives relaunch, every box can be deleted, and changing it invalidates the current
 //      arrangement.
+//
+// Reached both from the setup screen, before a run starts, and from the measuring screens. Both edit
+// the same saved list for that payload; `onChange` is how the measuring side learns to re-solve.
 
 struct BoxCatalogView: View {
-    @Bindable var store: PackingStore
+    let catalogue: BoxCatalogue
+    /// Called after every edit. Nil from the setup screen, where nothing is solved yet.
+    var onChange: (() -> Void)? = nil
+
     @Environment(\.dismiss) private var dismiss
 
     @State private var length: Double = 200
@@ -21,18 +27,18 @@ struct BoxCatalogView: View {
         NavigationStack {
             Form {
                 Section {
-                    if store.boxPresets.isEmpty {
+                    if catalogue.presets.isEmpty {
                         Text("No boxes. Add one below, or every object will have to be marked as already a box.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(store.boxPresets) { preset in
+                    ForEach(catalogue.presets) { preset in
                         HStack {
                             Text(preset.name)
                                 .monospacedDigit()
                             Spacer(minLength: 0)
                             Button(role: .destructive) {
-                                store.removeBox(id: preset.id)
+                                remove(preset.id)
                             } label: {
                                 Image(systemName: "trash")
                             }
@@ -41,8 +47,8 @@ struct BoxCatalogView: View {
                         }
                     }
                     .onDelete { offsets in
-                        for id in offsets.map({ store.boxPresets[$0].id }) {
-                            store.removeBox(id: id)
+                        for id in offsets.map({ catalogue.presets[$0].id }) {
+                            remove(id)
                         }
                     }
                 } header: {
@@ -69,8 +75,10 @@ struct BoxCatalogView: View {
                 } footer: {
                     Text("The size is the box's name, and it is taken as the space available inside. Nothing is subtracted for walls.")
                 }
+
+                resetSection
             }
-            .navigationTitle("Boxes")
+            .navigationTitle(titleText)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -78,6 +86,10 @@ struct BoxCatalogView: View {
                 }
             }
         }
+    }
+
+    private var titleText: String {
+        catalogue.payload == .big ? "Boxes · big payload" : "Boxes · small payload"
     }
 
     private var outerSize: SIMD3<Double> {
@@ -89,7 +101,7 @@ struct BoxCatalogView: View {
     }
 
     private var isDuplicate: Bool {
-        store.boxPresets.contains { $0.outerSizeMillimetres == outerSize }
+        catalogue.presets.contains { $0.outerSizeMillimetres == outerSize }
     }
 
     private var canAdd: Bool {
@@ -97,13 +109,31 @@ struct BoxCatalogView: View {
     }
 
     private func add() {
-        guard store.addBox(outerSizeMillimetres: outerSize) != nil else {
+        guard catalogue.add(outerSizeMillimetres: outerSize) != nil else {
             message = isDuplicate
                 ? "That size is already in the list."
                 : "This size is too small to have 1 mm walls."
             return
         }
         message = nil
+        onChange?()
+    }
+
+    private func remove(_ id: String) {
+        catalogue.remove(id: id)
+        onChange?()
+    }
+
+    private var resetSection: some View {
+        Section {
+            Button("Put the standard boxes back") {
+                catalogue.resetToDefaults()
+                onChange?()
+            }
+            .disabled(catalogue.isDefault)
+        } footer: {
+            Text("Restores this payload's standard list.")
+        }
     }
 
 

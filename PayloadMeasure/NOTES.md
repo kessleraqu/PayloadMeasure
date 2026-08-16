@@ -129,6 +129,61 @@ that grew with each object measured.
 twelve dashed edges at the per-edge maximum would need nearly 300 of them — a visible stall exactly
 when the box first appears.
 
+**Package boxes are per payload, and the practice payload borrows the small module's.** The two modules
+are stocked differently, so one shared list would offer the small module boxes that cannot go in it.
+`BoxCatalogue` holds one list per `StudyBox` and `StudyStore.catalogueOwner` decides which applies —
+`.small` while practising, since the practice payload is the same size and stands in for it.
+`PackingStore.setPayload` is called when the measuring screen appears, which is also what picks up an
+edit made on the setup screen: both write to the same saved list rather than keeping a copy each.
+
+The defaults are saved under `packing.boxes.v2.<payload>`. The generation in that key matters — an
+earlier build kept one shared list of fourteen boxes under `packing.boxPresets`, and reusing the old key
+would have restored those on upgrade instead of the sets the study actually uses.
+
+**The drawn box's height follows the current fit; its footprint does not.** Both used to be seeded from
+the first frame of a measurement and then refreshed only from a matching view — the footprint while
+`classifyView` said `.topDown`, the height while it said `.side`. Hovering over an object is `.topDown`
+or the gap between the two, so the height kept whatever the first frame guessed while the point cloud
+filled in and settled underneath it, and the top of the box was left hanging above the dots.
+
+The height is now updated every frame, through the same deadband, and the gating is kept for the
+footprint alone. The asymmetry is the point: the height is the highest reading above the support plane,
+and how high a point is does not depend on where it was seen from, whereas a footprint measured from an
+oblique view genuinely is foreshortened. The coverage counters and the observations fed to the stopping
+rule were left inside the view cases, so what the app asks of the operator is unchanged.
+
+`BoundingBoxHeightTests` pins what the height means — top on the highest reading, bottom on the support
+plane — so the drawn box has something to be held to. The fitter was never at fault here, and an
+earlier attempt to explain this as the footprint spreading across the tabletop was wrong: it added a
+clearance nothing in either paper calls for, and has been removed.
+
+**While the AR session is suspended, the scene is switched off as well.** A paused session still leaves
+the ARView drawing every box, edge, point and mesh triangle against a frozen camera image, and with the
+packing screens up the room view is a second RealityKit renderer on top of it. RealityKit has no
+`isPaused`, so `handleEngineRevisionChange` disables the top-level anchors instead — only those, so each
+entity keeps its own visibility for when it comes back.
+
+**How long a measurement takes is set by where the phone has been, not by the object.** In Full 3D,
+`viewGatedBox` records width and depth *only* while `classifyView` says `.topDown`, and height *only*
+while it says `.side`. The stopping rule needs 24 samples on each of the three axes, so a measurement
+cannot finish until the phone has spent enough time in both poses, and the same object measured along
+a different path can take several times longer. Two consequences worth knowing:
+
+- `classifyView` leaves a dead band. It is `.topDown` below −0.55 of forward Y (steeper than about
+  33° down) and `.side` within 0.4 (about 24° of horizontal), so a tilt between roughly 24° and 33°
+  down — a very natural way to hold a phone over a table — is `.other`, and `.other` records nothing
+  for any axis. Time spent there is simply lost. Closing the gap would be a one-line change, but the
+  gap is what keeps a tilted view from contributing a perspective-biased height, so it should not be
+  closed without measuring the effect on accuracy first.
+- The 2.5 s evidence-exhausted exit cannot rescue a starved axis. It fires when *no* observation has
+  arrived recently, and holding a top-down view keeps width and depth arriving, so height can starve
+  indefinitely while the rule still considers itself fed.
+
+The HUD's job is therefore to say which pose is missing. `MeasurementConvergence` already reports
+`.needsTopView` / `.needsSideView`, and the progress ring shows that text — it must not be reduced to
+"hold steady", which is what it said when the ring was first written and is why a stalled measurement
+looked like a slow one.
+
 **The accuracy test compares sorted side lengths, not axes.** A reading and its reference are both
 sorted largest first before being compared. The app cannot know which side the operator thought of as
 the width, and it can come out differently from one round to the next depending on how the object was

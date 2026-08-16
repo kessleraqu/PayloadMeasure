@@ -117,6 +117,9 @@ struct MesOverlayView: View {
                 packingStore.module.widthMillimetres = size.y
                 packingStore.module.heightMillimetres = size.z
             }
+            // And the boxes that go in it, which are that payload's own. Also picks up any edit made
+            // on the setup screen, since both work from the same saved list.
+            packingStore.setPayload(study.catalogueOwner)
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -626,11 +629,23 @@ struct MesOverlayView: View {
         return captureEngine.framingGuidance
     }
 
+    /// Distance first, because nothing else can be judged from the wrong distance; after that it is
+    /// whatever the stopping rule is actually waiting for. Width and depth are only measured looking
+    /// down and height only from the side, so a measurement can sit at the same percentage for a long
+    /// time purely because the phone has not been where it needs to be — and saying "hold steady"
+    /// then is worse than saying nothing.
     private var measuringTitle: String {
         switch measuringGuidance {
         case .moveCloser: "Move closer"
         case .moveFarther: "Move back"
-        default: captureEngine.convergence.isConverged ? "Size settled" : "Hold steady"
+        default:
+            switch captureEngine.convergence.limitingFactor {
+            case .needsTopView: "Point down at it"
+            case .needsSideView: "Look from the side"
+            case .waitingForSupportPlane: "Find the surface"
+            case .converged: "Size settled"
+            default: "Hold steady"
+            }
         }
     }
 
@@ -639,9 +654,18 @@ struct MesOverlayView: View {
         case .moveCloser: "Bring the phone nearer the object."
         case .moveFarther: "Pull the phone back a little."
         default:
-            captureEngine.convergence.isConverged
-                ? "The reading has stopped changing. You can finish."
-                : "Keep the object in view while the size settles."
+            switch captureEngine.convergence.limitingFactor {
+            case .needsTopView:
+                "Its width and length are measured from above. Hold the phone over it, pointing straight down."
+            case .needsSideView:
+                "Its height is measured from the side. Bring the phone down to the object's own level."
+            case .waitingForSupportPlane:
+                "Sweep across the table under the object so the floor it stands on is known."
+            case .converged:
+                "The reading has stopped changing. You can finish."
+            default:
+                captureEngine.convergence.detail
+            }
         }
     }
 
@@ -649,14 +673,26 @@ struct MesOverlayView: View {
         switch measuringGuidance {
         case .moveCloser: "arrow.down.right.and.arrow.up.left"
         case .moveFarther: "arrow.up.left.and.arrow.down.right"
-        default: captureEngine.convergence.isConverged ? "checkmark" : "dot.viewfinder"
+        default:
+            switch captureEngine.convergence.limitingFactor {
+            case .needsTopView: "arrow.down.to.line"
+            case .needsSideView: "arrow.right.to.line"
+            case .waitingForSupportPlane: "square.dashed"
+            case .converged: "checkmark"
+            default: "dot.viewfinder"
+            }
         }
     }
 
     private var measuringColor: Color {
         switch measuringGuidance {
         case .moveCloser, .moveFarther: .orange
-        default: captureEngine.convergence.isConverged ? .green : .white
+        default:
+            switch captureEngine.convergence.limitingFactor {
+            case .needsTopView, .needsSideView, .waitingForSupportPlane: .yellow
+            case .converged: .green
+            default: .white
+            }
         }
     }
 

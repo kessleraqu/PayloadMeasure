@@ -128,7 +128,7 @@ private struct PackingPreparationView: View {
         }
         .onAppear(perform: prepareDrafts)
         .sheet(isPresented: $isShowingBoxCatalog, onDismiss: reassignBoxes) {
-            BoxCatalogView(store: store)
+            BoxCatalogView(catalogue: store.boxes) { store.reloadBoxes() }
         }
     }
 
