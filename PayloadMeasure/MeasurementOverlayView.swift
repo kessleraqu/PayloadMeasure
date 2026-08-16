@@ -28,10 +28,13 @@ struct MesOverlayView: View {
     let onFullReset: () -> Void
     /// Called from inside the loading plan, behind the study password, when this payload is done.
     let onPayloadFinished: () -> Void
+    /// Abandons the whole run and goes back to the start screen. Behind the study password.
+    let onRunCancelled: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
     @State private var showsPanel = false
+    @State private var showsCancelRunPassword = false
     @State private var showsLiDARLimitations = false
     @State private var objectDetailsContext: ObjectDetailsContext?
     @State private var objectNameText = ""
@@ -62,23 +65,38 @@ struct MesOverlayView: View {
     // with a shallow call stack and frame 0 inside the runtime, not recursion in our code. It only
     // showed on device: the simulator's main thread has an 8 MB stack against 1 MB on iOS. AnyView
     // puts a boundary in the type tree at each layer, which is what keeps it walkable.
+    /// The layers with their animations, type-erased before anything else is attached.
+    ///
+    /// The second boundary in this file, and for a different reason from the layers themselves. Every
+    /// modifier below adds to one expression, and with the animations, the onChanges, the sheets, the
+    /// alerts and the confirmation dialogs all on the same chain the type-checker ran out of budget and
+    /// gave up — "unable to type-check this expression in reasonable time", which then cascades into a
+    /// dozen bogus "cannot find type" errors elsewhere in the file. Command-line builds happened to get
+    /// under the limit while Xcode did not, which is the worst way for this to show up. Splitting the
+    /// chain in two halves the work on each side.
+    private var animatedLayers: AnyView {
+        AnyView(
+            ZStack {
+                liveContentLayer
+                topLayer
+                bottomLayer
+            }
+            .animation(.snappy(duration: 0.22), value: showsPanel)
+            .animation(.snappy(duration: 0.22), value: showsSavedObjects)
+            .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
+            .animation(
+                .snappy(duration: 0.2),
+                value: captureEngine.hasCompletedObjectRecognitionWarmup
+            )
+            .animation(
+                .snappy(duration: 0.25),
+                value: sessionManager.isObjectTrackingEnvironmentReady
+            )
+        )
+    }
+
     var body: some View {
-        ZStack {
-            liveContentLayer
-            topLayer
-            bottomLayer
-        }
-        .animation(.snappy(duration: 0.22), value: showsPanel)
-        .animation(.snappy(duration: 0.22), value: showsSavedObjects)
-        .animation(.snappy(duration: 0.2), value: captureEngine.hasCapture)
-        .animation(
-            .snappy(duration: 0.2),
-            value: captureEngine.hasCompletedObjectRecognitionWarmup
-        )
-        .animation(
-            .snappy(duration: 0.25),
-            value: sessionManager.isObjectTrackingEnvironmentReady
-        )
+        animatedLayers
         .onChange(of: captureEngine.resetRevision) { _, _ in
             showsSavedObjects = false
             packingStore.clear()
@@ -138,6 +156,16 @@ struct MesOverlayView: View {
             // as such and the clock goes back to measuring when it closes.
             .onAppear { study.beginPhase(.pack) }
             .onDisappear { study.beginPhase(.measure) }
+        }
+        .sheet(isPresented: $showsCancelRunPassword) {
+            StudyPasswordSheet(
+                title: "Cancel this run",
+                message: "Returns to the start screen. Anything already saved for this participant stays in Saved runs; the payload in progress is not recorded.",
+                password: StudyStore.nextBoxPassword,
+                confirmTitle: "Cancel the run"
+            ) {
+                onRunCancelled()
+            }
         }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
@@ -638,6 +666,7 @@ struct MesOverlayView: View {
         switch measuringGuidance {
         case .moveCloser: "Move closer"
         case .moveFarther: "Move back"
+        case .centre: "Aim at it"
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView: "Point down at it"
@@ -653,6 +682,7 @@ struct MesOverlayView: View {
         switch measuringGuidance {
         case .moveCloser: "Bring the phone nearer the object."
         case .moveFarther: "Pull the phone back a little."
+        case .centre: "The object runs off the edge. Point at the middle of it."
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView:
@@ -673,6 +703,7 @@ struct MesOverlayView: View {
         switch measuringGuidance {
         case .moveCloser: "arrow.down.right.and.arrow.up.left"
         case .moveFarther: "arrow.up.left.and.arrow.down.right"
+        case .centre: "viewfinder"
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView: "arrow.down.to.line"
@@ -686,7 +717,7 @@ struct MesOverlayView: View {
 
     private var measuringColor: Color {
         switch measuringGuidance {
-        case .moveCloser, .moveFarther: .orange
+        case .moveCloser, .moveFarther, .centre: .orange
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView, .needsSideView, .waitingForSupportPlane: .yellow
@@ -925,6 +956,17 @@ struct MesOverlayView: View {
             // Finish and Reset live here rather than on the camera: neither is part of measuring,
             // and Reset in particular is destructive enough that it should take a deliberate look.
             testingControls
+
+            // Abandoning the run is the operator's decision, never the participant's, so it is behind
+            // the study password like every other way out of a payload.
+            Button {
+                showsCancelRunPassword = true
+            } label: {
+                Label("Cancel the run", systemImage: "xmark.circle")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.red)
+            }
+            .accessibilityHint("Asks for the study password, then returns to the start screen.")
 
             HStack(spacing: 10) {
                 Circle()
@@ -1212,38 +1254,32 @@ struct MesOverlayView: View {
            captureEngine.activeObjectID == nil,
            !showsPanel,
            captureEngine.isTopViewAligned {
-            let isRemeasure = captureEngine.canEditFocusedObject
+            // Pointing at something already measured greys the button out and says so. There is no
+            // remeasure: a participant who is unsure re-does the whole payload from the info panel, and
+            // dropping it is what lets finished objects stop being tracked at all — see
+            // ObjectCaptureEngine.isTrackingFinishedObjects.
+            let isDone = captureEngine.isPointingAtFinishedObject
             Button {
                 showsSavedObjects = false
-                if isRemeasure {
-                    captureEngine.reactivateFocusedObject()
-                } else {
-                    captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
-                }
+                captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
             } label: {
-                Text(isRemeasure ? "Remeasure" : "Measure")
+                Text(isDone ? "Already measured" : "Measure")
                     .font(.headline)
-                    .foregroundStyle(isRemeasure ? Color.secondary : Color.white)
+                    .foregroundStyle(isDone ? Color.secondary : Color.white)
                     .frame(maxWidth: .infinity, minHeight: 54)
                     .background(
-                        isRemeasure ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(Color.accentColor),
+                        isDone ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(Color.accentColor),
                         in: Capsule()
                     )
-                    .overlay {
-                        if isRemeasure {
-                            Capsule().stroke(Color.secondary.opacity(0.35), lineWidth: 1)
-                        }
-                    }
                     .contentShape(Capsule())
             }
             .buttonStyle(.plain)
-            .disabled(captureEngine.isObjectSelectionPending || !measurementCanStart)
-            .opacity(measurementCanStart ? 1 : 0.5)
-            .accessibilityLabel(isRemeasure ? "Remeasure this object" : "Measure the object in the centre")
-            .accessibilityHint(
-                isRemeasure
-                    ? "Measures the finished object you are pointing at again."
-                    : "Measures whatever the centre of the screen is pointing at."
+            .disabled(isDone || captureEngine.isObjectSelectionPending || !measurementCanStart)
+            .opacity(isDone || measurementCanStart ? 1 : 0.5)
+            .accessibilityLabel(
+                isDone
+                    ? "This object has already been measured"
+                    : "Measure the object in the centre"
             )
             .transition(.opacity.combined(with: .scale(scale: 0.96)))
         }
@@ -1320,9 +1356,9 @@ struct MesOverlayView: View {
 
     @ViewBuilder
     private func workflowButtonIfAvailable(showsTitle: Bool) -> some View {
-        if isAutomaticCaptureSupported,
-           captureEngine.activeObjectID != nil
-            || (flow.tracksFinishedObjects && captureEngine.canEditFocusedObject) {
+        // Only while something is being measured. There is no longer an Edit button for a finished
+        // object: nothing can be remeasured, so pointing at one offers nothing to do.
+        if isAutomaticCaptureSupported, captureEngine.activeObjectID != nil {
             objectWorkflowButton(showsTitle: showsTitle)
         }
     }
@@ -1410,17 +1446,6 @@ struct MesOverlayView: View {
                         ? "Saves the measurement so you can select another object."
                         : "Keep scanning until a LiDAR box is ready."
             )
-        } else if flow.tracksFinishedObjects, captureEngine.canEditFocusedObject {
-            Button {
-                showsSavedObjects = false
-                captureEngine.reactivateFocusedObject()
-            } label: {
-                actionLabel("Edit", systemImage: "pencil", tint: .orange, showsTitle: showsTitle)
-            }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.capsule)
-            .accessibilityLabel("Edit the object you are pointing at")
-            .accessibilityHint("Resumes measuring it. Only one object can be edited at a time.")
         }
     }
 
@@ -2157,6 +2182,7 @@ struct MesOverlayView: View {
         flow: .batch,
         study: StudyStore(),
         onFullReset: {},
-        onPayloadFinished: {}
+        onPayloadFinished: {},
+        onRunCancelled: {}
     )
 }

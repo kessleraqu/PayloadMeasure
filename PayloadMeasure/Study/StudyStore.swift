@@ -8,8 +8,11 @@ import simd
 //      hand over each box's result.
 // Out: observable state for the study screens, plus files under Documents/StudyRuns/.
 //
-// There is no delete. `saved` only ever grows, every mutation is written straight through, and a run
-// is persisted the moment it is created rather than when it finishes.
+// Every mutation is written straight through, and a run is persisted the moment it is created rather
+// than when it finishes, so a crash mid-study loses at most the box in progress.
+//
+// `delete(runID:)` is the one destructive path, added on request and gated behind a password at every
+// call site. Nothing else removes a run, and there is no copy elsewhere: deleting is final.
 
 @MainActor
 @Observable
@@ -160,6 +163,43 @@ final class StudyStore {
             saved.append(run)
         }
         exportReport(for: run)
+    }
+
+    /// Whether a saved run already uses this participant name. Compared case- and space-insensitively,
+    /// because "P01" and "p01 " are the same participant to everyone except a string comparison.
+    func savedRun(named name: String) -> StudyRun? {
+        let wanted = Self.comparableName(name)
+        guard !wanted.isEmpty else { return nil }
+        return saved.first { Self.comparableName($0.participantName) == wanted }
+    }
+
+    private static func comparableName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Deletes a saved run and everything under it: the JSON, the photos and the report.
+    ///
+    /// This is here because it was asked for, behind `restartPassword`, and it is the one destructive
+    /// action in the app. It cannot be undone and there is no copy anywhere else, so every caller puts
+    /// the password in front of it.
+    func delete(runID: UUID) {
+        let reportName = saved.first { $0.id == runID }?.reportFileName
+            ?? activeRun.flatMap { $0.id == runID ? $0.reportFileName : nil }
+        saved.removeAll { $0.id == runID }
+        if activeRun?.id == runID {
+            activeRun = nil
+            currentBoxIndex = 0
+            isPractice = false
+        }
+        try? FileManager.default.removeItem(at: Self.runFolder(runID: runID))
+        // exportReport also leaves a copy at the top of the folder, named after the participant rather
+        // than the run id, so deleting the run's own folder does not take it with it.
+        if let reportName {
+            try? FileManager.default.removeItem(
+                at: Self.rootFolder.appendingPathComponent(reportName)
+            )
+        }
+        lastExportURL = nil
     }
 
     /// Clears the run in progress without touching anything already saved.

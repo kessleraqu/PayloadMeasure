@@ -2079,6 +2079,75 @@ struct ARCameraView: UIViewRepresentable {
             }
             sessionManager.updateFrameStatus(from: frame)
             updateTopViewAlignment(from: frame)
+            updatePointingAtFinishedObject(from: frame, in: arView)
+        }
+
+        /// Whether the crosshair is on something already measured, so the button can say so.
+        ///
+        /// Worked out from the stored boxes rather than from tracking: a handful of ray-versus-box
+        /// tests per frame, against nothing per frame at all now that finished objects have been
+        /// dropped from the mask tracker. That is the whole point — the answer to "have I measured
+        /// this?" does not need Vision to keep following it around.
+        private func updatePointingAtFinishedObject(from frame: ARFrame, in arView: ARView) {
+            let finalized = captureEngine.finalizedObjectIDs
+            guard !finalized.isEmpty, captureEngine.activeObjectID == nil else {
+                captureEngine.setPointingAtFinishedObject(false)
+                return
+            }
+
+            let origin = SIMD3<Float>(
+                frame.camera.transform.columns.3.x,
+                frame.camera.transform.columns.3.y,
+                frame.camera.transform.columns.3.z
+            )
+            let direction = simd_normalize(
+                -SIMD3<Float>(
+                    frame.camera.transform.columns.2.x,
+                    frame.camera.transform.columns.2.y,
+                    frame.camera.transform.columns.2.z
+                )
+            )
+
+            let isPointing = finalized.contains { id in
+                guard let object = captureEngine.capturedObjectsByID[id] else { return false }
+                return Self.ray(
+                    origin: origin,
+                    direction: direction,
+                    hits: object
+                )
+            }
+            captureEngine.setPointingAtFinishedObject(isPointing)
+        }
+
+        /// Ray against an oriented box, by putting the ray into the box's own frame and running the
+        /// usual slab test. Sampled along the ray rather than solved, because the box is small on
+        /// screen and a coarse answer is all a button label needs.
+        private static func ray(
+            origin: SIMD3<Float>,
+            direction: SIMD3<Float>,
+            hits object: CapturedObject
+        ) -> Bool {
+            let axes = [object.axes.width, object.axes.depth, object.axes.height]
+            let half = object.dimensions / 2
+            var near: Float = 0.05
+            var far: Float = 4
+
+            for index in 0..<3 {
+                let axis = axes[index]
+                let extent = half[index]
+                let originOnAxis = simd_dot(origin - object.center, axis)
+                let directionOnAxis = simd_dot(direction, axis)
+                if abs(directionOnAxis) < 1e-6 {
+                    if abs(originOnAxis) > extent { return false }
+                    continue
+                }
+                let first = (-extent - originOnAxis) / directionOnAxis
+                let second = (extent - originOnAxis) / directionOnAxis
+                near = max(near, min(first, second))
+                far = min(far, max(first, second))
+                if near > far { return false }
+            }
+            return true
         }
 
         private func updateTopViewAlignment(from frame: ARFrame?) {

@@ -119,3 +119,22 @@ the simplex stalls. The scaling changes no feasible point.
 Run them with `xcodebuild test -scheme PayloadMeasure -destination 'platform=iOS Simulator,name=iPhone 17 Pro'`.
 
 The Balance path has no automated tests. It is exercised through the UI only.
+
+## How a package is drawn
+
+These boxes lift open like a trapdoor: the whole l × w face swings up, hinged along one of its long
+edges, rather than splitting down the middle. The AR view draws that as a darker panel over the top
+face, and the hinge edge as a darker bar again — once on the top face and once on the bottom face
+directly beneath it.
+
+Marking both faces is the point rather than duplication. Whichever way up the operator picks the package
+up, one of the two marks faces them, and the pair reads as one edge running through the box, so which
+way round it goes into the module is readable without turning it over. The mark always runs along the
+longer horizontal side, and always on the same side of it, so every package in a layer is marked
+consistently and the drawing can be compared with the real thing at a glance.
+
+The lid and hinge fade with their layer at a little more alpha than the package itself: they are darker
+than it, and at the opacities the faint layers use they would otherwise vanish before the box does.
+
+The 2-D plan in `KnapsackSceneView` still draws the older marker — both mirrored top edges. Worth
+bringing into line with the above; it is only a drawing change.

@@ -616,7 +616,15 @@ actor ObjectMaskProcessor {
             trackedObjects.removeAll()
             trackingGeneration = frame.trackingGeneration
         }
-        var retainedObjectIDs = frame.finalizedObjectIDs
+        // Only the object being measured is tracked. Every finished one used to be kept here for the
+        // rest of the session, and Vision re-tracked all of them on every pass, so each object saved
+        // made the next measurement slower — which is exactly how it felt after one or two.
+        //
+        // They can go because nothing needs them any more: their markers are not drawn, there is no
+        // remeasure, and "already measured" is decided from the stored boxes rather than from tracking.
+        // What is given up is tapping a finished object in the camera to select it; the saved-objects
+        // list does that instead.
+        var retainedObjectIDs: Set<UUID> = []
         if let activeObjectID = frame.activeObjectID {
             retainedObjectIDs.insert(activeObjectID)
         }

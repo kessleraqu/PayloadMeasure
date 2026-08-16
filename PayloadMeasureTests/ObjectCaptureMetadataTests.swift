@@ -78,6 +78,8 @@ final class ObjectCaptureMetadataTests: XCTestCase {
             ),
             .moveCloser
         )
+        // Clipped at an edge but not filling the frame: an aiming problem. Telling the operator to
+        // back away from something that is off to one side is the advice that appeared to do nothing.
         XCTAssertEqual(
             ObjectCaptureEngine.framingGuidance(
                 forNormalizedViewportBoundingBox: CGRect(
@@ -85,6 +87,18 @@ final class ObjectCaptureMetadataTests: XCTestCase {
                     y: 0.2,
                     width: 0.45,
                     height: 0.45
+                )
+            ),
+            .centre
+        )
+        // Genuinely filling the frame: backing away is the only thing that helps.
+        XCTAssertEqual(
+            ObjectCaptureEngine.framingGuidance(
+                forNormalizedViewportBoundingBox: CGRect(
+                    x: 0.05,
+                    y: 0.05,
+                    width: 0.9,
+                    height: 0.9
                 )
             ),
             .moveFarther
@@ -100,19 +114,6 @@ final class ObjectCaptureMetadataTests: XCTestCase {
             ),
             .okay
         )
-        XCTAssertEqual(
-            ObjectCaptureEngine.framingGuidance(
-                forNormalizedViewportBoundingBox: CGRect(
-                    x: 0.2,
-                    y: 0.2,
-                    width: 0.5,
-                    height: 0.5
-                ),
-                hasSufficientMeasurementDetail: false
-            ),
-            .moveCloser,
-            "A visually large small object still needs a closer view when LiDAR evidence is insufficient."
-        )
 
         let engine = ObjectCaptureEngine()
         let id = beginMeasuredObject(in: engine)
@@ -124,7 +125,14 @@ final class ObjectCaptureMetadataTests: XCTestCase {
         XCTAssertNil(engine.framingGuidance)
     }
 
-    func testFramingWaitsForEnoughStableDepthEvidence() {
+    /// Framing advice is about framing, and nothing else.
+    ///
+    /// It used to return "move closer" whenever the fit had too little depth evidence, at any distance.
+    /// A dark or glancing surface therefore asked the operator to close in on something already close
+    /// enough, and the apparent-size rule then asked them to back off — the two chasing each other,
+    /// which is what made the advice feel arbitrary. How much evidence there is belongs to the progress
+    /// ring, which reports it as "keep it in view", not to a distance instruction.
+    func testFramingAdviceIgnoresHowMuchEvidenceTheFitHas() {
         let engine = ObjectCaptureEngine()
         let id = UUID()
         engine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
@@ -134,44 +142,29 @@ final class ObjectCaptureMetadataTests: XCTestCase {
         ])
         XCTAssertEqual(
             engine.framingGuidance,
-            .moveCloser,
-            "A large screen box is not enough before stable depth evidence arrives."
+            .okay,
+            "Well framed is well framed, however thin the evidence is so far."
         )
 
         engine.updateActiveMeasurementDetail(id: id, stablePointCount: 12)
-        XCTAssertEqual(engine.framingGuidance, .moveCloser)
-
-        engine.updateActiveMeasurementDetail(
-            id: id,
-            stablePointCount: ObjectCapturePipeline.minimumClusterPoints
-        )
         XCTAssertEqual(engine.framingGuidance, .okay)
 
         engine.reportActiveMeasurementNeedsMoreDetail(id: id)
-        XCTAssertEqual(engine.framingGuidance, .moveCloser)
-
-        engine.updateActiveMeasurementDetail(
-            id: id,
-            stablePointCount: ObjectCapturePipeline.minimumClusterPoints + 100
+        XCTAssertEqual(
+            engine.framingGuidance,
+            .okay,
+            "Needing more detail is not a reason to send the operator anywhere."
         )
-        XCTAssertEqual(engine.framingGuidance, .moveCloser)
 
-        engine.updateCapture(
-            id: id,
-            object: CapturedObject(
-                dimensions: SIMD3<Float>(0.02, 0.03, 0.04),
-                center: SIMD3<Float>(0, 0.02, 0),
-                axes: (
-                    width: SIMD3<Float>(1, 0, 0),
-                    depth: SIMD3<Float>(0, 0, 1),
-                    height: SIMD3<Float>(0, 1, 0)
-                ),
-                corners: [],
-                volume: 0.000024,
-                sampleCount: ObjectCapturePipeline.minimumClusterPoints + 100
-            )
-        )
-        XCTAssertEqual(engine.framingGuidance, .okay)
+        // Moving the object to the edge is still reported, because that is framing. It has to agree
+        // with itself for several updates first: a mask wobbling at the frame edge would otherwise
+        // flick the advice on and off, which is what the hold count is for.
+        for _ in 0..<6 {
+            engine.updateObjectMaskDisplayBoundingBoxes([
+                id: CGRect(x: 0.01, y: 0.2, width: 0.4, height: 0.4)
+            ])
+        }
+        XCTAssertEqual(engine.framingGuidance, .centre)
     }
 
     private func beginMeasuredObject(in engine: ObjectCaptureEngine) -> UUID {

@@ -20,6 +20,8 @@ struct PackingARView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var model: PackingARModel
+    /// Which turn button is being held, and the ticker that keeps it turning.
+    @State private var heldDirection: Float?
 
     init(solution: BaldiSolution, colours: [UUID: Color]) {
         self.solution = solution
@@ -53,7 +55,19 @@ struct PackingARView: View {
             .padding(16)
         }
         .statusBarHidden()
+        .onAppear { model.beginSession() }
         .animation(.easeInOut(duration: 0.2), value: model.cameraWarning)
+        .animation(.easeInOut(duration: 0.2), value: model.isSurfaceReady)
+        // 3° every 40 ms while held: a full turn in about five seconds, slow enough to stop where you
+        // meant to.
+        .task(id: heldDirection) {
+            guard let heldDirection else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(40))
+                if Task.isCancelled { return }
+                model.requestTurn(by: heldDirection * .pi / 60)
+            }
+        }
     }
 
     private var header: some View {
@@ -90,44 +104,66 @@ struct PackingARView: View {
         }
     }
 
-    /// Quarter turns either way, and the current angle between them. Twisting two fingers on a phone
-    /// held in one hand is awkward, and lining the module up with a table edge is nearly always a
-    /// right angle away.
+    /// Hold one side or the other and it turns, for as long as you hold it.
+    ///
+    /// Twisting two fingers on a phone that is being held in one hand while the other hand holds a box
+    /// does not work, and tapping a quarter turn at a time is too coarse for lining up with a table
+    /// edge. Holding is the gesture that suits the situation: press, watch it turn, let go when it looks
+    /// right. Each side steps a small angle on a timer, so a tap is a nudge and a hold is a sweep.
     private var turnControls: some View {
-        HStack(spacing: 10) {
-            turnButton("rotate.left", radians: -.pi / 2, label: "Turn a quarter left")
+        HStack(spacing: 12) {
+            turnButton("rotate.left", direction: -1, label: "Hold to turn left")
 
-            Text(String(format: "%.0f°", model.turnDegrees))
-                .font(.subheadline.monospacedDigit().weight(.semibold))
-                .frame(minWidth: 54)
+            VStack(spacing: 0) {
+                Text(String(format: "%.0f°", model.turnDegrees))
+                    .font(.subheadline.monospacedDigit().weight(.semibold))
+                Text("hold to turn")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(minWidth: 78)
 
-            turnButton("rotate.right", radians: .pi / 2, label: "Turn a quarter right")
+            turnButton("rotate.right", direction: 1, label: "Hold to turn right")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
         .glassEffect(.regular, in: .capsule)
     }
 
     private func turnButton(
         _ icon: String,
-        radians: Float,
+        direction: Float,
         label: String
     ) -> some View {
-        Button {
-            model.requestTurn(by: radians)
-        } label: {
-            Image(systemName: icon)
-                .font(.body.weight(.semibold))
-                .frame(width: 46, height: 40)
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
+        Image(systemName: icon)
+            .font(.title3.weight(.semibold))
+            .frame(width: 62, height: 46)
+            .contentShape(Capsule())
+            .background(
+                heldDirection == direction ? Color.accentColor.opacity(0.28) : Color.clear,
+                in: Capsule()
+            )
+            // A press, not a tap: zero minimum distance so it reports the moment the finger lands, and
+            // the gesture stays alive while it is held.
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard heldDirection != direction else { return }
+                        heldDirection = direction
+                        model.requestTurn(by: direction * .pi / 60)
+                    }
+                    .onEnded { _ in heldDirection = nil }
+            )
+            .accessibilityLabel(label)
     }
 
     private var placementPrompt: some View {
-        Text(model.statusText)
+        Label(
+            model.statusText,
+            systemImage: model.isSurfaceReady ? "hand.tap.fill" : "viewfinder"
+        )
             .font(.callout.weight(.medium))
+            .foregroundStyle(model.isSurfaceReady ? Color.green : Color.primary)
             .multilineTextAlignment(.center)
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
@@ -212,7 +248,7 @@ final class PackingARModel {
     private(set) var isPlaced = false
     private(set) var visibleLayerIndex = 0
     private(set) var selectedPackageName: String?
-    private(set) var statusText = "Point at the table and tap to put the module down."
+    private(set) var statusText = PackingARModel.searchingText
     /// How far the module has been turned about the vertical, 0 to 360, for the readout.
     private(set) var turnDegrees: Double = 0
     /// Set while the camera is being taken back from whatever else grabbed it.
@@ -221,6 +257,9 @@ final class PackingARModel {
     private(set) var revision = 0
     /// Bumped when the operator wants to place the module again.
     private(set) var unplaceRevision = 0
+    /// Bumped each time this screen appears, so the AR side restarts its session even when the view
+    /// itself has been reused.
+    private(set) var sessionEpoch = 0
     /// Bumped by the turn buttons; the delta is in radians about the vertical.
     private(set) var turnRequestRevision = 0
     private(set) var requestedTurnDelta: Float = 0
@@ -270,19 +309,42 @@ final class PackingARModel {
         isPlaced = false
         selectedPackageName = nil
         turnDegrees = 0
-        statusText = "Point at the table and tap to put the module down."
+        isSurfaceReady = false
+        statusText = Self.searchingText
         unplaceRevision &+= 1
     }
 
-    func reportNoSurface() {
+    static let searchingText = "Move the phone slowly across the table until a surface is found."
+
+    /// Whether a surface is under the middle of the screen right now, so the prompt can say when it is
+    /// worth tapping instead of leaving the operator to guess.
+    private(set) var isSurfaceReady = false
+
+    func reportSurface(found: Bool) {
         guard !isPlaced else { return }
-        statusText = "Move the phone slowly across the table until a surface is found, then tap."
+        isSurfaceReady = found
+        statusText = found
+            ? "Ready. Tap to put the module down."
+            : Self.searchingText
+    }
+
+    func reportNoSurface() {
+        reportSurface(found: false)
     }
 
     /// Whole degrees, and only when they change: this is called for every touch move, and the
     /// readout it feeds cannot show anything finer anyway.
     /// A turn asked for by the buttons. The AR side owns the actual rotation, so this is a request it
     /// picks up on the next sync rather than a value applied here.
+    func beginSession() {
+        sessionEpoch &+= 1
+        isPlaced = false
+        selectedPackageName = nil
+        turnDegrees = 0
+        cameraWarning = nil
+        statusText = Self.searchingText
+    }
+
     func requestTurn(by radians: Float) {
         requestedTurnDelta = radians
         turnRequestRevision &+= 1
@@ -297,6 +359,11 @@ final class PackingARModel {
 
     func reportCameraRestarting() {
         cameraWarning = "Getting the camera back…"
+    }
+
+    /// Frames have stopped arriving and nothing is being done automatically, so this says what to do.
+    func reportCameraStalled() {
+        cameraWarning = "The camera has stopped. Close this view and open it again."
     }
 
     func clearCameraWarning() {
@@ -351,9 +418,13 @@ private struct PackingARContainer: UIViewRepresentable {
         /// the anchor's alignment with the real surface.
         private var contentRoot: Entity?
         private var packageEntities: [UUID: ModelEntity] = [:]
+        /// The lid and hinge parts, with the colour each was built from, so they can be faded with the
+        /// layer they belong to instead of staying solid over a faint package.
+        private var decorationsByPackage: [UUID: [(entity: ModelEntity, colour: UIColor)]] = [:]
         private var observedRevision = -1
         private var observedUnplaceRevision = 0
         private var observedTurnRequestRevision = 0
+        private var observedSessionEpoch = 0
         private var searchTimer: Timer?
         private var watchdogTimer: Timer?
         private var lastFrameTime: TimeInterval = 0
@@ -362,6 +433,8 @@ private struct PackingARContainer: UIViewRepresentable {
         private var turn: Float = 0
         /// Suppresses the tap that ends a drag, so sliding the module does not also select a package.
         private var isDragging = false
+        /// Where the module sat relative to the first raycast hit of the current drag.
+        private var dragOffset: SIMD2<Float>?
         private var turnAtGestureStart: Float = 0
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
@@ -393,13 +466,26 @@ private struct PackingARContainer: UIViewRepresentable {
             let twist = UIRotationGestureRecognizer(target: self, action: #selector(handleTwist))
             view.addGestureRecognizer(twist)
 
-            searchTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.model.reportNoSurface() }
+            // Twice a second, is there a surface under the middle of the screen? One raycast, and it is
+            // what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
+            searchTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.probeForSurface() }
             }
             lastFrameTime = CACurrentMediaTime()
             watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.checkForStalledCamera() }
             }
+        }
+
+        private func probeForSurface() {
+            guard let view, !model.isPlaced else { return }
+            let centre = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+            let found = !view.raycast(
+                from: centre,
+                allowing: .estimatedPlane,
+                alignment: .horizontal
+            ).isEmpty
+            model.reportSurface(found: found)
         }
 
         func detach() {
@@ -430,32 +516,28 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Only one ARKit session can hold the camera. If anything else takes it — the measuring
-        /// session waking up behind this screen, a phone call, the app going away and coming back —
-        /// this one simply stops being given frames and the picture sits there frozen, with no error
-        /// and no interruption callback to react to. So the session's own frame clock is read once a
-        /// second, and if it has stopped moving the session is told to run again.
+        /// Reports a stalled camera; it no longer tries to fix one.
         ///
-        /// Once a second, from the session itself: no per-frame delegate work, which at sixty frames
-        /// a second would cost more than the problem it is watching for.
+        /// This used to call `session.run` again every couple of seconds while frames were not arriving.
+        /// That was a bad trade: re-running a session restarts its camera pipeline, so on a session that
+        /// was merely slow the watchdog produced exactly the flicker it was meant to prevent, several
+        /// times over. Interruption and failure are still handled through the delegate, which is the
+        /// path ARKit actually tells us about. If frames stop for another reason the operator is told,
+        /// and nothing is done behind their back.
         private func checkForStalledCamera() {
-            guard let view, restartsRemaining > 0 else { return }
-            let now = CACurrentMediaTime()
+            guard let view else { return }
             guard let timestamp = view.session.currentFrame?.timestamp else { return }
+            let now = CACurrentMediaTime()
 
             if timestamp != lastFrameTimestamp {
                 lastFrameTimestamp = timestamp
                 lastFrameTime = now
-                restartsRemaining = 4
                 model.clearCameraWarning()
                 return
             }
-            guard now - lastFrameTime > 2 else { return }
-            restartsRemaining -= 1
-            model.reportCameraRestarting()
-            // No reset: the placed module and the tracked world are kept if the session comes back.
-            view.session.run(Self.makeConfiguration())
-            lastFrameTime = now
+            if now - lastFrameTime > 3 {
+                model.reportCameraStalled()
+            }
         }
 
         private func restartSession(resettingTracking: Bool) {
@@ -482,6 +564,7 @@ private struct PackingARContainer: UIViewRepresentable {
             switch recogniser.state {
             case .began:
                 isDragging = true
+                dragOffset = nil
             case .changed:
                 let point = recogniser.location(in: view)
                 guard let result = view.raycast(
@@ -491,10 +574,27 @@ private struct PackingARContainer: UIViewRepresentable {
                 ).first else {
                     return
                 }
-                // Only the position follows the finger. Taking the raycast's whole transform would
-                // also take the plane's own rotation and undo whatever turn has been dialled in.
+                // Move by how far the finger has moved, not to where it is. Setting the position to the
+                // hit point put the module's own origin under the finger, so it jumped the moment the
+                // drag started — grabbing a corner teleported the whole thing. The offset between the
+                // module and the first hit is taken once and held for the rest of the gesture.
+                //
+                // Height is left alone: the raycast happily returns the floor once the finger passes the
+                // edge of the table, and following it dropped the module off the table mid-drag.
                 var transform = anchor.transform
-                transform.translation = Transform(matrix: result.worldTransform).translation
+                let hit = Transform(matrix: result.worldTransform).translation
+                if dragOffset == nil {
+                    dragOffset = SIMD2(
+                        transform.translation.x - hit.x,
+                        transform.translation.z - hit.z
+                    )
+                }
+                let offset = dragOffset ?? .zero
+                transform.translation = SIMD3(
+                    hit.x + offset.x,
+                    transform.translation.y,
+                    hit.z + offset.y
+                )
                 anchor.transform = transform
             case .ended, .cancelled, .failed:
                 isDragging = false
@@ -503,11 +603,12 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// A quarter turn at a time, for the operator who wants the module square to the table rather
-        /// than approximately square. Twisting is still there for anything in between.
+        /// One step of a held turn. Deliberately does not snap to a right angle: the buttons step a few
+        /// degrees at a time, and snapping on every step would stick the module to each right angle
+        /// instead of letting it turn through them. The twist gesture still snaps when it is let go.
         func nudgeTurn(by radians: Float) {
             guard contentRoot != nil else { return }
-            apply(turn: turn + radians, settling: true)
+            apply(turn: turn + radians, settling: false)
         }
 
         @objc private func handleTwist(_ recogniser: UIRotationGestureRecognizer) {
@@ -542,6 +643,23 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         func sync() {
+            // The container can be reused when this screen is presented a second time — for the second
+            // payload, most of all. `makeUIView` is then not called again, so the session paused by the
+            // first dismissal is never restarted, and the view keeps showing the last frame it drew while
+            // anchors and gestures carry on working underneath. That is the frozen picture on the second
+            // box, with a live plan on top of a still image.
+            if model.sessionEpoch != observedSessionEpoch {
+                observedSessionEpoch = model.sessionEpoch
+                if let view {
+                    view.session.run(
+                        Self.makeConfiguration(),
+                        options: [.resetTracking, .removeExistingAnchors]
+                    )
+                    clearPlacement()
+                    lastFrameTimestamp = 0
+                    lastFrameTime = CACurrentMediaTime()
+                }
+            }
             if model.turnRequestRevision != observedTurnRequestRevision {
                 observedTurnRequestRevision = model.turnRequestRevision
                 nudgeTurn(by: model.requestedTurnDelta)
@@ -561,6 +679,7 @@ private struct PackingARContainer: UIViewRepresentable {
             anchor = nil
             contentRoot = nil
             packageEntities.removeAll()
+            decorationsByPackage.removeAll()
             observedRevision = -1
             turn = 0
         }
@@ -643,49 +762,98 @@ private struct PackingARContainer: UIViewRepresentable {
                 box.generateCollisionShapes(recursive: false)
                 anchor.addChild(box)
                 packageEntities[placement.id] = box
-                addOpeningEdges(for: placement, on: box, extent: extent, colour: colour)
+                addFaceMarkings(for: placement, on: box, extent: extent, colour: colour, id: placement.id)
             }
         }
 
         /// The opening runs along the package's length, and the operator has to line the real box up
         /// with it. Drawn on both mirrored length edges of the top face, in a darker tone of the
         /// package's own colour, so whichever way the box is picked up one of them faces them.
-        private func addOpeningEdges(
+        /// The two l × w faces darker, each with a line down the middle along the length.
+        ///
+        /// Which faces those are depends on how the package was turned. `placement.size` is already in
+        /// container axes, so the box's own length, width and height can be pointing along any of them —
+        /// a package stood on its end has its l × w faces vertical. The first version marked the
+        /// horizontal faces regardless, which is why the line kept appearing on the w × h side.
+        ///
+        /// `rotation.sourceAxis[c]` gives the box's own axis carried by container axis `c`: 0 is its
+        /// length, 1 its width, 2 its height. The faces to mark are the two perpendicular to whichever
+        /// container axis carries axis 2, and the line runs along whichever carries axis 0.
+        private func addFaceMarkings(
             for placement: BaldiPlacement,
             on box: ModelEntity,
             extent: SIMD3<Float>,
-            colour: UIColor
+            colour: UIColor,
+            id: UUID
         ) {
-            let axis = BaldiOpeningMarker.containerAxis(for: placement)
-            guard axis != 2 else { return }
-            let along = axis == 0
-            let lengthSpan = along ? extent.x : extent.y
-            let acrossSpan = along ? extent.y : extent.x
-            let bar = max(0.0015, min(lengthSpan, acrossSpan) * 0.05)
-            guard lengthSpan > 0, acrossSpan > bar else { return }
-
-            var material = SimpleMaterial(
-                color: darkened(colour, by: 0.55).withAlphaComponent(0.85),
-                isMetallic: false
-            )
-            material.roughness = 0.9
-            let top = extent.z / 2 + bar / 2
-
-            for side in [Float(-1), Float(1)] {
-                let offset = (acrossSpan - bar) / 2 * side
-                let line = ModelEntity(
-                    mesh: .generateBox(
-                        size: along
-                            ? SIMD3(lengthSpan * 0.96, bar, bar)
-                            : SIMD3(bar, bar, lengthSpan * 0.96)
-                    ),
-                    materials: [material]
-                )
-                line.position = along
-                    ? SIMD3(0, top, offset)
-                    : SIMD3(offset, top, 0)
-                box.addChild(line)
+            let sourceAxis = placement.rotation.sourceAxis
+            guard let normal = sourceAxis.firstIndex(of: 2),
+                  let length = sourceAxis.firstIndex(of: 0),
+                  let width = sourceAxis.firstIndex(of: 1),
+                  extent[normal] > 0, extent[length] > 0, extent[width] > 0 else {
+                return
             }
+
+            let plate = max(0.0010, extent[normal] * 0.02)
+            let line = max(0.0015, extent[width] * 0.06)
+            let faceColour = darkened(colour, by: 0.4)
+            let lineColour = darkened(colour, by: 0.75)
+
+            /// Packing is z-up, RealityKit is y-up, so the two vertical axes swap.
+            func realityKit(_ values: [Float]) -> SIMD3<Float> {
+                SIMD3(values[0], values[2], values[1])
+            }
+
+            for face in [Float(1), Float(-1)] {
+                let offset = face * (extent[normal] / 2 - plate / 2)
+
+                var faceSize = [Float](repeating: 0, count: 3)
+                faceSize[normal] = plate
+                faceSize[length] = extent[length] * 0.99
+                faceSize[width] = extent[width] * 0.99
+
+                var faceAt = [Float](repeating: 0, count: 3)
+                faceAt[normal] = offset
+
+                add(
+                    size: realityKit(faceSize),
+                    at: realityKit(faceAt),
+                    colour: faceColour,
+                    on: box,
+                    id: id
+                )
+
+                var lineSize = [Float](repeating: 0, count: 3)
+                lineSize[normal] = plate * 1.8
+                lineSize[length] = extent[length] * 0.9
+                lineSize[width] = line
+
+                var lineAt = [Float](repeating: 0, count: 3)
+                lineAt[normal] = face * (extent[normal] / 2 - plate * 0.9)
+
+                add(
+                    size: realityKit(lineSize),
+                    at: realityKit(lineAt),
+                    colour: lineColour,
+                    on: box,
+                    id: id
+                )
+            }
+        }
+
+        private func add(
+            size: SIMD3<Float>,
+            at position: SIMD3<Float>,
+            colour: UIColor,
+            on box: ModelEntity,
+            id: UUID
+        ) {
+            var material = SimpleMaterial(color: colour, isMetallic: false)
+            material.roughness = 0.9
+            let entity = ModelEntity(mesh: .generateBox(size: size), materials: [material])
+            entity.position = position
+            box.addChild(entity)
+            decorationsByPackage[id, default: []].append((entity, colour))
         }
 
         private func darkened(_ colour: UIColor, by amount: CGFloat) -> UIColor {
@@ -753,6 +921,20 @@ private struct PackingARContainer: UIViewRepresentable {
                     )
                     material.roughness = 0.85
                     entity.model?.materials = [material]
+
+                    // The face markings fade with their package. They are darker than it, so they are
+                    // given a little more alpha — at the layer opacities used here they would otherwise
+                    // disappear before the box does, and the hinge is the part worth seeing.
+                    for decoration in decorationsByPackage[placement.id] ?? [] {
+                        var decorated = SimpleMaterial(
+                            color: decoration.colour.withAlphaComponent(
+                                CGFloat(min(opacity * 1.6, 1))
+                            ),
+                            isMetallic: false
+                        )
+                        decorated.roughness = 0.9
+                        decoration.entity.model?.materials = [decorated]
+                    }
                 }
             }
         }

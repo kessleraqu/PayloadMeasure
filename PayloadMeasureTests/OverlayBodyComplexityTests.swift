@@ -21,7 +21,8 @@ final class OverlayBodyComplexityTests: XCTestCase {
             flow: .batch,
             study: StudyStore(),
             onFullReset: {},
-            onPayloadFinished: {}
+            onPayloadFinished: {},
+            onRunCancelled: {}
         )
         let name = String(reflecting: type(of: view.body))
         print("MesOverlayView.body type length: \(name.count)")

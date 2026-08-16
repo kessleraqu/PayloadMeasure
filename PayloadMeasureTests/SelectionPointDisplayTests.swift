@@ -85,6 +85,61 @@ final class SelectionPointDisplayTests: XCTestCase {
         )
     }
 
+    /// The dots came out in stripes, and this is the shape of that fault.
+    ///
+    /// FNV ends on a multiply, so the low bits of the hash are a near-linear function of the low bits of
+    /// the voxel key. Taking the remainder modulo a power of two therefore made "is this point drawn" a
+    /// periodic function of position — across a flat face, whole rows of voxels came out drawn and whole
+    /// rows came out empty.
+    ///
+    /// So what is measured is the density per row, per column and per diagonal of one face, against what
+    /// independent coin flips would give. A 1-D walk was tried first and is useless here: the unmixed
+    /// hash scores *better* than chance on neighbour agreement while still banding badly, so that test
+    /// passed on the broken hash. Measured over a face, the two are unmistakable — row sd 7.5 before the
+    /// avalanche step, 2.6 after, against a binomial 2.65.
+    func testDrawnPointsAreEvenlySpreadAcrossAFaceRatherThanBanded() {
+        let side = 64
+        let keepOneIn = 8
+        let threshold = SelectionPointDisplay.scale / UInt64(keepOneIn)
+        let drawn = (0..<side).map { x in
+            (0..<side).map { z in
+                SelectionPointDisplay.hash(x: Int32(x), y: 5, z: Int32(z))
+                    % SelectionPointDisplay.scale < threshold
+            }
+        }
+
+        func standardDeviation(_ counts: [Int]) -> Double {
+            let mean = Double(counts.reduce(0, +)) / Double(counts.count)
+            let variance = counts.reduce(0.0) { $0 + pow(Double($1) - mean, 2) }
+                / Double(counts.count)
+            return variance.squareRoot()
+        }
+
+        let share = 1.0 / Double(keepOneIn)
+        let binomial = (Double(side) * share * (1 - share)).squareRoot()
+        // Twice binomial: comfortably above the noise of an even spread, far below the 2.8× the
+        // unmixed hash produced.
+        let limit = 2 * binomial
+
+        let rows = drawn.map { $0.count { $0 } }
+        let columns = (0..<side).map { z in drawn.count { $0[z] } }
+        let diagonals = (0..<side).map { offset in
+            (0..<side).count { x in drawn[x][(x + offset) % side] }
+        }
+
+        XCTAssertLessThan(standardDeviation(rows), limit, "Banding along the rows of the face.")
+        XCTAssertLessThan(standardDeviation(columns), limit, "Banding along the columns.")
+        XCTAssertLessThan(standardDeviation(diagonals), limit, "Banding along the diagonals.")
+
+        // And the budget has to be roughly honoured, not quietly biased low as the unmixed hash was.
+        let total = rows.reduce(0, +)
+        XCTAssertEqual(
+            Double(total),
+            Double(side * side) * share,
+            accuracy: Double(side * side) * share * 0.25
+        )
+    }
+
     func testAZeroBudgetDrawsNothingRatherThanCrashing() {
         XCTAssertTrue(subset(Array(0..<10), limit: 0).isEmpty)
     }

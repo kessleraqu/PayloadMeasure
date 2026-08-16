@@ -78,6 +78,7 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         switch payload {
         case .big:
             sizes = [
+                SIMD3(35, 22, 115),
                 SIMD3(75, 75, 230),
                 SIMD3(95, 95, 160),
                 SIMD3(100, 95, 85),
@@ -85,7 +86,6 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
             ]
         case .small:
             sizes = [
-                SIMD3(35, 22, 115),
                 SIMD3(100, 75, 90),
                 SIMD3(120, 90, 40),
             ]

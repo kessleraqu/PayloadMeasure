@@ -42,7 +42,8 @@ struct ContentView: View {
                     flow: flow,
                     study: study,
                     onFullReset: restartCurrentPayload,
-                    onPayloadFinished: startNextBox
+                    onPayloadFinished: startNextBox,
+                    onRunCancelled: cancelRun
                 )
             }
             .id(sessionToken)
@@ -72,6 +73,14 @@ struct ContentView: View {
         } else {
             study.advanceToNextBox()
         }
+    }
+
+    /// Abandons the run from the info panel, behind the study password. Whatever was already recorded
+    /// for finished payloads stays on disk; the payload in progress simply never completes.
+    private func cancelRun() {
+        captureEngine.reset()
+        sessionToken &+= 1
+        study.clearActiveRun()
     }
 
     /// From the results screen. Keeps every saved run; only clears the screen.

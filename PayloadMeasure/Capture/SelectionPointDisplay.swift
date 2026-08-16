@@ -28,7 +28,26 @@ nonisolated enum SelectionPointDisplay {
         for component in [x, y, z] {
             value = (value ^ UInt64(UInt32(bitPattern: component))) &* prime
         }
-        return value
+        return finalised(value)
+    }
+
+    /// Avalanche step, and the reason the dots came out in stripes.
+    ///
+    /// FNV ends on a multiply, and the low bits of a product depend only on the low bits of its
+    /// operands — bit 0 of the hash is bit 0 of the input, and so on up. Voxel keys march by one along
+    /// each axis, so `hash % 2^16` marched with them: whether a point was drawn became a periodic
+    /// function of its position, which is a set of stripes across the surface rather than a scatter.
+    ///
+    /// This is splitmix64's finaliser: two shift-xors around a multiply, which spreads every input bit
+    /// across the whole word so the low bits are as good as any other.
+    private static func finalised(_ value: UInt64) -> UInt64 {
+        var mixed = value
+        mixed ^= mixed >> 33
+        mixed = mixed &* 0xFF51_AFD7_ED55_8CCD
+        mixed ^= mixed >> 33
+        mixed = mixed &* 0xC4CE_B9FE_1A85_EC53
+        mixed ^= mixed >> 33
+        return mixed
     }
 
     /// Up to `limit` items: the ones ranking lowest by hash, rather than the ones in the right places

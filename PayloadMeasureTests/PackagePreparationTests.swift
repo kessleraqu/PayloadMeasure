@@ -383,11 +383,11 @@ final class PackagePreparationTests: XCTestCase {
 
         XCTAssertEqual(
             big.map(\.id),
-            ["75x75x230", "95x95x160", "100x95x85", "130x100x105"]
+            ["35x22x115", "75x75x230", "95x95x160", "100x95x85", "130x100x105"]
         )
         XCTAssertEqual(
             small.map(\.id),
-            ["35x22x115", "100x75x90", "120x90x40"]
+            ["100x75x90", "120x90x40"]
         )
         XCTAssertEqual(Set(big.map(\.id)).count, big.count)
         XCTAssertEqual(Set(small.map(\.id)).count, small.count)

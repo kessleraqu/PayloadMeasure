@@ -13,6 +13,10 @@ import simd
 nonisolated enum ObjectFramingGuidance: String, Sendable, Equatable, CaseIterable {
     case moveCloser
     case moveFarther
+    /// The object runs off the edge of the frame. A distance instruction is the wrong advice here —
+    /// backing away from something that is off to one side does not bring it into view, which is why
+    /// "move further" used to be given and then appear to do nothing.
+    case centre
     case okay
 }
 
@@ -64,8 +68,10 @@ final class ObjectCaptureEngine {
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
     private(set) var showsSelectedPoints = true
-    private(set) var showsLiveMaskPreview = false
-    private(set) var showsSelectedObjectMaskPreview = false
+    // The mask is shown from the start. It is the clearest sign that the app has found the object and
+    // is working on the right thing, so hiding it by default left the operator guessing.
+    private(set) var showsLiveMaskPreview = true
+    private(set) var showsSelectedObjectMaskPreview = true
     private(set) var showsBoundingBoxes = true
     private(set) var showsObjectMaskMarkers = true
     private(set) var hasCompletedObjectRecognitionWarmup = false
@@ -97,6 +103,9 @@ final class ObjectCaptureEngine {
     private(set) var isTopViewAligned = false
     private(set) var topMeasurementStable = false
     private(set) var hasDefinitiveSupportPlaneForActiveObject = false
+    /// True when the crosshair is on an object that has already been measured. Set from the AR side
+    /// out of the stored boxes; no tracking is involved.
+    private(set) var isPointingAtFinishedObject = false
     private(set) var framingGuidance: ObjectFramingGuidance?
     private var candidateFramingGuidance: ObjectFramingGuidance?
     private var candidateFramingGuidanceCount = 0
@@ -832,6 +841,11 @@ final class ObjectCaptureEngine {
         refreshConvergence()
     }
 
+    func setPointingAtFinishedObject(_ isPointing: Bool) {
+        guard isPointingAtFinishedObject != isPointing else { return }
+        isPointingAtFinishedObject = isPointing
+    }
+
     func updateTopViewAlignment(
         deviationDegrees: Int?,
         isAligned: Bool
@@ -941,8 +955,7 @@ final class ObjectCaptureEngine {
     }
 
     static func framingGuidance(
-        forNormalizedViewportBoundingBox boundingBox: CGRect,
-        hasSufficientMeasurementDetail: Bool = true
+        forNormalizedViewportBoundingBox boundingBox: CGRect
     ) -> ObjectFramingGuidance? {
         guard boundingBox.origin.x.isFinite,
               boundingBox.origin.y.isFinite,
@@ -958,19 +971,26 @@ final class ObjectCaptureEngine {
             return nil
         }
 
-        let edgeMargin: CGFloat = 0.03
-        let isEdgeClipped = boundingBox.minX <= edgeMargin
-            || boundingBox.minY <= edgeMargin
-            || boundingBox.maxX >= 1 - edgeMargin
-            || boundingBox.maxY >= 1 - edgeMargin
-        let isTooLarge = boundingBox.width >= 0.85
-            || boundingBox.height >= 0.85
-        if isEdgeClipped || isTooLarge {
+        // Genuinely filling the frame: backing away is the only thing that helps.
+        if boundingBox.width >= 0.85 || boundingBox.height >= 0.85 {
             return .moveFarther
         }
 
-        if max(boundingBox.width, boundingBox.height) < 0.28
-            || !hasSufficientMeasurementDetail {
+        // Running off an edge without filling the frame is an aiming problem, not a distance one.
+        let edgeMargin: CGFloat = 0.03
+        if boundingBox.minX <= edgeMargin
+            || boundingBox.minY <= edgeMargin
+            || boundingBox.maxX >= 1 - edgeMargin
+            || boundingBox.maxY >= 1 - edgeMargin {
+            return .centre
+        }
+
+        // Small in the frame, so closer really does help. Note what is *not* here: whether the fit has
+        // enough detail yet. That used to return "move closer" too, which meant a dark or glancing
+        // surface asked the operator to close in on something already close enough, and then the size
+        // threshold asked them to back off again — the pair of them chasing each other. Thin evidence
+        // is reported by the progress bar, not as a distance instruction.
+        if max(boundingBox.width, boundingBox.height) < 0.28 {
             return .moveCloser
         }
         return .okay
@@ -987,11 +1007,7 @@ final class ObjectCaptureEngine {
         let updatedGuidance = activeObjectID
             .flatMap { objectMaskDisplayBoundingBoxes[$0] }
             .flatMap {
-                Self.framingGuidance(
-                    forNormalizedViewportBoundingBox: $0,
-                    hasSufficientMeasurementDetail:
-                        measurementDetailStatus == .sufficient
-                )
+                Self.framingGuidance(forNormalizedViewportBoundingBox: $0)
             }
 
         guard updatedGuidance != framingGuidance else {

@@ -23,6 +23,8 @@ struct StudySetupView: View {
     @State private var showsArchive = false
     @State private var showsAccuracy = false
     @State private var editedCatalogue: StudyBox?
+    @State private var duplicateRun: StudyRun?
+    @State private var showsOverwritePassword = false
     /// One per payload, kept for the life of this screen so the lists redraw as they are edited.
     @State private var catalogues: [StudyBox: BoxCatalogue] = [:]
 
@@ -74,7 +76,14 @@ struct StudySetupView: View {
                     // shows the live camera with instructions while the rest finishes loading, which
                     // is more useful than a spinner on a form.
                     Button {
-                        start()
+                        // A repeated participant name almost always means the operator has typed the
+                        // wrong one, so it is refused rather than quietly making a second run that is
+                        // indistinguishable from the first in the archive.
+                        if let existing = store.savedRun(named: name) {
+                            duplicateRun = existing
+                        } else {
+                            start()
+                        }
                     } label: {
                         Text("Start the study")
                             .font(.headline)
@@ -124,7 +133,34 @@ struct StudySetupView: View {
             .sheet(item: $editedCatalogue) { payload in
                 BoxCatalogView(catalogue: catalogue(for: payload))
             }
+            .alert("That name is already used", isPresented: duplicateIsPresented) {
+                Button("Cancel", role: .cancel) { duplicateRun = nil }
+                Button("Overwrite", role: .destructive) { showsOverwritePassword = true }
+            } message: {
+                Text("A run for \(duplicateRun?.participantName ?? "this participant") was recorded on \(duplicateRun.map { StudyRun.displayDateFormatter.string(from: $0.studyDate) } ?? ""). Overwriting deletes it and everything in it.")
+            }
+            .sheet(isPresented: $showsOverwritePassword) {
+                StudyPasswordSheet(
+                    title: "Overwrite the run",
+                    message: "Deletes the earlier run for this participant, with its photos and report, and starts again. This cannot be undone.",
+                    password: StudyStore.nextBoxPassword,
+                    confirmTitle: "Overwrite"
+                ) {
+                    if let duplicateRun {
+                        store.delete(runID: duplicateRun.id)
+                    }
+                    duplicateRun = nil
+                    start()
+                }
+            }
         }
+    }
+
+    private var duplicateIsPresented: Binding<Bool> {
+        Binding(
+            get: { duplicateRun != nil && !showsOverwritePassword },
+            set: { if !$0 { duplicateRun = nil } }
+        )
     }
 
     private func catalogue(for payload: StudyBox) -> BoxCatalogue {
@@ -268,7 +304,7 @@ struct StudyResultsView: View {
                     .padding(.top, 4)
                 }
 
-                Text("Nothing on this screen can be deleted. Every run stays on the device.")
+                Text("Runs stay on the device. Deleting one is possible from Saved runs, behind the password.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -474,6 +510,8 @@ struct StudyResultsView: View {
 struct StudyArchiveView: View {
     let store: StudyStore
     @Environment(\.dismiss) private var dismiss
+    @State private var pendingDeletion: StudyRun?
+    @State private var showsDeletePassword = false
 
     var body: some View {
         NavigationStack {
@@ -482,24 +520,57 @@ struct StudyArchiveView: View {
                     ContentUnavailableView {
                         Label("No runs yet", systemImage: "tray")
                     } description: {
-                        Text("Completed study runs appear here and are never removed.")
+                        Text("Completed study runs appear here. Swipe one to delete it; the password is asked for first.")
                     }
                 } else {
                     List {
                         ForEach(store.saved) { run in
                             row(for: run)
+                                .swipeActions(edge: .trailing) {
+                                    Button(role: .destructive) {
+                                        pendingDeletion = run
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
+                                    }
+                                }
                         }
                     }
                 }
             }
             .navigationTitle("Saved runs")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("Delete this run?", isPresented: deletionIsPresented) {
+                Button("Cancel", role: .cancel) { pendingDeletion = nil }
+                Button("Delete", role: .destructive) { showsDeletePassword = true }
+            } message: {
+                Text("\(pendingDeletion?.participantName ?? "This run"), with its photos and report. There is no copy anywhere else.")
+            }
+            .sheet(isPresented: $showsDeletePassword) {
+                StudyPasswordSheet(
+                    title: "Delete the run",
+                    message: "Removes it and everything in it from the device for good.",
+                    password: StudyStore.nextBoxPassword,
+                    confirmTitle: "Delete"
+                ) {
+                    if let pendingDeletion {
+                        store.delete(runID: pendingDeletion.id)
+                    }
+                    pendingDeletion = nil
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
+    }
+
+    private var deletionIsPresented: Binding<Bool> {
+        Binding(
+            get: { pendingDeletion != nil && !showsDeletePassword },
+            set: { if !$0 { pendingDeletion = nil } }
+        )
     }
 
     private func row(for run: StudyRun) -> some View {

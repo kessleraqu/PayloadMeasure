@@ -66,6 +66,8 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
         case none
         case precisionTarget
         case evidenceExhausted
+        /// The ten-second limit ran out. The reading is whatever had been measured by then.
+        case timeLimit
     }
 
     var progress: Double = 0
@@ -115,10 +117,8 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
             parts.append("Move to the side")
         case .collectingSamples:
             parts.append("Keep it in view")
-        case .drifting:
-            parts.append("\(axisLabel.capitalized) still changing")
-        case .precision:
-            parts.append("\(axisLabel.capitalized) still noisy")
+        case .drifting, .precision:
+            parts.append("Keep it in view while the size settles")
         case .converged:
             parts.append(
                 basis == .evidenceExhausted
@@ -126,12 +126,10 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
                     : "Converged"
             )
         }
-        if let precisionText {
-            parts.append(precisionText)
-        }
-        if let timeText {
-            parts.append(timeText)
-        }
+        // No millimetres, no axis names, no seconds remaining. Which dimension is still moving and by
+        // how much is diagnostic detail: the person holding the phone can act on "keep it in view" and
+        // cannot act on "length ±3.2 mm → ±2.5 mm". The figures are still on the state for the info
+        // panel and the tests.
         return parts.joined(separator: " · ")
     }
 
@@ -178,6 +176,10 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         var pilotSampleCount = 4
         /// No new observation for this long means the estimator can no longer change.
         var evidenceTimeout: TimeInterval = 2.5
+        /// A measurement ends here whatever the statistics say. A participant should not be left
+        /// holding a phone over an object indefinitely because the last millimetre will not settle;
+        /// past this the reading is taken as it stands.
+        var timeLimit: TimeInterval = 10
 
         /// Declared as the **total width** of the confidence interval, which is how it reads to an
         /// operator: "this dimension is known to within 5 mm". The half-width tolerance the rule
@@ -229,6 +231,10 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
     let configuration: Configuration
     private var axes: [AxisState]
     private var lastSampleTimestamp: TimeInterval?
+    private var firstSampleTimestamp: TimeInterval?
+    /// The published progress never decreases. Both parts it is built from move both ways as evidence
+    /// arrives, and a bar that slides backwards reads as the app losing work it had already done.
+    private var highWaterProgress: Double = 0
 
     init(configuration: Configuration = .default) {
         self.configuration = configuration
@@ -238,6 +244,8 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
     mutating func reset() {
         axes = Array(repeating: AxisState(), count: MeasurementAxis.allCases.count)
         lastSampleTimestamp = nil
+        firstSampleTimestamp = nil
+        highWaterProgress = 0
     }
 
     mutating func record(_ axis: MeasurementAxis, value: Float, at timestamp: TimeInterval) {
@@ -254,9 +262,10 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         }
         axes[axis.rawValue] = state
         lastSampleTimestamp = max(lastSampleTimestamp ?? timestamp, timestamp)
+        firstSampleTimestamp = min(firstSampleTimestamp ?? timestamp, timestamp)
     }
 
-    func evaluate(coverage: Coverage, now: TimeInterval) -> MeasurementConvergence {
+    mutating func evaluate(coverage: Coverage, now: TimeInterval) -> MeasurementConvergence {
         var result = MeasurementConvergence()
         result.minimumSampleCount = configuration.minimumSampleCount
         result.sampleCount = axes.map(\.values.count).min() ?? 0
@@ -297,20 +306,21 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
                 min(assessment.precisionRatio, assessment.plateauRatio)
             )
         } / Double(assessments.count)
-        result.progress = min(coverageProgress, dimensionProgress)
-
-        let remaining = max(
-            largestRemaining,
-            configuration.minimumSampleCount - result.sampleCount
+        // Three things push the bar along, and it takes whichever is furthest: how much of the rule is
+        // satisfied, how much of the ten seconds has gone, and how far it had already got. The time
+        // term is what makes it dependable — the measurement ends at the limit whatever the statistics
+        // are doing, so a bar that tracks the clock is a promise the app can always keep. The
+        // high-water term is what stops it sliding backwards when evidence is revised.
+        let elapsedFraction = firstSampleTimestamp.map {
+            configuration.timeLimit > 0
+                ? min(max((now - $0) / configuration.timeLimit, 0), 1)
+                : 0
+        } ?? 0
+        highWaterProgress = max(
+            highWaterProgress,
+            max(min(coverageProgress, dimensionProgress), elapsedFraction)
         )
-        if remaining > 0 {
-            if let interval = meanSampleInterval, interval > 0 {
-                result.estimatedSecondsRemaining = max(
-                    Int((Double(remaining) * interval).rounded()),
-                    1
-                )
-            }
-        }
+        result.progress = highWaterProgress
 
         let hasFullWindows = result.sampleCount >= configuration.minimumSampleCount
         let precisionSatisfied = hasFullWindows
@@ -328,6 +338,13 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
            let lastSampleTimestamp,
            now - lastSampleTimestamp >= configuration.evidenceTimeout {
             return converged(result, basis: .evidenceExhausted)
+        }
+        // The hard limit, and deliberately not conditional on anything: past ten seconds the reading
+        // is taken as it stands. If no support plane was ever found there is nothing to save and the
+        // finish is refused further down the line, which is the one case the limit cannot rescue.
+        if let firstSampleTimestamp,
+           now - firstSampleTimestamp >= configuration.timeLimit {
+            return converged(result, basis: .timeLimit)
         }
 
         if !coverage.hasSupportPlane {
