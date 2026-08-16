@@ -39,6 +39,8 @@ struct AccuracyReading: Codable, Identifiable, Sendable {
     /// As measured, in the app's own width/length/height order.
     var sizeMillimetres: [Double]
     var recordedAt: Date
+    /// Nil is retained for tests recorded by versions that only measured the 3D workflow.
+    var workflowMode: MeasurementWorkflowMode? = nil
 
     /// Largest side first. What every comparison uses.
     var sortedSizeMillimetres: [Double] {
@@ -61,17 +63,42 @@ struct AccuracyTestRun: Codable, Identifiable, Sendable {
     var readings: [AccuracyReading] = []
     /// Keyed by object number as a string, because JSON object keys cannot be integers.
     var referenceSizesMillimetres: [String: [Double]] = [:]
+    /// New tests compare both methods. Nil identifies a legacy, 3D-only test and keeps old files
+    /// decodable without a migration step.
+    var workflowModes: [MeasurementWorkflowMode]? = nil
+
+    var measurementModes: [MeasurementWorkflowMode] {
+        guard let workflowModes, !workflowModes.isEmpty else { return [.spatial3D] }
+        return workflowModes.reduce(into: []) { modes, mode in
+            if !modes.contains(mode) { modes.append(mode) }
+        }
+    }
 
     var objectNumbers: [Int] { Array(1...max(objectCount, 1)) }
 
-    var totalExpectedReadings: Int { objectCount * passes }
+    var totalExpectedReadings: Int { objectCount * passes * measurementModes.count }
 
     var isComplete: Bool { readings.count >= totalExpectedReadings }
 
     func readings(forObject objectNumber: Int) -> [AccuracyReading] {
         readings
             .filter { $0.objectNumber == objectNumber }
-            .sorted { $0.pass < $1.pass }
+            .sorted {
+                if $0.pass != $1.pass { return $0.pass < $1.pass }
+                let firstMode = $0.workflowMode ?? .spatial3D
+                let secondMode = $1.workflowMode ?? .spatial3D
+                return (measurementModes.firstIndex(of: firstMode) ?? 0)
+                    < (measurementModes.firstIndex(of: secondMode) ?? 0)
+            }
+    }
+
+    func readings(
+        forObject objectNumber: Int,
+        workflowMode: MeasurementWorkflowMode
+    ) -> [AccuracyReading] {
+        readings(forObject: objectNumber).filter {
+            ($0.workflowMode ?? .spatial3D) == workflowMode
+        }
     }
 
     func reference(forObject objectNumber: Int) -> [Double]? {
@@ -89,13 +116,22 @@ struct AccuracyTestRun: Codable, Identifiable, Sendable {
 
     // MARK: Position in the test
 
-    /// Where the next reading goes: pass first, then object, so every object is measured once per pass
-    /// in the same order.
-    var nextSlot: (objectNumber: Int, pass: Int)? {
+    /// Where the next reading goes: all passes for one method, then the next method. Inside a method,
+    /// every object is measured once per pass in the same order.
+    var nextSlot: (objectNumber: Int, pass: Int, workflowMode: MeasurementWorkflowMode)? {
         guard objectCount > 0, passes > 0 else { return nil }
         let done = readings.count
         guard done < totalExpectedReadings else { return nil }
-        return (objectNumber: done % objectCount + 1, pass: done / objectCount + 1)
+        let modes = measurementModes
+        // Keep each method in one block. Changing mode deliberately clears the AR fit, so alternating
+        // Top/3D for every object would repeatedly restart recognition and make a long test painful.
+        let measurementsPerMode = objectCount * passes
+        let positionInMode = done % measurementsPerMode
+        return (
+            objectNumber: positionInMode % objectCount + 1,
+            pass: positionInMode / objectCount + 1,
+            workflowMode: modes[done / measurementsPerMode]
+        )
     }
 
     static func sizeText(_ values: [Double]) -> String {
@@ -264,11 +300,16 @@ enum AccuracyStatistics {
 
     /// Builds the whole summary. Objects without a reference size, or with no readings, are left out
     /// rather than reported as zero error.
-    static func summarise(_ run: AccuracyTestRun) -> AccuracySummary {
+    static func summarise(
+        _ run: AccuracyTestRun,
+        workflowMode: MeasurementWorkflowMode? = nil
+    ) -> AccuracySummary {
         var objects: [AccuracyObjectStatistics] = []
         for number in run.objectNumbers {
             guard let reference = run.reference(forObject: number) else { continue }
-            let readings = run.readings(forObject: number)
+            let readings = workflowMode.map {
+                run.readings(forObject: number, workflowMode: $0)
+            } ?? run.readings(forObject: number)
             guard !readings.isEmpty else { continue }
 
             let sortedReference = reference.sorted(by: >)
@@ -313,6 +354,7 @@ extension AccuracyTestRun {
         lines.append("Recorded  : \(StudyRun.displayDateFormatter.string(from: createdAt))")
         lines.append("Objects   : \(objectCount)")
         lines.append("Passes    : \(passes)")
+        lines.append("Methods   : \(measurementModes.map(\.title).joined(separator: " + "))")
         lines.append("Readings  : \(readings.count) of \(totalExpectedReadings)")
         lines.append("Test id   : \(id.uuidString)")
         lines.append("")
@@ -320,13 +362,27 @@ extension AccuracyTestRun {
         lines.append("not counted as an error. All figures are millimetres unless marked otherwise.")
         lines.append("")
 
+        if measurementModes.count > 1 {
+            lines.append("Method comparison")
+            lines.append("-----------------")
+            for mode in measurementModes {
+                let method = AccuracyStatistics.summarise(self, workflowMode: mode)
+                guard !method.objects.isEmpty else { continue }
+                lines.append(
+                    "\(mode.title): bias \(Self.number(method.bias)), MAE \(Self.number(method.meanAbsoluteError)), RMSE \(Self.number(method.rootMeanSquareError)), worst \(Self.number(method.maximumAbsoluteError))"
+                )
+            }
+            lines.append("")
+        }
+
         for object in summary.objects {
             lines.append("-------------------------------------------------------------")
             lines.append("Object \(object.objectNumber)   reference \(Self.sizeText(object.reference))")
             lines.append("-------------------------------------------------------------")
             lines.append("Readings (\(object.readingCount)), as measured:")
             for reading in readings(forObject: object.objectNumber) {
-                lines.append("  pass \(reading.pass): \(reading.sizeText)")
+                let methodPrefix = reading.workflowMode.map { "\($0.shortTitle) · " } ?? ""
+                lines.append("  \(methodPrefix)pass \(reading.pass): \(reading.sizeText)")
             }
             lines.append("")
             lines.append("  side      ref     mean     bias     bias%      sd      CV%     r     MAE    RMSE   max|e|   ±95%")

@@ -1,5 +1,6 @@
 import ARKit
 import AVFoundation
+import CoreVideo
 import Observation
 
 // Owns the ARKit session: configuration, capability checks, interruption handling and suspension.
@@ -18,6 +19,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
     private weak var activeSession: ARSession?
     private var activeConfiguration: ARWorldTrackingConfiguration?
+    private var initialRunOptions: ARSession.RunOptions = [
+        .resetTracking,
+        .removeExistingAnchors
+    ]
     private var sessionStartTask: Task<Void, Never>?
     private var suspensionReasons: Set<SuspensionReason> = []
     private var isSessionRunning = false
@@ -110,6 +115,10 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
     private(set) var isCoachingActive = false
     private(set) var isTrackingSuspended = false
+    /// The packing workflow owns the camera for its entire lifetime. ContentView uses this distinct
+    /// flag to remove the measurement ARView from the hierarchy, rather than merely pausing its
+    /// session and leaving a second RealityKit renderer underneath the packing renderer.
+    private(set) var isPackingArrangementPresented = false
     private(set) var frameEpoch = 0
     private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
         "Move the iPhone slowly across the object and its supporting surface."
@@ -185,7 +194,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
     }
 
-    func configure(_ session: ARSession) {
+    func configure(_ session: ARSession, resetsTracking: Bool = true) {
         sessionStartTask?.cancel()
         sessionStartTask = nil
         isSessionRunning = false
@@ -193,6 +202,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         activeSession = session
         session.delegate = self
         isCoachingActive = false
+        initialRunOptions = resetsTracking
+            ? [.resetTracking, .removeExistingAnchors]
+            : []
 
         // A rebuilt view hierarchy means no packing sheet is on screen any more. That suspension
         // reason is owned by a SwiftUI presentation, so if the view that set it is destroyed without
@@ -201,6 +213,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         // sits on "understanding environment" that never completes. Application inactivity is not
         // cleared here: that one reflects real app state, not a presentation.
         suspensionReasons.remove(.packingArrangement)
+        isPackingArrangementPresented = false
         isTrackingSuspended = !suspensionReasons.isEmpty
         frameEpoch &+= 1
         trackingStatus = .starting
@@ -243,6 +256,14 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
 
         activeConfiguration = configuration
+        if !resetsTracking, let frame = session.currentFrame {
+            updateEnvironmentAnchors(from: frame.anchors)
+            worldMappingStatus = frame.worldMappingStatus
+            if let depth = frame.sceneDepth {
+                hasReceivedSceneDepth = true
+                sceneDepthResolutionText = "\(CVPixelBufferGetWidth(depth.depthMap)) × \(CVPixelBufferGetHeight(depth.depthMap)) px"
+            }
+        }
         if isTrackingSuspended {
             session.pause()
             updateSuspendedReadiness()
@@ -273,10 +294,19 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         activeSession = nil
         activeConfiguration = nil
         isSessionRunning = false
-        isCoachingActive = false
+        // detach is invoked by UIViewRepresentable.dismantleUIView during SwiftUI reconciliation.
+        // Publishing here causes "Modifying state during view update". Clear the visible coaching
+        // flag on the next turn, unless a new measurement renderer has already configured itself.
+        Task { @MainActor [weak self] in
+            guard let self, self.activeSession == nil else { return }
+            self.isCoachingActive = false
+        }
     }
 
     func setPackingArrangementPresented(_ isPresented: Bool) {
+        if isPackingArrangementPresented != isPresented {
+            isPackingArrangementPresented = isPresented
+        }
         setSuspensionReason(.packingArrangement, isActive: isPresented)
     }
 
@@ -372,8 +402,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         run(
             session,
             configuration: configuration,
-            options: [.resetTracking, .removeExistingAnchors]
+            options: initialRunOptions
         )
+        initialRunOptions = []
     }
 
     private func setSuspensionReason(
@@ -425,7 +456,12 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         )
 
         if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
-            run(activeSession, configuration: activeConfiguration)
+            run(
+                activeSession,
+                configuration: activeConfiguration,
+                options: initialRunOptions
+            )
+            initialRunOptions = []
         } else {
             startWhenCameraIsAuthorized(
                 activeSession,

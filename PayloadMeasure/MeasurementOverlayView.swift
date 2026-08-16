@@ -59,21 +59,11 @@ struct MesOverlayView: View {
         !sessionManager.isCoachingActive
     }
 
-    // The three layers are deliberately AnyView. `body`'s static type is the nesting of every
-    // modifier and branch underneath it, and this screen had grown enough that the Swift runtime
-    // overflowed the stack just walking that type in SubstGenericParametersFromMetadata — a crash
-    // with a shallow call stack and frame 0 inside the runtime, not recursion in our code. It only
-    // showed on device: the simulator's main thread has an 8 MB stack against 1 MB on iOS. AnyView
-    // puts a boundary in the type tree at each layer, which is what keeps it walkable.
-    /// The layers with their animations, type-erased before anything else is attached.
-    ///
-    /// The second boundary in this file, and for a different reason from the layers themselves. Every
-    /// modifier below adds to one expression, and with the animations, the onChanges, the sheets, the
-    /// alerts and the confirmation dialogs all on the same chain the type-checker ran out of budget and
-    /// gave up — "unable to type-check this expression in reasonable time", which then cascades into a
-    /// dozen bogus "cannot find type" errors elsewhere in the file. Command-line builds happened to get
-    /// under the limit while Xcode did not, which is the worst way for this to show up. Splitting the
-    /// chain in two halves the work on each side.
+    // Each group below is deliberately type-erased before another group of modifiers is attached.
+    // One continuous expression made Xcode's editor type-checker time out even when a command-line
+    // build succeeded. The timeout then produced misleading follow-on errors such as "Cannot find
+    // StudyStore in scope". These named boundaries also keep the runtime view type shallow enough for
+    // an iPhone's smaller main-thread stack.
     private var animatedLayers: AnyView {
         AnyView(
             ZStack {
@@ -95,8 +85,10 @@ struct MesOverlayView: View {
         )
     }
 
-    var body: some View {
-        animatedLayers
+    // MARK: - Lifecycle and presentation layers
+
+    private var overlayObservationLayer: AnyView {
+        AnyView(animatedLayers
         .onChange(of: captureEngine.resetRevision) { _, _ in
             showsSavedObjects = false
             packingStore.clear()
@@ -116,6 +108,11 @@ struct MesOverlayView: View {
                 pendingWorkflowMode = nil
             }
         }
+        )
+    }
+
+    private var measurementEventLayer: AnyView {
+        AnyView(overlayObservationLayer
         .onChange(of: captureEngine.automaticLockRequestRevision) { _, _ in
             presentAutomaticLockIfRequested()
         }
@@ -127,17 +124,13 @@ struct MesOverlayView: View {
                 lockFeedback.prepare()
             }
         }
-        .onAppear {
-            handleAppearance()
-            // The module the plan is built for: the study's current payload box, or the practice one.
-            if let size = study.activeModuleSizeMillimetres {
-                packingStore.module.lengthMillimetres = size.x
-                packingStore.module.widthMillimetres = size.y
-                packingStore.module.heightMillimetres = size.z
-            }
-            // And the boxes that go in it, which are that payload's own. Also picks up any edit made
-            // on the setup screen, since both work from the same saved list.
-            packingStore.setPayload(study.catalogueOwner)
+        )
+    }
+
+    private var applicationLifecycleLayer: AnyView {
+        AnyView(measurementEventLayer
+        .task {
+            await prepareForAppearance()
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -145,6 +138,11 @@ struct MesOverlayView: View {
         .onChange(of: showsPackingWorkflow) { _, isPresented in
             handlePackingWorkflowPresentationChange(isPresented)
         }
+        )
+    }
+
+    private var objectSheetLayer: AnyView {
+        AnyView(applicationLifecycleLayer
         .sheet(item: $packageDetails) { entry in
             PackageDetailsSheet(
                 objectID: entry.id,
@@ -167,6 +165,11 @@ struct MesOverlayView: View {
                 onRunCancelled()
             }
         }
+        )
+    }
+
+    private var workflowSheetLayer: AnyView {
+        AnyView(objectSheetLayer
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
@@ -183,6 +186,11 @@ struct MesOverlayView: View {
                 onBoxFinished: onPayloadFinished
             )
         }
+        )
+    }
+
+    private var objectDetailsAlertLayer: AnyView {
+        AnyView(workflowSheetLayer
         .alert(
             objectDetailsTitle,
             isPresented: objectDetailsIsPresented
@@ -199,6 +207,11 @@ struct MesOverlayView: View {
         } message: {
             Text(objectDetailsMessage)
         }
+        )
+    }
+
+    private var removalConfirmationLayer: AnyView {
+        AnyView(objectDetailsAlertLayer
         .confirmationDialog(
             removalConfirmationTitle,
             isPresented: removalConfirmationIsPresented,
@@ -223,6 +236,11 @@ struct MesOverlayView: View {
                 Text("\(boxSummary(for: id)) and its saved measurement data will be removed.")
             }
         }
+        )
+    }
+
+    private var resetConfirmationLayer: AnyView {
+        AnyView(removalConfirmationLayer
         .confirmationDialog(
             "Reset all measurements?",
             isPresented: $showsResetConfirmation,
@@ -236,6 +254,11 @@ struct MesOverlayView: View {
         } message: {
             Text("This clears every measurement, name, box, weight and loading plan, restarts the AR session and returns to the start screen. It cannot be undone.")
         }
+        )
+    }
+
+    private var finishLoadConfirmationLayer: AnyView {
+        AnyView(resetConfirmationLayer
         .confirmationDialog(
             "Finished with this load?",
             isPresented: $showsFinishLoadConfirmation,
@@ -250,6 +273,11 @@ struct MesOverlayView: View {
         } message: {
             Text("Closing the loading plan clears every measurement and starts again from the beginning. Choose Keep working to go back to the plan.")
         }
+        )
+    }
+
+    private var modeConfirmationLayer: AnyView {
+        AnyView(finishLoadConfirmationLayer
         .confirmationDialog(
             "Switch measurement mode?",
             isPresented: $showsModeChangeConfirmation,
@@ -271,6 +299,27 @@ struct MesOverlayView: View {
         } message: {
             Text("Changing the measurement method clears the current scan and all saved objects.")
         }
+        )
+    }
+
+    var body: some View {
+        modeConfirmationLayer
+    }
+
+    private func prepareForAppearance() async {
+        // A SwiftUI `.task` may begin in the same run-loop turn in which its view is installed.
+        // Yield once so these observable writes never occur inside the view-update transaction.
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+
+        handleAppearance()
+        if let size = study.activeModuleSizeMillimetres {
+            packingStore.module.lengthMillimetres = size.x
+            packingStore.module.widthMillimetres = size.y
+            packingStore.module.heightMillimetres = size.z
+        }
+        // Use the current payload's own catalogue and pick up edits made on the setup screen.
+        packingStore.setPayload(study.catalogueOwner)
     }
 
     private func handleAppearance() {
@@ -548,7 +597,7 @@ struct MesOverlayView: View {
     private var faceCoverageAccessibilityLabel: String {
         let top = captureEngine.footprintSatisfied ? "captured" : "still needed"
         let side = captureEngine.heightSatisfied ? "captured" : "still needed"
-        return "\(captureEngine.primaryText). Top view \(top). Side view \(side). \(measuringTitle)"
+        return "\(captureEngine.primaryText). Top view \(top). Isometric or side view \(side). \(measuringTitle)"
     }
 
     private var topCaptureGuide: some View {
@@ -670,7 +719,7 @@ struct MesOverlayView: View {
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView: "Point down at it"
-            case .needsSideView: "Look from the side"
+            case .needsSideView: "Use a 3/4 or side view"
             case .waitingForSupportPlane: "Find the surface"
             case .converged: "Size settled"
             default: "Hold steady"
@@ -688,7 +737,7 @@ struct MesOverlayView: View {
             case .needsTopView:
                 "Its width and length are measured from above. Hold the phone over it, pointing straight down."
             case .needsSideView:
-                "Its height is measured from the side. Bring the phone down to the object's own level."
+                "Its height is measured from an isometric or lateral view. Lower the phone and keep the whole object visible."
             case .waitingForSupportPlane:
                 "Sweep across the table under the object so the floor it stands on is known."
             case .converged:
@@ -1247,13 +1296,14 @@ struct MesOverlayView: View {
     /// The one thing the operator presses to start measuring. It replaces tapping the object: the
     /// aimer already says what is being pointed at, so a button is unambiguous and does not fight
     /// the drag gestures. Blue invites; the grey Remeasure says "you can, but you should not need
-    /// to". It is hidden entirely until the phone is level, because a tilted measurement is bad.
+    /// to". Top mode waits for overhead alignment; 3D mode stays available because its second view
+    /// is intentionally isometric or lateral.
     @ViewBuilder
     private var measureButton: some View {
         if isAutomaticCaptureSupported,
            captureEngine.activeObjectID == nil,
            !showsPanel,
-           captureEngine.isTopViewAligned {
+           (workflowMode == .spatial3D || captureEngine.isTopViewAligned) {
             // Pointing at something already measured greys the button out and says so. There is no
             // remeasure: a participant who is unsure re-does the whole payload from the info panel, and
             // dropping it is what lets finished objects stop being tracked at all — see
@@ -1333,6 +1383,7 @@ struct MesOverlayView: View {
            captureEngine.activeObjectID == nil,
            !showsPanel,
            !isPreparingToMeasure,
+           workflowMode == .top,
            !captureEngine.isTopViewAligned {
             VStack(spacing: 10) {
                 Image(systemName: "iphone.gen3.radiowaves.left.and.right")

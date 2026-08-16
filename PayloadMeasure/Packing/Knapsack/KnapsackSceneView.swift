@@ -69,6 +69,22 @@ nonisolated enum BaldiOpeningMarker {
         placement.rotation.sourceAxis.firstIndex(of: 0) ?? 0
     }
 
+    /// Container-space axes for the package's two L x W faces and their centre line.
+    ///
+    /// `sourceAxis[c]` is the measured package axis carried by container axis `c`. The two
+    /// L x W faces are therefore normal to measured height (axis 2), while the line on them runs
+    /// along measured length (axis 0). Keeping this mapping in one place prevents the 3D guide from
+    /// silently treating every package as though its L x W faces were horizontal.
+    static func faceAxes(
+        for placement: BaldiPlacement
+    ) -> (normal: Int, length: Int, width: Int)? {
+        let axes = placement.rotation.sourceAxis
+        guard let normal = axes.firstIndex(of: 2),
+              let length = axes.firstIndex(of: 0),
+              let width = axes.firstIndex(of: 1) else { return nil }
+        return (normal, length, width)
+    }
+
     static func description(for placement: BaldiPlacement) -> String {
         switch containerAxis(for: placement) {
         case 0: "Opening and length along the container"
@@ -320,6 +336,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
     final class Coordinator: NSObject {
         let cameraNode = SCNNode()
         var lastResetToken: Int?
+        var lastSceneState: SceneState?
         var selectPackage: (UUID?) -> Void = { _ in }
 
         @objc func handleTap(_ recognizer: UITapGestureRecognizer) {
@@ -373,7 +390,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         view.pointOfView = context.coordinator.cameraNode
 
         addLighting(to: scene.rootNode)
-        rebuildContent(in: view)
+        rebuildContentIfNeeded(in: view, coordinator: context.coordinator, force: true)
         resetCamera(in: view, coordinator: context.coordinator)
         context.coordinator.lastResetToken = cameraResetToken
 
@@ -386,7 +403,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
 
     func updateUIView(_ view: SCNView, context: Context) {
         context.coordinator.selectPackage = selectionHandler
-        rebuildContent(in: view)
+        rebuildContentIfNeeded(in: view, coordinator: context.coordinator)
         view.accessibilityLabel = accessibilityLabel
 
         if context.coordinator.lastResetToken != cameraResetToken {
@@ -405,13 +422,27 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         }
     }
 
-    private func rebuildContent(in view: SCNView) {
+    /// SwiftUI may call `updateUIView` for surrounding scroll and animation state which has nothing
+    /// to do with this scene. Removing and recreating the complete node tree on every such update
+    /// produced a blank/double-rendered frame while the user rotated it. Rebuild only when a value
+    /// which changes the drawing has actually changed.
+    private func rebuildContentIfNeeded(
+        in view: SCNView,
+        coordinator: Coordinator,
+        force: Bool = false
+    ) {
         guard let root = view.scene?.rootNode else { return }
-        root.childNode(withName: "packing-content", recursively: false)?.removeFromParentNode()
+        let state = SceneState(
+            solution: solution,
+            highlightedPackageID: highlightedPackageID,
+            selectedLayerIndex: selectedLayerIndex,
+            colours: colours,
+            interfaceStyle: view.traitCollection.userInterfaceStyle.rawValue
+        )
+        guard force || coordinator.lastSceneState != state else { return }
 
         let content = SCNNode()
         content.name = "packing-content"
-        root.addChildNode(content)
 
         let metrics = SceneMetrics(knapsack: solution.knapsack)
         SceneBuilder.addContainer(to: content, metrics: metrics)
@@ -442,6 +473,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
                 hasLayerSelection: selectedLayer != nil,
                 hasPackageHighlight: highlightedPackageID != nil
             )
+            guard presentation.isVisible else { continue }
             SceneBuilder.addPackage(
                 placement,
                 number: numbering[placement.id],
@@ -451,24 +483,34 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
                 metrics: metrics
             )
         }
+
+        // Build off-tree, then swap both trees in one transaction. SceneKit never renders the
+        // half-built scene and there is no implicit fade between two identical sets of geometry.
+        let previous = root.childNode(withName: "packing-content", recursively: false)
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 0
+        root.addChildNode(content)
+        previous?.removeFromParentNode()
+        SCNTransaction.commit()
+        coordinator.lastSceneState = state
     }
 
     private func addLighting(to root: SCNNode) {
         let ambientNode = SCNNode()
         let ambient = SCNLight()
         ambient.type = .ambient
-        ambient.intensity = 650
-        ambient.color = UIColor(white: 0.82, alpha: 1)
+        ambient.intensity = 850
+        ambient.color = UIColor(white: 0.94, alpha: 1)
         ambientNode.light = ambient
         root.addChildNode(ambientNode)
 
         let keyNode = SCNNode()
         let key = SCNLight()
         key.type = .directional
-        key.intensity = 1_000
-        key.castsShadow = true
-        key.shadowRadius = 5
-        key.shadowColor = UIColor.black.withAlphaComponent(0.22)
+        key.intensity = 650
+        // This is an instructional diagram, not a photorealistic render. Shadow maps on adjacent
+        // cuboids caused dark seams and shimmer as the camera moved.
+        key.castsShadow = false
         keyNode.light = key
         keyNode.eulerAngles = SCNVector3(-0.85, 0.65, 0)
         root.addChildNode(keyNode)
@@ -513,6 +555,54 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
     }
 }
 
+private struct SceneState: Equatable {
+    struct Placement: Equatable {
+        let id: UUID
+        let origin: SIMD3<Double>
+        let size: SIMD3<Int>
+        let sourceAxis: [Int]
+    }
+
+    let knapsackSize: SIMD3<Int>
+    let domainLower: SIMD3<Double>
+    let domainUpper: SIMD3<Double>
+    let idealCentreOfMass: SIMD3<Double>
+    let actualCentreOfMass: SIMD3<Double>
+    let placements: [Placement]
+    let colourDescriptions: [String]
+    let highlightedPackageID: UUID?
+    let selectedLayerIndex: Int?
+    let interfaceStyle: Int
+
+    init(
+        solution: BaldiSolution,
+        highlightedPackageID: UUID?,
+        selectedLayerIndex: Int?,
+        colours: [UUID: Color],
+        interfaceStyle: Int
+    ) {
+        knapsackSize = solution.knapsack.size
+        domainLower = solution.knapsack.domainLower
+        domainUpper = solution.knapsack.domainUpper
+        idealCentreOfMass = solution.knapsack.idealCentreOfMass
+        actualCentreOfMass = solution.centreOfMass
+        placements = BaldiLoadingGuide.orderedPlacements(in: solution).map {
+            Placement(
+                id: $0.id,
+                origin: $0.origin,
+                size: $0.size,
+                sourceAxis: $0.rotation.sourceAxis
+            )
+        }
+        colourDescriptions = placements.map {
+            String(reflecting: colours[$0.id] ?? Color.accentColor)
+        }
+        self.highlightedPackageID = highlightedPackageID
+        self.selectedLayerIndex = selectedLayerIndex
+        self.interfaceStyle = interfaceStyle
+    }
+}
+
 // MARK: - Scene construction
 
 private struct SceneMetrics {
@@ -549,14 +639,20 @@ private struct PackagePresentation {
     let hasLayerSelection: Bool
     let hasPackageHighlight: Bool
 
-    var opacity: CGFloat {
-        if isHighlighted { return 1 }
+    /// Future layers are omitted while following one loading step. Drawing them at 9% alpha used
+    /// translucent, intersecting boxes and made it harder—not easier—to see the active layer.
+    var isVisible: Bool {
+        !hasLayerSelection || isInSelectedLayer || isDirectSupporter || isHighlighted
+    }
+
+    /// Visible boxes stay opaque. Muting by colour rather than alpha avoids SceneKit having to sort
+    /// six transparent faces for every touching package on every camera frame.
+    var softening: CGFloat {
+        if isHighlighted { return 0 }
         if hasLayerSelection {
-            if isInSelectedLayer { return 0.88 }
-            if isDirectSupporter { return 0.42 }
-            return 0.09
+            return isInSelectedLayer ? 0.08 : 0.58
         }
-        return hasPackageHighlight ? 0.28 : 0.8
+        return hasPackageHighlight ? 0.52 : 0.06
     }
 
     var showsLabel: Bool {
@@ -573,12 +669,15 @@ private enum SceneBuilder {
             chamferRadius: 0
         )
         floor.firstMaterial = material(
-            colour: UIColor.secondarySystemFill,
-            opacity: 0.42,
+            colour: UIColor.systemGray5,
+            opacity: 1,
             lightingModel: .constant
         )
         let floorNode = SCNNode(geometry: floor)
-        floorNode.position.y = Float(-metrics.containerHeight / 2)
+        // Its top sits a hair below the package bottoms rather than intersecting them.
+        floorNode.position.y = Float(
+            -metrics.containerHeight / 2 - metrics.edgeThickness / 2 - metrics.edgeThickness * 0.02
+        )
         root.addChildNode(floorNode)
 
         addBoxEdges(
@@ -587,7 +686,7 @@ private enum SceneBuilder {
             depth: metrics.containerDepth,
             centre: SCNVector3Zero,
             thickness: metrics.edgeThickness,
-            colour: UIColor.secondaryLabel.withAlphaComponent(0.65),
+            colour: UIColor.systemGray2,
             to: root
         )
     }
@@ -610,30 +709,16 @@ private enum SceneBuilder {
         let domainDepth = max(CGFloat(domainSize.y) * metrics.scale, minimumDomainSide)
         let domainCentre = metrics.point((lower + upper) / 2)
 
-        let domain = SCNBox(
-            width: domainWidth,
-            height: domainHeight,
-            length: domainDepth,
-            chamferRadius: 0
-        )
-        let domainMaterial = material(
-            colour: UIColor.systemGreen,
-            opacity: 0.1,
-            lightingModel: .constant
-        )
-        domainMaterial.writesToDepthBuffer = false
-        domain.firstMaterial = domainMaterial
-        let domainNode = SCNNode(geometry: domain)
-        domainNode.position = domainCentre
-        domainNode.renderingOrder = 20
-        root.addChildNode(domainNode)
+        // A transparent enclosing solid tinted whichever package faces happened to be behind it and
+        // had to be depth-sorted on every camera move. The wireframe communicates the same admissible
+        // region without changing any package colour.
         addBoxEdges(
             width: domainWidth,
             height: domainHeight,
             depth: domainDepth,
             centre: domainCentre,
             thickness: metrics.edgeThickness * 0.65,
-            colour: UIColor.systemGreen.withAlphaComponent(0.72),
+            colour: UIColor.systemGreen,
             to: root,
             renderingOrder: 21
         )
@@ -691,34 +776,17 @@ private enum SceneBuilder {
             length: depth,
             chamferRadius: min(width, height, depth) * 0.025
         )
-        let packageMaterial = material(
+        package.materials = packageMaterials(
+            for: placement,
             colour: colour,
-            opacity: presentation.opacity,
-            lightingModel: .physicallyBased
+            softening: presentation.softening,
+            highlighted: presentation.isHighlighted
         )
-        packageMaterial.roughness.contents = 0.78
-        packageMaterial.metalness.contents = 0
-        if presentation.isHighlighted {
-            packageMaterial.emission.contents = colour.withAlphaComponent(0.32)
-        }
-        package.firstMaterial = packageMaterial
 
         let node = SCNNode(geometry: package)
         node.name = "package-\(placement.id.uuidString)"
         node.position = metrics.point(placement.centreOfMass)
         root.addChildNode(node)
-
-        addOpeningMarker(
-            for: placement,
-            width: width,
-            height: height,
-            depth: depth,
-            centre: node.simdPosition,
-            colour: colour,
-            opacity: max(0.16, presentation.opacity),
-            thickness: metrics.edgeThickness,
-            to: root
-        )
 
         if presentation.isHighlighted {
             addBoxEdges(
@@ -741,8 +809,27 @@ private enum SceneBuilder {
             x: CGFloat(node.position.x),
             z: CGFloat(node.position.z),
             metrics: metrics,
-            opacity: max(0.5, presentation.opacity),
             to: root
+        )
+    }
+
+    private static func softened(_ colour: UIColor, by amount: CGFloat) -> UIColor {
+        guard amount > 0 else { return colour }
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0
+        var brightness: CGFloat = 0
+        var alpha: CGFloat = 0
+        guard colour.getHue(
+            &hue,
+            saturation: &saturation,
+            brightness: &brightness,
+            alpha: &alpha
+        ) else { return colour }
+        return UIColor(
+            hue: hue,
+            saturation: saturation * (1 - amount * 0.72),
+            brightness: brightness + (1 - brightness) * amount * 0.32,
+            alpha: alpha
         )
     }
 
@@ -767,7 +854,6 @@ private enum SceneBuilder {
         x: CGFloat,
         z: CGFloat,
         metrics: SceneMetrics,
-        opacity: CGFloat,
         to root: SCNNode
     ) {
         let text = SCNText(string: String(number), extrusionDepth: 0.012)
@@ -775,7 +861,7 @@ private enum SceneBuilder {
         text.flatness = 0.08
         text.firstMaterial = material(
             colour: UIColor.label,
-            opacity: opacity,
+            opacity: 1,
             lightingModel: .constant
         )
 
@@ -795,94 +881,95 @@ private enum SceneBuilder {
         root.addChildNode(textNode)
     }
 
-    /// Every package is a box with a tongue that opens, and that opening runs along the length —
-    /// the longest side. The operator has to line the real box up with it, so it is drawn on both
-    /// mirrored length edges of the top face, never just one: whichever way round the box is picked
-    /// up, one of the two is facing them.
-    ///
-    /// Three tones of the package's own colour: the top face slightly darker, a band along each
-    /// opening edge darker still, and the edge line darkest. Keeping it in the package's own hue
-    /// means the colour still identifies the package.
-    private static func addOpeningMarker(
+    /// Matches the AR package without adding geometry on top of, inside, or outside the cuboid.
+    /// Both true L x W faces get a shaded material with a centred length line baked into it. Because
+    /// these are the SCNBox's own faces, touching packages cannot create coplanar marker surfaces or
+    /// have a marker protrude into their neighbour.
+    private static func packageMaterials(
         for placement: BaldiPlacement,
-        width: CGFloat,
-        height: CGFloat,
-        depth: CGFloat,
-        centre: SIMD3<Float>,
         colour: UIColor,
-        opacity: CGFloat,
-        thickness: CGFloat,
-        to root: SCNNode
-    ) {
-        let axis = BaldiOpeningMarker.containerAxis(for: placement)
-        let packageName = "package-\(placement.id.uuidString)"
-        let surfaceOffset = Float(max(0.02, thickness * 1.4))
-        let topCentre = centre + SIMD3(0, Float(height) / 2 + surfaceOffset, 0)
-        let bar = Float(max(0.02, thickness * 1.1))
-
-        func plate(size: SIMD3<Float>, at position: SIMD3<Float>, tone: CGFloat) {
-            guard size.min() > 0 else { return }
-            let box = SCNBox(
-                width: CGFloat(size.x),
-                height: CGFloat(size.y),
-                length: CGFloat(size.z),
-                chamferRadius: 0
-            )
-            box.firstMaterial = material(
-                colour: darkened(colour, by: tone),
-                opacity: opacity,
-                lightingModel: .constant
-            )
-            let node = SCNNode(geometry: box)
-            node.name = packageName
-            node.simdPosition = position
-            node.renderingOrder = 45
-            root.addChildNode(node)
+        softening: CGFloat,
+        highlighted: Bool
+    ) -> [SCNMaterial] {
+        let baseColour = softened(colour, by: softening)
+        let base = material(colour: baseColour, opacity: 1, lightingModel: .lambert)
+        base.ambient.contents = baseColour
+        if highlighted {
+            base.emission.contents = colour.withAlphaComponent(0.32)
         }
 
-        // Length vertical: no opening edge lies on the top face, so mark it on the front instead.
-        guard axis != 2 else {
-            plate(
-                size: SIMD3(bar, Float(height) * 0.82, bar),
-                at: centre + SIMD3(0, 0, Float(depth) / 2 + surfaceOffset),
-                tone: 0.55
-            )
-            return
+        // SCNBox material order is front(+z), right(+x), back(-z), left(-x), top(+y), bottom(-y).
+        var result = Array(repeating: base, count: 6)
+        guard let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return result }
+        let markedFaces: [Int]
+        let lineIsHorizontal: Bool
+        switch axes.normal {
+        case 0:
+            markedFaces = [1, 3]
+            lineIsHorizontal = axes.length == 1
+        case 1:
+            markedFaces = [0, 2]
+            lineIsHorizontal = axes.length == 0
+        default:
+            markedFaces = [4, 5]
+            lineIsHorizontal = axes.length == 0
         }
 
-        let along = axis == 0
-        let lengthSpan = Float(along ? width : depth)
-        let acrossSpan = Float(along ? depth : width)
-        let bandDepth = acrossSpan * 0.26
-
-        // The whole top face, a shade darker: this is the face the opening is on.
-        plate(
-            size: along
-                ? SIMD3(lengthSpan, bar * 0.45, acrossSpan)
-                : SIMD3(acrossSpan, bar * 0.45, lengthSpan),
-            at: topCentre,
-            tone: 0.18
+        let marked = markedFaceMaterial(
+            colour: baseColour,
+            lineIsHorizontal: lineIsHorizontal,
+            highlighted: highlighted ? colour : nil
         )
-
-        // Both mirrored length edges: a darker band, and the opening line darker still on top of it.
-        for side in [Float(-1), Float(1)] {
-            let bandOffset = (acrossSpan - bandDepth) / 2 * side
-            let edgeOffset = (acrossSpan - bar) / 2 * side
-            plate(
-                size: along
-                    ? SIMD3(lengthSpan, bar * 0.7, bandDepth)
-                    : SIMD3(bandDepth, bar * 0.7, lengthSpan),
-                at: topCentre + (along ? SIMD3(0, 0, bandOffset) : SIMD3(bandOffset, 0, 0)),
-                tone: 0.38
-            )
-            plate(
-                size: along
-                    ? SIMD3(lengthSpan * 0.96, bar, bar)
-                    : SIMD3(bar, bar, lengthSpan * 0.96),
-                at: topCentre + (along ? SIMD3(0, 0, edgeOffset) : SIMD3(edgeOffset, 0, 0)),
-                tone: 0.62
-            )
+        for index in markedFaces {
+            result[index] = marked
         }
+        return result
+    }
+
+    private static func markedFaceMaterial(
+        colour: UIColor,
+        lineIsHorizontal: Bool,
+        highlighted: UIColor?
+    ) -> SCNMaterial {
+        let faceColour = darkened(colour, by: 0.4)
+        let lineColour = darkened(colour, by: 0.75)
+        let side: CGFloat = 96
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let image = UIGraphicsImageRenderer(
+            size: CGSize(width: side, height: side),
+            format: format
+        ).image { context in
+            faceColour.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+            let inset = side * 0.05
+            let path = UIBezierPath()
+            if lineIsHorizontal {
+                path.move(to: CGPoint(x: inset, y: side / 2))
+                path.addLine(to: CGPoint(x: side - inset, y: side / 2))
+            } else {
+                path.move(to: CGPoint(x: side / 2, y: inset))
+                path.addLine(to: CGPoint(x: side / 2, y: side - inset))
+            }
+            path.lineWidth = side * 0.06
+            path.lineCapStyle = .round
+            lineColour.setStroke()
+            path.stroke()
+        }
+
+        let marked = material(colour: faceColour, opacity: 1, lightingModel: .lambert)
+        marked.diffuse.contents = image
+        marked.ambient.contents = image
+        marked.diffuse.magnificationFilter = .linear
+        marked.diffuse.minificationFilter = .linear
+        marked.diffuse.mipFilter = .linear
+        marked.diffuse.wrapS = .clamp
+        marked.diffuse.wrapT = .clamp
+        if let highlighted {
+            marked.emission.contents = highlighted.withAlphaComponent(0.22)
+        }
+        return marked
     }
 
     private static func addBoxEdges(
@@ -943,10 +1030,18 @@ private enum SceneBuilder {
         lightingModel: SCNMaterial.LightingModel
     ) -> SCNMaterial {
         let material = SCNMaterial()
-        material.diffuse.contents = colour
+        // Alpha comes only from the explicit `opacity` argument. UIColor system roles often carry
+        // an implicit alpha of their own; letting that leak into intersecting edge rods recreated
+        // the dark-corner sorting artefact even when `transparency` was one.
+        material.diffuse.contents = colour.withAlphaComponent(1)
         material.transparency = opacity
         material.lightingModel = lightingModel
-        material.isDoubleSided = true
+        // All geometry built here is closed. Drawing back faces made transparent boxes accumulate
+        // their colour twice and change darkness as SceneKit's sort order changed.
+        material.isDoubleSided = false
+        if opacity < 1 {
+            material.transparencyMode = .singleLayer
+        }
         return material
     }
 }

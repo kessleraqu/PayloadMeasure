@@ -157,11 +157,11 @@ plane — so the drawn box has something to be held to. The fitter was never at 
 earlier attempt to explain this as the footprint spreading across the tabletop was wrong: it added a
 clearance nothing in either paper calls for, and has been removed.
 
-**While the AR session is suspended, the scene is switched off as well.** A paused session still leaves
-the ARView drawing every box, edge, point and mesh triangle against a frozen camera image, and with the
-packing screens up the room view is a second RealityKit renderer on top of it. RealityKit has no
-`isPaused`, so `handleEngineRevisionChange` disables the top-level anchors instead — only those, so each
-entity keeps its own visibility for when it comes back.
+**The measurement renderer is removed for the whole packing workflow.** Pausing its `ARSession` was
+not sufficient: the old `ARView` and camera texture remained underneath the room view. `ContentView`
+now unmounts measurement while packing is presented, and both modes lease the one persistent renderer
+from `SharedARViewHost`. Dismantling measurement also stops its timers/display link, cancels frame work,
+removes coaching and scene content, and releases its lease before packing can acquire it.
 
 **How long a measurement takes is set by where the phone has been, not by the object.** In Full 3D,
 `viewGatedBox` records width and depth *only* while `classifyView` says `.topDown`, and height *only*
@@ -226,12 +226,11 @@ clutter, and the point budget is split evenly between objects, so keeping finish
 object actually being measured sparser with every object saved. The data stays, because a remeasure
 merges into it and the marker is how the app knows a saved object is on screen.
 
-**The room view watches its own frame clock.** Only one ARKit session can hold the camera, and the
-loser is not told: it simply stops being handed frames, with no error and no interruption callback,
-so the picture freezes. `PackingARView` therefore reads `session.currentFrame?.timestamp` once a
-second and re-runs its configuration — without resetting tracking, so the placed module survives —
-if the timestamp has not moved for two seconds. Once a second from the session, not per frame from a
-delegate: at sixty frames a second the watchdog would cost more than the freeze it watches for.
+**The room view watches its own frame clock but never restarts a merely slow session.** It reads
+`session.currentFrame?.timestamp` once a second and shows a clear warning if frames stop. Session
+restart is reserved for ARKit's interruption/failure callbacks. The earlier watchdog repeatedly ran
+the configuration while frames were delayed, which could itself create camera flicker. Camera
+ownership is instead prevented at the source by the shared renderer and lease hand-off.
 
 **Reports are saved through the system's save panel.** `ShareLink` alone was not enough; the ask was
 a file on the device. `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` also expose the

@@ -30,7 +30,11 @@ final class AccuracyStore {
     // MARK: - Where the test is up to
 
     /// The object and pass the next reading belongs to.
-    var nextSlot: (objectNumber: Int, pass: Int)? {
+    var nextSlot: (
+        objectNumber: Int,
+        pass: Int,
+        workflowMode: MeasurementWorkflowMode
+    )? {
         activeTest?.nextSlot
     }
 
@@ -44,6 +48,7 @@ final class AccuracyStore {
             return "All \(test.totalExpectedReadings) readings done."
         }
         return "Object \(slot.objectNumber) of \(test.objectCount) · pass \(slot.pass) of \(test.passes)"
+            + " · \(slot.workflowMode.shortTitle)"
     }
 
     // MARK: - Lifecycle
@@ -54,7 +59,8 @@ final class AccuracyStore {
             createdAt: Date(),
             label: label.trimmingCharacters(in: .whitespacesAndNewlines),
             objectCount: min(max(objectCount, 1), Self.maximumObjects),
-            passes: min(max(passes, 1), Self.maximumPasses)
+            passes: min(max(passes, 1), Self.maximumPasses),
+            workflowModes: [.top, .spatial3D]
         )
         activeTest = test
         persist()
@@ -88,7 +94,8 @@ final class AccuracyStore {
                 objectNumber: slot.objectNumber,
                 pass: slot.pass,
                 sizeMillimetres: values,
-                recordedAt: Date()
+                recordedAt: Date(),
+                workflowMode: slot.workflowMode
             )
         )
         activeTest = test
@@ -120,7 +127,7 @@ final class AccuracyStore {
     }
 
     var summary: AccuracySummary? {
-        activeTest.map(AccuracyStatistics.summarise)
+        activeTest.map { AccuracyStatistics.summarise($0) }
     }
 
     // MARK: - Export

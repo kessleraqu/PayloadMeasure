@@ -28,12 +28,12 @@ final class OverlayBodyComplexityTests: XCTestCase {
         print("MesOverlayView.body type length: \(name.count)")
         XCTAssertLessThan(
             name.count,
-            7_000,
+            100,
             """
-            The overlay's body type has grown again. This is a watermark, not a proven-safe bound: \
-            the device crash happened at some unknown depth above it, so treat any growth as \
-            dangerous. Do not fix it by trimming the UI — put an AnyView boundary around whichever \
-            layer grew, as liveContentLayer / topLayer / bottomLayer already do.
+            The overlay's public body must remain one shallow type-erasure boundary. Lifecycle, \
+            sheet, alert and confirmation modifiers belong in the named AnyView layers inside \
+            MesOverlayView; joining them back into body can overwhelm Xcode's editor type-checker \
+            and previously overflowed the smaller device main-thread stack.
             """
         )
     }

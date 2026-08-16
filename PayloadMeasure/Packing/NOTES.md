@@ -64,10 +64,12 @@ loop polls `Task.isCancelled` between rounds.
 support and centre of mass from the placements alone. If it fails, the solver returns no solution
 rather than a suspect one. The same holds for Balance via `PackingGeometryCheck`.
 
-**The augmented view runs its own AR session.** Presenting the packing workflow already suspends the
-measurement session (`setPackingArrangementPresented`), which releases the camera, so
-`PackingARView` can start a second `ARWorldTrackingConfiguration` of its own. If that suspension is
-ever removed, two sessions will fight over the camera.
+**The augmented view shares one AR renderer with measurement.** `SharedARViewHost` retains one
+`ARView`, `CAMetalLayer` and `ARSession` for the app. Presenting the packing workflow removes the
+measurement representable from the hierarchy; measurement and `PackingARView` then acquire that
+renderer through mutually exclusive leases. A stale dismantle cannot pause or clear the delegate of
+the newer owner. Packing switches the shared session to its lightweight configuration without
+resetting the coordinate frame. Only an actual payload boundary requests a fresh measurement world.
 
 **Packing is z-up, RealityKit is y-up.** Every placement crossing into `PackingARView` swaps those
 axes, and the horizontal ones are offset by half the container because the shell is centred on the
@@ -122,19 +124,14 @@ The Balance path has no automated tests. It is exercised through the UI only.
 
 ## How a package is drawn
 
-These boxes lift open like a trapdoor: the whole l × w face swings up, hinged along one of its long
-edges, rather than splitting down the middle. The AR view draws that as a darker panel over the top
-face, and the hinge edge as a darker bar again — once on the top face and once on the bottom face
-directly beneath it.
+Each package is a lightly translucent, inset solid with an opaque coloured edge frame and an
+invisible full-size collision volume. A
+centred dark line appears on both true l × w faces and always runs parallel to the package's measured
+length axis. `BaldiOpeningMarker.faceAxes` performs that mapping for all six rotations, and both the
+menu and room-scale views use it.
 
-Marking both faces is the point rather than duplication. Whichever way up the operator picks the package
-up, one of the two marks faces them, and the pair reads as one edge running through the box, so which
-way round it goes into the module is readable without turning it over. The mark always runs along the
-longer horizontal side, and always on the same side of it, so every package in a layer is marked
-consistently and the drawing can be compared with the real thing at a glance.
-
-The lid and hinge fade with their layer at a little more alpha than the package itself: they are darker
-than it, and at the opacities the faint layers use they would otherwise vanish before the box does.
-
-The 2-D plan in `KnapsackSceneView` still draws the older marker — both mirrored top edges. Worth
-bringing into line with the above; it is only a drawing change.
+The wireframe and marker are inset 0.35–0.75 mm inside the exact package bounds. Collision and packing
+dimensions remain exact; the visual inset only prevents touching packages from drawing coplanar edges
+or putting a marker inside their neighbour. Completed layers are desaturated rather than made
+transparent. This keeps the camera visible without sending overlapping cuboids through RealityKit's
+unstable transparent render pass.

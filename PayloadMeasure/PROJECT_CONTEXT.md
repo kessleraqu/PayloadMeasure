@@ -266,11 +266,13 @@ load followed by bottom-to-top coloured floor plans; package names stay out of t
 package is selected. The same opening-edge marker appears in 2D and 3D, with the measured package
 length defined parallel to that marker so the operator can match the physical orientation.
 
-✅ Opening the arrangement workflow suspends the AR session and the app's frame-driven mask,
-projection, fitting and display loops. The arrangement is presented full-screen; dismissal resumes
-the existing AR world without resetting anchors or measured packages. Scene inactivity and the
-arrangement presentation are independent suspension reasons, so overlapping lifecycle transitions
-cannot restart the camera prematurely.
+✅ Opening the arrangement workflow suspends measurement, stops its frame-driven mask, projection,
+fitting and display loops, and removes its `ARView` from the hierarchy. Measurement and room-scale
+packing lease one persistent `ARView`/`ARSession` rather than competing through separate camera
+renderers. Packing changes to a lightweight configuration without resetting the coordinate frame;
+dismissal therefore resumes the same payload world and does not erase measured packages. A real
+payload transition requests exactly one tracking reset. Scene inactivity and packing presentation
+remain independent suspension reasons.
 
 ✅ The separate floor-only mixed-integer program uses a self-contained exact solver: a
 bounded-variable primal and dual simplex with refactorisation and a Harris ratio test, driven by a

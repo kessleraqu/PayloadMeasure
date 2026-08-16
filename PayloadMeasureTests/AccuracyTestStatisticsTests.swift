@@ -65,6 +65,40 @@ final class AccuracyTestStatisticsTests: XCTestCase {
         XCTAssertNil(test.nextSlot, "A full test asks for nothing more.")
     }
 
+    func testDualMethodTestFinishesTopBlockBefore3DBlock() {
+        var test = AccuracyTestRun(
+            id: UUID(),
+            createdAt: Date(timeIntervalSince1970: 0),
+            label: "dual",
+            objectCount: 2,
+            passes: 2,
+            workflowModes: [.top, .spatial3D]
+        )
+        var order: [String] = []
+        while let slot = test.nextSlot {
+            order.append("\(slot.workflowMode.rawValue)/\(slot.objectNumber)/\(slot.pass)")
+            test.readings.append(
+                AccuracyReading(
+                    id: UUID(),
+                    objectNumber: slot.objectNumber,
+                    pass: slot.pass,
+                    sizeMillimetres: [1, 1, 1],
+                    recordedAt: Date(timeIntervalSince1970: 0),
+                    workflowMode: slot.workflowMode
+                )
+            )
+        }
+
+        XCTAssertEqual(
+            order,
+            [
+                "top/1/1", "top/2/1", "top/1/2", "top/2/2",
+                "spatial3D/1/1", "spatial3D/2/1", "spatial3D/1/2", "spatial3D/2/2"
+            ]
+        )
+        XCTAssertEqual(test.totalExpectedReadings, 8)
+    }
+
     // MARK: - Per-axis figures
 
     /// Reference 100 × 50 × 25, measured 1 mm over then 1 mm under on every side.
@@ -167,6 +201,30 @@ final class AccuracyTestStatisticsTests: XCTestCase {
         let spread = 1.96 * (6.0 / 5.0).squareRoot()
         XCTAssertEqual(summary.limitsOfAgreement.lower, 2 - spread, accuracy: 1e-9)
         XCTAssertEqual(summary.limitsOfAgreement.upper, 2 + spread, accuracy: 1e-9)
+    }
+
+    func testWorkflowSummariesDoNotMixTopAnd3DReadings() throws {
+        var test = run(
+            objectCount: 1,
+            passes: 2,
+            readings: [
+                (1, 1, [101, 51, 26]),
+                (1, 2, [110, 60, 35])
+            ],
+            references: [1: [100, 50, 25]]
+        )
+        test.workflowModes = [.top, .spatial3D]
+        test.readings[0].workflowMode = .top
+        test.readings[1].workflowMode = .spatial3D
+
+        let top = try XCTUnwrap(
+            AccuracyStatistics.summarise(test, workflowMode: .top).objects.first
+        )
+        let spatial = try XCTUnwrap(
+            AccuracyStatistics.summarise(test, workflowMode: .spatial3D).objects.first
+        )
+        XCTAssertEqual(top.bias, 1, accuracy: 1e-9)
+        XCTAssertEqual(spatial.bias, 10, accuracy: 1e-9)
     }
 
     func testObjectsWithoutAReferenceOrWithoutReadingsAreLeftOut() {

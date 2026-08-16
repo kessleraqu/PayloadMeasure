@@ -5,6 +5,14 @@ import simd
 final class BaldiLoadingGuideTests: XCTestCase {
     func testOpeningMarkerFollowsOriginalAxisZeroThroughEveryRotation() {
         let expectedContainerAxes = [0, 0, 1, 2, 1, 2]
+        let expectedFaceAxes = [
+            (normal: 2, length: 0, width: 1),
+            (normal: 1, length: 0, width: 2),
+            (normal: 2, length: 1, width: 0),
+            (normal: 1, length: 2, width: 0),
+            (normal: 0, length: 1, width: 2),
+            (normal: 0, length: 2, width: 1),
+        ]
         let expectedDescriptions = [
             "Opening and length along the container",
             "Opening and length along the container",
@@ -19,6 +27,10 @@ final class BaldiLoadingGuideTests: XCTestCase {
 
             XCTAssertEqual(BaldiOpeningMarker.containerAxis(for: placement), expectedContainerAxes[index])
             XCTAssertEqual(BaldiOpeningMarker.description(for: placement), expectedDescriptions[index])
+            let faceAxes = BaldiOpeningMarker.faceAxes(for: placement)
+            XCTAssertEqual(faceAxes?.normal, expectedFaceAxes[index].normal)
+            XCTAssertEqual(faceAxes?.length, expectedFaceAxes[index].length)
+            XCTAssertEqual(faceAxes?.width, expectedFaceAxes[index].width)
         }
     }
 

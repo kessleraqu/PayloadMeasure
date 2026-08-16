@@ -6,6 +6,19 @@ import SwiftUI
 // In:  a BaldiComparison from the store.
 // Out: on screen only.
 
+/// One coordinator/model lifetime for a room-scale AR presentation. The camera renderer itself is
+/// deliberately shared across the app; this identity only prevents SwiftUI from retaining old
+/// placement state when the room view is opened again.
+nonisolated struct PackingARPresentation: Identifiable, Sendable {
+    let id: UUID
+    let solution: BaldiSolution
+
+    init(id: UUID = UUID(), solution: BaldiSolution) {
+        self.id = id
+        self.solution = solution
+    }
+}
+
 struct BaldiResultView: View {
     let comparison: BaldiComparison
     let colours: [UUID: Color]
@@ -13,7 +26,10 @@ struct BaldiResultView: View {
 
     @State private var selectedMode: BaldiPackingMode = .paper
     @State private var selectedLayerIndex: Int?
-    @State private var showsAugmentedView = false
+    /// Every opening gets a fresh model and coordinator lease. The single ARView/CAMetalLayer is
+    /// reused intentionally, because creating a later RealityKit renderer is what can strand its
+    /// camera background on an old texture on iOS 26.
+    @State private var augmentedPresentation: PackingARPresentation?
     @State private var showsDetails = false
 
     private var result: BaldiResult {
@@ -46,10 +62,9 @@ struct BaldiResultView: View {
             // Picking the other algorithm is a decision, so get out of the way and show its result.
             showsDetails = false
         }
-        .fullScreenCover(isPresented: $showsAugmentedView) {
-            if let solution = verifiedSolution {
-                PackingARView(solution: solution, colours: colours)
-            }
+        .fullScreenCover(item: $augmentedPresentation) { presentation in
+            PackingARView(solution: presentation.solution, colours: colours)
+                .id(presentation.id)
         }
     }
 
@@ -117,7 +132,8 @@ struct BaldiResultView: View {
     /// the plan changes while it is open.
     private var placeOnTableButton: some View {
         Button {
-            showsAugmentedView = true
+            guard let solution = verifiedSolution else { return }
+            augmentedPresentation = PackingARPresentation(solution: solution)
         } label: {
             Label("Show it on the table", systemImage: "arkit")
                 .font(.subheadline.weight(.semibold))

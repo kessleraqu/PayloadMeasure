@@ -9,6 +9,19 @@ import ARKit
 
 @MainActor
 final class StudyTransitionTests: XCTestCase {
+    func testEachRoomScaleAROpeningHasFreshPresentationIdentity() {
+        let solution = BaldiTestFixtures.solution(placements: [])
+
+        let firstPayload = PackingARPresentation(solution: solution)
+        let secondPayload = PackingARPresentation(solution: solution)
+
+        XCTAssertNotEqual(
+            firstPayload.id,
+            secondPayload.id,
+            "Each opening needs fresh placement/coordinator state while sharing the camera renderer."
+        )
+    }
+
     func testConfiguringAFreshSessionClearsAStalePackingSuspension() {
         let manager = ARSessionManager()
         manager.setPackingArrangementPresented(true)

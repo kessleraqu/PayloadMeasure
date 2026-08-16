@@ -20,35 +20,58 @@ struct ARCameraView: UIViewRepresentable {
     let aimerState: AimerState
     let captureEngine: ObjectCaptureEngine
     let workflowMode: MeasurementWorkflowMode
+    let sharedViewHost: SharedARViewHost?
+
+    init(
+        sessionManager: ARSessionManager,
+        aimerState: AimerState,
+        captureEngine: ObjectCaptureEngine,
+        workflowMode: MeasurementWorkflowMode,
+        sharedViewHost: SharedARViewHost? = nil
+    ) {
+        self.sessionManager = sessionManager
+        self.aimerState = aimerState
+        self.captureEngine = captureEngine
+        self.workflowMode = workflowMode
+        self.sharedViewHost = sharedViewHost
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             sessionManager: sessionManager,
             aimerState: aimerState,
             captureEngine: captureEngine,
-            workflowMode: workflowMode
+            workflowMode: workflowMode,
+            sharedViewHost: sharedViewHost
         )
     }
 
-    func makeUIView(context: Context) -> ARView {
-        let arView = ARView(
-            frame: .zero,
-            cameraMode: .ar,
-            automaticallyConfigureSession: false
-        )
-        context.coordinator.prepareForNewWorld()
-        sessionManager.configure(arView.session)
+    func makeUIView(context: Context) -> UIView {
+        // SwiftUI owns this lightweight wrapper, never the persistent ARView itself. Measurement
+        // and packing each get a distinct wrapper, so a late presentation teardown cannot remove or
+        // snapshot the renderer after its next owner has mounted it elsewhere.
+        let container = UIView(frame: .zero)
+        container.backgroundColor = .black
+        container.isOpaque = true
+        let arView = context.coordinator.acquireView(mountingIn: container)
+        // ContentView resets the capture engine and requests a new world only at real payload
+        // boundaries. A remount after closing the packing workflow is the same payload, so erasing
+        // every measured object here would be a destructive lifecycle side effect.
+        let resetsTracking = sharedViewHost?.consumeMeasurementWorldRequest() ?? true
         context.coordinator.attach(to: arView)
-        return arView
+        context.coordinator.scheduleSessionStart(resetsTracking: resetsTracking)
+        return container
     }
 
-    func updateUIView(_ uiView: ARView, context: Context) {
-        context.coordinator.setWorkflowMode(workflowMode)
+    func updateUIView(_ uiView: UIView, context: Context) {
+        // UIViewRepresentable updates run inside SwiftUI's view transaction. setWorkflowMode also
+        // publishes through the capture engine, so doing it synchronously here produces Xcode's
+        // "Modifying state during view update" warning and undefined reconciliation behaviour.
+        context.coordinator.scheduleWorkflowMode(workflowMode)
     }
 
-    static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
         coordinator.detach()
-        uiView.session.pause()
     }
 
     @MainActor
@@ -178,7 +201,13 @@ struct ARCameraView: UIViewRepresentable {
         private let sessionManager: ARSessionManager
         private let aimerState: AimerState
         private let captureEngine: ObjectCaptureEngine
+        private let sharedViewHost: SharedARViewHost?
+        private var sharedViewLease: SharedARRendererOwnership.Lease?
         private var workflowMode: MeasurementWorkflowMode
+        private var requestedWorkflowModeRevision = 0
+        private var workflowModeUpdateTask: Task<Void, Never>?
+        private var sessionStartTask: Task<Void, Never>?
+        private var requestedSessionStartRevision = 0
         private weak var arView: ARView?
         private var coachingOverlayView: ARCoachingOverlayView?
         private var contentAnchor: AnchorEntity?
@@ -297,15 +326,48 @@ struct ARCameraView: UIViewRepresentable {
             sessionManager: ARSessionManager,
             aimerState: AimerState,
             captureEngine: ObjectCaptureEngine,
-            workflowMode: MeasurementWorkflowMode
+            workflowMode: MeasurementWorkflowMode,
+            sharedViewHost: SharedARViewHost?
         ) {
             self.sessionManager = sessionManager
             self.aimerState = aimerState
             self.captureEngine = captureEngine
             self.workflowMode = workflowMode
+            self.sharedViewHost = sharedViewHost
         }
 
         // MARK: - Lifecycle
+
+        func acquireView(mountingIn container: UIView) -> ARView {
+            guard let sharedViewHost else {
+                let view = ARView(
+                    frame: .zero,
+                    cameraMode: .ar,
+                    automaticallyConfigureSession: false
+                )
+                mount(view, in: container)
+                return view
+            }
+            let lease = sharedViewHost.acquire(
+                .measurement,
+                mountingIn: container
+            ) { [weak self] in
+                self?.detach()
+            }
+            sharedViewLease = lease
+            return sharedViewHost.view
+        }
+
+        private func mount(_ view: ARView, in container: UIView) {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                view.topAnchor.constraint(equalTo: container.topAnchor),
+                view.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ])
+        }
 
         func prepareForNewWorld() {
             captureEngine.reset()
@@ -313,7 +375,6 @@ struct ARCameraView: UIViewRepresentable {
 
         func attach(to arView: ARView) {
             self.arView = arView
-            captureEngine.setMeasurementMode(workflowMode)
             installCoachingOverlay(in: arView)
             observedCaptureResetRevision = captureEngine.resetRevision
             observedObjectMaskToggleRequestRevision =
@@ -325,6 +386,13 @@ struct ARCameraView: UIViewRepresentable {
                 captureEngine.objectWorkflowRequestRevision
             observedFrameEpoch = sessionManager.frameEpoch
             createContentAnchorIfNeeded(in: arView)
+            // The shared session keeps the same coordinate frame while the operator briefly visits
+            // packing. Its old RealityKit entities were correctly removed during hand-off, so rebuild
+            // the saved measurement outlines in the new coordinator without altering their data.
+            for (id, object) in captureEngine.capturedObjectsByID {
+                objectMaskColorsByID[id] = captureEngine.objectColor(for: id)
+                addCapturedBox(object, for: id)
+            }
             updateMeshVisibility()
 
             synchronizeRealtimeProcessing()
@@ -342,7 +410,55 @@ struct ARCameraView: UIViewRepresentable {
             observeEngineRevisions()
         }
 
-        func setWorkflowMode(_ mode: MeasurementWorkflowMode) {
+        /// UIViewRepresentable construction happens during SwiftUI reconciliation. Configuring the
+        /// observable session/capture models synchronously there triggers "Modifying state during
+        /// view update". Yield one actor turn, then start only if this coordinator still owns the
+        /// renderer; a cover can be presented or dismissed during that turn.
+        func scheduleSessionStart(resetsTracking: Bool) {
+            requestedSessionStartRevision &+= 1
+            let revision = requestedSessionStartRevision
+            sessionStartTask?.cancel()
+            sessionStartTask = Task { @MainActor [weak self] in
+                await Task.yield()
+                guard !Task.isCancelled,
+                      let self,
+                      self.requestedSessionStartRevision == revision,
+                      self.ownsSharedView,
+                      let arView = self.arView else {
+                    return
+                }
+                self.sessionManager.configure(
+                    arView.session,
+                    resetsTracking: resetsTracking
+                )
+                self.captureEngine.setMeasurementMode(self.workflowMode)
+                if let sharedViewHost = self.sharedViewHost,
+                   let sharedViewLease = self.sharedViewLease {
+                    sharedViewHost.activateCameraFeed(for: sharedViewLease)
+                } else {
+                    arView.environment.background = .cameraFeed()
+                }
+                self.sessionStartTask = nil
+            }
+        }
+
+        func scheduleWorkflowMode(_ mode: MeasurementWorkflowMode) {
+            guard workflowMode != mode else { return }
+            requestedWorkflowModeRevision &+= 1
+            let revision = requestedWorkflowModeRevision
+            workflowModeUpdateTask?.cancel()
+            workflowModeUpdateTask = Task { @MainActor [weak self] in
+                guard !Task.isCancelled,
+                      let self,
+                      self.requestedWorkflowModeRevision == revision,
+                      self.ownsSharedView else {
+                    return
+                }
+                self.setWorkflowMode(mode)
+            }
+        }
+
+        private func setWorkflowMode(_ mode: MeasurementWorkflowMode) {
             guard workflowMode != mode else {
                 return
             }
@@ -433,24 +549,29 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        private func stopRealtimeProcessing() {
+        private func stopRealtimeProcessing(publishesCancellation: Bool = true) {
             aimerUpdateTimer?.invalidate()
             aimerUpdateTimer = nil
             maskDisplayLink?.invalidate()
             maskDisplayLink = nil
             rendererWarmupTask?.cancel()
             rendererWarmupTask = nil
-            invalidateInFlightFrameWork()
+            invalidateInFlightFrameWork(publishesCancellation: publishesCancellation)
         }
 
         func detach() {
+            sessionStartTask?.cancel()
+            sessionStartTask = nil
+            requestedSessionStartRevision &+= 1
+            workflowModeUpdateTask?.cancel()
+            workflowModeUpdateTask = nil
+            requestedWorkflowModeRevision &+= 1
             isRealtimeProcessingSuspended = true
-            stopRealtimeProcessing()
+            stopRealtimeProcessing(publishesCancellation: false)
             coachingOverlayView?.delegate = nil
             coachingOverlayView?.session = nil
             coachingOverlayView?.removeFromSuperview()
             coachingOverlayView = nil
-            sessionManager.updateCoachingState(isActive: false)
             if let memoryWarningObserver {
                 NotificationCenter.default.removeObserver(memoryWarningObserver)
                 self.memoryWarningObserver = nil
@@ -459,7 +580,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
             cancelCaptureFit()
-            captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
             objectMaskDisplayTask = nil
@@ -478,10 +598,7 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             removeAllObjectMaskAnchors()
-            captureEngine.updateLockedObjectMaskCount(0)
-            captureEngine.updateObjectMaskTracking(visibleCount: 0, markers: [])
-            captureEngine.clearObjectMaskPreview()
-            clearAllCaptureContent()
+            clearAllCaptureContent(publishesScanReset: false)
 
             removeSelectionPointEntity()
             captureBoxEntityPool.removeAll()
@@ -491,11 +608,45 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             if let arView {
-                sessionManager.detach(arView.session)
+                if let sharedViewHost, let sharedViewLease {
+                    // A SwiftUI dismantle can arrive after the next screen has acquired this same
+                    // ARView. In that case this coordinator is stale and must not clear the new
+                    // owner's delegate or pause its session.
+                    if sharedViewHost.owns(sharedViewLease) {
+                        sessionManager.detach(arView.session)
+                        sharedViewHost.release(sharedViewLease)
+                    }
+                } else {
+                    sessionManager.detach(arView.session)
+                    arView.session.delegate = nil
+                    arView.session.pause()
+                    arView.removeFromSuperview()
+                }
             }
 
             arView = nil
+            sharedViewLease = nil
             contentAnchor = nil
+
+            // Observable UI cleanup cannot be published from dismantleUIView's SwiftUI update
+            // transaction. Do it on the next main-actor turn, and never let a stale dismantle clear
+            // state after a new measurement renderer has already acquired the shared view.
+            let captureEngine = captureEngine
+            let sharedViewHost = sharedViewHost
+            Task { @MainActor [weak captureEngine, weak sharedViewHost] in
+                guard sharedViewHost?.hasMeasurementOwner != true else { return }
+                captureEngine?.cancelObjectSelection()
+                captureEngine?.updateLockedObjectMaskCount(0)
+                captureEngine?.updateObjectMaskTracking(visibleCount: 0, markers: [])
+                captureEngine?.clearObjectMaskPreview()
+                captureEngine?.resetScanGuidance()
+            }
+        }
+
+        private var ownsSharedView: Bool {
+            guard let sharedViewHost else { return true }
+            guard let sharedViewLease else { return false }
+            return sharedViewHost.owns(sharedViewLease)
         }
 
         // MARK: - Coaching overlay
@@ -605,7 +756,7 @@ struct ARCameraView: UIViewRepresentable {
             if let arView, isSceneContentEnabled == sessionManager.isTrackingSuspended {
                 isSceneContentEnabled = !sessionManager.isTrackingSuspended
                 for anchor in arView.scene.anchors {
-                    (anchor as? Entity)?.isEnabled = isSceneContentEnabled
+                    anchor.isEnabled = isSceneContentEnabled
                 }
             }
 
@@ -663,7 +814,9 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        private func invalidateInFlightFrameWork() {
+        private func invalidateInFlightFrameWork(
+            publishesCancellation: Bool = true
+        ) {
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
@@ -674,7 +827,9 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
-            captureEngine.cancelObjectSelection()
+            if publishesCancellation {
+                captureEngine.cancelObjectSelection()
+            }
             lastObjectMaskSubmittedFrameTimestamp = -.greatestFiniteMagnitude
             lastAutomaticPointCleanupTimestamp = -.greatestFiniteMagnitude
             previewTargetPosition = nil
@@ -3474,7 +3629,7 @@ struct ARCameraView: UIViewRepresentable {
             return simd_quatf(simd_float3x3(columns: (xAxis, yAxis, zAxis)))
         }
 
-        private func clearAllCaptureContent() {
+        private func clearAllCaptureContent(publishesScanReset: Bool = true) {
             for entities in captureEntitiesByObject.values {
                 for entity in entities {
                     entity.removeFromParent()
@@ -3507,7 +3662,9 @@ struct ARCameraView: UIViewRepresentable {
             heightFromSideObjects.removeAll()
             footprintStableTicks.removeAll()
             heightStableTicks.removeAll()
-            captureEngine.resetScanGuidance()
+            if publishesScanReset {
+                captureEngine.resetScanGuidance()
+            }
             hideAllSelectionMarkers()
             selectionPointsByObject.removeAll()
         }
@@ -3546,10 +3703,15 @@ struct ARCameraView: UIViewRepresentable {
 
         private func classifyView(_ camera: simd_float4x4) -> ObjectCaptureEngine.ScanViewHint {
             let forwardY = -camera.columns.2.y
-            if forwardY < -0.55 {
+            // A footprint taken from a steep three-quarter angle grows with segmentation/depth
+            // spill, which showed up as repeatable over-reading in accuracy tests. Reserve the top
+            // fit for a genuinely overhead view (within about 35° of vertical). The remaining useful
+            // downward-to-level range supplies height, so Full 3D accepts either an isometric or a
+            // lateral second view instead of forcing the phone exactly level with the object.
+            if forwardY < -0.82 {
                 return .topDown
             }
-            if abs(forwardY) < 0.4 {
+            if forwardY <= 0.4 {
                 return .side
             }
             return .other

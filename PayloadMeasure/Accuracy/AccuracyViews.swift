@@ -41,8 +41,8 @@ private struct AccuracySetupView: View {
     let store: AccuracyStore
 
     @State private var label = ""
-    @State private var objectCount = 3
-    @State private var passes = 10
+    @State private var objectCount = 4
+    @State private var passes = 5
 
     var body: some View {
         Form {
@@ -52,6 +52,11 @@ private struct AccuracySetupView: View {
                 Stepper("Times each: \(passes)", value: $passes, in: 1...AccuracyStore.maximumPasses)
             }
 
+            Section("Measurement methods") {
+                Label("Top view", systemImage: "arrow.down.to.line")
+                Label("Full 3D · top + 3/4 or side", systemImage: "cube.transparent")
+            }
+
             Section {
                 Button {
                     store.startTest(label: label, objectCount: objectCount, passes: passes)
@@ -59,7 +64,7 @@ private struct AccuracySetupView: View {
                     Text("Start measuring").font(.headline)
                 }
             } footer: {
-                Text("\(objectCount * passes) measurements in total: object 1 to \(objectCount), then round again, \(passes) times. Measure them in the same order every round. Type the real sizes in at the end.")
+                Text("\(objectCount * passes * 2) measurements in total: \(objectCount * passes) Top readings, then \(objectCount * passes) 3D readings. Each 3D reading uses an overhead view plus an isometric or lateral view. Type the real sizes in at the end.")
             }
 
             if !store.saved.isEmpty {
@@ -74,7 +79,7 @@ private struct AccuracySetupView: View {
                                 Text(StudyRun.displayDateFormatter.string(from: test.createdAt))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                Text("\(test.readings.count) of \(test.totalExpectedReadings) readings")
+                                Text("\(test.readings.count) of \(test.totalExpectedReadings) readings · \(test.measurementModes.map(\.shortTitle).joined(separator: " + "))")
                                     .font(.caption2)
                                     .foregroundStyle(test.isComplete ? Color.secondary : Color.orange)
                             }
@@ -101,47 +106,114 @@ private struct AccuracyMeasureView: View {
     @State private var lastRecorded: String?
     @Environment(\.scenePhase) private var scenePhase
 
+    private var workflowMode: MeasurementWorkflowMode {
+        store.nextSlot?.workflowMode ?? .spatial3D
+    }
+
     var body: some View {
         ZStack {
             ARCameraView(
                 sessionManager: sessionManager,
                 aimerState: aimerState,
                 captureEngine: captureEngine,
-                workflowMode: .spatial3D
+                workflowMode: workflowMode
             )
             .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                banner
+                topHUD
                 Spacer()
-                controls
+                VStack(spacing: 10) {
+                    measurementCard
+                    controls
+                }
             }
             .padding(16)
         }
         .navigationTitle("Measuring")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { captureEngine.setMeasurementMode(.spatial3D) }
+        .onAppear { captureEngine.setMeasurementMode(workflowMode) }
         .onChange(of: scenePhase) { _, phase in
             sessionManager.setApplicationActive(phase == .active)
         }
     }
 
-    private var banner: some View {
-        VStack(spacing: 4) {
-            Text(store.progressText)
-                .font(.headline)
-            Text(captureEngine.statusText)
+    private var topHUD: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(store.progressText)
+                    .font(.headline)
+                Text(methodProgressText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Text(workflowMode.shortTitle)
+                .font(.caption.weight(.bold))
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .background(methodColor.opacity(0.2), in: Capsule())
+                .foregroundStyle(methodColor)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+    }
+
+    private var measurementCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: workflowMode == .top ? "arrow.down.to.line" : "cube.transparent")
+                    .foregroundStyle(methodColor)
+                Text(cardHeadline)
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 4)
+                if captureEngine.activeObjectID != nil,
+                   captureEngine.primaryText != "--" {
+                    Text(captureEngine.primaryText)
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+            }
+
+            Text(cardDetail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if workflowMode == .spatial3D,
+               captureEngine.activeObjectID != nil {
+                HStack(spacing: 8) {
+                    coverageChip(
+                        "Top",
+                        systemImage: "arrow.down.to.line",
+                        isDone: captureEngine.footprintSatisfied,
+                        isCurrent: captureEngine.scanViewHint == .topDown
+                    )
+                    coverageChip(
+                        "3/4 or side",
+                        systemImage: "move.3d",
+                        isDone: captureEngine.heightSatisfied,
+                        isCurrent: captureEngine.scanViewHint == .side
+                    )
+                }
+            }
+
+            if captureEngine.convergence.isActive {
+                ProgressView(value: captureEngine.convergence.progress)
+                    .tint(captureEngine.convergence.isConverged ? .green : methodColor)
+            }
+
             if let lastRecorded {
                 Text(lastRecorded)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.green)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
         .frame(maxWidth: .infinity)
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
@@ -149,8 +221,12 @@ private struct AccuracyMeasureView: View {
     private var controls: some View {
         VStack(spacing: 10) {
             if captureEngine.activeObjectID == nil {
-                Button("Measure") {
+                Button {
                     captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
+                } label: {
+                    Text(workflowMode == .top ? "Measure top view" : "Measure in 3D")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: 48)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -162,7 +238,11 @@ private struct AccuracyMeasureView: View {
                         .font(.footnote)
                 }
             } else {
-                Button("Save this reading") { saveReading() }
+                Button { saveReading() } label: {
+                    Text("Save this \(workflowMode.shortTitle) reading")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity, minHeight: 48)
+                }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .frame(maxWidth: .infinity)
@@ -182,6 +262,72 @@ private struct AccuracyMeasureView: View {
             && sessionManager.isObjectTrackingEnvironmentReady
             && captureEngine.hasCompletedObjectRecognitionWarmup
             && !captureEngine.isObjectSelectionPending
+            && captureEngine.measurementMode == workflowMode
+            && (workflowMode != .top || captureEngine.isTopViewAligned)
+    }
+
+    private var methodColor: Color {
+        workflowMode == .top ? .cyan : .orange
+    }
+
+    private var methodProgressText: String {
+        guard let test = store.activeTest else { return "" }
+        let completed = test.readings.filter {
+            ($0.workflowMode ?? .spatial3D) == workflowMode
+        }.count
+        return "\(completed) of \(test.objectCount * test.passes) \(workflowMode.shortTitle) readings"
+    }
+
+    private var cardHeadline: String {
+        if captureEngine.activeObjectID == nil {
+            if workflowMode == .top, !captureEngine.isTopViewAligned {
+                return "Point straight down"
+            }
+            return "Ready for \(workflowMode.shortTitle)"
+        }
+        if captureEngine.convergence.isConverged { return "Reading settled" }
+        switch captureEngine.convergence.limitingFactor {
+        case .needsTopView: return "Capture the top"
+        case .needsSideView: return "Move to a 3/4 or side view"
+        case .waitingForSupportPlane: return "Find the supporting surface"
+        default: return "Measuring \(workflowMode.shortTitle)"
+        }
+    }
+
+    private var cardDetail: String {
+        if captureEngine.activeObjectID == nil {
+            if workflowMode == .top,
+               let degrees = captureEngine.topViewDeviationDegrees,
+               !captureEngine.isTopViewAligned {
+                return "The phone is \(degrees)° off vertical. \(workflowMode.accuracyInstruction)"
+            }
+            return workflowMode.accuracyInstruction
+        }
+        if captureEngine.convergence.isConverged {
+            return "The dimensions have stopped changing. Save this reading."
+        }
+        if workflowMode == .spatial3D {
+            return "The footprint comes from above; height comes from an isometric or lateral view. Complete both view chips."
+        }
+        return captureEngine.statusText
+    }
+
+    private func coverageChip(
+        _ title: String,
+        systemImage: String,
+        isDone: Bool,
+        isCurrent: Bool
+    ) -> some View {
+        Label(title, systemImage: isDone ? "checkmark" : systemImage)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isDone ? .green : (isCurrent ? .yellow : .secondary))
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .background(
+                (isDone ? Color.green : (isCurrent ? Color.yellow : Color.secondary))
+                    .opacity(0.16),
+                in: Capsule()
+            )
     }
 
     /// Finishes the measurement, files the size, then throws the object away again. Keeping it would
@@ -193,7 +339,7 @@ private struct AccuracyMeasureView: View {
         }
         let size = captured.sizeMillimetres
         if store.record(sizeMillimetres: size) {
-            lastRecorded = "Recorded \(AccuracyTestRun.sizeText([size.x, size.y, size.z]))"
+            lastRecorded = "Recorded \(workflowMode.shortTitle): \(AccuracyTestRun.sizeText([size.x, size.y, size.z]))"
         }
         captureEngine.removeFinalizedObject(id: id)
     }
@@ -222,7 +368,24 @@ private struct AccuracyResultsView: View {
             }
 
             if let summary = store.summary, !summary.objects.isEmpty {
-                Section("Overall") {
+                if test.measurementModes.count > 1 {
+                    ForEach(test.measurementModes) { mode in
+                        let methodSummary = AccuracyStatistics.summarise(
+                            test,
+                            workflowMode: mode
+                        )
+                        if !methodSummary.objects.isEmpty {
+                            Section("\(mode.shortTitle) overall") {
+                                figure("Bias", AccuracyTestRun.number(methodSummary.bias) + " mm")
+                                figure("Mean absolute error", AccuracyTestRun.number(methodSummary.meanAbsoluteError) + " mm")
+                                figure("RMSE", AccuracyTestRun.number(methodSummary.rootMeanSquareError) + " mm")
+                                figure("Largest error", AccuracyTestRun.number(methodSummary.maximumAbsoluteError) + " mm")
+                            }
+                        }
+                    }
+                }
+
+                Section(test.measurementModes.count > 1 ? "Both methods combined" : "Overall") {
                     figure(
                         "Readings compared",
                         "\(summary.readingCount) · \(summary.comparisonCount) sides"
@@ -243,20 +406,26 @@ private struct AccuracyResultsView: View {
                     )
                 }
 
-                ForEach(summary.objects, id: \.objectNumber) { object in
-                    Section("Object \(object.objectNumber) · \(AccuracyTestRun.sizeText(object.reference))") {
-                        ForEach(object.axes, id: \.axisIndex) { axis in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("\(axis.axisLabel.capitalized) side · reference \(AccuracyTestRun.number(axis.reference)) mm")
-                                    .font(.subheadline.weight(.semibold))
-                                Text("mean \(AccuracyTestRun.number(axis.mean)) · bias \(AccuracyTestRun.number(axis.bias)) (\(AccuracyTestRun.number(axis.relativeBiasPercent))%)")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                Text("sd \(AccuracyTestRun.number(axis.standardDeviation)) · RMSE \(AccuracyTestRun.number(axis.rootMeanSquareError)) · worst \(AccuracyTestRun.number(axis.maximumAbsoluteError))")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                ForEach(test.measurementModes) { mode in
+                    let methodSummary = AccuracyStatistics.summarise(
+                        test,
+                        workflowMode: mode
+                    )
+                    ForEach(methodSummary.objects, id: \.objectNumber) { object in
+                        Section("\(mode.shortTitle) · Object \(object.objectNumber) · \(AccuracyTestRun.sizeText(object.reference))") {
+                            ForEach(object.axes, id: \.axisIndex) { axis in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(axis.axisLabel.capitalized) side · reference \(AccuracyTestRun.number(axis.reference)) mm")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("mean \(AccuracyTestRun.number(axis.mean)) · bias \(AccuracyTestRun.number(axis.bias)) (\(AccuracyTestRun.number(axis.relativeBiasPercent))%)")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                    Text("sd \(AccuracyTestRun.number(axis.standardDeviation)) · RMSE \(AccuracyTestRun.number(axis.rootMeanSquareError)) · worst \(AccuracyTestRun.number(axis.maximumAbsoluteError))")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 2)
                             }
-                            .padding(.vertical, 2)
                         }
                     }
                 }
@@ -275,7 +444,7 @@ private struct AccuracyResultsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Object \(number)").font(.subheadline.weight(.semibold))
                             ForEach(readings) { reading in
-                                Text("pass \(reading.pass): \(reading.sizeText)")
+                                Text("\((reading.workflowMode ?? .spatial3D).shortTitle) · pass \(reading.pass): \(reading.sizeText)")
                                     .font(.caption.monospacedDigit())
                                     .foregroundStyle(.secondary)
                             }
