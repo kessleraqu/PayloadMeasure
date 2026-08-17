@@ -119,6 +119,14 @@ final class ObjectCaptureEngine {
     // MARK: - Automatic lock
 
     private(set) var convergence: MeasurementConvergence = .idle
+    /// When the active measurement began, on the monotonic clock. Both the "it never started" rule and
+    /// the cancel lock-out are read off it.
+    private var activeMeasurementStartedAt: TimeInterval?
+    /// How long the active measurement has been running, published so the Cancel button can count down.
+    private(set) var secondsSinceMeasurementStarted: TimeInterval = 0
+    /// False for the first few seconds of a measurement. Cancelling instantly was the wrong habit to
+    /// teach: a measurement barely under way looks stuck, and the app already restarts one that is.
+    private(set) var canCancelActiveMeasurement = false
     private(set) var isAutomaticLockEnabled = true
     private(set) var automaticLockRequest: UUID?
     private(set) var automaticLockRequestRevision = 0
@@ -167,6 +175,10 @@ final class ObjectCaptureEngine {
     }
 
     func refreshConvergence() {
+        // Before anything is judged about how well the measurement is going: is it going at all?
+        guard !abandonMeasurementIfItNeverStarted() else {
+            return
+        }
         let isMeasuring = activeObjectID != nil
         let coverage = MeasurementConvergenceMonitor.Coverage(
             isMeasuring: isMeasuring,
@@ -181,6 +193,33 @@ final class ObjectCaptureEngine {
             convergence = updated
         }
         requestAutomaticLockIfConverged()
+    }
+
+    /// Drops a measurement that never produced anything, and puts the app back to looking for an
+    /// object. Also keeps `canCancelActiveMeasurement` in step with the clock, because both answers come
+    /// from the same elapsed time. Returns true when the measurement was abandoned.
+    @discardableResult
+    private func abandonMeasurementIfItNeverStarted() -> Bool {
+        guard let id = activeObjectID, let startedAt = activeMeasurementStartedAt else {
+            if canCancelActiveMeasurement { canCancelActiveMeasurement = false }
+            return false
+        }
+        let secondsActive = ProcessInfo.processInfo.systemUptime - startedAt
+        let allowsCancel = MeasurementStartRule.allowsCancel(secondsActive: secondsActive)
+        if canCancelActiveMeasurement != allowsCancel {
+            canCancelActiveMeasurement = allowsCancel
+        }
+        secondsSinceMeasurementStarted = max(secondsActive, 0)
+        guard MeasurementStartRule.abandonsMeasurement(
+            secondsActive: secondsActive,
+            hasMeasurement: capturedObjectsByID[id] != nil
+        ) else {
+            return false
+        }
+        cancelActiveMeasurement()
+        statusText = "That did not start measuring. Aim at the object again and tap Measure."
+        objectMaskFeedbackText = statusText
+        return true
     }
 
     private func requestAutomaticLockIfConverged() {
@@ -460,8 +499,12 @@ final class ObjectCaptureEngine {
                 }
                 liveMaskLayer = layer
             }
-            if objectMaskDisplayBoundingBoxes[layer.id] == nil,
-               let referenceBoundingBox = layer.referenceViewportBoundingBox {
+            // A fresh mask image is authoritative about where it belongs, so the tracked box goes back
+            // to its reference the moment the image arrives. Keeping the old tracked box instead meant
+            // the mask was drawn offset by however far the tracker had drifted since the *previous*
+            // image, and then snapped back on the tracker's next pass — a small jump several times a
+            // second, which is what the drifting, twitching mask actually was.
+            if let referenceBoundingBox = layer.referenceViewportBoundingBox {
                 objectMaskDisplayBoundingBoxes[layer.id] = referenceBoundingBox
             }
         }
@@ -637,11 +680,24 @@ final class ObjectCaptureEngine {
         measurementDetailStatus = .unknown
         didEncounterInsufficientFit = false
         activeObjectID = id
+        startMeasurementClock()
         refreshFramingGuidance()
         focusedCaptureID = id
         isObjectSelectionPending = false
         statusText = activeMeasurementPrompt
         objectMaskFeedbackText = activeMaskFeedback
+    }
+
+    private func startMeasurementClock() {
+        activeMeasurementStartedAt = ProcessInfo.processInfo.systemUptime
+        secondsSinceMeasurementStarted = 0
+        canCancelActiveMeasurement = false
+    }
+
+    private func stopMeasurementClock() {
+        activeMeasurementStartedAt = nil
+        secondsSinceMeasurementStarted = 0
+        canCancelActiveMeasurement = false
     }
 
     func focusFinalizedObject(id: UUID) {
@@ -672,6 +728,7 @@ final class ObjectCaptureEngine {
 
         let snapshotViewportBoundingBox = objectMaskDisplayBoundingBoxes[id]
         activeObjectID = nil
+        stopMeasurementClock()
         hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.insert(id)
         resetScanGuidance()
@@ -696,6 +753,7 @@ final class ObjectCaptureEngine {
         guard let id = activeObjectID else { return }
 
         activeObjectID = nil
+        stopMeasurementClock()
         hasDefinitiveSupportPlaneForActiveObject = false
         isObjectSelectionPending = false
         measurementDetailStatus = .unknown
@@ -995,6 +1053,7 @@ final class ObjectCaptureEngine {
         automaticLockOfferTimestamps.removeValue(forKey: id)
         hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
+        startMeasurementClock()
         isObjectSelectionPending = false
         objectWorkflowRequest = ObjectWorkflowRequest(id: id, kind: .reactivate)
         objectWorkflowRequestRevision += 1
@@ -1301,6 +1360,7 @@ final class ObjectCaptureEngine {
     func reset() {
         capturedObjectsByID.removeAll()
         activeObjectID = nil
+        stopMeasurementClock()
         hasDefinitiveSupportPlaneForActiveObject = false
         finalizedObjectIDs.removeAll()
         captureOrder.removeAll()

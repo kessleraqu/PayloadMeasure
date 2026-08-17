@@ -172,6 +172,13 @@ struct ArrangementView: View {
                 .padding(20)
             }
             .background(Color(.systemGroupedBackground))
+            // Inside the navigation stack: inset around it, the strip was drawn over the navigation
+            // bar's own buttons.
+            .safeAreaInset(edge: .top) {
+                StudyTimerStrip(study: study)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 4)
+            }
             .navigationTitle(
                 study.isPractice
                     ? "Practice arrangement"

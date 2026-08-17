@@ -1723,24 +1723,44 @@ struct MesOverlayView: View {
     }
 
     /// Only offered while a measurement is running, and it discards that measurement outright.
+    ///
+    /// Withheld for the first seconds of one. Offered from the first frame, it was pressed while the
+    /// measurement was still normally getting started, which taught cancelling instead of holding the
+    /// phone still — and a measurement that really is not starting is restarted by the app before this
+    /// button appears at all.
     @ViewBuilder
     private func cancelMeasurementButton(showsTitle: Bool) -> some View {
         if isAutomaticCaptureSupported, captureEngine.activeObjectID != nil {
-            Button {
-                showsSavedObjects = false
-                captureEngine.cancelActiveMeasurement()
-            } label: {
+            if captureEngine.canCancelActiveMeasurement {
+                Button {
+                    showsSavedObjects = false
+                    captureEngine.cancelActiveMeasurement()
+                } label: {
+                    actionLabel(
+                        "Cancel measurement",
+                        systemImage: "xmark",
+                        tint: .red,
+                        showsTitle: showsTitle
+                    )
+                }
+                .buttonStyle(.glass)
+                .buttonBorderShape(.capsule)
+                .accessibilityLabel("Cancel measurement")
+                .accessibilityHint("Discards this measurement and deselects the object.")
+            } else if let countdown = MeasurementStartRule.cancelCountdown(
+                secondsActive: captureEngine.secondsSinceMeasurementStarted
+            ) {
                 actionLabel(
-                    "Cancel measurement",
-                    systemImage: "xmark",
-                    tint: .red,
+                    "Cancel in \(countdown) s",
+                    systemImage: "clock",
+                    tint: .secondary,
                     showsTitle: showsTitle
                 )
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                .glassEffect(.regular, in: .capsule)
+                .accessibilityLabel("Cancel becomes available in \(countdown) seconds")
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.capsule)
-            .accessibilityLabel("Cancel measurement")
-            .accessibilityHint("Discards this measurement and deselects the object.")
         }
     }
 

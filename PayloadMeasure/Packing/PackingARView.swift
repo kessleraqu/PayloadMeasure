@@ -51,23 +51,23 @@ nonisolated enum PackingARVisualGeometry {
         return SIMD3(bounded(offset.x), bounded(offset.y), bounded(offset.z))
     }
 
-    /// Converts a screen drag into a stable translation on the placement plane. It deliberately
-    /// needs no new plane raycast, so the module remains movable beyond ARKit's finite plane polygon.
-    static func draggedPosition(
-        from start: SIMD3<Float>,
-        screenRight: SIMD2<Float>,
-        screenUp: SIMD2<Float>,
-        screenDelta: CGPoint,
-        cameraDistance: Float,
-        surfaceHeight: Float
+    /// Where the module ends up after the finger has moved from one point on the table to another.
+    ///
+    /// The two world points come from unprojecting the touch onto the table itself, so the module keeps
+    /// up with the finger exactly, at any camera angle. What this replaced converted screen points into
+    /// metres through a fixed fudge factor and derived its two horizontal directions by normalising the
+    /// camera's axes — which collapses when the phone is held upright, because the axis being
+    /// normalised is then nearly vertical and its horizontal part is mostly noise. That is what made
+    /// the module wander off at odd angles and at the wrong speed.
+    static func draggedOffset(
+        from startOffset: SIMD3<Float>,
+        startingAt startWorldPoint: SIMD3<Float>,
+        following currentWorldPoint: SIMD3<Float>
     ) -> SIMD3<Float> {
-        let metresPerPoint = min(max(cameraDistance / 800, 0.0003), 0.0015)
-        let horizontal = screenRight * Float(screenDelta.x) * metresPerPoint
-            - screenUp * Float(screenDelta.y) * metresPerPoint
-        return SIMD3(
-            start.x + horizontal.x,
-            surfaceHeight,
-            start.z + horizontal.y
+        let delta = currentWorldPoint - startWorldPoint
+        // Vertical is not the drag's business: the module stays on the surface it was put down on.
+        return clampedDragOffset(
+            SIMD3(startOffset.x + delta.x, 0, startOffset.z + delta.z)
         )
     }
 }
@@ -352,12 +352,21 @@ final class PackingARModel {
         statusText = ""
     }
 
+    /// Set by the AR coordinator so that "Place again" tears the module down there and then.
+    ///
+    /// This used to be published as a revision for the coordinator to notice on its next SwiftUI update
+    /// pass. When that update did not arrive, the old payload stayed in the scene and its anchor stayed
+    /// in place — so the next tap hit the old module's packages instead of the table, and nothing could
+    /// be placed again. A button whose whole job is to remove something calls the code that removes it.
+    @ObservationIgnored var unplaceHandler: (() -> Void)?
+
     func unplace() {
         isPlaced = false
         selectedPackageID = nil
         isSurfaceReady = false
         statusText = Self.searchingText
         unplaceRevision &+= 1
+        unplaceHandler?()
     }
 
     /// Says where to aim, not just to wave the phone about: the surface is looked for under the middle
@@ -484,9 +493,11 @@ private struct PackingARContainer: UIViewRepresentable {
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var turn: Float = 0
-        /// The content's offset inside the anchor when a one-finger drag began. Movement is relative to
-        /// it, so it needs no new plane raycast and works beyond ARKit's finite plane polygon.
+        /// The content's offset inside the anchor when a one-finger drag began, and the point on the
+        /// table the finger started from. Movement is the difference between the two, so the module
+        /// follows the finger exactly.
         private var dragStartContentOffset: SIMD3<Float>?
+        private var dragStartSurfacePoint: SIMD3<Float>?
         private var turnAtGestureStart: Float = 0
         private var twoFingerTurnAtStart: Float = 0
         private var twistIsActive = false
@@ -545,9 +556,19 @@ private struct PackingARContainer: UIViewRepresentable {
         private func updateModel(_ newModel: PackingARModel) {
             guard model !== newModel else { return }
             clearPlacement()
+            model.unplaceHandler = nil
             model = newModel
             observedRevision = -1
             observedUnplaceRevision = newModel.unplaceRevision
+            adoptUnplaceHandler()
+        }
+
+        private func adoptUnplaceHandler() {
+            model.unplaceHandler = { [weak self] in
+                guard let self, self.ownsSharedView else { return }
+                self.observedUnplaceRevision = self.model.unplaceRevision
+                self.clearPlacement()
+            }
         }
 
         static func makeConfiguration() -> ARWorldTrackingConfiguration {
@@ -567,6 +588,7 @@ private struct PackingARContainer: UIViewRepresentable {
 
         func attach(to view: ARView) {
             self.view = view
+            adoptUnplaceHandler()
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
             view.addGestureRecognizer(tap)
 
@@ -681,6 +703,7 @@ private struct PackingARContainer: UIViewRepresentable {
             watchdogTimer = nil
             guard let view else {
                 sharedViewLease = nil
+                model.unplaceHandler = nil
                 return
             }
             for recognizer in installedGestureRecognizers {
@@ -702,12 +725,22 @@ private struct PackingARContainer: UIViewRepresentable {
             }
             self.view = nil
             sharedViewLease = nil
+            model.unplaceHandler = nil
             // Last, because clearing the placement arms the probe again for the next placement — and
             // there is no next one after a detach.
             stopSurfaceProbe()
         }
 
         // MARK: - Keeping the camera alive
+
+        /// Also the safety net for placement state. `unplaceHandler` does the work the moment the button
+        /// is pressed; this catches anything that changed the model without going through it, without
+        /// depending on a SwiftUI update pass arriving.
+        nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            Task { @MainActor [weak self] in
+                self?.sync()
+            }
+        }
 
         nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
             Task { @MainActor [weak self] in
@@ -779,55 +812,68 @@ private struct PackingARContainer: UIViewRepresentable {
         /// and rewritten wholesale after a relocalisation — so an app that also writes to it is in a
         /// fight it cannot win, and the visible result is a module that jumps somewhere absurd.
         @objc private func handleDrag(_ recogniser: UIPanGestureRecognizer) {
-            guard ownsSharedView, let view, let anchor, let contentRoot else { return }
+            guard ownsSharedView, let view, anchor != nil, let contentRoot else { return }
             switch recogniser.state {
             case .began:
                 guard recogniser.numberOfTouches == 1, !twistIsActive else { return }
                 dragStartContentOffset = contentRoot.position
+                dragStartSurfacePoint = surfacePoint(
+                    at: recogniser.location(in: view),
+                    in: view
+                )
             case .changed:
                 guard recogniser.numberOfTouches == 1,
                       !twistIsActive,
                       let start = dragStartContentOffset,
-                      let frame = view.session.currentFrame else {
+                      let startSurfacePoint = dragStartSurfacePoint,
+                      let currentSurfacePoint = surfacePoint(
+                          at: recogniser.location(in: view),
+                          in: view
+                      ) else {
                     return
                 }
-                let camera = frame.camera.transform
-                let rightRaw = SIMD2<Float>(camera.columns.0.x, camera.columns.0.z)
-                let upRaw = SIMD2<Float>(camera.columns.1.x, camera.columns.1.z)
-                let right = simd_length(rightRaw) > 0.001
-                    ? simd_normalize(rightRaw)
-                    : SIMD2<Float>(1, 0)
-                let screenUp = simd_length(upRaw) > 0.001
-                    ? simd_normalize(upRaw)
-                    : SIMD2<Float>(0, -1)
-                let cameraPosition = SIMD3<Float>(
-                    camera.columns.3.x,
-                    camera.columns.3.y,
-                    camera.columns.3.z
-                )
                 // The anchor's own rotation is identity, so its axes are the world's and a world-space
-                // screen delta can be applied to the child offset directly. Height stays at the anchor,
-                // which is the surface it was put down on.
-                let distance = simd_distance(
-                    cameraPosition,
-                    anchor.transform.translation + start
-                )
-                let screenDelta = recogniser.translation(in: view)
-                contentRoot.position = PackingARVisualGeometry.clampedDragOffset(
-                    PackingARVisualGeometry.draggedPosition(
-                        from: start,
-                        screenRight: right,
-                        screenUp: screenUp,
-                        screenDelta: screenDelta,
-                        cameraDistance: distance,
-                        surfaceHeight: 0
-                    )
+                // movement can be applied to the child offset directly.
+                contentRoot.position = PackingARVisualGeometry.draggedOffset(
+                    from: start,
+                    startingAt: startSurfacePoint,
+                    following: currentSurfacePoint
                 )
             case .ended, .cancelled, .failed:
                 dragStartContentOffset = nil
+                dragStartSurfacePoint = nil
             default:
                 break
             }
+        }
+
+        /// Where a point on screen meets the table the module is standing on. Unprojecting onto the
+        /// plane itself is what makes dragging one-to-one with the finger; it needs no plane polygon, so
+        /// it keeps working past the edge of what ARKit has mapped.
+        private func surfacePoint(at point: CGPoint, in view: ARView) -> SIMD3<Float>? {
+            guard let frame = view.session.currentFrame,
+                  view.bounds.width > 0,
+                  view.bounds.height > 0 else {
+                return nil
+            }
+            // ARKit's own anchor transform, not the entity's: RealityKit adopts an anchor's transform on
+            // its own schedule, and a height read a frame too early would put the plane on the floor.
+            guard let surfaceHeight = placedWorldAnchor?.transform.columns.3.y
+                ?? anchor?.transform.translation.y else {
+                return nil
+            }
+            var plane = matrix_identity_float4x4
+            plane.columns.3 = SIMD4<Float>(0, surfaceHeight, 0, 1)
+            return frame.camera.unprojectPoint(
+                point,
+                ontoPlane: plane,
+                orientation: interfaceOrientation(in: view),
+                viewportSize: view.bounds.size
+            )
+        }
+
+        private func interfaceOrientation(in view: ARView) -> UIInterfaceOrientation {
+            view.window?.windowScene?.effectiveGeometry.interfaceOrientation ?? .portrait
         }
 
         @objc private func handleTwist(_ recogniser: UIRotationGestureRecognizer) {
@@ -916,6 +962,7 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         private func sync() {
+            guard ownsSharedView else { return }
             if model.unplaceRevision != observedUnplaceRevision {
                 observedUnplaceRevision = model.unplaceRevision
                 clearPlacement()

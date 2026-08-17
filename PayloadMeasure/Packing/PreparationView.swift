@@ -41,9 +41,13 @@ struct PreparationView: View {
             .onAppear { study.endCurrentPhase() }
 
         case .preparation:
+            // The timer strip is inset inside the screen's own navigation stack rather than around it.
+            // Wrapped around, it was laid over the navigation bar, and the bar's Previous button ended
+            // up underneath the timers where it could be neither read nor pressed.
             PackingPreparationView(
                 captureEngine: captureEngine,
-                store: store
+                store: store,
+                study: study
             ) {
                 study.endCurrentPhase()
                 withAnimation(.snappy(duration: 0.25)) {
@@ -51,11 +55,6 @@ struct PreparationView: View {
                 }
             }
             .transition(.opacity)
-            .safeAreaInset(edge: .top) {
-                StudyTimerStrip(study: study)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 4)
-            }
 
         case .payloadHandoff:
             StudyPhaseHandoffView(
@@ -80,11 +79,6 @@ struct PreparationView: View {
                 onBoxFinished: onBoxFinished
             )
             .transition(.opacity)
-            .safeAreaInset(edge: .top) {
-                StudyTimerStrip(study: study)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 4)
-            }
         }
     }
 }
@@ -102,6 +96,7 @@ private struct PackingPreparationView: View {
 
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
+    let study: StudyStore
     let onComplete: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -134,15 +129,14 @@ private struct PackingPreparationView: View {
                 }
             }
             .background(Color(.systemGroupedBackground))
+            .safeAreaInset(edge: .top) {
+                StudyTimerStrip(study: study)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 4)
+            }
             .navigationTitle("Prepare packages")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button(currentIndex == 0 ? "Back" : "Previous") {
-                        goBack()
-                    }
-                }
-
                 if focusedField == .weight,
                    let currentObjectID {
                     ToolbarItemGroup(placement: .keyboard) {
@@ -202,7 +196,7 @@ private struct PackingPreparationView: View {
         .scrollDismissesKeyboard(.interactively)
         .id(objectID)
         .safeAreaInset(edge: .bottom) {
-            nextButton(for: objectID)
+            bottomBar(for: objectID)
         }
     }
 
@@ -465,12 +459,26 @@ private struct PackingPreparationView: View {
                 .font(.title3.weight(.bold))
                 .foregroundStyle(.orange)
 
-            Text("This object does not fit any available box, even when turned.")
+            Text("This object does not fit any available box, even when turned. Usually that means the measurement came out too big.")
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text("Continue to leave it out. It will not appear in the loading instructions, and no name or packed weight is required.")
-                .font(.footnote.weight(.semibold))
+            // The skip is spelled out and given its own button rather than left to a "Continue" that
+            // says nothing about what it does. Skipping is the honest outcome for an over-measured
+            // object: it is not boxed, and it is not loaded.
+            Button {
+                skip(objectID: objectID)
+            } label: {
+                Label("Skip this object", systemImage: "arrow.uturn.forward")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .accessibilityHint("Leaves this object out: no box, no weight, and no place in the loading plan.")
+
+            Text("Skipped objects are recorded as not boxable and are left out of the loading plan. No name or packed weight is needed.")
+                .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -495,52 +503,79 @@ private struct PackingPreparationView: View {
             RoundedRectangle(cornerRadius: 18)
                 .stroke(Color.orange.opacity(0.7), lineWidth: 2)
         }
-        .accessibilityElement(children: .combine)
+        // Deliberately `.contain` rather than `.combine`: the card holds the Skip button and the
+        // already-a-box switch, and combining them into one element would put both out of reach.
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "\(displayName(for: objectID)) does not fit any available box. Continue to leave it out of the loading plan. No name, box choice or packed weight is required."
+            "\(displayName(for: objectID)) does not fit any available box."
         )
     }
 
-    private func nextButton(for objectID: UUID) -> some View {
+    /// Previous and Next together at the bottom. Previous used to be the navigation bar's leading item,
+    /// where the study timers were laid over it.
+    private func bottomBar(for objectID: UUID) -> some View {
         let hasNoFittingBox = store.fittingBoxPresets(
             for: objectID,
             in: captureEngine
         ).isEmpty
         let isLastObject = currentIndex == objectIDs.count - 1
 
-        return Button {
-            saveAndAdvance(objectID: objectID)
-        } label: {
-            HStack {
-                Text(nextActionTitle(for: objectID))
-                Spacer()
-                Image(systemName: isLastObject ? "square.grid.3x3.square" : "arrow.right")
+        return HStack(spacing: 10) {
+            Button {
+                goBack()
+            } label: {
+                Label(
+                    currentIndex == 0 ? "Back" : "Previous",
+                    systemImage: "chevron.left"
+                )
+                .font(.headline)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 52)
             }
-            .font(.headline)
-            .padding(.horizontal, 18)
-            .frame(maxWidth: .infinity, minHeight: 52)
+            .buttonStyle(.bordered)
+            .accessibilityHint(
+                currentIndex == 0
+                    ? "Leaves the packing screen."
+                    : "Goes back to the previous object."
+            )
+
+            Button {
+                saveAndAdvance(objectID: objectID)
+            } label: {
+                HStack {
+                    Text(nextActionTitle(for: objectID))
+                    Spacer(minLength: 6)
+                    Image(systemName: isLastObject ? "square.grid.3x3.square" : "arrow.right")
+                }
+                .font(.headline)
+                .padding(.horizontal, 18)
+                .frame(maxWidth: .infinity, minHeight: 52)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityHint(
+                hasNoFittingBox
+                    ? isLastObject
+                        ? "Skips this object and creates a loading plan from the objects that fit available boxes."
+                        : "Skips this object and shows the next one."
+                    : isLastObject
+                        ? "Checks every prepared package, then opens the loading plan."
+                        : "Saves this box and packed weight, then shows the next object."
+            )
         }
-        .buttonStyle(.borderedProminent)
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
         .background(.bar)
-        .accessibilityHint(
-            hasNoFittingBox
-                ? isLastObject
-                    ? "Excludes this object and creates a loading plan from the objects that fit available boxes."
-                    : "Excludes this object from loading instructions and shows the next object."
-                : isLastObject
-                    ? "Checks every prepared package, then opens the loading plan."
-                    : "Saves this box and packed weight, then shows the next object."
-        )
     }
 
     private func nextActionTitle(for objectID: UUID) -> String {
-        if currentIndex == objectIDs.count - 1 {
-            return "Create loading plan"
+        if store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty,
+           !store.isItsOwnBox(objectID, in: captureEngine) {
+            return currentIndex == objectIDs.count - 1
+                ? "Skip and create the plan"
+                : "Skip this object"
         }
-        return store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
-            ? "Continue"
+        return currentIndex == objectIDs.count - 1
+            ? "Create loading plan"
             : "Next object"
     }
 
@@ -644,6 +679,23 @@ private struct PackingPreparationView: View {
         drafts[objectID] = draft
         validationMessage = nil
         invalidFields = []
+    }
+
+    /// Leaves an object out for good: it is marked as fitting no box, so it is neither boxed nor placed
+    /// in the payload, and it needs no name or weight. For an object that fits nothing, this is what
+    /// Next does too — the button just says so plainly.
+    private func skip(objectID: UUID) {
+        focusedField = nil
+        validationMessage = nil
+        invalidFields = []
+        guard store.markExcludedBecauseNoStockedBoxFits(
+            objectID,
+            in: captureEngine
+        ) else {
+            validationMessage = "This object could not be skipped, because a box does fit it. Choose the box and weigh it instead."
+            return
+        }
+        advanceAfterCurrentObject()
     }
 
     private func saveAndAdvance(objectID: UUID) {

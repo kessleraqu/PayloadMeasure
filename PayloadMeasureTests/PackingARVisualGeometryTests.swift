@@ -90,17 +90,37 @@ final class PackingARVisualGeometryTests: XCTestCase {
         XCTAssertEqual(nonNumbers.z, 0.25, accuracy: 0.000_001)
     }
 
-    func testOneFingerDragMovesAtConstantSurfaceHeightWithoutARaycast() {
-        let moved = PackingARVisualGeometry.draggedPosition(
-            from: SIMD3(1, 0.7, 2),
-            screenRight: SIMD2(1, 0),
-            screenUp: SIMD2(0, -1),
-            screenDelta: CGPoint(x: 80, y: 40),
-            cameraDistance: 0.5,
-            surfaceHeight: 0.7
+    /// One-to-one with the finger: the module moves by exactly as much as the point under the finger
+    /// moved across the table, and never off the table.
+    func testTheModuleMovesExactlyAsFarAsTheFingerDidAcrossTheSurface() {
+        let moved = PackingARVisualGeometry.draggedOffset(
+            from: SIMD3(0.10, 0, -0.20),
+            startingAt: SIMD3(1.00, 0.72, 2.00),
+            following: SIMD3(1.18, 0.72, 1.85)
         )
-        XCTAssertEqual(moved.x, 1.05, accuracy: 0.000_001)
-        XCTAssertEqual(moved.y, 0.7, accuracy: 0.000_001)
-        XCTAssertEqual(moved.z, 2.025, accuracy: 0.000_001)
+        XCTAssertEqual(moved.x, 0.28, accuracy: 0.000_001)
+        XCTAssertEqual(moved.z, -0.35, accuracy: 0.000_001)
+    }
+
+    /// Height is not the drag's business. Even if the unprojected points disagree vertically — they can,
+    /// by a millimetre or two — the module stays on the surface it was put down on.
+    func testDraggingNeverLiftsOrSinksTheModule() {
+        let moved = PackingARVisualGeometry.draggedOffset(
+            from: SIMD3(0, 0, 0),
+            startingAt: SIMD3(0, 0.72, 0),
+            following: SIMD3(0.05, 0.90, 0)
+        )
+        XCTAssertEqual(moved.y, 0, accuracy: 0.000_001)
+        XCTAssertEqual(moved.x, 0.05, accuracy: 0.000_001)
+    }
+
+    func testADragBeyondTheLimitIsClamped() {
+        let limit = PackingARVisualGeometry.maximumDragOffsetMetres
+        let moved = PackingARVisualGeometry.draggedOffset(
+            from: SIMD3(0, 0, 0),
+            startingAt: SIMD3(0, 0.72, 0),
+            following: SIMD3(50, 0.72, 0)
+        )
+        XCTAssertEqual(moved.x, limit, accuracy: 0.000_001)
     }
 }

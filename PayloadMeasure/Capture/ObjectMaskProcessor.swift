@@ -21,6 +21,17 @@ nonisolated enum ObjectMaskCandidatePolicy {
     /// Some slack is needed because a small object's mask does not always sit under a hand-held
     /// crosshair; a whole screen-width of slack is what put masks on objects at the edge.
     static let aimBoundsSlack: CGFloat = 0.05
+    /// The same rule for a mask that is *already* on screen, deliberately looser. One threshold for
+    /// both makes the mask blink on and off while the crosshair sits on the boundary; letting go later
+    /// than it takes hold is what stops that.
+    static let heldAimBoundsSlack: CGFloat = 0.11
+    /// How much of the mask already on screen a candidate must cover to count as the same object from
+    /// one segmentation to the next. Vision renumbers its instances every frame, so sameness can only
+    /// be judged geometrically.
+    static let continuationOverlap: CGFloat = 0.45
+    /// After this long with no live mask, there is nothing left to continue: the phone has been pointed
+    /// somewhere else and the next mask is a fresh decision.
+    static let continuationTimeout: TimeInterval = 0.7
 
     /// Probes on the crosshair are the cheap, preferred path. When they miss — a small object can
     /// slip between them — widen only to the instances found inside the aim window. Widening to
@@ -59,6 +70,58 @@ nonisolated enum ObjectMaskCandidatePolicy {
             max(rect.minX - point.x, point.x - rect.maxX, 0),
             max(rect.minY - point.y, point.y - rect.maxY, 0)
         )
+    }
+
+    /// Which candidate is the mask already on screen, if any of them is.
+    ///
+    /// Without this the preview is a fresh decision every segmentation, and two candidates whose scores
+    /// are all but identical — an object and the object plus its shadow, two touching objects — swap
+    /// places several times a second. That is the flicker, and the jump from one object to the other.
+    static func continuation(
+        of previous: CGRect,
+        among candidates: [(instance: Int, boundingBox: CGRect)],
+        minimumOverlap: CGFloat = continuationOverlap
+    ) -> Int? {
+        guard previous.width > 0, previous.height > 0 else { return nil }
+        var best: (instance: Int, overlap: CGFloat)?
+        for candidate in candidates {
+            let overlap = intersectionOverUnion(previous, candidate.boundingBox)
+            guard overlap >= minimumOverlap else { continue }
+            if best == nil || overlap > best!.overlap {
+                best = (candidate.instance, overlap)
+            }
+        }
+        return best?.instance
+    }
+
+    /// Whether to stay on the mask already on screen rather than take the best-scoring candidate.
+    ///
+    /// The held mask wins every close call — that is what stops the flicker — but not once the crosshair
+    /// has moved right inside another object. Then the operator has plainly aimed somewhere else and a
+    /// mask that clung on would be its own kind of wrong.
+    static func keepsHeldMask(
+        heldAimDistance: CGFloat,
+        challengerAimDistance: CGFloat?
+    ) -> Bool {
+        guard heldAimDistance <= heldAimBoundsSlack else { return false }
+        guard let challengerAimDistance else { return true }
+        return !(challengerAimDistance <= 0 && heldAimDistance > 0)
+    }
+
+    static func intersectionOverUnion(_ first: CGRect, _ second: CGRect) -> CGFloat {
+        guard first.width > 0, first.height > 0, second.width > 0, second.height > 0 else {
+            return 0
+        }
+        let intersection = first.intersection(second)
+        guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
+            return 0
+        }
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = first.width * first.height
+            + second.width * second.height
+            - intersectionArea
+        guard unionArea > 0 else { return 0 }
+        return intersectionArea / unionArea
     }
 }
 
@@ -644,6 +707,10 @@ actor ObjectMaskProcessor {
     /// next object cannot silently reuse it.
     private var reservedColorIndexesByID: [UUID: Int] = [:]
     private var trackingGeneration: Int?
+    /// Where the live mask was last drawn, so the next segmentation can recognise the same object
+    /// instead of choosing one all over again. Vision's instance numbers cannot be used for this: they
+    /// are per-frame.
+    private var lastLivePreview: (boundingBox: CGRect, timestamp: TimeInterval)?
     private var hasWarmedAppearanceSignature = false
     private var hasWarmedScaledMask = false
     private var hasWarmedLockCandidate = false
@@ -651,6 +718,7 @@ actor ObjectMaskProcessor {
     func makePreview(from frame: ObjectMaskFrame) async -> ObjectMaskProcessingResult {
         if trackingGeneration != frame.trackingGeneration {
             trackedObjects.removeAll()
+            lastLivePreview = nil
             trackingGeneration = frame.trackingGeneration
         }
         var colourOwners = frame.finalizedObjectIDs
@@ -1343,16 +1411,20 @@ actor ObjectMaskProcessor {
     /// outright rather than won by default.
     ///
     /// Preview and selection both go through here, which is what makes them agree: the object that
-    /// lights up is the object that gets measured.
+    /// lights up is the object that gets measured. `continuing` is the mask that is on screen now, and
+    /// it wins any argument it is still eligible for — a mask that keeps being re-chosen from scratch
+    /// several times a second does not look like a mask on an object, it looks like a fault.
     private func aimedCandidate(
         at point: NormalizedPoint,
         candidates: [Int],
         preferred: IndexSet,
-        in observation: InstanceMaskObservation
+        in observation: InstanceMaskObservation,
+        continuing previous: CGRect? = nil
     ) throws -> (instance: Int, geometry: MaskGeometry)? {
         let aim = point.cgPoint
         let preferredInstances = Set(preferred)
         var best: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
+        var geometriesByInstance: [Int: MaskGeometry] = [:]
 
         for instance in candidates {
             // Vision hands back a full-resolution mask buffer per instance, so without a pool of its
@@ -1366,6 +1438,7 @@ actor ObjectMaskProcessor {
                   !(geometry.boundingBox.width > 0.985 && geometry.boundingBox.height > 0.985) else {
                 continue
             }
+            geometriesByInstance[instance] = geometry
 
             let rect = geometry.boundingBox.cgRect
             guard ObjectMaskCandidatePolicy.isAimedAt(boundingBox: rect, aim: aim) else {
@@ -1382,6 +1455,29 @@ actor ObjectMaskProcessor {
             if best == nil || score < best!.score {
                 best = (instance, geometry, score)
             }
+        }
+
+        // Stay on the object already masked while the crosshair is still on it, judged with the looser
+        // held threshold so sitting on the boundary does not flick the mask on and off.
+        if let previous,
+           let heldInstance = ObjectMaskCandidatePolicy.continuation(
+               of: previous,
+               among: geometriesByInstance.map { ($0.key, $0.value.boundingBox.cgRect) }
+           ),
+           let heldGeometry = geometriesByInstance[heldInstance],
+           ObjectMaskCandidatePolicy.keepsHeldMask(
+               heldAimDistance: ObjectMaskCandidatePolicy.distance(
+                   from: aim,
+                   toBoundsOf: heldGeometry.boundingBox.cgRect
+               ),
+               challengerAimDistance: best.map {
+                   ObjectMaskCandidatePolicy.distance(
+                       from: aim,
+                       toBoundsOf: $0.geometry.boundingBox.cgRect
+                   )
+               }
+           ) {
+            return (heldInstance, heldGeometry)
         }
 
         return best.map { ($0.instance, $0.geometry) }
@@ -1816,10 +1912,15 @@ actor ObjectMaskProcessor {
                 at: centerPoint,
                 candidates: candidateInstances,
                 preferred: nearbyInstances,
-                in: observation
+                in: observation,
+                continuing: livePreviewBoundingBox(at: frame.timestamp)
             )
 
             if let bestPreview {
+                lastLivePreview = (
+                    boundingBox: bestPreview.geometry.boundingBox.cgRect,
+                    timestamp: frame.timestamp
+                )
                 selections.append(
                     RenderSelection(
                         lockID: nil,
@@ -1833,6 +1934,17 @@ actor ObjectMaskProcessor {
         }
 
         return selections
+    }
+
+    /// The mask on screen, as long as it is recent enough to still be on screen. A stale one would pull
+    /// the preview back onto an object the phone is no longer pointed at.
+    private func livePreviewBoundingBox(at timestamp: TimeInterval) -> CGRect? {
+        guard let lastLivePreview,
+              timestamp - lastLivePreview.timestamp
+                  <= ObjectMaskCandidatePolicy.continuationTimeout else {
+            return nil
+        }
+        return lastLivePreview.boundingBox
     }
 
     private func makeDisplayImage(
