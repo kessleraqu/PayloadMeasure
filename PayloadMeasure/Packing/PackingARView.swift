@@ -37,6 +37,20 @@ nonisolated enum PackingARVisualGeometry {
         return (face < 0 ? -1 : 1) * magnitude
     }
 
+    /// How far the module may be slid from where it was put down. A drag is a nudge across a table,
+    /// not a throw across the building, and without a bound an unlucky gesture could put the module
+    /// tens of metres away — off screen, with no way back except placing it again.
+    static let maximumDragOffsetMetres: Float = 4
+
+    /// Keeps a dragged offset finite and within `maximumDragOffsetMetres` of the anchor.
+    static func clampedDragOffset(_ offset: SIMD3<Float>) -> SIMD3<Float> {
+        func bounded(_ value: Float) -> Float {
+            guard value.isFinite else { return 0 }
+            return min(max(value, -maximumDragOffsetMetres), maximumDragOffsetMetres)
+        }
+        return SIMD3(bounded(offset.x), bounded(offset.y), bounded(offset.z))
+    }
+
     /// Converts a screen drag into a stable translation on the placement plane. It deliberately
     /// needs no new plane raycast, so the module remains movable beyond ARKit's finite plane polygon.
     static func draggedPosition(
@@ -164,14 +178,7 @@ struct PackingARView: View {
 
     private var controls: some View {
         VStack(spacing: 12) {
-            if let name = model.selectedPackageName {
-                Text(name)
-                    .font(.headline)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .glassEffect(.regular, in: .rect(cornerRadius: 16))
-                    .transition(.opacity)
-            }
+            selectedPackageLabel
 
             HStack(spacing: 10) {
                 Button {
@@ -225,8 +232,46 @@ struct PackingARView: View {
                 .multilineTextAlignment(.center)
         }
         .padding(.bottom, 24)
-        .animation(.snappy(duration: 0.2), value: model.selectedPackageName)
+        .animation(.snappy(duration: 0.2), value: model.selectedPackageID)
         .animation(.snappy(duration: 0.2), value: model.visibleLayerIndex)
+    }
+
+    /// The answer to "which one is this?", at the size of the question. The name carries the package's
+    /// own colour and its guide number, so the box in the hand, the box on the screen and the numbered
+    /// step in the loading guide are obviously the same package.
+    @ViewBuilder
+    private var selectedPackageLabel: some View {
+        if let placement = model.selectedPlacement {
+            let colour = model.selectedPackageColour
+            VStack(spacing: 4) {
+                HStack(spacing: 9) {
+                    if let number = model.selectedPackageNumber {
+                        Text("#\(number)")
+                            .font(.title3.weight(.heavy).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 9)
+                            .frame(minWidth: 42, minHeight: 34)
+                            .background(colour, in: .rect(cornerRadius: 9))
+                    }
+                    Text(placement.name)
+                        .font(.title.weight(.bold))
+                        .foregroundStyle(colour)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.5)
+                }
+                Text(BaldiOpeningMarker.description(for: placement))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .frame(maxWidth: 420)
+            .glassEffect(.regular, in: .rect(cornerRadius: 18))
+            .transition(.opacity)
+            .accessibilityElement(children: .combine)
+        }
     }
 }
 
@@ -238,10 +283,12 @@ final class PackingARModel {
     let solution: BaldiSolution
     let colours: [UUID: Color]
     let layers: [BaldiLoadingLayer]
+    /// The same numbering the printed loading guide uses, so "#3" means the same thing on both.
+    let numbering: [UUID: Int]
 
     private(set) var isPlaced = false
     private(set) var visibleLayerIndex = 0
-    private(set) var selectedPackageName: String?
+    private(set) var selectedPackageID: UUID?
     private(set) var statusText = PackingARModel.searchingText
     /// Set while the camera is being taken back from whatever else grabbed it.
     private(set) var cameraWarning: String?
@@ -254,10 +301,24 @@ final class PackingARModel {
         self.solution = solution
         self.colours = colours
         self.layers = BaldiLoadingGuide.layers(for: solution)
+        self.numbering = BaldiLoadingGuide.numbering(for: solution)
     }
 
     var canShowPreviousLayer: Bool { visibleLayerIndex > 0 }
     var canShowNextLayer: Bool { visibleLayerIndex + 1 < layers.count }
+
+    var selectedPlacement: BaldiPlacement? {
+        guard let selectedPackageID else { return nil }
+        return solution.placements.first { $0.id == selectedPackageID }
+    }
+
+    var selectedPackageNumber: Int? {
+        selectedPackageID.flatMap { numbering[$0] }
+    }
+
+    var selectedPackageColour: Color {
+        selectedPackageID.flatMap { colours[$0] } ?? .accentColor
+    }
 
     var layerTitle: String {
         layers.isEmpty
@@ -274,14 +335,14 @@ final class PackingARModel {
     func showNextLayer() {
         guard canShowNextLayer else { return }
         visibleLayerIndex += 1
-        selectedPackageName = nil
+        selectedPackageID = nil
         revision &+= 1
     }
 
     func showPreviousLayer() {
         guard canShowPreviousLayer else { return }
         visibleLayerIndex -= 1
-        selectedPackageName = nil
+        selectedPackageID = nil
         revision &+= 1
     }
 
@@ -293,13 +354,15 @@ final class PackingARModel {
 
     func unplace() {
         isPlaced = false
-        selectedPackageName = nil
+        selectedPackageID = nil
         isSurfaceReady = false
         statusText = Self.searchingText
         unplaceRevision &+= 1
     }
 
-    static let searchingText = "Move the phone slowly across the table until a surface is found."
+    /// Says where to aim, not just to wave the phone about: the surface is looked for under the middle
+    /// of the screen, so sweeping the room while pointing elsewhere finds nothing.
+    static let searchingText = "Point the middle of the screen at the table or floor and move the phone slowly until the surface is found."
 
     /// Whether a surface is under the middle of the screen right now, so the prompt can say when it is
     /// worth tapping instead of leaving the operator to guess.
@@ -333,11 +396,13 @@ final class PackingARModel {
 
     func select(packageID: UUID?) {
         guard let packageID,
-              let placement = solution.placements.first(where: { $0.id == packageID }) else {
-            selectedPackageName = nil
+              solution.placements.contains(where: { $0.id == packageID }) else {
+            selectedPackageID = nil
             return
         }
-        selectedPackageName = placement.name
+        // Tapping the same package again clears it, so the label can be dismissed without hunting for
+        // an empty piece of table to tap.
+        selectedPackageID = selectedPackageID == packageID ? nil : packageID
     }
 }
 
@@ -419,17 +484,19 @@ private struct PackingARContainer: UIViewRepresentable {
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var turn: Float = 0
-        /// One-finger movement is relative to this stable start transform. It therefore remains
-        /// available even when ARKit's finite plane polygon does not extend under the finger.
-        private var dragStartAnchorTranslation: SIMD3<Float>?
+        /// The content's offset inside the anchor when a one-finger drag began. Movement is relative to
+        /// it, so it needs no new plane raycast and works beyond ARKit's finite plane polygon.
+        private var dragStartContentOffset: SIMD3<Float>?
         private var turnAtGestureStart: Float = 0
         private var twoFingerTurnAtStart: Float = 0
         private var twistIsActive = false
         private var suppressTwoFingerPanUntilEnd = false
-        /// The table height chosen at placement. Dragging holds this value exactly instead of
-        /// raycasting under the finger and jumping to a floor or another horizontal plane.
-        private var placementSurfaceHeight: Float?
+        /// The height of the surface last found under the middle of the screen. Placing prefers it, so
+        /// a tap lands on the surface the prompt was talking about rather than on a floor behind it.
         private var probedSurfaceHeight: Float?
+        /// The ARKit anchor the module hangs from. ARKit keeps it on the real surface across tracking
+        /// corrections, which a bare world transform is not.
+        private var placedWorldAnchor: ARAnchor?
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
         private let scale: Float = 0.001
@@ -488,6 +555,13 @@ private struct PackingARContainer: UIViewRepresentable {
             configuration.worldAlignment = .gravity
             configuration.planeDetection = [.horizontal]
             configuration.environmentTexturing = .none
+            // Plane detection without depth waits for enough visual features, which on a bare table
+            // can be most of a minute of sweeping — the measuring screens have always run with depth
+            // and find surfaces at once. Same hardware, same session; there was no reason for this
+            // screen to be the slow one.
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                configuration.frameSemantics.insert(.sceneDepth)
+            }
             return configuration
         }
 
@@ -522,11 +596,7 @@ private struct PackingARContainer: UIViewRepresentable {
             tap.require(toFail: twoFingerTurn)
             installedGestureRecognizers = [tap, drag, twist, twoFingerTurn]
 
-            // Twice a second, is there a surface under the middle of the screen? One raycast, and it is
-            // what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
-            searchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.probeForSurface() }
-            }
+            startSurfaceProbe()
             lastFrameTime = CACurrentMediaTime()
             watchdogTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.checkForStalledCamera() }
@@ -547,6 +617,12 @@ private struct PackingARContainer: UIViewRepresentable {
         /// Uses only a plane ARKit has actually detected. The infinite target is merely an extension
         /// of that detected plane; estimated planes can be the floor behind a table and were the
         /// reason a placement could appear underneath the surface.
+        ///
+        /// Planes classified as floors used to be rejected outright, to stop a tap on a table landing
+        /// on the floor visible behind it. That also made the guide impossible to use on a floor — and
+        /// ARKit calls plenty of large surfaces floors — so nothing ever locked. Results come back
+        /// nearest-first, so taking the first is already the surface under the finger; the height match
+        /// below does the rest of that job.
         private func stableSurfaceHit(
             at point: CGPoint,
             in view: ARView,
@@ -558,17 +634,33 @@ private struct PackingARContainer: UIViewRepresentable {
                     allowing: target,
                     alignment: .horizontal
                 ).first(where: { result in
-                    if let plane = result.anchor as? ARPlaneAnchor,
-                       plane.classification == .floor {
-                        return false
-                    }
+                    let height = result.worldTransform.columns.3.y
+                    guard height.isFinite else { return false }
                     guard let expectedHeight else { return true }
-                    return abs(result.worldTransform.columns.3.y - expectedHeight) <= 0.025
+                    return abs(height - expectedHeight) <= 0.025
                 }) {
                     return hit
                 }
             }
             return nil
+        }
+
+        /// Three times a second, is there a surface under the middle of the screen? One raycast, and it
+        /// is what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
+        ///
+        /// It runs for the whole life of the coordinator. Placing the module used to stop it, and
+        /// nothing ever started it again — so after "Place again" no surface was ever found and the
+        /// module could not be put down a second time.
+        private func startSurfaceProbe() {
+            searchTimer?.invalidate()
+            searchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.probeForSurface() }
+            }
+        }
+
+        private func stopSurfaceProbe() {
+            searchTimer?.invalidate()
+            searchTimer = nil
         }
 
         private func probeForSurface() {
@@ -610,6 +702,9 @@ private struct PackingARContainer: UIViewRepresentable {
             }
             self.view = nil
             sharedViewLease = nil
+            // Last, because clearing the placement arms the probe again for the next placement — and
+            // there is no next one after a detach.
+            stopSurfaceProbe()
         }
 
         // MARK: - Keeping the camera alive
@@ -678,17 +773,21 @@ private struct PackingARContainer: UIViewRepresentable {
         /// One finger slides the module across the surface, which is what everyone tries first and
         /// what every other AR app does. It used to turn it, which meant the module spun when you
         /// tried to nudge it and there was no way to move it at all short of putting it down again.
+        ///
+        /// The module is moved by offsetting the content *inside* the anchor, never by writing to the
+        /// anchor itself. An anchor's transform belongs to ARKit — it is corrected as tracking improves
+        /// and rewritten wholesale after a relocalisation — so an app that also writes to it is in a
+        /// fight it cannot win, and the visible result is a module that jumps somewhere absurd.
         @objc private func handleDrag(_ recogniser: UIPanGestureRecognizer) {
-            guard ownsSharedView, let view, let anchor, contentRoot != nil else { return }
+            guard ownsSharedView, let view, let anchor, let contentRoot else { return }
             switch recogniser.state {
             case .began:
                 guard recogniser.numberOfTouches == 1, !twistIsActive else { return }
-                dragStartAnchorTranslation = anchor.transform.translation
+                dragStartContentOffset = contentRoot.position
             case .changed:
                 guard recogniser.numberOfTouches == 1,
                       !twistIsActive,
-                      let placementSurfaceHeight,
-                      let start = dragStartAnchorTranslation,
+                      let start = dragStartContentOffset,
                       let frame = view.session.currentFrame else {
                     return
                 }
@@ -706,20 +805,26 @@ private struct PackingARContainer: UIViewRepresentable {
                     camera.columns.3.y,
                     camera.columns.3.z
                 )
-                let distance = simd_distance(cameraPosition, start)
-                let screenDelta = recogniser.translation(in: view)
-                var transform = anchor.transform
-                transform.translation = PackingARVisualGeometry.draggedPosition(
-                    from: start,
-                    screenRight: right,
-                    screenUp: screenUp,
-                    screenDelta: screenDelta,
-                    cameraDistance: distance,
-                    surfaceHeight: placementSurfaceHeight
+                // The anchor's own rotation is identity, so its axes are the world's and a world-space
+                // screen delta can be applied to the child offset directly. Height stays at the anchor,
+                // which is the surface it was put down on.
+                let distance = simd_distance(
+                    cameraPosition,
+                    anchor.transform.translation + start
                 )
-                anchor.transform = transform
+                let screenDelta = recogniser.translation(in: view)
+                contentRoot.position = PackingARVisualGeometry.clampedDragOffset(
+                    PackingARVisualGeometry.draggedPosition(
+                        from: start,
+                        screenRight: right,
+                        screenUp: screenUp,
+                        screenDelta: screenDelta,
+                        cameraDistance: distance,
+                        surfaceHeight: 0
+                    )
+                )
             case .ended, .cancelled, .failed:
-                dragStartAnchorTranslation = nil
+                dragStartContentOffset = nil
             default:
                 break
             }
@@ -731,7 +836,7 @@ private struct PackingARContainer: UIViewRepresentable {
             case .began:
                 twistIsActive = true
                 suppressTwoFingerPanUntilEnd = true
-                dragStartAnchorTranslation = nil
+                dragStartContentOffset = nil
                 turnAtGestureStart = turn
             case .changed, .ended:
                 apply(
@@ -827,8 +932,19 @@ private struct PackingARContainer: UIViewRepresentable {
             return sharedViewHost.owns(sharedViewLease)
         }
 
+        /// Takes the module out of the scene *and* out of the session. Removing the entity alone left
+        /// ARKit's anchor behind, and RealityKit will happily draw a previously bound anchor's content
+        /// again — which is why "Place again" appeared to leave the old payload standing there.
         private func clearPlacement() {
-            anchor?.removeFromParent()
+            if let anchor {
+                view?.scene.removeAnchor(anchor)
+                anchor.children.removeAll()
+                anchor.removeFromParent()
+            }
+            if let placedWorldAnchor {
+                view?.session.remove(anchor: placedWorldAnchor)
+            }
+            placedWorldAnchor = nil
             anchor = nil
             contentRoot = nil
             packageEntities.removeAll()
@@ -837,9 +953,10 @@ private struct PackingARContainer: UIViewRepresentable {
             turn = 0
             twistIsActive = false
             suppressTwoFingerPanUntilEnd = false
-            placementSurfaceHeight = nil
             probedSurfaceHeight = nil
-            dragStartAnchorTranslation = nil
+            dragStartContentOffset = nil
+            // Whatever is being put down next needs a surface of its own found first.
+            startSurfaceProbe()
         }
 
         @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
@@ -860,36 +977,41 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         private func place(at point: CGPoint, in view: ARView) {
-            guard let probedSurfaceHeight,
-                  let result = stableSurfaceHit(
-                at: point,
-                in: view,
-                matchingHeight: probedSurfaceHeight
-            ) else {
+            // Prefer the surface the prompt was talking about — the one under the middle of the screen —
+            // and fall back to whatever was actually tapped. Insisting on the probed height meant a tap
+            // on a different but perfectly good surface did nothing at all.
+            let result = probedSurfaceHeight.flatMap {
+                stableSurfaceHit(at: point, in: view, matchingHeight: $0)
+            } ?? stableSurfaceHit(at: point, in: view)
+            guard let result else {
                 model.reportNoSurface()
                 return
             }
-            searchTimer?.invalidate()
-            searchTimer = nil
 
             // Raycast orientation can carry a small tilt or arbitrary yaw. The module is meant to sit
             // level and gets its yaw only from the two-finger gesture, so anchor it with translation
             // alone in the gravity-aligned world frame.
             var stableTransform = matrix_identity_float4x4
             stableTransform.columns.3 = result.worldTransform.columns.3
-            let placed = AnchorEntity(world: stableTransform)
+            // A session anchor rather than a bare world transform: ARKit then owns keeping it on the
+            // real surface as tracking is refined, instead of the module drifting off the table.
+            let worldAnchor = ARAnchor(name: Self.moduleAnchorName, transform: stableTransform)
+            view.session.add(anchor: worldAnchor)
+            let placed = AnchorEntity(anchor: worldAnchor)
             let content = Entity()
             placed.addChild(content)
             view.scene.addAnchor(placed)
+            placedWorldAnchor = worldAnchor
             anchor = placed
             contentRoot = content
-            placementSurfaceHeight = result.worldTransform.columns.3.y
             turn = 0
             build(into: content)
             observedRevision = model.revision
             refreshLayerVisibility()
             model.markPlaced()
         }
+
+        private static let moduleAnchorName = "packing-module"
 
         // MARK: - Content
 

@@ -551,6 +551,16 @@ n ≥ 24    ∧    hₙ ≤ dₙ    ∧    δₙ ≤ dₙ    ∧    a support pl
 Second exit: if at least 4 observations exist and none has arrived for 2.5 s, the measurement
 finishes anyway, on the grounds that no further waiting can tighten it.
 
+Third exit: after 10 s the reading is taken as it stands, whatever the statistics are doing.
+
+The support-plane condition applies to **all three** exits, because a finish without it is refused
+further down the line, and a measurement that both claims to have converged and cannot end is a
+measurement that never ends. For the same reason the progress shown on the HUD is held below 100%
+while the support is unknown. The support may come from an ARKit plane anchor, a raycast against
+estimated planes, or the depth histogram of the surface around the object — the same height the
+fitted box is already standing on; small objects, whose tables ARKit is slowest to bound, otherwise
+measure indefinitely.
+
 `dₙ` is a single threshold, not two alternative tests. The relative term governs dimensions above
 500 mm; the 5 mm floor governs everything smaller, so a 100 mm object is never asked for the 1 mm
 precision it could not reach.
@@ -567,6 +577,7 @@ precision it could not reach.
 | 5 mm floor, 1% relative term | Project-defined |
 | The drift test `δₙ ≤ dₙ` | Project-defined; no counterpart in Chow & Robbins |
 | The 2.5 s stale-evidence exit | Project-defined safeguard |
+| The 10 s time limit | Project-defined safeguard |
 | Requiring a support plane | Project-defined; a physical precondition the statistics cannot see |
 
 ## Why this is not the Chow–Robbins procedure

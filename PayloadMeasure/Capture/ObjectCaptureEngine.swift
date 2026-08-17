@@ -123,13 +123,17 @@ final class ObjectCaptureEngine {
     private(set) var automaticLockRequest: UUID?
     private(set) var automaticLockRequestRevision = 0
     private var convergenceMonitor = MeasurementConvergenceMonitor()
-    private var automaticLockOfferedObjectIDs: Set<UUID> = []
+    /// When each object was last offered for an automatic finish.
+    private var automaticLockOfferTimestamps: [UUID: TimeInterval] = [:]
+    /// How long to wait before offering the same object again. There is no manual Finish on the
+    /// camera screen, so an offer the overlay could not act on must not be the only one it gets.
+    private static let automaticLockRetryInterval: TimeInterval = 1
 
     var isAutomaticLockDisarmedForActiveObject: Bool {
         guard isAutomaticLockEnabled, let activeObjectID else {
             return false
         }
-        return automaticLockOfferedObjectIDs.contains(activeObjectID)
+        return automaticLockOfferTimestamps[activeObjectID] != nil
     }
 
     func setAutomaticLockEnabled(_ isEnabled: Bool) {
@@ -138,7 +142,7 @@ final class ObjectCaptureEngine {
         }
         isAutomaticLockEnabled = isEnabled
         if isEnabled, let activeObjectID {
-            automaticLockOfferedObjectIDs.remove(activeObjectID)
+            automaticLockOfferTimestamps.removeValue(forKey: activeObjectID)
         }
         refreshConvergence()
     }
@@ -183,11 +187,19 @@ final class ObjectCaptureEngine {
         guard isAutomaticLockEnabled,
               convergence.isConverged,
               canFinalizeActiveObject,
-              let id = activeObjectID,
-              !automaticLockOfferedObjectIDs.contains(id) else {
+              let id = activeObjectID else {
             return
         }
-        automaticLockOfferedObjectIDs.insert(id)
+        // The offer used to be made exactly once per object. Anything that stopped the overlay acting
+        // on it — standing too close, a sheet in the way, tracking dropping for a frame — stranded
+        // the measurement at "converged" with no way to finish it. So keep offering, slowly. A
+        // successful finish clears the active object, which ends this by itself.
+        let now = ProcessInfo.processInfo.systemUptime
+        if let offered = automaticLockOfferTimestamps[id],
+           now - offered < Self.automaticLockRetryInterval {
+            return
+        }
+        automaticLockOfferTimestamps[id] = now
         automaticLockRequest = id
         automaticLockRequestRevision += 1
     }
@@ -620,7 +632,7 @@ final class ObjectCaptureEngine {
             return
         }
         resetScanGuidance()
-        automaticLockOfferedObjectIDs.remove(id)
+        automaticLockOfferTimestamps.removeValue(forKey: id)
         hasDefinitiveSupportPlaneForActiveObject = false
         measurementDetailStatus = .unknown
         didEncounterInsufficientFit = false
@@ -700,7 +712,7 @@ final class ObjectCaptureEngine {
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
         objectMaskMarkers.removeAll { $0.id == id }
         objectMaskMarkerMissCounts.removeValue(forKey: id)
-        automaticLockOfferedObjectIDs.remove(id)
+        automaticLockOfferTimestamps.removeValue(forKey: id)
 
         resetScanGuidance()
         hideObjectMask(id: id)
@@ -941,7 +953,7 @@ final class ObjectCaptureEngine {
         objectMaskDisplayBoundingBoxes.removeValue(forKey: id)
         objectMaskMarkers.removeAll(where: { $0.id == id })
         objectMaskMarkerMissCounts.removeValue(forKey: id)
-        automaticLockOfferedObjectIDs.remove(id)
+        automaticLockOfferTimestamps.removeValue(forKey: id)
         if focusedCaptureID == id {
             focusedCaptureID = activeObjectID ?? measuredObjectIDs.last
         }
@@ -980,7 +992,7 @@ final class ObjectCaptureEngine {
         finalizedObjectIDs.remove(id)
         clearSnapshotJPEGData(for: id)
         resetScanGuidance()
-        automaticLockOfferedObjectIDs.remove(id)
+        automaticLockOfferTimestamps.removeValue(forKey: id)
         hasDefinitiveSupportPlaneForActiveObject = false
         activeObjectID = id
         isObjectSelectionPending = false
@@ -1314,7 +1326,7 @@ final class ObjectCaptureEngine {
         objectMaskToggleRequest = nil
         statusText = idleMeasurementPrompt
         hasCompletedObjectRecognitionWarmup = false
-        automaticLockOfferedObjectIDs.removeAll()
+        automaticLockOfferTimestamps.removeAll()
         resetScanGuidance()
         topViewDeviationDegrees = nil
         isTopViewAligned = false

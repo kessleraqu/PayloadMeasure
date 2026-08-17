@@ -19,7 +19,11 @@ import Foundation
 //     n ≥ 24            ∧   hₙ ≤ dₙ            ∧   δₙ ≤ dₙ            ∧   a support plane exists
 //
 // There is a second exit: if no new observation has arrived for 2.5 s and at least 4 exist, the
-// measurement finishes on the grounds that no further waiting can tighten it.
+// measurement finishes on the grounds that no further waiting can tighten it. And a third: after
+// 10 s the reading is taken as it stands. Every exit still requires the support plane, because a
+// height measured from an unknown floor is not a measurement — and a bar that reads 100% while the
+// finish is being refused is how a stall looks to the person holding the phone, so the progress
+// shown is capped below completion until the support is known.
 //
 // PROVENANCE. Only the middle condition, hₙ ≤ dₙ, has a literature source: it is the fixed-width
 // sequential stopping form of Chow and Robbins (1965). It is *not* their procedure. They accumulate
@@ -208,6 +212,8 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042
     ]
     private static let normalQuantile95 = 1.960
+    /// Highest progress the HUD may show while the support plane is still missing.
+    private static let progressCeilingWithoutSupport = 0.9
 
     private struct AxisState: Sendable {
         var values: [Float] = []
@@ -320,7 +326,12 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
             highWaterProgress,
             max(min(coverageProgress, dimensionProgress), elapsedFraction)
         )
-        result.progress = highWaterProgress
+        // Without a support plane no exit can fire, so the bar must not read as finished. It used to:
+        // the time term drove it to 100% after ten seconds while the finish was refused, which is
+        // exactly the stall a full bar promises is over.
+        result.progress = coverage.hasSupportPlane
+            ? highWaterProgress
+            : min(highWaterProgress, Self.progressCeilingWithoutSupport)
 
         let hasFullWindows = result.sampleCount >= configuration.minimumSampleCount
         let precisionSatisfied = hasFullWindows
@@ -339,10 +350,12 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
            now - lastSampleTimestamp >= configuration.evidenceTimeout {
             return converged(result, basis: .evidenceExhausted)
         }
-        // The hard limit, and deliberately not conditional on anything: past ten seconds the reading
-        // is taken as it stands. If no support plane was ever found there is nothing to save and the
-        // finish is refused further down the line, which is the one case the limit cannot rescue.
-        if let firstSampleTimestamp,
+        // The hard limit: past ten seconds the reading is taken as it stands. Conditional on the
+        // support plane like the other two exits, because without one the finish is refused further
+        // down the line — declaring convergence there only produced a measurement that claimed to be
+        // over and never ended.
+        if coverage.hasSupportPlane,
+           let firstSampleTimestamp,
            now - firstSampleTimestamp >= configuration.timeLimit {
             return converged(result, basis: .timeLimit)
         }

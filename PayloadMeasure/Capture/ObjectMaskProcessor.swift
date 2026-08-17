@@ -13,18 +13,52 @@ import Vision
 //      Work happens off the main actor; results are timestamped so late frames can be discarded.
 
 nonisolated enum ObjectMaskCandidatePolicy {
-    /// Centre probes are the cheap, preferred path. If they miss, keep processing every Vision
-    /// instance so an object does not disappear merely because it became small on screen.
+    /// Half-width of the window around the crosshair that counts as "what the phone is pointed at",
+    /// in normalized image units. Nothing outside it may be masked or measured, however well Vision
+    /// segmented it.
+    static let aimWindowRadius: CGFloat = 0.12
+    /// How far the crosshair may fall outside a mask's own bounds and still count as pointing at it.
+    /// Some slack is needed because a small object's mask does not always sit under a hand-held
+    /// crosshair; a whole screen-width of slack is what put masks on objects at the edge.
+    static let aimBoundsSlack: CGFloat = 0.05
+
+    /// Probes on the crosshair are the cheap, preferred path. When they miss — a small object can
+    /// slip between them — widen only to the instances found inside the aim window. Widening to
+    /// every instance in the frame, as this used to, is what let the nearest-centroid choice land on
+    /// an object at the edge of the screen that nobody was pointing at.
     static func previewInstances(
         nearby: IndexSet,
-        all: IndexSet,
+        withinAim: @autoclosure () -> IndexSet,
         excluding excluded: Set<Int>
     ) -> [Int] {
         let eligibleNearby = nearby.filter { !excluded.contains($0) }
         if !eligibleNearby.isEmpty {
             return eligibleNearby
         }
-        return all.filter { !excluded.contains($0) }
+        return withinAim().filter { !excluded.contains($0) }
+    }
+
+    /// True when the crosshair is inside the mask's bounds, or close enough outside them to be read
+    /// as pointing at it.
+    static func isAimedAt(
+        boundingBox: CGRect,
+        aim: CGPoint,
+        slack: CGFloat = aimBoundsSlack
+    ) -> Bool {
+        guard !boundingBox.isNull,
+              boundingBox.width > 0,
+              boundingBox.height > 0 else {
+            return false
+        }
+        return distance(from: aim, toBoundsOf: boundingBox) <= slack
+    }
+
+    /// Zero while the point is inside the rectangle, and how far outside it otherwise.
+    static func distance(from point: CGPoint, toBoundsOf rect: CGRect) -> CGFloat {
+        hypot(
+            max(rect.minX - point.x, point.x - rect.maxX, 0),
+            max(rect.minY - point.y, point.y - rect.maxY, 0)
+        )
     }
 }
 
@@ -1045,9 +1079,13 @@ actor ObjectMaskProcessor {
             if let cachedGeometry = geometryCache[instance] {
                 geometry = cachedGeometry
             } else {
-                guard let mask = try? observation.generateMask(
-                    for: IndexSet(integer: instance)
-                ), let measuredGeometry = maskGeometry(of: mask) else {
+                // Pooled: each of these is a full-resolution buffer, and this runs on every frame of
+                // every measurement.
+                guard let measuredGeometry = autoreleasepool(invoking: {
+                    (try? observation.generateMask(
+                        for: IndexSet(integer: instance)
+                    )).flatMap { maskGeometry(of: $0) }
+                }) else {
                     continue
                 }
                 geometryCache[instance] = measuredGeometry
@@ -1206,12 +1244,14 @@ actor ObjectMaskProcessor {
         let hintsByID = Dictionary(uniqueKeysWithValues: frame.anchorHints.map { ($0.id, $0) })
         let tappedInstances = instances(near: point, in: observation)
         let tappedBoundingBoxes = tappedInstances.compactMap { instance -> CGRect? in
-            guard let mask = try? observation.generateMask(
-                for: IndexSet(integer: instance)
-            ) else {
-                return nil
+            autoreleasepool {
+                guard let mask = try? observation.generateMask(
+                    for: IndexSet(integer: instance)
+                ) else {
+                    return nil
+                }
+                return maskGeometry(of: mask)?.boundingBox.cgRect
             }
-            return maskGeometry(of: mask)?.boundingBox.cgRect
         }
         if let existing = trackedObjects.first(where: { trackedObject in
             guard frame.finalizedObjectIDs.contains(trackedObject.id),
@@ -1285,27 +1325,58 @@ actor ObjectMaskProcessor {
         preferredInstances: IndexSet,
         in observation: InstanceMaskObservation
     ) throws -> (instance: Int, geometry: MaskGeometry)? {
-        let preferred = Set(preferredInstances)
+        try aimedCandidate(
+            at: point,
+            candidates: ObjectMaskCandidatePolicy.previewInstances(
+                nearby: preferredInstances,
+                withinAim: instances(inAimWindowAround: point, in: observation),
+                excluding: []
+            ),
+            preferred: preferredInstances,
+            in: observation
+        )
+    }
+
+    /// The one instance the crosshair is on, or nothing. Distance from the aim to the mask's own
+    /// bounds dominates the score, so a mask the crosshair sits inside always beats a larger one that
+    /// merely has its centroid nearby, and anything the crosshair is not pointing at is rejected
+    /// outright rather than won by default.
+    ///
+    /// Preview and selection both go through here, which is what makes them agree: the object that
+    /// lights up is the object that gets measured.
+    private func aimedCandidate(
+        at point: NormalizedPoint,
+        candidates: [Int],
+        preferred: IndexSet,
+        in observation: InstanceMaskObservation
+    ) throws -> (instance: Int, geometry: MaskGeometry)? {
+        let aim = point.cgPoint
+        let preferredInstances = Set(preferred)
         var best: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
 
-        for instance in observation.allInstances {
-            let mask = try observation.generateMask(for: IndexSet(integer: instance))
-            guard let geometry = maskGeometry(of: mask),
+        for instance in candidates {
+            // Vision hands back a full-resolution mask buffer per instance, so without a pool of its
+            // own this loop is the peak-memory moment of the frame.
+            let geometry: MaskGeometry? = try autoreleasepool {
+                let mask = try observation.generateMask(for: IndexSet(integer: instance))
+                return maskGeometry(of: mask)
+            }
+            guard let geometry,
                   geometry.area < 0.90,
                   !(geometry.boundingBox.width > 0.985 && geometry.boundingBox.height > 0.985) else {
                 continue
             }
 
             let rect = geometry.boundingBox.cgRect
-            let dx = max(rect.minX - point.x, point.x - rect.maxX, 0)
-            let dy = max(rect.minY - point.y, point.y - rect.maxY, 0)
-            let distanceToMaskBounds = hypot(dx, dy)
+            guard ObjectMaskCandidatePolicy.isAimedAt(boundingBox: rect, aim: aim) else {
+                continue
+            }
             let centroidDistance = hypot(
-                geometry.centroid.x - point.x,
-                geometry.centroid.y - point.y
+                geometry.centroid.x - aim.x,
+                geometry.centroid.y - aim.y
             )
-            let score = (preferred.contains(instance) ? -1 : 0)
-                + distanceToMaskBounds * 5
+            let score = (preferredInstances.contains(instance) ? -1 : 0)
+                + ObjectMaskCandidatePolicy.distance(from: aim, toBoundsOf: rect) * 5
                 + centroidDistance * 0.15
                 + geometry.area * 0.02
             if best == nil || score < best!.score {
@@ -1314,6 +1385,33 @@ actor ObjectMaskProcessor {
         }
 
         return best.map { ($0.instance, $0.geometry) }
+    }
+
+    /// Every instance that appears anywhere in the square around the crosshair. Point probes are
+    /// cheap — the tracker already samples a 7 × 7 grid per candidate — so this is a far better
+    /// fallback than generating a mask for every instance in the frame.
+    private func instances(
+        inAimWindowAround point: NormalizedPoint,
+        in observation: InstanceMaskObservation
+    ) -> IndexSet {
+        let radius = ObjectMaskCandidatePolicy.aimWindowRadius
+        let steps = 8
+        var found = IndexSet()
+        for row in 0 ... steps {
+            for column in 0 ... steps {
+                let x = point.x - radius + 2 * radius * CGFloat(column) / CGFloat(steps)
+                let y = point.y - radius + 2 * radius * CGFloat(row) / CGFloat(steps)
+                guard (0 ... 1).contains(x), (0 ... 1).contains(y) else {
+                    continue
+                }
+                found.formUnion(
+                    observation.instanceAtPoint(NormalizedPoint(x: x, y: y))
+                )
+            }
+        }
+        // Probes report whatever is under them, including the background; only segmented instances
+        // are candidates for a mask.
+        return found.intersection(observation.allInstances)
     }
 
     private func firstAvailableColorIndex() -> Int {
@@ -1706,31 +1804,20 @@ actor ObjectMaskProcessor {
             )
             let nearbyInstances = instances(near: centerPoint, in: observation)
             // A distant or physically small object can occupy fewer pixels than the centre probes.
-            // Vision may still segment it perfectly, so fall back to every eligible instance and
-            // choose the one whose mask centroid is nearest the aimer instead of dropping it.
+            // Vision may still segment it perfectly, so widen the search to the aim window rather
+            // than dropping it — but only to the aim window, so the preview cannot walk off to an
+            // object at the edge of the frame.
             let candidateInstances = ObjectMaskCandidatePolicy.previewInstances(
                 nearby: nearbyInstances,
-                all: observation.allInstances,
+                withinAim: instances(inAimWindowAround: centerPoint, in: observation),
                 excluding: finalizedInstances
             )
-            var bestPreview: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
-
-            for instance in candidateInstances {
-                let mask = try observation.generateMask(for: IndexSet(integer: instance))
-                guard let geometry = maskGeometry(of: mask),
-                      geometry.area < 0.90,
-                      !(geometry.boundingBox.width > 0.985
-                          && geometry.boundingBox.height > 0.985) else {
-                    continue
-                }
-                let score = hypot(
-                    geometry.centroid.x - centerPoint.x,
-                    geometry.centroid.y - centerPoint.y
-                ) + geometry.area * 0.02
-                if bestPreview == nil || score < bestPreview!.score {
-                    bestPreview = (instance, geometry, score)
-                }
-            }
+            let bestPreview = try aimedCandidate(
+                at: centerPoint,
+                candidates: candidateInstances,
+                preferred: nearbyInstances,
+                in: observation
+            )
 
             if let bestPreview {
                 selections.append(

@@ -2703,9 +2703,15 @@ struct ARCameraView: UIViewRepresentable {
                     forKey: activeObjectID
                 )
             }
+            // An ARKit plane anchor is the best support evidence, not the only kind the app trusts:
+            // the box being drawn is already sitting on whatever `resolvedSupportHeight` returned,
+            // raycast or depth histogram included. Requiring the plane anchor here as well is what
+            // left small objects — the ones whose table ARKit is slowest to bound — measuring to
+            // 100% and then refusing to finish, with no manual finish to fall back on.
             captureEngine.updateActiveSupportPlaneAvailability(
                 id: activeObjectID,
                 isAvailable: planeSupportMatch != nil
+                    || supportHeightStateByObject[activeObjectID]?.value != nil
             )
 
             updateTopViewAlignment(from: frame)

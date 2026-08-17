@@ -190,6 +190,10 @@ struct StudyRun: Codable, Identifiable, Sendable {
     /// Whether the participant had a practice payload first. Optional so runs recorded before the
     /// practice run existed still decode; those read as unknown rather than as "no".
     var includedPracticeRun: Bool?
+    /// The run's own folder under StudyRuns, named after the run and made unique when the name is
+    /// already taken on disk. Nil for runs written before this existed: those still live in a folder
+    /// named after their id, and are still read from it.
+    var folderName: String?
 
     var isComplete: Bool {
         boxOrder.allSatisfy { box in
@@ -270,8 +274,45 @@ extension StudyRun {
         }
     }
 
+    /// The run's name, as a name a file system will accept. Everything a path cannot carry becomes a
+    /// hyphen; brackets go too, because brackets are what makes a duplicate name unique.
+    static func safeName(_ name: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " _-"))
+        let cleaned = name
+            .components(separatedBy: allowed.inverted)
+            .joined(separator: "-")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " -_"))
+        return cleaned.isEmpty ? "Run" : cleaned
+    }
+
+    /// What this run's folder is called before any duplicate numbering: the participant's name and the
+    /// condition, which together are how a run is referred to on screen.
+    var exportBaseName: String {
+        let condition: String
+        switch inputPlan {
+        case .arOnly: condition = " AR"
+        case .manualOnly: condition = " no AR"
+        case .both: condition = " AR and no AR"
+        case nil: condition = ""
+        }
+        return Self.safeName(participantName + condition)
+    }
+
+    /// The folder this run's files live in, relative to StudyRuns.
+    var exportFolderName: String {
+        folderName ?? id.uuidString
+    }
+
+    /// One report, named after the run, sitting beside the photos folder inside the run's own folder.
     var reportFileName: String {
-        let safeName = participantName
+        "\(folderName ?? exportBaseName).txt"
+    }
+
+    /// The old flat name, kept only so deleting a run can still clear a report written by an earlier
+    /// version at the top of StudyRuns.
+    var legacyReportFileName: String {
+        let safe = participantName
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
             .joined(separator: "-")
@@ -283,7 +324,7 @@ extension StudyRun {
         case .both: conditionSuffix = "-ar-and-no-ar"
         case nil: conditionSuffix = ""
         }
-        return "payloadmeasure-\(safeName.isEmpty ? "participant" : safeName)\(conditionSuffix)-\(stamp).txt"
+        return "payloadmeasure-\(safe.isEmpty ? "participant" : safe)\(conditionSuffix)-\(stamp).txt"
     }
 
     /// The whole run as plain text. Written automatically when the run completes and re-writable on

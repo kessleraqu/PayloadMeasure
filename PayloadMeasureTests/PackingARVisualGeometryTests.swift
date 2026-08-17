@@ -71,6 +71,25 @@ final class PackingARVisualGeometryTests: XCTestCase {
         )
     }
 
+    /// A drag is a nudge across a table. Without a bound, one unlucky gesture put the module somewhere
+    /// it could not be seen or recovered from.
+    func testDragOffsetIsBoundedAndNeverCarriesANonNumber() {
+        let limit = PackingARVisualGeometry.maximumDragOffsetMetres
+        let clamped = PackingARVisualGeometry.clampedDragOffset(
+            SIMD3(20, -0.5, -40)
+        )
+        XCTAssertEqual(clamped.x, limit, accuracy: 0.000_001)
+        XCTAssertEqual(clamped.y, -0.5, accuracy: 0.000_001)
+        XCTAssertEqual(clamped.z, -limit, accuracy: 0.000_001)
+
+        let nonNumbers = PackingARVisualGeometry.clampedDragOffset(
+            SIMD3(.nan, .infinity, 0.25)
+        )
+        XCTAssertEqual(nonNumbers.x, 0, accuracy: 0.000_001)
+        XCTAssertEqual(nonNumbers.y, 0, accuracy: 0.000_001)
+        XCTAssertEqual(nonNumbers.z, 0.25, accuracy: 0.000_001)
+    }
+
     func testOneFingerDragMovesAtConstantSurfaceHeightWithoutARaycast() {
         let moved = PackingARVisualGeometry.draggedPosition(
             from: SIMD3(1, 0.7, 2),

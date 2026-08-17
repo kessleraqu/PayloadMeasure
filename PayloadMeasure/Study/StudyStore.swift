@@ -141,6 +141,10 @@ final class StudyStore {
         run.firstInputMode = inputPlan == .arOnly
             ? .augmentedReality
             : inputPlan == .manualOnly ? .manual : inputPlan == .both ? firstInputMode : nil
+        // Fixed once, at the start: everything this run writes goes into this one folder, and the name
+        // is checked against what is on disk rather than against the app's own list. A folder left
+        // behind by a run that was deleted in the app is therefore never written into by a new one.
+        run.folderName = Self.availableFolderName(base: run.exportBaseName)
         activeRun = run
         currentBoxIndex = 0
         isPractice = includesPractice
@@ -261,8 +265,9 @@ final class StudyStore {
     /// action in the app. It cannot be undone and there is no copy anywhere else, so every caller puts
     /// the password in front of it.
     func delete(runID: UUID) {
-        let reportName = saved.first { $0.id == runID }?.reportFileName
-            ?? activeRun.flatMap { $0.id == runID ? $0.reportFileName : nil }
+        let deleted = run(withID: runID)
+        let folder = runFolder(runID: runID)
+        let legacyReportName = deleted?.legacyReportFileName
         saved.removeAll { $0.id == runID }
         if activeRun?.id == runID {
             activeRun = nil
@@ -272,12 +277,12 @@ final class StudyStore {
             currentPhase = nil
             phaseStartedAt = nil
         }
-        try? FileManager.default.removeItem(at: Self.runFolder(runID: runID))
-        // exportReport also leaves a copy at the top of the folder, named after the participant rather
-        // than the run id, so deleting the run's own folder does not take it with it.
-        if let reportName {
+        try? FileManager.default.removeItem(at: folder)
+        // Earlier versions also left a copy of the report at the top of StudyRuns. Nothing writes one
+        // any more, but a run recorded back then still has one to clear.
+        if let legacyReportName {
             try? FileManager.default.removeItem(
-                at: Self.rootFolder.appendingPathComponent(reportName)
+                at: Self.rootFolder.appendingPathComponent(legacyReportName)
             )
         }
         lastExportURL = nil
@@ -367,11 +372,19 @@ final class StudyStore {
     }
 
     /// Writes one object's photo into the run folder and returns the file name to store with it.
+    ///
+    /// Named after the object and the payload it was measured for, so the photos folder can be read by
+    /// a person. Object names are unique within a run, and re-recording the same box overwrites its own
+    /// photos, so the name identifies the file for the whole run.
     @discardableResult
-    func storePhoto(_ data: Data, objectID: UUID) -> String? {
+    func storePhoto(_ data: Data, objectID: UUID, objectName: String? = nil) -> String? {
         guard !isPractice, let run = activeRun else { return nil }
-        let name = "\(objectID.uuidString).jpg"
-        let folder = Self.photosFolder(runID: run.id)
+        let name = Self.photoFileName(
+            objectID: objectID,
+            objectName: objectName,
+            box: currentBox
+        )
+        let folder = Self.photosFolder(for: run)
         do {
             try FileManager.default.createDirectory(
                 at: folder,
@@ -384,24 +397,37 @@ final class StudyStore {
         }
     }
 
+    static func photoFileName(
+        objectID: UUID,
+        objectName: String?,
+        box: StudyBox?
+    ) -> String {
+        let object = objectName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !object.isEmpty else { return "\(objectID.uuidString).jpg" }
+        let prefix = box.map { StudyRun.safeName($0.shortTitle) + " - " } ?? ""
+        return "\(prefix)\(StudyRun.safeName(object)).jpg"
+    }
+
     func photoURL(runID: UUID, fileName: String) -> URL {
-        Self.photosFolder(runID: runID).appendingPathComponent(fileName)
+        runFolder(runID: runID)
+            .appendingPathComponent("photos", isDirectory: true)
+            .appendingPathComponent(fileName)
     }
 
     // MARK: - Export
 
+    /// One report, inside the run's own folder, named after the run. There used to be a second copy at
+    /// the top of StudyRuns as well; with a folder per run there is nothing left to dig through, and two
+    /// copies of the same report is how a folder becomes a mess.
     @discardableResult
     func exportReport(for run: StudyRun) -> URL? {
-        let folder = Self.runFolder(runID: run.id)
+        let folder = Self.runFolder(for: run)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let url = folder.appendingPathComponent(run.reportFileName)
             try run.reportText().write(to: url, atomically: true, encoding: .utf8)
-            // A copy at the top level too, so it is easy to find in Files without digging.
-            let flat = Self.rootFolder.appendingPathComponent(run.reportFileName)
-            try? run.reportText().write(to: flat, atomically: true, encoding: .utf8)
             lastExportURL = url
-            exportMessage = "Saved \(run.reportFileName)"
+            exportMessage = "Saved \(run.exportFolderName)/\(run.reportFileName)"
             return url
         } catch {
             exportMessage = "Could not write the report: \(error.localizedDescription)"
@@ -420,7 +446,7 @@ final class StudyStore {
     }
 
     private func write(_ run: StudyRun) {
-        let folder = Self.runFolder(runID: run.id)
+        let folder = Self.runFolder(for: run)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
@@ -438,12 +464,57 @@ final class StudyStore {
         return documents.appendingPathComponent("StudyRuns", isDirectory: true)
     }
 
-    static func runFolder(runID: UUID) -> URL {
-        rootFolder.appendingPathComponent(runID.uuidString, isDirectory: true)
+    // StudyRuns/
+    //   <Run name>/
+    //     <Run name>.txt      the whole run as text
+    //     run.json            what the app reads back
+    //     photos/             one JPEG per object, named after the object
+    //   <Run name>(1)/        a second run whose name was already taken
+    //
+    // Runs written before this layout are in a folder named after their id, and are still found there:
+    // `folderName` is what moved, and it is nil for those.
+
+    static func runFolder(for run: StudyRun) -> URL {
+        rootFolder.appendingPathComponent(run.exportFolderName, isDirectory: true)
     }
 
-    static func photosFolder(runID: UUID) -> URL {
-        runFolder(runID: runID).appendingPathComponent("photos", isDirectory: true)
+    static func photosFolder(for run: StudyRun) -> URL {
+        runFolder(for: run).appendingPathComponent("photos", isDirectory: true)
+    }
+
+    /// Resolves a run's folder from its id, for the screens that only carry one.
+    func runFolder(runID: UUID) -> URL {
+        guard let run = run(withID: runID) else {
+            return Self.rootFolder.appendingPathComponent(runID.uuidString, isDirectory: true)
+        }
+        return Self.runFolder(for: run)
+    }
+
+    private func run(withID runID: UUID) -> StudyRun? {
+        if let activeRun, activeRun.id == runID { return activeRun }
+        return saved.first { $0.id == runID }
+    }
+
+    /// The name to give a new run's folder: its own, or its own with a number in brackets when that is
+    /// taken. Everything already in StudyRuns counts as taken, whether or not the app still lists it.
+    static func availableFolderName(base: String) -> String {
+        let existing = (try? FileManager.default.contentsOfDirectory(
+            atPath: rootFolder.path
+        )) ?? []
+        return uniqueFolderName(base: base, taken: Set(existing))
+    }
+
+    /// `Run`, then `Run(1)`, `Run(2)`, … Comparison ignores case, because two folders differing only in
+    /// case are the same folder on this file system and one run would then write over another.
+    static func uniqueFolderName(base: String, taken: Set<String>) -> String {
+        let safeBase = StudyRun.safeName(base)
+        let lowercased = Set(taken.map { $0.lowercased() })
+        guard lowercased.contains(safeBase.lowercased()) else { return safeBase }
+        var suffix = 1
+        while lowercased.contains("\(safeBase)(\(suffix))".lowercased()) {
+            suffix += 1
+        }
+        return "\(safeBase)(\(suffix))"
     }
 
     private static func loadAll() -> [StudyRun] {

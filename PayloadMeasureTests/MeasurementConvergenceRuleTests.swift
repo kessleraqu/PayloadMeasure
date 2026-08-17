@@ -137,6 +137,61 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         XCTAssertEqual(state.limitingFactor, .waitingForSupportPlane)
     }
 
+    /// The ten-second limit is an exit, not an exception: it may not declare a measurement converged
+    /// while the missing support plane would make the finish be refused. That combination is what left
+    /// small objects reading 100% for ever.
+    func testTheTimeLimitDoesNotFinishAScanThatHasNoSupportPlane() {
+        var monitor = MeasurementConvergenceMonitor()
+        let configuration = MeasurementConvergenceMonitor.Configuration.default
+        let withoutPlane = MeasurementConvergenceMonitor.Coverage(
+            isMeasuring: true,
+            hasSupportPlane: false,
+            reportsSideViewSeparately: true
+        )
+        // Deliberately noisy, and still arriving, so nothing but the clock could ever end this.
+        let elapsed = recordPastTheTimeLimit(&monitor)
+        let state = monitor.evaluate(coverage: withoutPlane, now: elapsed)
+        XCTAssertGreaterThanOrEqual(elapsed, configuration.timeLimit)
+
+        XCTAssertFalse(state.isConverged)
+        XCTAssertEqual(state.limitingFactor, .waitingForSupportPlane)
+        XCTAssertLessThan(
+            state.progress,
+            1,
+            "A full bar promises the measurement is over, and here it cannot be."
+        )
+    }
+
+    func testTheTimeLimitStillFinishesAScanThatHasOne() {
+        var monitor = MeasurementConvergenceMonitor()
+        let elapsed = recordPastTheTimeLimit(&monitor)
+        let state = monitor.evaluate(coverage: coverage, now: elapsed)
+
+        XCTAssertTrue(state.isConverged)
+        XCTAssertEqual(state.basis, .timeLimit)
+        XCTAssertEqual(state.progress, 1, accuracy: 1e-9)
+    }
+
+    /// Noisy observations arriving every 50 ms until past the ten-second limit: the precision test can
+    /// never be met and the stale-evidence exit can never fire, so the clock is the only exit left.
+    /// Returns the timestamp of the last observation.
+    private func recordPastTheTimeLimit(
+        _ monitor: inout MeasurementConvergenceMonitor
+    ) -> TimeInterval {
+        let interval = 0.05
+        let count = Int(
+            (MeasurementConvergenceMonitor.Configuration.default.timeLimit / interval).rounded(.up)
+        ) + 2
+        for index in 0..<count {
+            record(
+                &monitor,
+                value: index.isMultiple(of: 2) ? 0.180 : 0.230,
+                at: Double(index) * interval
+            )
+        }
+        return Double(count - 1) * interval
+    }
+
     // MARK: - The second exit
 
     func testStaleEvidenceFinishesTheScanWithoutThePrecisionTest() {

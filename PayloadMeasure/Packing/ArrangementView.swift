@@ -17,6 +17,7 @@ struct ArrangementView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var showsNextBoxPassword = false
+    @State private var showsFinishedPackingConfirmation = false
     @State private var highlightedPackageID: UUID?
     @State private var showsSettings = false
     @State private var showsDiagnostics = false
@@ -31,37 +32,57 @@ struct ArrangementView: View {
         store.packagesMissingPreparation(from: captureEngine)
     }
 
-    /// The only way out of a participant's payload, and it is behind a password so they cannot end
-    /// their own run by pressing something. Records the box before moving on — except after the
-    /// practice payload, which is never recorded.
+    /// The only way out of a participant's payload, and the last thing on the screen: everything above
+    /// it is the plan being followed, and this ends it. Pressing it asks for confirmation first and the
+    /// study password after, so neither a stray tap nor a participant can close a payload. The box is
+    /// recorded once the confirmation is given — except after the practice payload, which is never
+    /// recorded.
     @ViewBuilder
     private var nextBoxButton: some View {
         if store.baldiComparison != nil || store.result != nil {
             Button {
-                if !study.isPractice {
-                    recordCurrentBox()
-                }
-                showsNextBoxPassword = true
+                showsFinishedPackingConfirmation = true
             } label: {
                 Label(nextStepTitle, systemImage: nextStepIcon)
                     .font(.headline)
                     .frame(maxWidth: .infinity, minHeight: 50)
             }
             .buttonStyle(.borderedProminent)
-            .accessibilityHint("Asks for the study password, then moves the participant on.")
+            .accessibilityHint("Asks whether the payload is really loaded, then for the study password.")
         }
     }
 
     private var nextStepTitle: String {
-        if study.isPractice { return "Start real measurement" }
-        if study.isOnLastBox { return "Finish the study" }
-        return study.switchesInputModeAfterCurrentBox ? "Next condition" : "Next box"
+        study.isPractice ? "Start real measurement" : "Finished packing"
     }
 
     private var nextStepIcon: String {
-        if study.isPractice { return "play.circle" }
-        if study.isOnLastBox { return "checkmark.seal" }
-        return study.switchesInputModeAfterCurrentBox ? "arrow.left.arrow.right.circle" : "arrow.right.circle"
+        study.isPractice ? "play.circle" : "checkmark.circle"
+    }
+
+    /// Spells out what happens next, because the button no longer does: "Finished packing" is the same
+    /// label whether the next thing is another payload, the other condition, or the end of the study.
+    private var finishedPackingQuestion: String {
+        if study.isPractice { return "Finished with the practice payload?" }
+        if study.isOnLastBox { return "Finished packing this payload?" }
+        return study.switchesInputModeAfterCurrentBox
+            ? "Finished packing this payload and this condition?"
+            : "Finished packing this payload?"
+    }
+
+    private var finishedPackingDetail: String {
+        if study.isPractice {
+            return "Nothing from the practice payload is kept. The real study starts next."
+        }
+        let consequence: String
+        if study.isOnLastBox {
+            consequence = "this condition is finished and saved"
+        } else if study.switchesInputModeAfterCurrentBox {
+            consequence = "the next condition starts"
+        } else {
+            consequence = "the next payload starts"
+        }
+        return "Everything measured, weighed and loaded for this payload is recorded, and \(consequence). It cannot be reopened. The study password is asked for next."
     }
 
     /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
@@ -75,14 +96,15 @@ struct ArrangementView: View {
             let measured = store.measuredSizeMillimetres(for: id, in: captureEngine)
             let packaged = store.packagedSizeMillimetres(for: id, in: captureEngine)
             let placement = solution?.placements.first { $0.id == id }
+            let name = captureEngine.name(for: id) ?? "Unnamed"
             var photoName: String?
             if let data = captureEngine.snapshotJPEGData(for: id) {
-                photoName = study.storePhoto(data, objectID: id)
+                photoName = study.storePhoto(data, objectID: id, objectName: name)
             }
             records.append(
                 StudyObjectRecord(
                     id: id,
-                    name: captureEngine.name(for: id) ?? "Unnamed",
+                    name: name,
                     measuredSizeMillimetres: measured.map { [$0.x, $0.y, $0.z] } ?? [],
                     packagedSizeMillimetres: packaged.map { [$0.x, $0.y, $0.z] } ?? [],
                     assignedBoxName: store.selectedBoxPreset(for: id)?.name,
@@ -111,9 +133,6 @@ struct ArrangementView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    approachPicker
-                    nextBoxButton
-
                     if captureEngine.measuredObjectIDs.isEmpty {
                         emptyCard
                     } else if !missingPreparationIDs.isEmpty {
@@ -147,6 +166,8 @@ struct ArrangementView: View {
                             }
                         }
                     }
+
+                    nextBoxButton
                 }
                 .padding(20)
             }
@@ -195,6 +216,20 @@ struct ArrangementView: View {
                 }
             }
             .onDisappear { store.cancel() }
+        }
+        .alert(
+            finishedPackingQuestion,
+            isPresented: $showsFinishedPackingConfirmation
+        ) {
+            Button("Not yet", role: .cancel) {}
+            Button("Yes, finished") {
+                if !study.isPractice {
+                    recordCurrentBox()
+                }
+                showsNextBoxPassword = true
+            }
+        } message: {
+            Text(finishedPackingDetail)
         }
         .sheet(isPresented: $showsNextBoxPassword) { studyPasswordSheet }
     }
@@ -248,25 +283,11 @@ struct ArrangementView: View {
         return "Closes this box, stops its timers, and opens a white Start screen for the \(study.currentBox?.other.shortTitle ?? "next box")."
     }
 
-    private var approachPicker: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Picker("Arrangement method", selection: $store.approach) {
-                ForEach(PackingApproach.allCases) { approach in
-                    Text(approach.title).tag(approach)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            Text(
-                store.approach == .knapsack3D
-                    ? "Stacks packages in supported layers; some may be left out."
-                    : "Places every package on the floor and balances the load."
-            )
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-    }
+    // The method picker has deliberately been removed from this screen. Balance is still implemented
+    // and still selectable through `PackingStore.approach`, but the study runs the 3D knapsack, and
+    // offering a second arrangement method to a participant only invites a condition nobody planned
+    // for. Everything below the picker — including `resultContent` — is left intact for when the
+    // balance method is wanted again.
 
     // MARK: - States
 

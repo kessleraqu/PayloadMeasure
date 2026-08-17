@@ -42,10 +42,12 @@ struct BaldiResultView: View {
             if let solution = verifiedSolution,
                let verification = result.verification {
                 headline(solution)
-                interactivePacking(solution)
+                // Above the drawing, because putting the plan on the real table is what the operator
+                // does next; the drawing is for checking it afterwards.
                 if allowsRoomScaleAR {
                     placeOnTableButton
                 }
+                interactivePacking(solution)
                 openingInstruction
                 loadingGuide(solution, verification: verification)
                 if !solution.unloaded.isEmpty {

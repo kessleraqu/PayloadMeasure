@@ -507,10 +507,31 @@ struct MesOverlayView: View {
             || !captureEngine.hasCompletedObjectRecognitionWarmup
     }
 
+    /// Only what the crosshair is on may be offered for measurement. The mask processor already
+    /// refuses to preview anything else, and this repeats the rule in viewport terms because it is
+    /// the Measure button and the distance guide that act on it.
+    private func isUnderCrosshair(_ layer: ObjectMaskPreviewLayer) -> Bool {
+        let centre = CGPoint(x: 0.5, y: 0.5)
+        // Deliberately looser than the image-space rule: viewport and image coordinates do not scale
+        // alike, and this gate exists to reject the object at the edge, not to second-guess the mask.
+        let slack = ObjectMaskCandidatePolicy.aimWindowRadius
+        if let box = layer.referenceViewportBoundingBox {
+            return ObjectMaskCandidatePolicy.isAimedAt(
+                boundingBox: box,
+                aim: centre,
+                slack: slack
+            )
+        }
+        guard let point = layer.referenceAnchorPoint else {
+            return true
+        }
+        return hypot(point.x - centre.x, point.y - centre.y) <= slack
+    }
+
     private var liveMeasurementCandidateLayer: ObjectMaskPreviewLayer? {
         let viewportCentre = CGPoint(x: 0.5, y: 0.5)
         return captureEngine.objectMaskPreview?.layers
-            .filter { $0.trackedObjectID == nil }
+            .filter { $0.trackedObjectID == nil && isUnderCrosshair($0) }
             .min {
                 let lhs = $0.referenceAnchorPoint ?? viewportCentre
                 let rhs = $1.referenceAnchorPoint ?? viewportCentre

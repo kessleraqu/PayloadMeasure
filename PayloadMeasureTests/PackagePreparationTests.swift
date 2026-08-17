@@ -71,9 +71,9 @@ final class PackagePreparationTests: XCTestCase {
         let store = PackingStore()
 
         XCTAssertNil(engine.name(for: objectID), "A lock must not invent an object name.")
-        XCTAssertEqual(store.recommendedBoxPreset(for: objectID, in: engine)?.id, "120x90x40")
+        XCTAssertEqual(store.recommendedBoxPreset(for: objectID, in: engine)?.id, "120x90x30")
         XCTAssertTrue(
-            store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine)
+            store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine)
         )
         engine.updateName(id: objectID, name: "  Camera  ")
         engine.updatePackedWeight(id: objectID, weightInGrams: 43.7)
@@ -84,11 +84,11 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
 
         let package = try! XCTUnwrap(store.packages(from: engine).first)
-        XCTAssertEqual(package.size, SIMD3(120, 90, 40))
+        XCTAssertEqual(package.size, SIMD3(120, 90, 30))
         XCTAssertEqual(package.massKilograms, 0.0437, accuracy: 1e-12)
 
         let baldiItem = try! XCTUnwrap(store.baldiItems(from: engine).first)
-        XCTAssertEqual(baldiItem.size, SIMD3(120, 90, 40))
+        XCTAssertEqual(baldiItem.size, SIMD3(120, 90, 30))
         XCTAssertEqual(baldiItem.mass, 0.0437, accuracy: 1e-12)
     }
 
@@ -99,7 +99,7 @@ final class PackagePreparationTests: XCTestCase {
         let store = PackingStore()
 
         XCTAssertFalse(
-            store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine)
+            store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine)
         )
         XCTAssertNil(store.selectedBoxPreset(for: objectID))
         XCTAssertTrue(
@@ -182,7 +182,7 @@ final class PackagePreparationTests: XCTestCase {
         )
         let store = PackingStore()
 
-        XCTAssertTrue(store.selectBoxPreset(id: "120x90x40", for: preparedID, in: engine))
+        XCTAssertTrue(store.selectBoxPreset(id: "120x90x30", for: preparedID, in: engine))
         engine.updateName(id: preparedID, name: "Camera")
         engine.updatePackedWeight(id: preparedID, weightInGrams: 250)
         XCTAssertTrue(
@@ -194,10 +194,10 @@ final class PackagePreparationTests: XCTestCase {
         let packages = store.packages(from: engine)
         let baldiItems = store.baldiItems(from: engine)
         XCTAssertEqual(packages.map(\.id), [preparedID])
-        XCTAssertEqual(packages.first?.size, SIMD3(120, 90, 40))
+        XCTAssertEqual(packages.first?.size, SIMD3(120, 90, 30))
         XCTAssertEqual(packages.first?.massKilograms ?? 0, 0.25, accuracy: 1e-12)
         XCTAssertEqual(baldiItems.map(\.id), [preparedID])
-        XCTAssertEqual(baldiItems.first?.size, SIMD3(120, 90, 40))
+        XCTAssertEqual(baldiItems.first?.size, SIMD3(120, 90, 30))
         XCTAssertEqual(baldiItems.first?.mass ?? 0, 0.25, accuracy: 1e-12)
     }
 
@@ -253,7 +253,7 @@ final class PackagePreparationTests: XCTestCase {
         )
         XCTAssertTrue(store.packagesMissingPreparation(from: engine).contains(objectID))
         store.reconcilePreparationState(with: engine)
-        XCTAssertTrue(store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine))
+        XCTAssertTrue(store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine))
         engine.updateName(id: objectID, name: "Remeasured object")
         engine.updatePackedWeight(id: objectID, weightInGrams: 100)
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .ready)
@@ -290,7 +290,7 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .needsFittingBox)
         store.assignBoxesAutomatically(in: engine)
 
-        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x40")
+        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x30")
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .needsName)
     }
 
@@ -323,8 +323,8 @@ final class PackagePreparationTests: XCTestCase {
 
         store.setIsItsOwnBox(false, for: objectID, in: engine)
         store.assignBoxesAutomatically(in: engine)
-        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x40")
-        XCTAssertEqual(store.packagedSizeMillimetres(for: objectID, in: engine), SIMD3(120, 90, 40))
+        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x30")
+        XCTAssertEqual(store.packagedSizeMillimetres(for: objectID, in: engine), SIMD3(120, 90, 30))
     }
 
     func testAddedBoxBecomesAvailableToAssignmentAndRemovingItReleasesTheObject() {
@@ -383,11 +383,11 @@ final class PackagePreparationTests: XCTestCase {
 
         XCTAssertEqual(
             big.map(\.id),
-            ["35x22x115", "75x75x230", "95x95x160", "100x95x85", "130x100x105"]
+            ["35x22x115", "75x75x235", "95x95x160", "100x95x85", "130x100x105"]
         )
         XCTAssertEqual(
             small.map(\.id),
-            ["100x75x90", "120x90x40"]
+            ["100x75x90", "120x90x30"]
         )
         XCTAssertEqual(Set(big.map(\.id)).count, big.count)
         XCTAssertEqual(Set(small.map(\.id)).count, small.count)

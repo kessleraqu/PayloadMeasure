@@ -66,8 +66,10 @@ final class BoxCatalogue {
 
     // MARK: - Persistence
 
+    /// v3: two boxes were remeasured inside (235 mm deep and 30 mm high). A saved v2 list would have
+    /// restored the label sizes on upgrade, so the generation moves with the numbers.
     private static func key(for payload: StudyBox) -> String {
-        "packing.boxes.v2.\(payload.rawValue)"
+        "packing.boxes.v3.\(payload.rawValue)"
     }
 
     private static func load(for payload: StudyBox) -> [PackingBoxPreset] {

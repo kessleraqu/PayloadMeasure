@@ -109,6 +109,9 @@ private struct PackingPreparationView: View {
     @State private var currentIndex = 0
     @State private var drafts: [UUID: Draft] = [:]
     @State private var validationMessage: String?
+    /// Which fields Next refused. A message at the bottom of the screen is easy to miss; the field
+    /// that is actually empty is not.
+    @State private var invalidFields: Set<FocusedField> = []
 
     private var objectIDs: [UUID] {
         captureEngine.measuredObjectIDs
@@ -173,11 +176,15 @@ private struct PackingPreparationView: View {
         return ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 progressHeader
-                objectCard(for: objectID, allowsNameEditing: canPrepare)
+                objectCard(for: objectID)
 
                 if canPrepare {
                     boxCard(for: objectID)
-                    weightCard(for: objectID)
+                    // Name and weight are the only two things to type, so they are one card, one after
+                    // the other. They used to sit on either side of the box instructions, which read as
+                    // two unrelated jobs and left the second one easy to walk past.
+                    detailsCard(for: objectID)
+                    ownBoxCard(for: objectID)
                 } else {
                     noFittingBoxCard(for: objectID)
                 }
@@ -216,10 +223,7 @@ private struct PackingPreparationView: View {
         return Double(currentIndex + 1) / Double(objectIDs.count)
     }
 
-    private func objectCard(
-        for objectID: UUID,
-        allowsNameEditing: Bool
-    ) -> some View {
+    private func objectCard(for objectID: UUID) -> some View {
         HStack(alignment: .top, spacing: 12) {
             objectVisual(for: objectID)
                 .frame(width: 78, height: 78)
@@ -232,21 +236,9 @@ private struct PackingPreparationView: View {
                     .frame(width: 11, height: 11)
                     .accessibilityHidden(true)
 
-                if allowsNameEditing {
-                    TextField("Object name", text: nameBinding(for: objectID))
-                        .textInputAutocapitalization(.words)
-                        .font(.title3.weight(.semibold))
-                        .textFieldStyle(.roundedBorder)
-                        .focused($focusedField, equals: .name)
-                        .submitLabel(.done)
-                        .onSubmit { focusedField = nil }
-                        .accessibilityLabel("Object name")
-                        .accessibilityHint("This name appears in the loading plan.")
-                } else {
-                    Text(displayName(for: objectID))
-                        .font(.title3.weight(.semibold))
-                        .accessibilityLabel("Object name, \(displayName(for: objectID))")
-                }
+                Text(displayName(for: objectID))
+                    .font(.title3.weight(.semibold))
+                    .accessibilityLabel("Object, \(displayName(for: objectID))")
             }
 
             if let measured = store.measuredSizeMillimetres(for: objectID, in: captureEngine) {
@@ -315,20 +307,15 @@ private struct PackingPreparationView: View {
                             .foregroundStyle(.secondary)
                         Text(assigned.name)
                             .font(.title2.monospacedDigit().weight(.bold))
-                        Text("Smallest available box that fits")
+                        Text("Smallest available box that fits · inside measurements")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
-
-            Divider()
-
-            Toggle(isOn: ownBoxBinding(for: objectID)) {
-                Text("This object is already a box")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .accessibilityHint("Uses the measured dimensions as the package size, with no outer box.")
+            // The "already a box" switch used to live here, under the assigned box size. Next to an
+            // instruction to put the object in a box, a tick box about boxes reads as "done that" —
+            // which is not what it means at all. It is now its own card at the bottom.
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -340,6 +327,125 @@ private struct PackingPreparationView: View {
             RoundedRectangle(cornerRadius: 18)
                 .stroke(objectColour(for: objectID), lineWidth: 3)
         }
+    }
+
+    /// The two things the operator has to type, side by side and labelled, with whichever one Next
+    /// refused marked in place.
+    private func detailsCard(for objectID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Fill in both", systemImage: "square.and.pencil")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel("Name of this object", field: .name)
+                TextField("For example: red cable drum", text: nameBinding(for: objectID))
+                    .textInputAutocapitalization(.words)
+                    .font(.title3)
+                    .focused($focusedField, equals: .name)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .weight }
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 50)
+                    .background(fieldFill(.name), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(fieldStroke(.name), lineWidth: 2)
+                    }
+                    .accessibilityLabel("Name of this object")
+                    .accessibilityHint("This name appears in the loading plan.")
+                if invalidFields.contains(.name) {
+                    fieldWarning("A name is needed before you can continue.")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel("Weight of the finished package", field: .weight)
+                Text(weightInstruction(for: objectID, packageName: displayName(for: objectID)))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    TextField("0", text: packedWeightBinding(for: objectID))
+                        .keyboardType(.decimalPad)
+                        .focused($focusedField, equals: .weight)
+                        .font(.title3.monospacedDigit())
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 50)
+                        .background(fieldFill(.weight), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(fieldStroke(.weight), lineWidth: 2)
+                        }
+                        .accessibilityLabel("Total packed weight in grams")
+                        .accessibilityHint("Include the object, outer box and all packing material.")
+
+                    Text("g")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+                if invalidFields.contains(.weight) {
+                    fieldWarning("A weight in grams is needed before you can continue.")
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func fieldLabel(_ title: String, field: FocusedField) -> some View {
+        HStack(spacing: 5) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+            if invalidFields.contains(field) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func fieldWarning(_ text: String) -> some View {
+        Text(text)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func fieldFill(_ field: FocusedField) -> Color {
+        invalidFields.contains(field)
+            ? Color.red.opacity(0.10)
+            : Color.primary.opacity(0.06)
+    }
+
+    private func fieldStroke(_ field: FocusedField) -> Color {
+        invalidFields.contains(field) ? .red : .clear
+    }
+
+    /// Deliberately last, quiet, and phrased as a question about the object rather than as a task.
+    private func ownBoxCard(for objectID: UUID) -> some View {
+        let isOwnBox = store.isItsOwnBox(objectID, in: captureEngine)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: ownBoxBinding(for: objectID)) {
+                Text("This object is a box itself, so it does not go inside another one")
+                    .font(.subheadline.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(
+                isOwnBox
+                    ? "It will be loaded exactly as measured. Weigh it as it is."
+                    : "Leave this off if the object is going into one of the boxes. Only turn it on for something that is already a rigid box or case."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.tertiarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+        .accessibilityHint("Uses the measured dimensions as the package size, with no outer box.")
     }
 
     private func ownBoxBinding(for objectID: UUID) -> Binding<Bool> {
@@ -372,19 +478,15 @@ private struct PackingPreparationView: View {
 
             Toggle(isOn: ownBoxBinding(for: objectID)) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Already a box")
-                        .font(.subheadline.weight(.medium))
-                    Text("Keep it in the plan at its measured size, with no outer box.")
+                    Text("This object is a box itself, so it does not go inside another one")
+                        .font(.subheadline.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Turn this on to keep it in the plan at its measured size. Otherwise continue, and it is left out.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-
-            Text("Tick ‘already a box’ to keep it in the plan at its measured size. Otherwise continue to leave it out.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -397,39 +499,6 @@ private struct PackingPreparationView: View {
         .accessibilityLabel(
             "\(displayName(for: objectID)) does not fit any available box. Continue to leave it out of the loading plan. No name, box choice or packed weight is required."
         )
-    }
-
-    private func weightCard(for objectID: UUID) -> some View {
-        let packageName = displayName(for: objectID)
-
-        return VStack(alignment: .leading, spacing: 9) {
-            Label("2. Pack and weigh", systemImage: "scalemass")
-                .font(.headline)
-
-            Text(weightInstruction(for: objectID, packageName: packageName))
-                .font(.subheadline)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 10) {
-                TextField("Total packed weight", text: packedWeightBinding(for: objectID))
-                    .keyboardType(.decimalPad)
-                    .focused($focusedField, equals: .weight)
-                    .font(.title3.monospacedDigit())
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: 50)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
-                    .accessibilityLabel("Total packed weight in grams")
-                    .accessibilityHint("Include the object, outer box and all packing material.")
-
-                Text("g")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-            }
-
-        }
-        .padding(13)
-        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
     }
 
     private func nextButton(for objectID: UUID) -> some View {
@@ -574,11 +643,13 @@ private struct PackingPreparationView: View {
         change(&draft)
         drafts[objectID] = draft
         validationMessage = nil
+        invalidFields = []
     }
 
     private func saveAndAdvance(objectID: UUID) {
         focusedField = nil
         validationMessage = nil
+        invalidFields = []
 
         // Only exclude an object that actually needs a box and has none. An object marked "already
         // a box" needs no outer box, so excluding it here would throw away the name and weight just
@@ -596,13 +667,26 @@ private struct PackingPreparationView: View {
             return
         }
 
+        // Both fields are checked before returning, so an operator who left both blank is told about
+        // both at once rather than being sent back a second time for the other one.
         let name = drafts[objectID]?.nameText
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !name.isEmpty else {
-            validationMessage = "Enter a name for this object."
+        let weightText = drafts[objectID]?.packedWeightText ?? ""
+        let packedWeight = PositiveDecimalText.parse(weightText)
+        if name.isEmpty { invalidFields.insert(.name) }
+        if packedWeight == nil { invalidFields.insert(.weight) }
+        if !invalidFields.isEmpty {
+            validationMessage = invalidFields == [.name]
+                ? "Enter a name for this object."
+                : invalidFields == [.weight]
+                    ? "Enter the packed weight in grams, as a number greater than zero."
+                    : "Enter a name and the packed weight in grams before continuing."
+            focusedField = invalidFields.contains(.name) ? .name : .weight
             return
         }
         guard captureEngine.isNameAvailable(name, excluding: objectID) else {
+            invalidFields.insert(.name)
+            focusedField = .name
             validationMessage = "Another object is already called “\(name)”. Give this one a different name."
             return
         }
@@ -610,9 +694,10 @@ private struct PackingPreparationView: View {
             validationMessage = "No available box fits this object. Mark it as already a box only if that is correct."
             return
         }
-        guard let text = drafts[objectID]?.packedWeightText,
-              let packedWeightGrams = PositiveDecimalText.parse(text) else {
-            validationMessage = "Enter the total packed weight as a number greater than zero grams."
+        guard let packedWeightGrams = packedWeight else {
+            invalidFields.insert(.weight)
+            focusedField = .weight
+            validationMessage = "Enter the packed weight in grams, as a number greater than zero."
             return
         }
 
@@ -653,6 +738,7 @@ private struct PackingPreparationView: View {
     private func goBack() {
         focusedField = nil
         validationMessage = nil
+        invalidFields = []
         if currentIndex > 0 {
             currentIndex -= 1
         } else {

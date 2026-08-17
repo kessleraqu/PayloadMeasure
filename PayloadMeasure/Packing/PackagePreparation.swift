@@ -79,7 +79,8 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         case .big:
             sizes = [
                 SIMD3(35, 22, 115),
-                SIMD3(75, 75, 230),
+                // Measured inside rather than taken from the label: this one is 235 mm deep inside.
+                SIMD3(75, 75, 235),
                 SIMD3(95, 95, 160),
                 SIMD3(100, 95, 85),
                 SIMD3(130, 100, 105),
@@ -87,7 +88,8 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         case .small:
             sizes = [
                 SIMD3(100, 75, 90),
-                SIMD3(120, 90, 40),
+                // Also an inside measurement: the label says 40 mm, only 30 mm is usable.
+                SIMD3(120, 90, 30),
             ]
         }
         return sizes.compactMap {

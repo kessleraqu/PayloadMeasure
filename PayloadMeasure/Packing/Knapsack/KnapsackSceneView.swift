@@ -155,19 +155,37 @@ struct BaldiPlanView: View {
             .accessibilityLabel("Reset 3D view")
             .accessibilityHint("Returns the packing to its original camera angle and zoom.")
         }
-        .overlay(alignment: .bottomLeading) {
+        .overlay(alignment: .bottom) {
+            // Whichever package was tapped, said loudly and in that package's own colour. A caption in
+            // the corner made the operator hunt for the answer to the question they had just asked.
             if let placement = selectedPlacement {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("#\(numbering[placement.id] ?? 0)  \(placement.name)")
-                        .font(.caption.weight(.semibold))
+                let colour = colours[placement.id] ?? .accentColor
+                VStack(spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("#\(numbering[placement.id] ?? 0)")
+                            .font(.title3.weight(.heavy).monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .frame(minWidth: 38, minHeight: 30)
+                            .background(colour, in: .rect(cornerRadius: 8))
+                        Text(placement.name)
+                            .font(.title2.weight(.bold))
+                            .foregroundStyle(colour)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.6)
+                            .multilineTextAlignment(.leading)
+                    }
                     Text(BaldiOpeningMarker.description(for: placement))
-                        .font(.caption2)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(.regularMaterial, in: .rect(cornerRadius: 9))
-                .padding(10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .background(.regularMaterial, in: .rect(cornerRadius: 12))
+                .padding(8)
                 .accessibilityElement(children: .combine)
             }
         }

@@ -54,7 +54,7 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("Boxes")
                 } footer: {
-                    Text("Tap the bin, or swipe, to delete a box. An object fits when it fits inside in any of the six orientations, and the system always assigns the smallest box that fits.")
+                    Text("Every size here is the usable space **inside** the box. For most boxes that is what is written on them; two of the standard ones are smaller inside than their label says and are listed at their measured inside size. Tap the bin, or swipe, to delete a box. An object fits when it fits inside in any of the six orientations, and the system always assigns the smallest box that fits.")
                 }
 
                 Section {
@@ -73,7 +73,7 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("New box")
                 } footer: {
-                    Text("The size is the box's name, and it is taken as the space available inside. Nothing is subtracted for walls.")
+                    Text("Enter the space available inside the box, measured rather than read off the label. The size is also the box's name, and nothing is subtracted for walls.")
                 }
 
                 resetSection

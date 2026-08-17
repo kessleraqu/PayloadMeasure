@@ -203,7 +203,10 @@ final class ManualStudyWorkflowTests: XCTestCase {
         XCTAssertTrue(report.contains("Input tools : Manual measurement"))
         XCTAssertTrue(report.contains("Input     : Manual measurement"))
         XCTAssertFalse(report.contains("Input     : AR measurement"))
-        XCTAssertTrue(run.reportFileName.contains("-no-ar-"))
+        // The condition is part of the run's name, so it is part of its folder and its report.
+        XCTAssertEqual(run.exportBaseName, "report no AR")
+        XCTAssertTrue(run.reportFileName.hasPrefix("report no AR"))
+        XCTAssertTrue(run.reportFileName.hasSuffix(".txt"))
     }
 
     func testLegacyRunsRemainTwoBoxARStudies() throws {
