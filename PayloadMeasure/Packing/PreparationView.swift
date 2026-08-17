@@ -109,8 +109,6 @@ private struct PackingPreparationView: View {
     @State private var currentIndex = 0
     @State private var drafts: [UUID: Draft] = [:]
     @State private var validationMessage: String?
-    @State private var isShowingBoxCatalog = false
-    @State private var forcedSizeDrafts: [UUID: SIMD3<Double>] = [:]
 
     private var objectIDs: [UUID] {
         captureEngine.measuredObjectIDs
@@ -142,20 +140,6 @@ private struct PackingPreparationView: View {
                     }
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button {
-                            isShowingBoxCatalog = true
-                        } label: {
-                            Label("Boxes…", systemImage: "shippingbox")
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                    .accessibilityLabel("Preparation options")
-                    .accessibilityHint("Review the boxes, add a size, or delete one.")
-                }
-
                 if focusedField == .weight,
                    let currentObjectID {
                     ToolbarItemGroup(placement: .keyboard) {
@@ -177,14 +161,10 @@ private struct PackingPreparationView: View {
             }
         }
         .onAppear(perform: prepareDrafts)
-        .sheet(isPresented: $isShowingBoxCatalog, onDismiss: reassignBoxes) {
-            BoxCatalogView(catalogue: store.boxes) { store.reloadBoxes() }
-        }
     }
 
     private func preparationContent(for objectID: UUID) -> some View {
         let canPrepare = store.isItsOwnBox(objectID, in: captureEngine)
-            || store.forcedSize(for: objectID, in: captureEngine) != nil
             || !store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
 
         // Sized to fit an iPhone 13 without scrolling: the photo is a thumbnail beside the name
@@ -316,110 +296,49 @@ private struct PackingPreparationView: View {
     private func boxCard(for objectID: UUID) -> some View {
         let isOwnBox = store.isItsOwnBox(objectID, in: captureEngine)
         let assigned = store.selectedBoxPreset(for: objectID)
-        let forced = store.forcedSize(for: objectID, in: captureEngine)
 
-        VStack(alignment: .leading, spacing: 9) {
-            Label("1. Box this object", systemImage: "shippingbox")
-                .font(.headline)
-
-            if let forced {
-                Text("Loaded at **\(sizeText(forced))**, the size you entered.")
+        VStack(alignment: .leading, spacing: 12) {
+            if isOwnBox {
+                Label("NO OUTER BOX NEEDED", systemImage: "checkmark.seal.fill")
+                    .font(.headline.weight(.heavy))
+                    .foregroundStyle(objectColour(for: objectID))
+                Text("Use the object exactly as measured.")
                     .font(.subheadline)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if isOwnBox {
-                Text("This object is already a box, so it is loaded exactly as measured. Nothing to pack.")
-                    .font(.subheadline)
-                    .fixedSize(horizontal: false, vertical: true)
             } else if let assigned {
-                Text("Put it in the **\(assigned.name)** box — the smallest one it fits.")
-                    .font(.subheadline)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("\(PackingBoxPreset.sizeName(assigned.usableInnerSizeMillimetres)) inside")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Image(systemName: "shippingbox.fill")
+                        .font(.system(size: 34, weight: .bold))
+                        .foregroundStyle(objectColour(for: objectID))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("PUT IT IN THIS BOX")
+                            .font(.caption.weight(.heavy))
+                            .foregroundStyle(.secondary)
+                        Text(assigned.name)
+                            .font(.title2.monospacedDigit().weight(.bold))
+                        Text("Smallest available box that fits")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Divider()
 
             Toggle(isOn: ownBoxBinding(for: objectID)) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Already a box")
-                        .font(.subheadline.weight(.medium))
-                    Text("Load it at its measured size instead of putting it in one.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("This object is already a box")
+                    .font(.subheadline.weight(.semibold))
             }
             .accessibilityHint("Uses the measured dimensions as the package size, with no outer box.")
-            .disabled(forced != nil)
-
-            Toggle(isOn: forcedSizeBinding(for: objectID)) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enforce box size")
-                        .font(.subheadline.weight(.medium))
-                    Text("Plan around a size you type, when the measurement is wrong.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            if forced != nil {
-                HStack(spacing: 8) {
-                    forcedSizeField("L", axis: 0, objectID: objectID)
-                    forcedSizeField("W", axis: 1, objectID: objectID)
-                    forcedSizeField("H", axis: 2, objectID: objectID)
-                    Text("mm").font(.caption).foregroundStyle(.secondary)
-                }
-            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            Color(.secondarySystemGroupedBackground),
+            objectColour(for: objectID).opacity(0.12),
             in: RoundedRectangle(cornerRadius: 18)
         )
-    }
-
-    private func forcedSizeBinding(for objectID: UUID) -> Binding<Bool> {
-        Binding(
-            get: { store.forcedSize(for: objectID, in: captureEngine) != nil },
-            set: { isForced in
-                if isForced {
-                    let start = forcedSizeDrafts[objectID]
-                        ?? store.measuredSizeMillimetres(for: objectID, in: captureEngine)
-                            .map { SIMD3($0.x.rounded(), $0.y.rounded(), $0.z.rounded()) }
-                        ?? SIMD3(100, 100, 100)
-                    forcedSizeDrafts[objectID] = start
-                    store.setForcedSize(start, for: objectID, in: captureEngine)
-                } else {
-                    store.setForcedSize(nil, for: objectID, in: captureEngine)
-                    store.assignBoxesAutomatically(in: captureEngine)
-                }
-                validationMessage = nil
-            }
-        )
-    }
-
-    private func forcedSizeField(_ title: String, axis: Int, objectID: UUID) -> some View {
-        let binding = Binding<Double>(
-            get: { store.forcedSize(for: objectID, in: captureEngine)?[axis] ?? 100 },
-            set: { new in
-                var size = store.forcedSize(for: objectID, in: captureEngine)
-                    ?? SIMD3(100, 100, 100)
-                size[axis] = min(max(new.rounded(), 1), 999)
-                forcedSizeDrafts[objectID] = size
-                store.setForcedSize(size, for: objectID, in: captureEngine)
-            }
-        )
-        return HStack(spacing: 3) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            TextField(title, value: binding, format: .number.precision(.fractionLength(0)))
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 52)
-                .textFieldStyle(.roundedBorder)
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(objectColour(for: objectID), lineWidth: 3)
         }
     }
 
@@ -462,18 +381,7 @@ private struct PackingPreparationView: View {
                 }
             }
 
-            Toggle(isOn: forcedSizeBinding(for: objectID)) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enforce box size")
-                        .font(.subheadline.weight(.medium))
-                    Text("Plan around a size you type instead.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Text("Or enforce a size below, or add a box big enough from the menu at the top right.")
+            Text("Tick ‘already a box’ to keep it in the plan at its measured size. Otherwise continue to leave it out.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -672,11 +580,10 @@ private struct PackingPreparationView: View {
         focusedField = nil
         validationMessage = nil
 
-        // Only exclude an object that actually needs a box and has none. Marked "already a box" or
-        // given an enforced size, it needs no box at all — excluding it here would throw away the
-        // name and weight just typed and leave it permanently incomplete.
+        // Only exclude an object that actually needs a box and has none. An object marked "already
+        // a box" needs no outer box, so excluding it here would throw away the name and weight just
+        // typed and leave it permanently incomplete.
         let needsNoBox = store.isItsOwnBox(objectID, in: captureEngine)
-            || store.forcedSize(for: objectID, in: captureEngine) != nil
         if !needsNoBox, store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty {
             guard store.markExcludedBecauseNoStockedBoxFits(
                 objectID,
@@ -700,7 +607,7 @@ private struct PackingPreparationView: View {
             return
         }
         guard store.packagedSizeMillimetres(for: objectID, in: captureEngine) != nil else {
-            validationMessage = "No box fits this object any more. Add a bigger box, or mark the object as already a box."
+            validationMessage = "No available box fits this object. Mark it as already a box only if that is correct."
             return
         }
         guard let text = drafts[objectID]?.packedWeightText,
@@ -759,7 +666,7 @@ private struct PackingPreparationView: View {
         if let name, !name.isEmpty {
             return name
         }
-        return "Unnamed object"
+        return "Object \((objectIDs.firstIndex(of: objectID) ?? 0) + 1)"
     }
 
     private func objectColour(for objectID: UUID) -> Color {
@@ -783,10 +690,4 @@ private struct PackingPreparationView: View {
         return "Pack \(packageName), then weigh it."
     }
 
-    /// Boxes are assigned by the system, so a new or deleted box size can change what an object
-    /// should go in. Re-run the assignment whenever the catalogue is edited.
-    private func reassignBoxes() {
-        store.assignBoxesAutomatically(in: captureEngine)
-        validationMessage = nil
-    }
 }

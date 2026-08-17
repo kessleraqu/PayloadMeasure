@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 import simd
 @testable import PayloadMeasure
 
@@ -68,5 +69,19 @@ final class PackingARVisualGeometryTests: XCTestCase {
             0.00225,
             accuracy: 0.000_001
         )
+    }
+
+    func testOneFingerDragMovesAtConstantSurfaceHeightWithoutARaycast() {
+        let moved = PackingARVisualGeometry.draggedPosition(
+            from: SIMD3(1, 0.7, 2),
+            screenRight: SIMD2(1, 0),
+            screenUp: SIMD2(0, -1),
+            screenDelta: CGPoint(x: 80, y: 40),
+            cameraDistance: 0.5,
+            surfaceHeight: 0.7
+        )
+        XCTAssertEqual(moved.x, 1.05, accuracy: 0.000_001)
+        XCTAssertEqual(moved.y, 0.7, accuracy: 0.000_001)
+        XCTAssertEqual(moved.z, 2.025, accuracy: 0.000_001)
     }
 }

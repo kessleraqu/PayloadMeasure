@@ -85,6 +85,33 @@ nonisolated enum BaldiOpeningMarker {
         return (normal, length, width)
     }
 
+    /// L × W faces that touch another package. Their orientation line remains useful, but is dotted
+    /// to show that the physical face is covered rather than exposed.
+    static func coveredFaceSigns(
+        for placement: BaldiPlacement,
+        among placements: [BaldiPlacement],
+        tolerance: Double = 1e-6
+    ) -> Set<Int> {
+        guard let axes = faceAxes(for: placement) else { return [] }
+        let normal = axes.normal
+        let sideAxes = [0, 1, 2].filter { $0 != normal }
+        var covered: Set<Int> = []
+        for other in placements where other.id != placement.id {
+            let overlapsFace = sideAxes.allSatisfy { axis in
+                min(placement.maximum[axis], other.maximum[axis])
+                    - max(placement.origin[axis], other.origin[axis]) > tolerance
+            }
+            guard overlapsFace else { continue }
+            if abs(other.maximum[normal] - placement.origin[normal]) <= tolerance {
+                covered.insert(-1)
+            }
+            if abs(other.origin[normal] - placement.maximum[normal]) <= tolerance {
+                covered.insert(1)
+            }
+        }
+        return covered
+    }
+
     static func description(for placement: BaldiPlacement) -> String {
         switch containerAxis(for: placement) {
         case 0: "Opening and length along the container"
@@ -287,7 +314,20 @@ struct BaldiLayerFootprintView: View {
             length.move(to: CGPoint(x: rect.midX, y: rect.minY + inset))
             length.addLine(to: CGPoint(x: rect.midX, y: rect.maxY - inset))
         }
-        context.stroke(length, with: .color(.black.opacity(0.82)), lineWidth: 2.4)
+        let topLWFaceIsCovered = BaldiOpeningMarker.faceAxes(for: placement)?.normal == 2
+            && BaldiOpeningMarker.coveredFaceSigns(
+                for: placement,
+                among: solution.placements
+            ).contains(1)
+        context.stroke(
+            length,
+            with: .color(.black.opacity(0.82)),
+            style: StrokeStyle(
+                lineWidth: 2.4,
+                lineCap: .round,
+                dash: topLWFaceIsCovered ? [5, 4] : []
+            )
+        )
     }
 
     private var directSupporters: Set<UUID> {
@@ -476,6 +516,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
             guard presentation.isVisible else { continue }
             SceneBuilder.addPackage(
                 placement,
+                among: solution.placements,
                 number: numbering[placement.id],
                 colour: UIColor(colours[placement.id] ?? .accentColor),
                 presentation: presentation,
@@ -761,6 +802,7 @@ private enum SceneBuilder {
 
     static func addPackage(
         _ placement: BaldiPlacement,
+        among allPlacements: [BaldiPlacement],
         number: Int?,
         colour: UIColor,
         presentation: PackagePresentation,
@@ -778,6 +820,7 @@ private enum SceneBuilder {
         )
         package.materials = packageMaterials(
             for: placement,
+            among: allPlacements,
             colour: colour,
             softening: presentation.softening,
             highlighted: presentation.isHighlighted
@@ -887,6 +930,7 @@ private enum SceneBuilder {
     /// have a marker protrude into their neighbour.
     private static func packageMaterials(
         for placement: BaldiPlacement,
+        among allPlacements: [BaldiPlacement],
         colour: UIColor,
         softening: CGFloat,
         highlighted: Bool
@@ -901,27 +945,31 @@ private enum SceneBuilder {
         // SCNBox material order is front(+z), right(+x), back(-z), left(-x), top(+y), bottom(-y).
         var result = Array(repeating: base, count: 6)
         guard let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return result }
-        let markedFaces: [Int]
+        let markedFaces: [(index: Int, sign: Int)]
         let lineIsHorizontal: Bool
         switch axes.normal {
         case 0:
-            markedFaces = [1, 3]
+            markedFaces = [(1, 1), (3, -1)]
             lineIsHorizontal = axes.length == 1
         case 1:
-            markedFaces = [0, 2]
+            markedFaces = [(0, 1), (2, -1)]
             lineIsHorizontal = axes.length == 0
         default:
-            markedFaces = [4, 5]
+            markedFaces = [(4, 1), (5, -1)]
             lineIsHorizontal = axes.length == 0
         }
 
-        let marked = markedFaceMaterial(
-            colour: baseColour,
-            lineIsHorizontal: lineIsHorizontal,
-            highlighted: highlighted ? colour : nil
+        let covered = BaldiOpeningMarker.coveredFaceSigns(
+            for: placement,
+            among: allPlacements
         )
-        for index in markedFaces {
-            result[index] = marked
+        for face in markedFaces {
+            result[face.index] = markedFaceMaterial(
+                colour: baseColour,
+                lineIsHorizontal: lineIsHorizontal,
+                isDotted: covered.contains(face.sign),
+                highlighted: highlighted ? colour : nil
+            )
         }
         return result
     }
@@ -929,6 +977,7 @@ private enum SceneBuilder {
     private static func markedFaceMaterial(
         colour: UIColor,
         lineIsHorizontal: Bool,
+        isDotted: Bool,
         highlighted: UIColor?
     ) -> SCNMaterial {
         let faceColour = darkened(colour, by: 0.4)
@@ -954,6 +1003,9 @@ private enum SceneBuilder {
             }
             path.lineWidth = side * 0.06
             path.lineCapStyle = .round
+            if isDotted {
+                path.setLineDash([side * 0.09, side * 0.075], count: 2, phase: 0)
+            }
             lineColour.setStroke()
             path.stroke()
         }

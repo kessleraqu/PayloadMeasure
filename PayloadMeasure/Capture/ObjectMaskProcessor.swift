@@ -599,29 +599,16 @@ actor ObjectMaskProcessor {
         case unchanged
     }
 
-    private static let lockedColors = [
-        ObjectMaskDisplayColor(red: 1.00, green: 0.78, blue: 0.12),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.22, blue: 0.62),
-        ObjectMaskDisplayColor(red: 0.20, green: 0.95, blue: 0.42),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.42, blue: 0.10),
-        ObjectMaskDisplayColor(red: 0.64, green: 0.38, blue: 1.00),
-        ObjectMaskDisplayColor(red: 0.20, green: 0.55, blue: 1.00),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.30, blue: 0.28),
-        ObjectMaskDisplayColor(red: 0.16, green: 0.92, blue: 0.78),
-        ObjectMaskDisplayColor(red: 0.72, green: 1.00, blue: 0.16),
-        ObjectMaskDisplayColor(red: 0.78, green: 0.55, blue: 1.00),
-        ObjectMaskDisplayColor(red: 0.10, green: 0.82, blue: 1.00),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.55, blue: 0.45),
-        ObjectMaskDisplayColor(red: 0.95, green: 0.62, blue: 0.05),
-        ObjectMaskDisplayColor(red: 0.45, green: 1.00, blue: 0.72),
-        ObjectMaskDisplayColor(red: 0.95, green: 0.20, blue: 0.35)
-    ]
+    private static let lockedColors = ObjectColourPalette.colours
 
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
     private let segmentationRequest = GenerateForegroundInstanceMaskRequest()
     private let livePreviewID = UUID()
     private var trackedObjects: [TrackedObject] = []
+    /// Finished masks are intentionally no longer tracked, but their colour remains reserved so the
+    /// next object cannot silently reuse it.
+    private var reservedColorIndexesByID: [UUID: Int] = [:]
     private var trackingGeneration: Int?
     private var hasWarmedAppearanceSignature = false
     private var hasWarmedScaledMask = false
@@ -631,6 +618,16 @@ actor ObjectMaskProcessor {
         if trackingGeneration != frame.trackingGeneration {
             trackedObjects.removeAll()
             trackingGeneration = frame.trackingGeneration
+        }
+        var colourOwners = frame.finalizedObjectIDs
+        if let activeObjectID = frame.activeObjectID {
+            colourOwners.insert(activeObjectID)
+        }
+        if let proposedLockID = frame.toggleRequest?.proposedLockID {
+            colourOwners.insert(proposedLockID)
+        }
+        reservedColorIndexesByID = reservedColorIndexesByID.filter {
+            colourOwners.contains($0.key)
         }
         // Only the object being measured is tracked. Every finished one used to be kept here for the
         // rest of the session, and Vision re-tracked all of them on every pass, so each object saved
@@ -1233,7 +1230,7 @@ actor ObjectMaskProcessor {
             )
         }
 
-        guard trackedObjects.count < Self.lockedColors.count,
+        guard reservedColorIndexesByID.count < Self.lockedColors.count,
               let candidate = try lockCandidate(
                   near: point,
                   preferredInstances: tappedInstances,
@@ -1250,6 +1247,7 @@ actor ObjectMaskProcessor {
 
         let instance = candidate.instance
         let geometry = candidate.geometry
+        let colorIndex = colorIndex(for: proposedLockID)
 
         let initialObservation = DetectedObjectObservation(boundingBox: geometry.boundingBox)
         let tracker = TrackObjectRequest(detectedObject: initialObservation)
@@ -1261,7 +1259,7 @@ actor ObjectMaskProcessor {
         trackedObjects.append(
             TrackedObject(
                 id: proposedLockID,
-                colorIndex: firstAvailableColorIndex(),
+                colorIndex: colorIndex,
                 request: tracker,
                 referenceGeometry: geometry,
                 anchorOffset: anchorOffset,
@@ -1319,8 +1317,16 @@ actor ObjectMaskProcessor {
     }
 
     private func firstAvailableColorIndex() -> Int {
-        let usedColors = Set(trackedObjects.map(\.colorIndex))
+        let usedColors = Set(reservedColorIndexesByID.values)
+            .union(trackedObjects.map(\.colorIndex))
         return Self.lockedColors.indices.first(where: { !usedColors.contains($0) }) ?? 0
+    }
+
+    private func colorIndex(for id: UUID) -> Int {
+        if let existing = reservedColorIndexesByID[id] { return existing }
+        let index = firstAvailableColorIndex()
+        reservedColorIndexesByID[id] = index
+        return index
     }
 
     private func imagePoint(

@@ -71,6 +71,11 @@ final class StudyTransitionTests: XCTestCase {
         XCTAssertFalse(store.isOnLastBox)
 
         store.advanceToNextBox()
+        XCTAssertNil(store.currentBox, "The second payload waits behind a neutral Start screen.")
+        XCTAssertEqual(store.scheduledBox, .big)
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertNil(store.currentPhase)
+        store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .big, "The second box is always the other one.")
         XCTAssertTrue(store.isOnLastBox)
 
@@ -79,6 +84,27 @@ final class StudyTransitionTests: XCTestCase {
         let run = try! XCTUnwrap(store.activeRun)
         XCTAssertEqual(run.boxOrder, [.small, .big])
         XCTAssertTrue(store.saved.contains { $0.id == run.id }, "A finished run must be archived.")
+    }
+
+    func testSinglePayloadRunsFromThePreviousVersionKeepTheirOriginalMeaning() {
+        var previousRun = StudyRun(
+            id: UUID(),
+            participantName: "Legacy single payload",
+            studyDate: Date(),
+            createdAt: Date(),
+            flow: MeasurementFlow.batch.rawValue,
+            firstBox: .big
+        )
+        previousRun.inputPlan = .manualOnly
+        previousRun.firstInputMode = .manual
+
+        XCTAssertNil(previousRun.includesBothPayloads)
+        XCTAssertEqual(previousRun.boxOrder, [.big])
+        XCTAssertEqual(previousRun.inputModeOrder, [.manual])
+
+        previousRun.includesBothPayloads = true
+        XCTAssertEqual(previousRun.boxOrder, [.big, .small])
+        XCTAssertEqual(previousRun.inputModeOrder, [.manual, .manual])
     }
 
     /// The practice payload exists so a participant can learn the app on something that does not
@@ -124,6 +150,10 @@ final class StudyTransitionTests: XCTestCase {
         store.startRealStudy()
 
         XCTAssertFalse(store.isPractice)
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertNil(store.currentBox)
+        XCTAssertNil(store.currentPhase)
+        store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .big, "The study starts on the chosen first box.")
         XCTAssertEqual(store.activeRun?.boxes.count, 1)
         let first = try XCTUnwrap(store.activeRun?.boxes.first)
@@ -180,6 +210,9 @@ final class StudyTransitionTests: XCTestCase {
                 store.finishRun()
             } else {
                 store.advanceToNextBox()
+                XCTAssertTrue(store.isAwaitingParticipantStart)
+                XCTAssertNil(store.currentPhase)
+                store.beginParticipantSession()
             }
         }
 
@@ -257,5 +290,39 @@ final class StudyTransitionTests: XCTestCase {
         store.beginPhase(.payload, at: loadingStart)
         XCTAssertEqual(store.currentPhase, .payload)
         XCTAssertEqual(store.elapsedSeconds(for: .payload, at: loadingStart), 0, accuracy: 0.0001)
+    }
+
+    func testSecondPayloadHasAWhiteHandoffAndIndependentTimers() {
+        let store = StudyStore()
+        store.startRun(
+            participantName: "two-timers-\(UUID().uuidString)",
+            studyDate: Date(),
+            flow: .batch,
+            firstBox: .small,
+            includesPractice: false,
+            inputPlan: .arOnly
+        )
+        store.beginParticipantSession()
+        store.endCurrentPhase()
+        let start = Date().addingTimeInterval(100)
+        store.beginPhase(.measure, at: start)
+        store.endCurrentPhase(at: start.addingTimeInterval(9))
+        XCTAssertEqual(store.elapsedSeconds(for: .measure), 9, accuracy: 0.0001)
+
+        store.advanceToNextBox()
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertEqual(store.scheduledBox, .big)
+        XCTAssertNil(store.currentPhase)
+        XCTAssertEqual(store.elapsedSeconds(for: .measure), 0)
+
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .big)
+        XCTAssertEqual(store.currentPhase, .measure)
+        XCTAssertEqual(store.elapsedSeconds(for: .measure), 0, accuracy: 0.05)
+        XCTAssertEqual(
+            store.activeRun?.result(for: .small)?.seconds(for: .measure) ?? -1,
+            9,
+            accuracy: 0.0001
+        )
     }
 }

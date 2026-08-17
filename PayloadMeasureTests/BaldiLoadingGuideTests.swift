@@ -34,6 +34,45 @@ final class BaldiLoadingGuideTests: XCTestCase {
         }
     }
 
+    func testOpeningLineIsMarkedCoveredOnlyOnTheTouchingLWFace() {
+        let package = BaldiTestFixtures.placement(
+            name: "Lower",
+            origin: .zero,
+            size: SIMD3(20, 20, 10)
+        )
+        let upper = BaldiTestFixtures.placement(
+            name: "Upper",
+            origin: SIMD3(5, 5, 10),
+            size: SIMD3(10, 10, 5)
+        )
+
+        XCTAssertEqual(
+            BaldiOpeningMarker.coveredFaceSigns(
+                for: package,
+                among: [package, upper]
+            ),
+            Set([1])
+        )
+        XCTAssertEqual(
+            BaldiOpeningMarker.coveredFaceSigns(
+                for: upper,
+                among: [package, upper]
+            ),
+            Set([-1])
+        )
+    }
+
+    func testSideContactDoesNotDotANonTouchingLWFace() {
+        let first = BaldiTestFixtures.placement(origin: .zero)
+        let beside = BaldiTestFixtures.placement(origin: SIMD3(10, 0, 0))
+        XCTAssertTrue(
+            BaldiOpeningMarker.coveredFaceSigns(
+                for: first,
+                among: [first, beside]
+            ).isEmpty
+        )
+    }
+
     func testFloorPackagesAtTheSameBaseShareLayerOne() {
         let first = BaldiTestFixtures.placement(
             name: "First",

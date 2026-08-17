@@ -237,7 +237,7 @@ struct ArrangementView: View {
 
     private var passwordSheetMessage: String {
         if study.isPractice {
-            return "Clears the practice payload, none of which is recorded, and starts the study on the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
+            return "Clears the unrecorded practice payload and opens a white Start screen for the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
         }
         if study.isOnLastBox {
             return "Saves this condition and returns to the main setup screen. The other condition can then be configured separately."
@@ -245,7 +245,7 @@ struct ArrangementView: View {
         if let nextMode = study.nextInputMode, study.switchesInputModeAfterCurrentBox {
             return "Closes this payload and starts \(nextMode.title.lowercased()) on the \(study.currentBox?.other.shortTitle ?? "next box"), without returning to setup."
         }
-        return "Closes this box and starts the participant on the \(study.currentBox?.other.shortTitle ?? "next box")."
+        return "Closes this box, stops its timers, and opens a white Start screen for the \(study.currentBox?.other.shortTitle ?? "next box")."
     }
 
     private var approachPicker: some View {

@@ -6,7 +6,6 @@ import simd
 
 struct ManualMeasurementView: View {
     private enum FocusedField: Hashable {
-        case name
         case length
         case width
         case height
@@ -19,7 +18,6 @@ struct ManualMeasurementView: View {
     let onRunCancelled: () -> Void
 
     @State private var packingStore = PackingStore()
-    @State private var nameText = ""
     @State private var lengthText = ""
     @State private var widthText = ""
     @State private var heightText = ""
@@ -91,7 +89,7 @@ struct ManualMeasurementView: View {
             }
             Button("Keep measuring", role: .cancel) {}
         } message: {
-            Text("Check that every object has a name and all three dimensions before continuing.")
+            Text("Check that every object has all three dimensions before continuing. Names are entered while packing and weighing.")
         }
         .confirmationDialog(
             "Reset all manual measurements?",
@@ -101,7 +99,7 @@ struct ManualMeasurementView: View {
             Button("Reset everything", role: .destructive, action: onFullReset)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Clears every entered size, name, box, weight and loading plan for this payload.")
+            Text("Clears every entered size, box, weight and loading plan for this payload.")
         }
         .confirmationDialog(
             "Remove this object?",
@@ -111,7 +109,7 @@ struct ManualMeasurementView: View {
             Button("Remove object", role: .destructive) { removePendingObject() }
             Button("Cancel", role: .cancel) { pendingRemovalID = nil }
         } message: {
-            Text("Its dimensions, name, package choice and weight will be removed.")
+            Text("Its dimensions, package choice and weight will be removed.")
         }
     }
 
@@ -174,15 +172,10 @@ struct ManualMeasurementView: View {
             )
             .font(.headline)
 
-            Text("Use a ruler or calliper. Enter the object's name and three outside dimensions in millimetres.")
+            Text("Use a ruler or calliper and enter the three outside dimensions in millimetres. You will name the object while packing and weighing it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            TextField("Object name", text: $nameText)
-                .textInputAutocapitalization(.words)
-                .textFieldStyle(.roundedBorder)
-                .focused($focusedField, equals: .name)
 
             HStack(spacing: 8) {
                 dimensionField("Length", text: $lengthText, field: .length)
@@ -275,7 +268,7 @@ struct ManualMeasurementView: View {
             .clipShape(.rect(cornerRadius: 11))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(captureEngine.name(for: id) ?? "Unnamed object")
+                Text(manualObjectTitle(id))
                     .font(.subheadline.weight(.semibold))
                 Text(sizeText(for: id))
                     .font(.caption.monospacedDigit())
@@ -301,7 +294,7 @@ struct ManualMeasurementView: View {
                     .frame(width: 44, height: 44)
                     .contentShape(Circle())
             }
-            .accessibilityLabel("Options for \(captureEngine.name(for: id) ?? "object")")
+            .accessibilityLabel("Options for \(manualObjectTitle(id))")
         }
         .padding(12)
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 16))
@@ -359,11 +352,6 @@ struct ManualMeasurementView: View {
     private func saveDraft() {
         focusedField = nil
         validationMessage = nil
-        let name = nameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            validationMessage = "Enter a name for this object."
-            return
-        }
         let values = [lengthText, widthText, heightText].compactMap(PositiveDecimalText.parse)
         guard values.count == 3 else {
             validationMessage = "Enter all three dimensions as numbers greater than zero."
@@ -372,25 +360,16 @@ struct ManualMeasurementView: View {
         let size = SIMD3(values[0], values[1], values[2])
 
         if let editingObjectID {
-            guard captureEngine.isNameAvailable(name, excluding: editingObjectID) else {
-                validationMessage = "Another object already has this name."
-                return
-            }
             packingStore.clearPreparation(for: editingObjectID)
             guard captureEngine.updateManualMeasurement(
                 id: editingObjectID,
-                name: name,
                 sizeMillimetres: size
             ) else {
                 validationMessage = "These dimensions could not be saved."
                 return
             }
         } else {
-            guard captureEngine.isNameAvailable(name, excluding: nil) else {
-                validationMessage = "Another object already has this name."
-                return
-            }
-            guard captureEngine.addManualMeasurement(name: name, sizeMillimetres: size) != nil else {
+            guard captureEngine.addManualMeasurement(sizeMillimetres: size) != nil else {
                 validationMessage = "These dimensions could not be added."
                 return
             }
@@ -403,17 +382,15 @@ struct ManualMeasurementView: View {
             return
         }
         editingObjectID = id
-        nameText = captureEngine.name(for: id) ?? ""
         lengthText = PositiveDecimalText.format(size.x, maximumFractionDigits: 2) ?? ""
         widthText = PositiveDecimalText.format(size.y, maximumFractionDigits: 2) ?? ""
         heightText = PositiveDecimalText.format(size.z, maximumFractionDigits: 2) ?? ""
         validationMessage = nil
-        focusedField = .name
+        focusedField = .length
     }
 
     private func clearDraft() {
         editingObjectID = nil
-        nameText = ""
         lengthText = ""
         widthText = ""
         heightText = ""
@@ -431,6 +408,11 @@ struct ManualMeasurementView: View {
     private func objectColour(_ id: UUID) -> Color {
         guard let colour = captureEngine.objectColor(for: id) else { return .cyan }
         return Color(red: colour.red, green: colour.green, blue: colour.blue)
+    }
+
+    private func manualObjectTitle(_ id: UUID) -> String {
+        if let name = captureEngine.name(for: id), !name.isEmpty { return name }
+        return "Object \((objectIDs.firstIndex(of: id) ?? 0) + 1)"
     }
 
     private func sizeText(for id: UUID) -> String {

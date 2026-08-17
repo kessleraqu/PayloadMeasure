@@ -11,8 +11,8 @@ import simd
 // A run is written as soon as it is created and rewritten after every change, so a crash mid-study
 // loses at most the box in progress.
 
-/// The two payload modules available to a study. New runs use the selected module only. The `other`
-/// relationship remains for decoding study files made by the earlier two-box workflow.
+/// The two payload modules available to a study. The setup choice determines their order; every
+/// selected input condition completes both modules.
 enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     case big
     case small
@@ -77,7 +77,7 @@ enum StudyInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
 }
 
 /// The selected measurement condition. `both` remains decodable for study files made before the
-/// conditions were split into independent runs; the current setup screen creates only single modes.
+/// AR and no-AR conditions were split into independent runs.
 enum StudyInputPlan: String, Codable, CaseIterable, Identifiable, Sendable {
     case both
     case arOnly
@@ -184,6 +184,9 @@ struct StudyRun: Codable, Identifiable, Sendable {
     /// Optional migration fields. Legacy runs were AR-only.
     var inputPlan: StudyInputPlan? = nil
     var firstInputMode: StudyInputMode? = nil
+    /// New study runs complete both payload sizes. Nil preserves the one-payload interpretation of
+    /// AR-only/no-AR-only files recorded by the immediately preceding app version.
+    var includesBothPayloads: Bool? = nil
     /// Whether the participant had a practice payload first. Optional so runs recorded before the
     /// practice run existed still decode; those read as unknown rather than as "no".
     var includedPracticeRun: Bool?
@@ -195,8 +198,10 @@ struct StudyRun: Codable, Identifiable, Sendable {
     }
 
     var boxOrder: [StudyBox] {
-        // Nil is a legacy run, recorded when every participant always completed both boxes with AR.
-        inputPlan == nil || inputPlan == .both ? [firstBox, firstBox.other] : [firstBox]
+        if inputPlan == nil || inputPlan == .both || includesBothPayloads == true {
+            return [firstBox, firstBox.other]
+        }
+        return [firstBox]
     }
 
     var resolvedInputPlan: StudyInputPlan { inputPlan ?? .arOnly }
@@ -206,7 +211,14 @@ struct StudyRun: Codable, Identifiable, Sendable {
         guard let inputPlan else {
             return Array(repeating: .augmentedReality, count: boxOrder.count)
         }
-        return inputPlan.modes(first: resolvedFirstInputMode)
+        switch inputPlan {
+        case .both:
+            return inputPlan.modes(first: resolvedFirstInputMode)
+        case .arOnly:
+            return Array(repeating: .augmentedReality, count: boxOrder.count)
+        case .manualOnly:
+            return Array(repeating: .manual, count: boxOrder.count)
+        }
     }
 
     func inputMode(for box: StudyBox) -> StudyInputMode {

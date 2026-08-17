@@ -4,7 +4,7 @@ import simd
 
 @MainActor
 final class ManualStudyWorkflowTests: XCTestCase {
-    func testARAndManualAreSeparateSingleConditionRuns() {
+    func testARAndManualAreSeparateTwoPayloadRuns() {
         let participant = "separate-\(UUID().uuidString)"
         let store = StudyStore()
         store.startRun(
@@ -20,9 +20,15 @@ final class ManualStudyWorkflowTests: XCTestCase {
         store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .big)
         XCTAssertEqual(store.currentInputMode, .manual)
-        XCTAssertNil(store.nextInputMode)
-        XCTAssertTrue(store.isOnLastBox)
+        XCTAssertEqual(store.nextInputMode, .manual)
+        XCTAssertFalse(store.isOnLastBox)
         XCTAssertEqual(StudyStore.nextBoxPassword, "130802")
+        store.advanceToNextBox()
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .small)
+        XCTAssertEqual(store.currentInputMode, .manual)
+        XCTAssertTrue(store.isOnLastBox)
         store.finishRun()
         store.returnToSetupAfterCompletion()
         XCTAssertNil(store.activeRun, "Finishing returns to setup instead of opening another condition.")
@@ -44,13 +50,17 @@ final class ManualStudyWorkflowTests: XCTestCase {
         store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .small)
         XCTAssertEqual(store.currentInputMode, .augmentedReality)
+        XCTAssertFalse(store.isOnLastBox)
+        store.advanceToNextBox()
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .big)
         XCTAssertTrue(store.isOnLastBox)
         store.finishRun()
         XCTAssertNotNil(store.savedRun(named: participant, inputMode: .manual))
         XCTAssertNotNil(store.savedRun(named: participant, inputMode: .augmentedReality))
     }
 
-    func testSingleConditionPlansUseOneStandalonePayload() {
+    func testSelectedConditionRepeatsAcrossBothPayloads() {
         let cases: [(StudyInputPlan, StudyInputMode)] = [
             (.arOnly, .augmentedReality),
             (.manualOnly, .manual)
@@ -70,10 +80,16 @@ final class ManualStudyWorkflowTests: XCTestCase {
             XCTAssertFalse(store.hasActiveSession)
             store.beginParticipantSession()
             XCTAssertEqual(store.currentInputMode, expected)
-            XCTAssertNil(store.nextInputMode)
+            XCTAssertEqual(store.nextInputMode, expected)
             XCTAssertFalse(store.switchesInputModeAfterCurrentBox)
+            XCTAssertFalse(store.isOnLastBox)
+            XCTAssertEqual(store.activeRun?.boxOrder, [.big, .small])
+            store.advanceToNextBox()
+            XCTAssertTrue(store.isAwaitingParticipantStart)
+            XCTAssertNil(store.currentPhase)
+            store.beginParticipantSession()
+            XCTAssertEqual(store.currentInputMode, expected)
             XCTAssertTrue(store.isOnLastBox)
-            XCTAssertEqual(store.activeRun?.boxOrder, [.big])
             store.finishRun()
             XCTAssertTrue(store.hasFinishedAllBoxes)
         }
@@ -96,6 +112,8 @@ final class ManualStudyWorkflowTests: XCTestCase {
 
         store.beginParticipantSession()
         store.startRealStudy()
+        XCTAssertTrue(store.isAwaitingParticipantStart)
+        store.beginParticipantSession()
         XCTAssertEqual(store.currentInputMode, .manual)
         XCTAssertEqual(store.activeRun?.boxes.first?.inputMode, .manual)
     }
@@ -135,6 +153,20 @@ final class ManualStudyWorkflowTests: XCTestCase {
         XCTAssertEqual(packages.first?.name, "Power bank edited")
         XCTAssertEqual(packages.first?.size, SIMD3(97, 66, 16))
         XCTAssertEqual(try XCTUnwrap(packages.first?.massKilograms), 0.25, accuracy: 1e-12)
+    }
+
+    func testManualMeasurementCanRemainUnnamedUntilPacking() throws {
+        let engine = ObjectCaptureEngine()
+        let id = try XCTUnwrap(
+            engine.addManualMeasurement(sizeMillimetres: SIMD3(123, 70, 37))
+        )
+        XCTAssertNil(engine.name(for: id))
+        engine.updateName(id: id, name: "Mouse")
+        XCTAssertEqual(engine.name(for: id), "Mouse")
+        XCTAssertTrue(
+            engine.updateManualMeasurement(id: id, sizeMillimetres: SIMD3(124, 71, 38))
+        )
+        XCTAssertEqual(engine.name(for: id), "Mouse")
     }
 
     func testManualMeasurementValidationAndUniqueNames() {

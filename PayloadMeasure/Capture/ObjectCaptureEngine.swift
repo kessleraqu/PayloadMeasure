@@ -816,6 +816,27 @@ final class ObjectCaptureEngine {
         return id
     }
 
+    /// Measurement and preparation are deliberately separate study phases. Manual entry therefore
+    /// creates an unnamed object; the participant names it beside the box and weight controls, just
+    /// as they do after AR measurement.
+    @discardableResult
+    func addManualMeasurement(sizeMillimetres: SIMD3<Double>) -> UUID? {
+        guard let object = Self.manualCapturedObject(sizeMillimetres: sizeMillimetres) else {
+            return nil
+        }
+        let id = UUID()
+        captureOrder.append(id)
+        capturedObjectsByID[id] = object
+        finalizedObjectIDs.insert(id)
+        objectColorsByID[id] = ObjectColourPalette.colour(at: captureOrder.count - 1)
+        focusedCaptureID = id
+        statusText = finalizedObjectIDs.count == 1
+            ? "1 object entered manually."
+            : "\(finalizedObjectIDs.count) objects entered manually."
+        objectMaskFeedbackText = statusText
+        return id
+    }
+
     @discardableResult
     func updateManualMeasurement(
         id: UUID,
@@ -831,6 +852,23 @@ final class ObjectCaptureEngine {
         }
         capturedObjectsByID[id] = object
         objectNamesByID[id] = trimmed
+        focusedCaptureID = id
+        statusText = "Manual dimensions updated."
+        objectMaskFeedbackText = statusText
+        return true
+    }
+
+    @discardableResult
+    func updateManualMeasurement(
+        id: UUID,
+        sizeMillimetres: SIMD3<Double>
+    ) -> Bool {
+        guard finalizedObjectIDs.contains(id),
+              capturedObjectsByID[id] != nil,
+              let object = Self.manualCapturedObject(sizeMillimetres: sizeMillimetres) else {
+            return false
+        }
+        capturedObjectsByID[id] = object
         focusedCaptureID = id
         statusText = "Manual dimensions updated."
         objectMaskFeedbackText = statusText
@@ -881,14 +919,7 @@ final class ObjectCaptureEngine {
         )
     }
 
-    private static let manualPalette: [ObjectMaskDisplayColor] = [
-        ObjectMaskDisplayColor(red: 0.20, green: 0.75, blue: 1.00),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.55, blue: 0.18),
-        ObjectMaskDisplayColor(red: 0.35, green: 0.85, blue: 0.48),
-        ObjectMaskDisplayColor(red: 0.72, green: 0.45, blue: 1.00),
-        ObjectMaskDisplayColor(red: 1.00, green: 0.35, blue: 0.45),
-        ObjectMaskDisplayColor(red: 0.15, green: 0.82, blue: 0.78)
-    ]
+    private static let manualPalette = ObjectColourPalette.colours
 
     func removeFinalizedObject(id: UUID) {
         guard finalizedObjectIDs.contains(id) else {

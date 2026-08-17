@@ -163,7 +163,6 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        fileprivate static let selectionMaterial = UnlitMaterial(color: .cyan, applyPostProcessToneMap: false)
         fileprivate static let unitCubeMesh = MeshResource.generateBox(size: 1.0)
         fileprivate static let captureBoxEdgeThickness: Float = 0.003
         fileprivate static let captureBoxDashTargetPeriod: Float = 0.018
@@ -4466,6 +4465,11 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
+            if let selectionPointEntity, var model = selectionPointEntity.model {
+                model.materials = [selectionPointMaterial()]
+                selectionPointEntity.model = model
+            }
+
             let verticesPerPoint = Self.selectionPointOffsets.count
             let indicesPerPoint = Self.selectionPointIndices.count
             let radius = Self.selectionPointRadius
@@ -4661,7 +4665,7 @@ struct ARCameraView: UIViewRepresentable {
 
             let entity = ModelEntity(
                 mesh: resource,
-                materials: [Coordinator.selectionMaterial]
+                materials: [selectionPointMaterial()]
             )
             selectionPointEntity?.removeFromParent()
             contentAnchor.addChild(entity)
@@ -4669,6 +4673,22 @@ struct ARCameraView: UIViewRepresentable {
             selectionPointEntity = entity
             selectionPointMeshCapacity = capacity
             return mesh
+        }
+
+        private func selectionPointMaterial() -> UnlitMaterial {
+            let id = captureEngine.activeObjectID
+            let colour = id.flatMap { captureEngine.objectColor(for: $0) }
+                ?? id.flatMap { objectMaskColorsByID[$0] }
+                ?? ObjectMaskDisplayColor(red: 0.10, green: 0.82, blue: 1.00)
+            return UnlitMaterial(
+                color: UIColor(
+                    red: CGFloat(colour.red),
+                    green: CGFloat(colour.green),
+                    blue: CGFloat(colour.blue),
+                    alpha: 1
+                ),
+                applyPostProcessToneMap: false
+            )
         }
 
         private func selectionPointBounds(_ points: [SIMD3<Float>]) -> BoundingBox {

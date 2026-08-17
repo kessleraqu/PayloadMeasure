@@ -18,11 +18,6 @@ struct PackageDetailsSheet: View {
     @State private var name = ""
     @State private var weightText = ""
     @State private var message: String?
-    @State private var isShowingBoxes = false
-    @State private var forcesSize = false
-    @State private var forcedLength: Double = 100
-    @State private var forcedWidth: Double = 100
-    @State private var forcedHeight: Double = 100
 
     var body: some View {
         NavigationStack {
@@ -37,38 +32,23 @@ struct PackageDetailsSheet: View {
                 }
 
                 Section {
-                    if forcesSize {
-                        Text("Loaded at the size you entered, ignoring the measurement.")
-                            .font(.subheadline)
-                    } else if store.isItsOwnBox(objectID, in: captureEngine) {
+                    if store.isItsOwnBox(objectID, in: captureEngine) {
                         Text("Loaded exactly as measured. Nothing to pack.")
                             .font(.subheadline)
                     } else if let assigned = store.selectedBoxPreset(for: objectID) {
                         LabeledContent("Put it in", value: assigned.name)
                             .monospacedDigit()
                     } else {
-                        Text("Nothing in the list fits this object. Mark it as already a box, or add a bigger one.")
+                        Text("Nothing in the list fits this object. Mark it as already a box only if that is correct.")
                             .font(.subheadline)
                             .foregroundStyle(.orange)
                     }
 
                     Toggle("Already a box", isOn: ownBoxBinding)
-                        .disabled(forcesSize)
-
-                    Toggle("Enforce box size", isOn: forcedSizeBinding)
-
-                    if forcesSize {
-                        millimetres("Length", value: $forcedLength)
-                        millimetres("Width", value: $forcedWidth)
-                        millimetres("Height", value: $forcedHeight)
-                    }
-
-                    Button("Boxes…") { isShowingBoxes = true }
-                        .disabled(forcesSize)
                 } header: {
                     Text("Box")
                 } footer: {
-                    Text("Enforce a size when the measurement is wrong: the load is planned around the size you type instead, with no box chosen for it.")
+                    Text("Tick this only when the measured object is already its own shipping box.")
                 }
 
                 Section("Packed weight") {
@@ -102,9 +82,6 @@ struct PackageDetailsSheet: View {
                     Button("Save", action: save)
                 }
             }
-            .sheet(isPresented: $isShowingBoxes, onDismiss: reassign) {
-                BoxCatalogView(catalogue: store.boxes) { store.reloadBoxes() }
-            }
         }
         .onAppear(perform: load)
     }
@@ -120,61 +97,12 @@ struct PackageDetailsSheet: View {
         )
     }
 
-    private var forcedSizeBinding: Binding<Bool> {
-        Binding(
-            get: { forcesSize },
-            set: { isForced in
-                forcesSize = isForced
-                message = nil
-                if isForced {
-                    store.setForcedSize(currentForcedSize, for: objectID, in: captureEngine)
-                } else {
-                    store.setForcedSize(nil, for: objectID, in: captureEngine)
-                    store.assignBoxesAutomatically(in: captureEngine)
-                }
-            }
-        )
-    }
-
-    private var currentForcedSize: SIMD3<Double> {
-        SIMD3(forcedLength, forcedWidth, forcedHeight)
-    }
-
-    private func millimetres(_ title: String, value: Binding<Double>) -> some View {
-        LabeledContent(title) {
-            HStack(spacing: 6) {
-                TextField(title, value: value, format: .number.precision(.fractionLength(0)))
-                    .keyboardType(.numberPad)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 84)
-                    .onChange(of: value.wrappedValue) { _, new in
-                        value.wrappedValue = min(max(new.rounded(), 1), 999)
-                        store.setForcedSize(currentForcedSize, for: objectID, in: captureEngine)
-                    }
-                Text("mm").foregroundStyle(.secondary)
-            }
-        }
-    }
-
     private func load() {
+        store.setForcedSize(nil, for: objectID, in: captureEngine)
         store.assignBoxesAutomatically(in: captureEngine)
-        if let forced = store.forcedSize(for: objectID, in: captureEngine) {
-            forcesSize = true
-            forcedLength = forced.x
-            forcedWidth = forced.y
-            forcedHeight = forced.z
-        } else if let measured = store.measuredSizeMillimetres(for: objectID, in: captureEngine) {
-            forcedLength = min(max(measured.x.rounded(), 1), 999)
-            forcedWidth = min(max(measured.y.rounded(), 1), 999)
-            forcedHeight = min(max(measured.z.rounded(), 1), 999)
-        }
         name = captureEngine.name(for: objectID) ?? ""
         weightText = captureEngine.weightInGrams(for: objectID)
             .flatMap { PositiveDecimalText.format($0, maximumFractionDigits: 3) } ?? ""
-    }
-
-    private func reassign() {
-        store.assignBoxesAutomatically(in: captureEngine)
     }
 
     private func save() {
@@ -192,7 +120,7 @@ struct PackageDetailsSheet: View {
             return
         }
         guard store.packagedSizeMillimetres(for: objectID, in: captureEngine) != nil else {
-            message = "No box fits this object. Enforce a size, add a bigger box, or mark it as already a box."
+            message = "No available box fits this object. Mark it as already a box if that is correct."
             return
         }
         captureEngine.updateName(id: objectID, name: trimmed)

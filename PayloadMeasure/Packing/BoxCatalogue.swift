@@ -87,6 +87,6 @@ final class BoxCatalogue {
 extension StudyStore {
     /// Which payload's boxes apply right now. The practice payload borrows the small module's.
     var catalogueOwner: StudyBox {
-        isPractice ? .small : (currentBox ?? .small)
+        isPractice ? .small : (currentBox ?? scheduledBox ?? .small)
     }
 }

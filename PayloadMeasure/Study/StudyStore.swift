@@ -17,7 +17,7 @@ import simd
 @MainActor
 @Observable
 final class StudyStore {
-    /// Gate for moving to the second condition, finishing a standalone condition, or cancelling.
+    /// Gate for finishing a payload or cancelling the selected study condition.
     static let nextBoxPassword = "130802"
     /// Gate for restarting the app from the results screen, and for opening the results screen.
     static let restartPassword = "13820485"
@@ -55,6 +55,15 @@ final class StudyStore {
     var currentBox: StudyBox? {
         guard !isPractice,
               !isAwaitingParticipantStart,
+              let activeRun,
+              activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
+        return activeRun.boxOrder[currentBoxIndex]
+    }
+
+    /// The payload shown on a neutral handoff screen. Unlike `currentBox`, this remains available
+    /// while timing is deliberately stopped.
+    var scheduledBox: StudyBox? {
+        guard !isPractice,
               let activeRun,
               activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
@@ -127,6 +136,7 @@ final class StudyStore {
             firstBox: firstBox
         )
         run.includedPracticeRun = includesPractice
+        run.includesBothPayloads = true
         run.inputPlan = inputPlan
         run.firstInputMode = inputPlan == .arOnly
             ? .augmentedReality
@@ -142,16 +152,18 @@ final class StudyStore {
     /// exact point at which the first timer starts.
     func beginParticipantSession() {
         guard var run = activeRun, isAwaitingParticipantStart else { return }
-        run.createdAt = Date()
+        if currentBoxIndex == 0, run.boxes.isEmpty {
+            run.createdAt = Date()
+        }
         activeRun = run
-        isAwaitingParticipantStart = false
         persistActiveRun()
         if isPractice {
+            isAwaitingParticipantStart = false
             // No box result yet. The first one is opened when the practice ends, so its start time is
             // when the study actually began rather than when the participant started playing.
             beginPhase(.measure)
         } else {
-            openFirstBox()
+            openCurrentBox()
         }
     }
 
@@ -160,23 +172,26 @@ final class StudyStore {
         guard isPractice else { return }
         endCurrentPhase()
         isPractice = false
-        openFirstBox()
+        currentBoxIndex = 0
+        isAwaitingParticipantStart = true
     }
 
-    private func openFirstBox() {
+    private func openCurrentBox() {
         guard var run = activeRun else { return }
         isPractice = false
-        currentBoxIndex = 0
-        if run.result(for: run.firstBox) == nil {
+        guard run.boxOrder.indices.contains(currentBoxIndex) else { return }
+        let box = run.boxOrder[currentBoxIndex]
+        if run.result(for: box) == nil {
             run.boxes.append(
                 StudyBoxResult(
-                    box: run.firstBox,
+                    box: box,
                     startedAt: Date(),
-                    inputMode: run.inputMode(for: run.firstBox)
+                    inputMode: run.inputMode(for: box)
                 )
             )
         }
         activeRun = run
+        isAwaitingParticipantStart = false
         persistActiveRun()
         beginPhase(.measure)
     }
@@ -191,19 +206,9 @@ final class StudyStore {
         guard var run = activeRun else { return }
         closeCurrentBox(in: &run)
         currentBoxIndex += 1
-        let next = run.boxOrder[currentBoxIndex]
-        if run.result(for: next) == nil {
-            run.boxes.append(
-                StudyBoxResult(
-                    box: next,
-                    startedAt: Date(),
-                    inputMode: run.inputMode(for: next)
-                )
-            )
-        }
         activeRun = run
+        isAwaitingParticipantStart = true
         persistActiveRun()
-        beginPhase(.measure)
     }
 
     /// Closes the last box and finalises the run: it joins `saved` and its report is written.

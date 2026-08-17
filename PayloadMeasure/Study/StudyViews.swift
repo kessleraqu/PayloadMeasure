@@ -70,9 +70,9 @@ struct StudySetupView: View {
                     .pickerStyle(.inline)
                     .labelsHidden()
                 } header: {
-                    Text("Which payload box")
+                    Text("First payload box")
                 } footer: {
-                    Text("Only the selected payload is used in this run. Select the other payload when setting up the participant's other condition.")
+                    Text("The selected condition uses both payloads. The chosen size is first, followed by the other size after a separate Start screen.")
                 }
 
                 Section {
@@ -219,7 +219,7 @@ struct StudySetupView: View {
             format: "%.0f × %.0f × %.0f cm",
             size.x / 10, size.y / 10, size.z / 10
         )
-        return "The participant uses \(inputMode.title.lowercased()) for a practice payload of \(centimetres) first. Nothing from it is recorded. The same selected condition is then used for the study payload."
+        return "The participant uses \(inputMode.title.lowercased()) for a practice payload of \(centimetres) first. Nothing from it is recorded. The same selected condition is then used for both study payloads."
     }
 
     private func start() {
@@ -254,7 +254,7 @@ struct StudyParticipantStartView: View {
                 Spacer()
             }
 
-            Button("Start", action: onStart)
+            Button(buttonTitle, action: onStart)
                 .font(.title2.weight(.semibold))
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -262,6 +262,14 @@ struct StudyParticipantStartView: View {
                 .accessibilityHint("Starts the study and its timer")
         }
         .preferredColorScheme(.light)
+    }
+
+    private var buttonTitle: String {
+        if store.isPractice {
+            return "Start practice"
+        }
+        guard let box = store.scheduledBox else { return "Start" }
+        return "Start \(box.shortTitle.lowercased())"
     }
 }
 

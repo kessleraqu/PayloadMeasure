@@ -36,6 +36,26 @@ nonisolated enum PackingARVisualGeometry {
         let magnitude = max(0, normalExtent / 2 - inset - markerDepth / 2)
         return (face < 0 ? -1 : 1) * magnitude
     }
+
+    /// Converts a screen drag into a stable translation on the placement plane. It deliberately
+    /// needs no new plane raycast, so the module remains movable beyond ARKit's finite plane polygon.
+    static func draggedPosition(
+        from start: SIMD3<Float>,
+        screenRight: SIMD2<Float>,
+        screenUp: SIMD2<Float>,
+        screenDelta: CGPoint,
+        cameraDistance: Float,
+        surfaceHeight: Float
+    ) -> SIMD3<Float> {
+        let metresPerPoint = min(max(cameraDistance / 800, 0.0003), 0.0015)
+        let horizontal = screenRight * Float(screenDelta.x) * metresPerPoint
+            - screenUp * Float(screenDelta.y) * metresPerPoint
+        return SIMD3(
+            start.x + horizontal.x,
+            surfaceHeight,
+            start.z + horizontal.y
+        )
+    }
 }
 
 // The finished packing, placed on a real table at full size so the operator can walk around it while
@@ -399,15 +419,17 @@ private struct PackingARContainer: UIViewRepresentable {
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var turn: Float = 0
-        /// Where the module sat relative to the first raycast hit of the current drag.
-        private var dragOffset: SIMD2<Float>?
+        /// One-finger movement is relative to this stable start transform. It therefore remains
+        /// available even when ARKit's finite plane polygon does not extend under the finger.
+        private var dragStartAnchorTranslation: SIMD3<Float>?
         private var turnAtGestureStart: Float = 0
         private var twoFingerTurnAtStart: Float = 0
         private var twistIsActive = false
         private var suppressTwoFingerPanUntilEnd = false
-        /// The table height chosen at placement. Later drag raycasts must stay on this surface instead
-        /// of jumping to a floor or another horizontal plane under the finger.
+        /// The table height chosen at placement. Dragging holds this value exactly instead of
+        /// raycasting under the finger and jumping to a floor or another horizontal plane.
         private var placementSurfaceHeight: Float?
+        private var probedSurfaceHeight: Float?
 
         /// Millimetres to metres. Everything in the packing is in millimetres.
         private let scale: Float = 0.001
@@ -502,7 +524,7 @@ private struct PackingARContainer: UIViewRepresentable {
 
             // Twice a second, is there a surface under the middle of the screen? One raycast, and it is
             // what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
-            searchTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            searchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.probeForSurface() }
             }
             lastFrameTime = CACurrentMediaTime()
@@ -522,28 +544,39 @@ private struct PackingARContainer: UIViewRepresentable {
                 && pair.contains { $0 is UIPanGestureRecognizer }
         }
 
-        /// Uses only geometry from a plane ARKit has actually detected. Estimated planes can be the
-        /// floor behind a table and were the reason a placement could appear underneath the surface.
+        /// Uses only a plane ARKit has actually detected. The infinite target is merely an extension
+        /// of that detected plane; estimated planes can be the floor behind a table and were the
+        /// reason a placement could appear underneath the surface.
         private func stableSurfaceHit(
             at point: CGPoint,
             in view: ARView,
             matchingHeight expectedHeight: Float? = nil
         ) -> ARRaycastResult? {
-            view.raycast(
-                from: point,
-                allowing: .existingPlaneGeometry,
-                alignment: .horizontal
-            ).first { result in
-                guard let expectedHeight else { return true }
-                return abs(result.worldTransform.columns.3.y - expectedHeight) <= 0.025
+            for target in [ARRaycastQuery.Target.existingPlaneGeometry, .existingPlaneInfinite] {
+                if let hit = view.raycast(
+                    from: point,
+                    allowing: target,
+                    alignment: .horizontal
+                ).first(where: { result in
+                    if let plane = result.anchor as? ARPlaneAnchor,
+                       plane.classification == .floor {
+                        return false
+                    }
+                    guard let expectedHeight else { return true }
+                    return abs(result.worldTransform.columns.3.y - expectedHeight) <= 0.025
+                }) {
+                    return hit
+                }
             }
+            return nil
         }
 
         private func probeForSurface() {
             guard ownsSharedView, let view, !model.isPlaced else { return }
             let centre = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
-            let found = stableSurfaceHit(at: centre, in: view) != nil
-            model.reportSurface(found: found)
+            let hit = stableSurfaceHit(at: centre, in: view)
+            probedSurfaceHeight = hit?.worldTransform.columns.3.y
+            model.reportSurface(found: hit != nil)
         }
 
         func detach() {
@@ -650,57 +683,43 @@ private struct PackingARContainer: UIViewRepresentable {
             switch recogniser.state {
             case .began:
                 guard recogniser.numberOfTouches == 1, !twistIsActive else { return }
-                dragOffset = nil
+                dragStartAnchorTranslation = anchor.transform.translation
             case .changed:
                 guard recogniser.numberOfTouches == 1,
                       !twistIsActive,
-                      let placementSurfaceHeight else {
+                      let placementSurfaceHeight,
+                      let start = dragStartAnchorTranslation,
+                      let frame = view.session.currentFrame else {
                     return
                 }
-                let point = recogniser.location(in: view)
-                guard let result = stableSurfaceHit(
-                    at: point,
-                    in: view,
-                    matchingHeight: placementSurfaceHeight
-                ) else {
-                    return
-                }
-                // Move by how far the finger has moved, not to where it is. Setting the position to the
-                // hit point put the module's own origin under the finger, so it jumped the moment the
-                // drag started — grabbing a corner teleported the whole thing. The offset between the
-                // module and the first hit is taken once and held for the rest of the gesture.
-                //
-                // Height is left alone: the raycast happily returns the floor once the finger passes the
-                // edge of the table, and following it dropped the module off the table mid-drag.
+                let camera = frame.camera.transform
+                let rightRaw = SIMD2<Float>(camera.columns.0.x, camera.columns.0.z)
+                let upRaw = SIMD2<Float>(camera.columns.1.x, camera.columns.1.z)
+                let right = simd_length(rightRaw) > 0.001
+                    ? simd_normalize(rightRaw)
+                    : SIMD2<Float>(1, 0)
+                let screenUp = simd_length(upRaw) > 0.001
+                    ? simd_normalize(upRaw)
+                    : SIMD2<Float>(0, -1)
+                let cameraPosition = SIMD3<Float>(
+                    camera.columns.3.x,
+                    camera.columns.3.y,
+                    camera.columns.3.z
+                )
+                let distance = simd_distance(cameraPosition, start)
+                let screenDelta = recogniser.translation(in: view)
                 var transform = anchor.transform
-                let hit = Transform(matrix: result.worldTransform).translation
-                if dragOffset == nil {
-                    dragOffset = SIMD2(
-                        transform.translation.x - hit.x,
-                        transform.translation.z - hit.z
-                    )
-                }
-                let offset = dragOffset ?? .zero
-                let requested = SIMD2<Float>(
-                    hit.x + offset.x,
-                    hit.z + offset.y
-                )
-                let current = SIMD2<Float>(
-                    transform.translation.x,
-                    transform.translation.z
-                )
-                let delta = requested - current
-                // Reject a discontinuous raycast jump. Normal dragging advances in small increments;
-                // a distant result means ARKit switched planes or briefly lost the table geometry.
-                guard simd_length(delta) <= 0.12 else { return }
-                transform.translation = SIMD3(
-                    requested.x,
-                    placementSurfaceHeight,
-                    requested.y
+                transform.translation = PackingARVisualGeometry.draggedPosition(
+                    from: start,
+                    screenRight: right,
+                    screenUp: screenUp,
+                    screenDelta: screenDelta,
+                    cameraDistance: distance,
+                    surfaceHeight: placementSurfaceHeight
                 )
                 anchor.transform = transform
             case .ended, .cancelled, .failed:
-                dragOffset = nil
+                dragStartAnchorTranslation = nil
             default:
                 break
             }
@@ -712,7 +731,7 @@ private struct PackingARContainer: UIViewRepresentable {
             case .began:
                 twistIsActive = true
                 suppressTwoFingerPanUntilEnd = true
-                dragOffset = nil
+                dragStartAnchorTranslation = nil
                 turnAtGestureStart = turn
             case .changed, .ended:
                 apply(
@@ -735,6 +754,11 @@ private struct PackingARContainer: UIViewRepresentable {
             guard ownsSharedView, contentRoot != nil else { return }
             switch recogniser.state {
             case .began:
+                // A real twist may end without the companion pan recognizer ever reaching `.ended`.
+                // Clear that gesture's suppression here so the next two-finger motion is never lost.
+                if !twistIsActive {
+                    suppressTwoFingerPanUntilEnd = false
+                }
                 twoFingerTurnAtStart = turn
             case .changed, .ended:
                 guard !twistIsActive, !suppressTwoFingerPanUntilEnd else {
@@ -814,6 +838,8 @@ private struct PackingARContainer: UIViewRepresentable {
             twistIsActive = false
             suppressTwoFingerPanUntilEnd = false
             placementSurfaceHeight = nil
+            probedSurfaceHeight = nil
+            dragStartAnchorTranslation = nil
         }
 
         @objc private func handleTap(_ recogniser: UITapGestureRecognizer) {
@@ -834,7 +860,12 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         private func place(at point: CGPoint, in view: ARView) {
-            guard let result = stableSurfaceHit(at: point, in: view) else {
+            guard let probedSurfaceHeight,
+                  let result = stableSurfaceHit(
+                at: point,
+                in: view,
+                matchingHeight: probedSurfaceHeight
+            ) else {
                 model.reportNoSurface()
                 return
             }
@@ -1005,6 +1036,10 @@ private struct PackingARContainer: UIViewRepresentable {
             let inset = PackingARVisualGeometry.packageInset(
                 for: outlineThickness
             )
+            let coveredFaces = BaldiOpeningMarker.coveredFaceSigns(
+                for: placement,
+                among: model.solution.placements
+            )
 
             /// Packing is z-up, RealityKit is y-up, so the two vertical axes swap.
             func realityKit(_ values: [Float]) -> SIMD3<Float> {
@@ -1014,7 +1049,6 @@ private struct PackingARContainer: UIViewRepresentable {
             for face in [Float(1), Float(-1)] {
                 var lineSize = [Float](repeating: 0, count: 3)
                 lineSize[normal] = markerDepth
-                lineSize[length] = extent[length] * 0.78
                 lineSize[width] = markerWidth
 
                 var lineAt = [Float](repeating: 0, count: 3)
@@ -1027,14 +1061,35 @@ private struct PackingARContainer: UIViewRepresentable {
                     inset: inset
                 )
 
-                addPackageVisual(
-                    size: realityKit(lineSize),
-                    at: realityKit(lineAt),
-                    colour: lineColour,
-                    on: box,
-                    id: id,
-                    role: .lengthMarker
-                )
+                let fullLength = extent[length] * 0.78
+                if coveredFaces.contains(face < 0 ? -1 : 1) {
+                    let dashCount = 5
+                    let dashLength = fullLength / Float(dashCount * 2 - 1)
+                    for dash in 0..<dashCount {
+                        lineSize[length] = dashLength
+                        lineAt[length] = -fullLength / 2
+                            + dashLength / 2
+                            + Float(dash * 2) * dashLength
+                        addPackageVisual(
+                            size: realityKit(lineSize),
+                            at: realityKit(lineAt),
+                            colour: lineColour,
+                            on: box,
+                            id: id,
+                            role: .lengthMarker
+                        )
+                    }
+                } else {
+                    lineSize[length] = fullLength
+                    addPackageVisual(
+                        size: realityKit(lineSize),
+                        at: realityKit(lineAt),
+                        colour: lineColour,
+                        on: box,
+                        id: id,
+                        role: .lengthMarker
+                    )
+                }
             }
         }
 

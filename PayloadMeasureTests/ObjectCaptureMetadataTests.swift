@@ -5,6 +5,20 @@ import simd
 
 @MainActor
 final class ObjectCaptureMetadataTests: XCTestCase {
+    func testEveryStudyObjectReceivesADistinctSharedColour() throws {
+        let engine = ObjectCaptureEngine()
+        var colours: Set<ObjectMaskDisplayColor> = []
+        for index in 0..<ObjectColourPalette.colours.count {
+            let id = try XCTUnwrap(
+                engine.addManualMeasurement(
+                    sizeMillimetres: SIMD3(100 + Double(index), 50, 20)
+                )
+            )
+            colours.insert(try XCTUnwrap(engine.objectColor(for: id)))
+        }
+        XCTAssertEqual(colours.count, ObjectColourPalette.colours.count)
+    }
+
     func testLockDoesNotInventNameAndCarriesLastViewportBox() {
         let engine = ObjectCaptureEngine()
         let id = beginMeasuredObject(in: engine)

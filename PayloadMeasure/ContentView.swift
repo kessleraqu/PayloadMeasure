@@ -1,7 +1,7 @@
 import SwiftUI
 
-// Root view. Runs one selected study condition, then returns to setup so the administrator can
-// configure the other condition separately.
+// Root view. Runs one selected input condition through both payload sizes, then returns to setup so
+// the administrator can configure the other input condition separately.
 //
 // The study owns the flow now — the method and the box order come from StudySetupView rather than
 // being picked ad hoc, so a session cannot start without being recorded.
@@ -99,8 +99,8 @@ struct ContentView: View {
     }
 
     /// At a payload boundary the measurements belong to the one just finished, so the capture
-    /// session is cleared and the view hierarchy rebuilt. Practice leads into the real payload;
-    /// finishing the selected condition returns to administrator setup.
+    /// session is cleared and the view hierarchy rebuilt. Practice and both real payloads are
+    /// separated by neutral participant-controlled start screens.
     private func startNextBox() {
         // The presenting overlay is replaced as part of this transition, so do not wait for its
         // onDismiss callback to return camera ownership. Clear it before constructing the next box.
