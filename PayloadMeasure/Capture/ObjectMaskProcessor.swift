@@ -12,6 +12,22 @@ import Vision
 // Out: mask layers to draw, per-object markers, and the depth samples belonging to each object.
 //      Work happens off the main actor; results are timestamped so late frames can be discarded.
 
+nonisolated enum ObjectMaskCandidatePolicy {
+    /// Centre probes are the cheap, preferred path. If they miss, keep processing every Vision
+    /// instance so an object does not disappear merely because it became small on screen.
+    static func previewInstances(
+        nearby: IndexSet,
+        all: IndexSet,
+        excluding excluded: Set<Int>
+    ) -> [Int] {
+        let eligibleNearby = nearby.filter { !excluded.contains($0) }
+        if !eligibleNearby.isEmpty {
+            return eligibleNearby
+        }
+        return all.filter { !excluded.contains($0) }
+    }
+}
+
 nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let id: UUID
     let image: CGImage
@@ -1683,10 +1699,17 @@ actor ObjectMaskProcessor {
                     .flatMap { $0 }
             )
             let nearbyInstances = instances(near: centerPoint, in: observation)
-                .filter { !finalizedInstances.contains($0) }
+            // A distant or physically small object can occupy fewer pixels than the centre probes.
+            // Vision may still segment it perfectly, so fall back to every eligible instance and
+            // choose the one whose mask centroid is nearest the aimer instead of dropping it.
+            let candidateInstances = ObjectMaskCandidatePolicy.previewInstances(
+                nearby: nearbyInstances,
+                all: observation.allInstances,
+                excluding: finalizedInstances
+            )
             var bestPreview: (instance: Int, geometry: MaskGeometry, score: CGFloat)?
 
-            for instance in nearbyInstances {
+            for instance in candidateInstances {
                 let mask = try observation.generateMask(for: IndexSet(integer: instance))
                 guard let geometry = maskGeometry(of: mask),
                       geometry.area < 0.90,

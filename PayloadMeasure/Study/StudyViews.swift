@@ -6,7 +6,7 @@ import SwiftUI
 // In:  StudyStore.
 // Out: on screen only, plus the text reports StudyStore writes.
 //
-// Nothing here can delete a run. The archive is read-only by design.
+// Saved runs can be deleted only through the archive's explicit red action and password gate.
 
 // MARK: - Setup
 
@@ -240,11 +240,19 @@ struct StudySetupView: View {
 /// A deliberately neutral screen between the administrator's setup and the timed study. The
 /// participant sees no names, condition controls, payload choices, or saved study data.
 struct StudyParticipantStartView: View {
+    let store: StudyStore
     let onStart: () -> Void
 
     var body: some View {
         ZStack {
             Color.white.ignoresSafeArea()
+
+            VStack {
+                StudyTimerStrip(study: store)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 10)
+                Spacer()
+            }
 
             Button("Start", action: onStart)
                 .font(.title2.weight(.semibold))
@@ -568,7 +576,7 @@ struct StudyArchiveView: View {
                     ContentUnavailableView {
                         Label("No runs yet", systemImage: "tray")
                     } description: {
-                        Text("Completed study runs appear here. Swipe one to delete it; the password is asked for first.")
+                        Text("Completed study runs appear here. Each row has a password-protected Delete button.")
                     }
                 } else {
                     List {
@@ -593,7 +601,10 @@ struct StudyArchiveView: View {
             } message: {
                 Text("\(pendingDeletion?.participantName ?? "This run"), with its photos and report. There is no copy anywhere else.")
             }
-            .sheet(isPresented: $showsDeletePassword) {
+            .sheet(
+                isPresented: $showsDeletePassword,
+                onDismiss: { pendingDeletion = nil }
+            ) {
                 StudyPasswordSheet(
                     title: "Delete the run",
                     message: "Removes it and everything in it from the device for good.",
@@ -617,24 +628,43 @@ struct StudyArchiveView: View {
     private var deletionIsPresented: Binding<Bool> {
         Binding(
             get: { pendingDeletion != nil && !showsDeletePassword },
-            set: { if !$0 { pendingDeletion = nil } }
+            set: {
+                if !$0, !showsDeletePassword {
+                    pendingDeletion = nil
+                }
+            }
         )
     }
 
     private func row(for run: StudyRun) -> some View {
-        NavigationLink {
-            StudyResultsView(run: run, store: store)
-        } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(run.participantName)
-                    .font(.headline)
-                Text(StudyRun.displayDateFormatter.string(from: run.studyDate))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(summary(for: run))
-                    .font(.caption2)
-                    .foregroundStyle(run.isComplete ? Color.secondary : Color.orange)
+        HStack(spacing: 10) {
+            NavigationLink {
+                StudyResultsView(run: run, store: store)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(run.participantName)
+                        .font(.headline)
+                    Text(StudyRun.displayDateFormatter.string(from: run.studyDate))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(summary(for: run))
+                        .font(.caption2)
+                        .foregroundStyle(run.isComplete ? Color.secondary : Color.orange)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            Button(role: .destructive) {
+                pendingDeletion = run
+            } label: {
+                Label("Delete", systemImage: "trash")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 40)
+                    .background(Color.red.opacity(0.12), in: Capsule())
+            }
+            .buttonStyle(.borderless)
+            .accessibilityHint("Asks for confirmation and the study password before deleting.")
         }
     }
 

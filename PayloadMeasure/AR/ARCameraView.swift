@@ -173,7 +173,7 @@ struct ARCameraView: UIViewRepresentable {
         private static let finalizeThumbnailMaximumDimension: CGFloat = 512
         private static let finalizeThumbnailFallbackMaximumDimension: CGFloat = 320
         private static let finalizeThumbnailMaximumByteCount = 512_000
-        fileprivate static let automaticPointCleanupBatchSize = 512
+        fileprivate static let automaticPointCleanupBatchSize = 1_024
         fileprivate static let captureBoxEdges = [
             (0, 1), (1, 3), (2, 3), (0, 2),
             (4, 5), (5, 7), (6, 7), (4, 6),
@@ -271,6 +271,9 @@ struct ARCameraView: UIViewRepresentable {
         private static let bootstrapFootprintRefreshPoints = 64
         private static let supportRaycastMissTolerance = 4
         private static let supportPlaneMissTolerance = 6
+        /// Idle segmentation runs at roughly 6 Hz. Retain a small/far live object through brief
+        /// Vision misses while the participant changes distance, but still clear a stale mask.
+        private static let liveMaskMissTolerance = 12
         private static let topAlignmentEnterDegrees: Float = 12
         private static let topAlignmentExitDegrees: Float = 18
         private var topAlignmentAccepted = false
@@ -1485,10 +1488,9 @@ struct ARCameraView: UIViewRepresentable {
             let submittedToggleRequest: ObjectMaskToggleRequest?
             if pendingObjectMaskToggleRequest != nil,
                !sessionManager.isObjectTrackingEnvironmentReady {
-                pendingObjectMaskToggleRequest = nil
-                objectMaskToggleAttemptsRemaining = 0
-                objectMaskProcessingFailuresRemaining = 0
-                captureEngine.reportObjectSelectionNotReady()
+                // Keep the user's accepted selection queued while ARKit finishes finding the
+                // supporting surface. Rejecting it here made the framing screen's Start action
+                // appear ineffective even though the user had already accepted the framing.
                 submittedToggleRequest = nil
             } else {
                 submittedToggleRequest = pendingObjectMaskToggleRequest
@@ -1694,6 +1696,11 @@ struct ARCameraView: UIViewRepresentable {
                        $0.trackingOrientation
                            == self.objectMaskDisplayOrientation
                    }) {
+                    let preview = self.previewByAddingLiveObjectDistance(
+                        preview,
+                        frame: currentFrame,
+                        in: arView
+                    )
                     self.consecutiveMaskMisses = 0
                     let includesLiveMask = preview.layers.contains {
                         $0.trackedObjectID == nil
@@ -1707,31 +1714,94 @@ struct ARCameraView: UIViewRepresentable {
                     if includesLiveMask {
                         self.consecutiveLiveMaskMisses = 0
                     } else if didAddLock {
-                        self.consecutiveLiveMaskMisses = 3
+                        self.consecutiveLiveMaskMisses = Self.liveMaskMissTolerance
                     } else {
                         self.consecutiveLiveMaskMisses += 1
                     }
                     self.updateObjectMaskDisplaySeeds(from: preview)
-                    self.captureEngine.showObjectMaskPreview(preview)
-                    if self.consecutiveLiveMaskMisses >= 3 {
+                    self.captureEngine.showObjectMaskPreview(
+                        preview,
+                        viewportSize: arView.bounds.size
+                    )
+                    if self.consecutiveLiveMaskMisses >= Self.liveMaskMissTolerance {
                         self.removeLiveObjectMaskDisplaySeed()
                         self.captureEngine.clearLiveObjectMaskPreview()
                     }
                 } else if result.preview == nil {
                     self.consecutiveMaskMisses += 1
                     self.consecutiveLiveMaskMisses += 1
-                    if self.consecutiveLiveMaskMisses >= 3 {
+                    if self.consecutiveLiveMaskMisses >= Self.liveMaskMissTolerance {
                         self.removeLiveObjectMaskDisplaySeed()
                         self.captureEngine.clearLiveObjectMaskPreview()
                     }
                     if result.lockedObjectCount == 0,
                        result.didToggleLock
                         || result.lockedObjectCount < previousLockedObjectCount
-                        || self.consecutiveMaskMisses >= 3 {
+                        || self.consecutiveMaskMisses >= Self.liveMaskMissTolerance {
                         self.captureEngine.clearObjectMaskPreview()
                     }
                 }
             }
+        }
+
+        /// Vision identifies the next object before it is anchored, but its live mask previously
+        /// carried no distance. Sample LiDAR at mask-covered points and attach the median surface
+        /// distance for preflight guidance. Once selected, the fitted centre remains authoritative.
+        private func previewByAddingLiveObjectDistance(
+            _ preview: ObjectMaskPreview,
+            frame: ARFrame,
+            in arView: ARView
+        ) -> ObjectMaskPreview {
+            let cameraPosition = frame.camera.transform.translation
+            let orientation = interfaceOrientation(in: arView)
+            let viewportSize = arView.bounds.size
+            let sampleFractions: [CGFloat] = [0.28, 0.5, 0.72]
+
+            let layers = preview.layers.map { layer in
+                guard layer.trackedObjectID == nil,
+                      let box = layer.referenceViewportBoundingBox,
+                      let alphaMap = ObjectMaskAlphaMap(layer.image) else {
+                    return layer
+                }
+
+                var samples: [(point: CGPoint, distance: Float)] = []
+                for yFraction in sampleFractions {
+                    for xFraction in sampleFractions {
+                        let point = CGPoint(
+                            x: box.minX + box.width * xFraction,
+                            y: box.minY + box.height * yFraction
+                        )
+                        guard alphaMap.contains(point, radius: 1),
+                              let worldPoint = DepthPointCloud.worldPoint(
+                                  from: frame,
+                                  normalizedViewportPoint: point,
+                                  interfaceOrientation: orientation,
+                                  viewportSize: viewportSize
+                              ) else {
+                            continue
+                        }
+                        samples.append((
+                            point: point,
+                            distance: simd_distance(cameraPosition, worldPoint)
+                        ))
+                    }
+                }
+                guard !samples.isEmpty else { return layer }
+                samples.sort { $0.distance < $1.distance }
+                let sample = samples[samples.count / 2]
+
+                return ObjectMaskPreviewLayer(
+                    id: layer.id,
+                    image: layer.image,
+                    trackedObjectID: layer.trackedObjectID,
+                    referenceAnchorPoint: sample.point,
+                    referenceCameraDistance: sample.distance,
+                    referenceViewportBoundingBox: layer.referenceViewportBoundingBox,
+                    trackingBoundingBox: layer.trackingBoundingBox,
+                    trackingOrientation: layer.trackingOrientation
+                )
+            }
+            return ObjectMaskPreview(layers: layers, timestamp: preview.timestamp)
         }
 
         private func updateFastObjectMaskPreview(in arView: ARView) {
@@ -2208,11 +2278,12 @@ struct ARCameraView: UIViewRepresentable {
                 volume: result.object.volume,
                 sampleCount: retainedSurfacePoints.count
             )
-            liveResultsByObject[objectID] = CaptureResult(
+            let cleanedResult = CaptureResult(
                 object: cleanedObject,
                 selectionPoints: retainedSelectionPoints,
                 surfacePoints: retainedSurfacePoints
             )
+            liveResultsByObject[objectID] = cleanedResult
             acceptedSurfaceVoxelKeysByObject[objectID] = Set(
                 retainedSelectionPoints.filter {
                     result.object.contains(
@@ -2222,7 +2293,9 @@ struct ARCameraView: UIViewRepresentable {
                 }.map(selectionVoxelKey(for:))
             )
             fittedMaskedPointTimestamp[objectID] = -.greatestFiniteMagnitude
-            selectionPointsByObject[objectID] = retainedSurfacePoints
+            selectionPointsByObject[objectID] = selectionVisualizationPoints(
+                for: cleanedResult
+            )
             updateSelectionVisualization()
         }
 
@@ -2641,7 +2714,12 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 0.5 {
+            // Do not spend the cleanup interval on a stale Vision result. Previously the timestamp
+            // advanced first and `removeVisiblePointsOutsideCurrentMask` then rejected the stale
+            // preview, so an unlucky phase between the two loops could prevent cleanup repeatedly.
+            if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 0.5,
+               let preview = captureEngine.objectMaskPreview,
+               abs(frame.timestamp - preview.timestamp) <= 0.2 {
                 lastAutomaticPointCleanupTimestamp = frame.timestamp
                 removeVisiblePointsOutsideCurrentMask(in: arView)
             }
@@ -2882,7 +2960,9 @@ struct ARCameraView: UIViewRepresentable {
                             )
                         )
                         liveResultsByObject[id] = retainedResult
-                        selectionPointsByObject[id] = retainedResult.surfacePoints
+                        selectionPointsByObject[id] = selectionVisualizationPoints(
+                            for: retainedResult
+                        )
                         updateSelectionVisualization()
                         return false
                     }
@@ -2906,7 +2986,9 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             liveResultsByObject[id] = acceptedResult
-            selectionPointsByObject[id] = acceptedResult.surfacePoints
+            selectionPointsByObject[id] = selectionVisualizationPoints(
+                for: acceptedResult
+            )
             updateSelectionVisualization()
             if acceptedSurfaceVoxelKeysByObject[id] == nil
                 || acceptedSurfaceExpansion {
@@ -3756,16 +3838,11 @@ struct ARCameraView: UIViewRepresentable {
                     captureEngine.recordDimensionObservation(.width, value: aligned.width)
                     captureEngine.recordDimensionObservation(.depth, value: aligned.depth)
                 }
-                if var stored = capturedFootprintByObject[id] {
+                if let stored = capturedFootprintByObject[id] {
                     let width = stabilize(stored.width, aligned.width)
                     let depth = stabilize(stored.depth, aligned.depth)
                     let center = stabilizePosition(stored.centerXZ, aligned.centerXZ)
                     let axis = stabilizeOrientation(stored.widthAxis, aligned.widthAxis)
-                    stored.width = width.value
-                    stored.depth = depth.value
-                    stored.widthAxis = axis.value
-                    stored.centerXZ = center.value
-                    capturedFootprintByObject[id] = stored
                     footprintStableTicks[id] = (
                         width.stable && depth.stable
                             && center.stable && axis.stable
@@ -3773,9 +3850,12 @@ struct ARCameraView: UIViewRepresentable {
                         ? (footprintStableTicks[id, default: 0] + 1)
                         : 0
                 } else {
-                    capturedFootprintByObject[id] = aligned
                     footprintStableTicks[id] = 0
                 }
+                // Stabilization decides only whether the scan has settled. Drawing or publishing
+                // its blended/deadband value makes the box geometrically different from the current
+                // full-cloud rectangle, which is visible at the far edge in a top view.
+                capturedFootprintByObject[id] = aligned
                 if (footprintStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
                     footprintFromTopObjects.insert(id)
                 }
@@ -3800,7 +3880,7 @@ struct ARCameraView: UIViewRepresentable {
                 break
             }
 
-            // The drawn height always follows the current fit, whichever way the phone is pointing.
+            // The drawn height follows the current fit exactly, whichever way the phone is pointing.
             //
             // It used to be seeded from the very first frame and then updated only while the view was
             // classified `.side`. Hover over an object — which is `.topDown`, or the gap between the
@@ -3810,14 +3890,11 @@ struct ARCameraView: UIViewRepresentable {
             //
             // Nothing here is gated, because nothing needs to be: the height is the highest point
             // above the support plane, and how high a point is does not depend on where it was seen
-            // from. The footprint gating stays exactly as it was, and for the opposite reason — a
-            // footprint measured from an oblique view really is foreshortened. The two coverage
-            // counters and the observations fed to the stopping rule are untouched, so what the app
-            // asks of the operator has not changed; only the box it draws has stopped going stale.
-            let previousHeight = capturedHeightByObject[id]
-            capturedHeightByObject[id] = previousHeight
-                .map { stabilize($0, candidateHeight).value }
-                ?? candidateHeight
+            // from. A deadband here could leave the top as much as 4 mm (or 3%) above the current
+            // cloud even after an outlying point had been mask-filtered. The convergence rule still
+            // uses its observation window; only the geometric box is kept exact. The paper-derived
+            // 2D footprint orientation and extents are untouched.
+            capturedHeightByObject[id] = candidateHeight
 
             if isActive {
                 captureEngine.updateScanGuidance(
@@ -3890,18 +3967,18 @@ struct ARCameraView: UIViewRepresentable {
             }
             let width = stabilize(previousFootprint.width, aligned.width)
             let depth = stabilize(previousFootprint.depth, aligned.depth)
-            let height = stabilize(previousHeight, candidateHeight)
+            let heightStability = stabilize(previousHeight, candidateHeight)
             let center = stabilizePosition(previousFootprint.centerXZ, aligned.centerXZ)
             let axis = stabilizeOrientation(previousFootprint.widthAxis, aligned.widthAxis)
-            capturedFootprintByObject[id] = ObjectFootprint(
-                widthAxis: axis.value,
-                width: width.value,
-                depth: depth.value,
-                centerXZ: center.value
-            )
-            capturedHeightByObject[id] = height.value
+            // Keep the comparison against the previous exact fit for stability, but publish the
+            // current fit itself. Liu/Zhang determines `aligned.widthAxis`; the application takes
+            // the full-cloud min/max extents, and neither should be altered by display smoothing.
+            capturedFootprintByObject[id] = aligned
+            // As in Full 3D, render and publish the current fitted height. Smoothing this value made
+            // the upper face visibly detach from the point that defined it after mask cleanup.
+            capturedHeightByObject[id] = candidateHeight
 
-            if width.stable && depth.stable && height.stable
+            if width.stable && depth.stable && heightStability.stable
                 && center.stable && axis.stable {
                 footprintStableTicks[id, default: 0] += 1
             } else {
@@ -4498,12 +4575,34 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
+        /// Raw depth samples are what the operator should see, but the fitted cloud uses each
+        /// stable voxel's mean as well. Include the highest fitted mean when it sits above every raw
+        /// sample so the cyan cloud always contains the exact point that can set the upper face.
+        private func selectionVisualizationPoints(
+            for result: CaptureResult
+        ) -> [SIMD3<Float>] {
+            guard let fittedTop = result.selectionPoints.max(by: { $0.y < $1.y }) else {
+                return result.surfacePoints
+            }
+            let observedTop = result.surfacePoints.max(by: { $0.y < $1.y })?.y
+                ?? -Float.greatestFiniteMagnitude
+            guard fittedTop.y > observedTop else {
+                return result.surfacePoints
+            }
+            var points = result.surfacePoints
+            points.append(fittedTop)
+            return points
+        }
+
         /// Which points to draw. See SelectionPointDisplay for why this is not a stride.
         private func stableDisplaySubset(
             _ points: [SIMD3<Float>],
             limit: Int
         ) -> [SIMD3<Float>] {
-            SelectionPointDisplay.subset(points, limit: limit) { point in
+            SelectionPointDisplay.subsetPreservingCoordinateExtrema(
+                points,
+                limit: limit
+            ) { point in
                 let key = selectionVoxelKey(for: point)
                 return SelectionPointDisplay.hash(x: key.x, y: key.y, z: key.z)
             }

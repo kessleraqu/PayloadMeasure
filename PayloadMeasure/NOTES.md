@@ -140,22 +140,40 @@ The defaults are saved under `packing.boxes.v2.<payload>`. The generation in tha
 earlier build kept one shared list of fourteen boxes under `packing.boxPresets`, and reusing the old key
 would have restored those on upgrade instead of the sets the study actually uses.
 
-**The drawn box's height follows the current fit; its footprint does not.** Both used to be seeded from
-the first frame of a measurement and then refreshed only from a matching view — the footprint while
-`classifyView` said `.topDown`, the height while it said `.side`. Hovering over an object is `.topDown`
-or the gap between the two, so the height kept whatever the first frame guessed while the point cloud
-filled in and settled underneath it, and the top of the box was left hanging above the dots.
+**The drawn box follows the current eligible fit; stabilization is evidence, not geometry.** Both
+footprint and height used to be seeded from the first frame and refreshed only from a matching view —
+the footprint while `classifyView` said `.topDown`, the height while it said `.side`. Hovering over an
+object is `.topDown` or the gap between the two, so the height kept whatever the first frame guessed
+while the point cloud filled in and settled underneath it, and the top of the box was left hanging
+above the dots.
 
-The height is now updated every frame, through the same deadband, and the gating is kept for the
-footprint alone. The asymmetry is the point: the height is the highest reading above the support plane,
-and how high a point is does not depend on where it was seen from, whereas a footprint measured from an
-oblique view genuinely is foreshortened. The coverage counters and the observations fed to the stopping
-rule were left inside the view cases, so what the app asks of the operator is unchanged.
+The height is now updated every frame and the gating is kept for the footprint alone. Height follows
+the current fit exactly because how high a point is does not depend on where it was seen from, whereas
+a footprint measured from an oblique view genuinely is foreshortened. On an eligible top view, the
+footprint also publishes the current Liu/Zhang-oriented, full-cloud rectangle exactly. Width, depth,
+centre and orientation are still compared with the preceding fit through the 4 mm / 3% and angular
+deadbands to decide whether the measurement has settled, but their blended values are no longer used
+as box geometry. That blending could leave the solid far edge visibly outside the current cyan cloud.
+The coverage counters and observations fed to the stopping rule are unchanged.
 
 `BoundingBoxHeightTests` pins what the height means — top on the highest reading, bottom on the support
 plane — so the drawn box has something to be held to. The fitter was never at fault here, and an
 earlier attempt to explain this as the footprint spreading across the tabletop was wrong: it added a
 clearance nothing in either paper calls for, and has been removed.
+
+**The thinned cyan cloud retains its extrema.** Box fitting uses the complete cloud but rendering is
+capped at 600 points. A purely hash-selected display could omit the one upper point that defines the
+box, making a correct enclosure look too tall. The display now includes the highest stable fitted
+point if it lies above the raw samples, pins the minimum and maximum displayed point on each world
+axis, and uses the stable hash selection for the rest of its budget. This affects only what is shown;
+the complete cloud still determines the fit.
+
+**Automatic mask cleanup waits for fresh evidence.** Cleanup used to advance its half-second timer
+before checking whether the latest Vision mask was at most 0.2 seconds old. If the Vision and cleanup
+loops were out of phase, the pass rejected the stale mask and still waited another half-second, so
+outside-mask points could survive for a long time. A stale preview no longer consumes the interval,
+and each valid pass checks 1,024 stored points instead of 512. Removal remains conservative: only
+currently visible, depth-consistent points outside the current mask are rejected.
 
 **The measurement renderer is removed for the whole packing workflow.** Pausing its `ARSession` was
 not sufficient: the old `ARView` and camera texture remained underneath the room view. `ContentView`

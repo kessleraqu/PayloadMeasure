@@ -6,7 +6,7 @@ import simd
 @MainActor
 @Observable
 final class FramingAccuracyStore {
-    static let maximumRounds = 10
+    static let maximumObjects = 20
 
     private(set) var activeTest: FramingAccuracyRun?
     private(set) var saved: [FramingAccuracyRun] = []
@@ -23,16 +23,22 @@ final class FramingAccuracyStore {
     var progressText: String {
         guard let test = activeTest else { return "" }
         guard let slot = nextSlot else { return "All \(test.totalExpectedReadings) readings done." }
-        return "Round \(slot.round) of \(test.rounds) · frame \(slot.levelPosition) of \(FramingCalibrationProtocol.targetFillPercentages.count)"
+        if test.usesObjectProtocol {
+            return "Object \(slot.round) of \(test.configuredObjectCount) · size \(slot.levelPosition) of \(test.resolvedTargetFillPercentages.count)"
+        }
+        return "Round \(slot.round) of \(test.rounds) · frame \(slot.levelPosition) of \(test.resolvedTargetFillPercentages.count)"
     }
 
-    func startTest(label: String, rounds: Int, workflowMode: MeasurementWorkflowMode) {
+    func startTest(label: String, objectCount: Int, workflowMode: MeasurementWorkflowMode) {
+        let count = min(max(objectCount, 1), Self.maximumObjects)
         activeTest = FramingAccuracyRun(
             id: UUID(),
             createdAt: Date(),
             label: label.trimmingCharacters(in: .whitespacesAndNewlines),
-            rounds: min(max(rounds, 1), Self.maximumRounds),
-            workflowMode: workflowMode
+            rounds: count,
+            workflowMode: workflowMode,
+            objectCount: count,
+            protocolFillPercentages: FramingCalibrationProtocol.targetFillPercentages
         )
         persistAndArchive()
     }
@@ -59,9 +65,7 @@ final class FramingAccuracyStore {
               let actualFill = FramingCalibrationProtocol.fillPercent(
                 boundingBox: viewportBoundingBox,
                 viewportSize: viewportSize
-              ),
-              abs(actualFill - slot.targetFillPercent)
-                <= FramingCalibrationProtocol.allowedFillErrorPercentagePoints else {
+              ) else {
             return false
         }
         let distanceMillimetres = cameraDistanceMetres.flatMap {
@@ -125,6 +129,22 @@ final class FramingAccuracyStore {
         } else {
             test.referenceSizeMillimetres = nil
         }
+        activeTest = test
+        persistAndArchive()
+    }
+
+    func setReference(_ size: SIMD3<Double>?, forObject objectNumber: Int) {
+        guard var test = activeTest,
+              (1...test.configuredObjectCount).contains(objectNumber) else { return }
+        var references = test.objectReferenceSizesMillimetres ?? [:]
+        if let size,
+           size.x.isFinite, size.y.isFinite, size.z.isFinite,
+           size.x > 0, size.y > 0, size.z > 0 {
+            references[objectNumber] = [size.x, size.y, size.z]
+        } else {
+            references.removeValue(forKey: objectNumber)
+        }
+        test.objectReferenceSizesMillimetres = references
         activeTest = test
         persistAndArchive()
     }

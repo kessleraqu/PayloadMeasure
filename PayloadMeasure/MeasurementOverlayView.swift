@@ -17,6 +17,23 @@ struct MesOverlayView: View {
         case edit(UUID)
     }
 
+    private enum MeasurementInstruction: Equatable {
+        case preparing
+        case findObject
+        case findNextObject
+        case moveFarther
+        case moveCloser
+        case holdStill
+        case pointDown
+        case useSideView
+        case findSurface
+    }
+
+    private struct AutomaticMeasurementCandidate: Hashable {
+        let id: UUID
+        let point: CGPoint
+    }
+
     let sessionManager: ARSessionManager
     let aimerState: AimerState
     let captureEngine: ObjectCaptureEngine
@@ -50,6 +67,7 @@ struct MesOverlayView: View {
     @State private var lockFeedback = UINotificationFeedbackGenerator()
     @State private var packingStore = PackingStore()
     @State private var showsPackingWorkflow = false
+    @State private var showsPackingConfirmation = false
 
     private var isAutomaticCaptureSupported: Bool {
         sessionManager.isAutomaticObjectCaptureSupported
@@ -82,6 +100,7 @@ struct MesOverlayView: View {
                 .snappy(duration: 0.25),
                 value: sessionManager.isObjectTrackingEnvironmentReady
             )
+            .animation(.snappy(duration: 0.2), value: isTooCloseForMeasurement)
         )
     }
 
@@ -115,6 +134,16 @@ struct MesOverlayView: View {
         AnyView(overlayObservationLayer
         .onChange(of: captureEngine.automaticLockRequestRevision) { _, _ in
             presentAutomaticLockIfRequested()
+        }
+        .task(id: automaticMeasurementCandidate?.id) {
+            await startMeasurementWhenDistanceIsStable()
+        }
+        .onChange(of: isTooCloseForMeasurement) { wasTooClose, isTooClose in
+            // Auto-lock may have become ready while the operator was inside the unsafe range. The
+            // engine will not issue a second request, so honour the existing one upon moving back.
+            if wasTooClose, !isTooClose {
+                presentAutomaticLockIfRequested()
+            }
         }
         .task(id: pendingDetailsObjectID) {
             await presentPendingDetailsSheet()
@@ -170,6 +199,18 @@ struct MesOverlayView: View {
 
     private var workflowSheetLayer: AnyView {
         AnyView(objectSheetLayer
+        .confirmationDialog(
+            "Did you scan all the objects?",
+            isPresented: $showsPackingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Continue to packing") {
+                beginPackingHandoff()
+            }
+            Button("Keep scanning", role: .cancel) {}
+        } message: {
+            Text("Check that every object has been scanned and saved before continuing.")
+        }
         .sheet(isPresented: $showsLiDARLimitations) {
             nonLiDARLimitationsSheet
                 .presentationDetents([.medium, .large])
@@ -333,6 +374,12 @@ struct MesOverlayView: View {
         sessionManager.setApplicationActive(phase == .active)
     }
 
+    private func beginPackingHandoff() {
+        showsSavedObjects = false
+        study.endCurrentPhase()
+        showsPackingWorkflow = true
+    }
+
     /// Leaving the loading plan means the load is done. Rather than drop back into a half-used
     /// session — which is what made the app feel worse afterwards — offer to clear everything.
     private func handlePackingWorkflowDismissal() {
@@ -357,8 +404,6 @@ struct MesOverlayView: View {
                 if !showsPanel {
                     aimer
                 }
-                preparingPrompt
-                levellingPrompt
             }
         )
     }
@@ -366,13 +411,22 @@ struct MesOverlayView: View {
     private var topLayer: AnyView {
         guard showsLiveOverlay else { return AnyView(EmptyView()) }
         return AnyView(
-            VStack {
+            VStack(spacing: 10) {
+                StudyTimerStrip(study: study)
+                    .padding(.top, 8)
+                    .padding(.horizontal, 16)
+
                 GlassEffectContainer(spacing: 14) {
                     topHUD
                 }
                 .frame(maxWidth: .infinity, alignment: .top)
-                .padding(.top, 16)
                 .padding(.horizontal, 16)
+
+                if !showsPanel {
+                    measurementInstructionBanner
+                        .padding(.horizontal, 16)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 Spacer()
             }
@@ -386,27 +440,15 @@ struct MesOverlayView: View {
                 Spacer()
 
                 VStack(alignment: .leading, spacing: 10) {
-                    bottomStatusCard
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-
-                    if showsSavedObjects, !finalizedMeasuredObjectIDs.isEmpty {
-                        savedObjectsPanel
-                            .transition(
-                                .opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))
-                            )
-                    }
-
-                    if !finalizedMeasuredObjectIDs.isEmpty
-                        || captureEngine.activeObjectID != nil {
+                    if captureEngine.activeObjectID != nil {
                         bottomActionRow
                     }
 
-                    measureButton
-
-                    HStack {
-                        scanQuickVisualControls
-                        Spacer(minLength: 0)
+                    if !finalizedMeasuredObjectIDs.isEmpty,
+                       captureEngine.activeObjectID == nil {
+                        startPackingSection
                     }
+
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 16)
@@ -478,6 +520,230 @@ struct MesOverlayView: View {
     private var isPreparingToMeasure: Bool {
         !sessionManager.isObjectTrackingEnvironmentReady
             || !captureEngine.hasCompletedObjectRecognitionWarmup
+    }
+
+    private var liveMeasurementCandidateLayer: ObjectMaskPreviewLayer? {
+        let viewportCentre = CGPoint(x: 0.5, y: 0.5)
+        return captureEngine.objectMaskPreview?.layers
+            .filter { $0.trackedObjectID == nil }
+            .min {
+                let lhs = $0.referenceAnchorPoint ?? viewportCentre
+                let rhs = $1.referenceAnchorPoint ?? viewportCentre
+                return hypot(lhs.x - viewportCentre.x, lhs.y - viewportCentre.y)
+                    < hypot(rhs.x - viewportCentre.x, rhs.y - viewportCentre.y)
+            }
+    }
+
+    /// Uses the fitted box centre once measuring has begun. Before selection, ARCameraView attaches
+    /// the median LiDAR distance sampled inside the live mask so differently sized objects are all
+    /// guided to the same physical range.
+    private var estimatedCameraToObjectCentreDistanceMetres: Double? {
+        if let activeID = captureEngine.activeObjectID {
+            if let captured = captureEngine.capturedObjectsByID[activeID],
+               let distance = sessionManager.cameraDistanceMetres(to: captured.center) {
+                return distance
+            }
+            if let marker = captureEngine.objectMaskMarkers.first(where: { $0.id == activeID }) {
+                return Double(marker.cameraDistance)
+            }
+            if let layer = captureEngine.objectMaskPreview?.layers.first(where: {
+                $0.trackedObjectID == activeID
+            }), let distance = layer.referenceCameraDistance {
+                return Double(distance)
+            }
+        }
+
+        return liveMeasurementCandidateLayer?.referenceCameraDistance.map(Double.init)
+    }
+
+    private var isTooCloseForMeasurement: Bool {
+        MeasurementFramingRule.isTooClose(
+            distanceMetres: estimatedCameraToObjectCentreDistanceMetres
+        )
+    }
+
+    private var measurementDistanceGuidance: MeasurementFramingRule.Guidance {
+        MeasurementFramingRule.guidance(
+            distanceMetres: estimatedCameraToObjectCentreDistanceMetres
+        )
+    }
+
+    private var automaticMeasurementCandidate: AutomaticMeasurementCandidate? {
+        guard isAutomaticCaptureSupported,
+              showsLiveOverlay,
+              !showsPanel,
+              captureEngine.activeObjectID == nil,
+              !captureEngine.isObjectSelectionPending,
+              finalizedMeasuredObjectIDs.count < 15,
+              !captureEngine.isPointingAtFinishedObject,
+              sessionManager.isTrackingReady,
+              sessionManager.isObjectTrackingEnvironmentReady,
+              captureEngine.hasCompletedObjectRecognitionWarmup,
+              workflowMode == .spatial3D || captureEngine.isTopViewAligned,
+              measurementDistanceGuidance == .ready,
+              let layer = liveMeasurementCandidateLayer else {
+            return nil
+        }
+        let point = layer.referenceAnchorPoint
+            ?? layer.referenceViewportBoundingBox.map {
+                CGPoint(x: $0.midX, y: $0.midY)
+            }
+            ?? CGPoint(x: 0.5, y: 0.5)
+        return AutomaticMeasurementCandidate(id: layer.id, point: point)
+    }
+
+    private var measurementInstruction: MeasurementInstruction {
+        if isPreparingToMeasure { return .preparing }
+        if captureEngine.isObjectSelectionPending || automaticMeasurementCandidate != nil {
+            return .holdStill
+        }
+        if captureEngine.activeObjectID != nil {
+            switch measurementDistanceGuidance {
+            case .moveFarther: return .moveFarther
+            case .moveCloser: return .moveCloser
+            case .ready, .unavailable:
+                if workflowMode == .top, !captureEngine.isTopViewAligned {
+                    return .pointDown
+                }
+                switch captureEngine.convergence.limitingFactor {
+                case .waitingForSupportPlane: return .findSurface
+                case .needsTopView: return .pointDown
+                case .needsSideView: return .useSideView
+                default: return .holdStill
+                }
+            }
+        }
+        if captureEngine.isPointingAtFinishedObject {
+            return .findNextObject
+        }
+        switch measurementDistanceGuidance {
+        case .moveFarther: return .moveFarther
+        case .moveCloser: return .moveCloser
+        case .ready:
+            if workflowMode == .top, !captureEngine.isTopViewAligned {
+                return .pointDown
+            }
+            return .holdStill
+        case .unavailable:
+            return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
+        }
+    }
+
+    private var measurementInstructionTitle: String {
+        switch measurementInstruction {
+        case .preparing: "Getting ready"
+        case .findObject: "Look for an object"
+        case .findNextObject: "Look for the next object"
+        case .moveFarther: "Move farther away"
+        case .moveCloser: "Move closer"
+        case .holdStill: "DON’T MOVE"
+        case .pointDown: "Point straight down"
+        case .useSideView: "Use a side view"
+        case .findSurface: "Find the surface"
+        }
+    }
+
+    private var measurementInstructionDetail: String {
+        let distance = estimatedCameraToObjectCentreDistanceMetres.map {
+            " Estimated distance: \(Int(($0 * 100).rounded())) cm."
+        } ?? ""
+        switch measurementInstruction {
+        case .preparing:
+            return "The app is preparing the camera and object recognition."
+        case .findObject:
+            return workflowMode == .top
+                ? "Aim at one complete object from above and point the phone straight down."
+                : "Aim at one complete object and keep it fully visible."
+        case .findNextObject:
+            return "Aim at the next unmeasured object and keep it fully visible."
+        case .moveFarther:
+            return "The phone is too close. Move back toward 40–50 cm.\(distance)"
+        case .moveCloser:
+            return "The phone is too far away. Move toward the object until 40–50 cm.\(distance)"
+        case .holdStill:
+            return captureEngine.activeObjectID == nil
+                ? "Distance is correct. Hold the phone still while the app starts measuring."
+                : "Hold the phone steady while the app collects and stabilises the measurement."
+        case .pointDown:
+            if let degrees = captureEngine.topViewDeviationDegrees {
+                return "Hold the phone above the object with the camera facing the floor. \(degrees)° to go."
+            }
+            return "Hold the phone above the object with the camera facing the floor."
+        case .useSideView:
+            return "Move to an isometric or lateral view while keeping the complete object visible."
+        case .findSurface:
+            return "Sweep slowly across the table beneath the object so the app can confirm its support."
+        }
+    }
+
+    private var measurementInstructionColor: Color {
+        switch measurementInstruction {
+        case .holdStill: .red
+        case .moveCloser, .moveFarther: .orange
+        case .pointDown, .useSideView, .findSurface: .yellow
+        case .findObject, .findNextObject: .blue
+        case .preparing: .secondary
+        }
+    }
+
+    private var measurementInstructionIcon: String {
+        switch measurementInstruction {
+        case .preparing: "camera.aperture"
+        case .findObject, .findNextObject: "viewfinder"
+        case .moveFarther: "arrow.up.left.and.arrow.down.right"
+        case .moveCloser: "arrow.down.right.and.arrow.up.left"
+        case .holdStill: "hand.raised.fill"
+        case .pointDown: "arrow.down.to.line"
+        case .useSideView: "arrow.right.to.line"
+        case .findSurface: "square.dashed"
+        }
+    }
+
+    private var measurementInstructionBanner: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if captureEngine.activeObjectID != nil {
+                Label("MEASURING", systemImage: "ruler.fill")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.cyan.opacity(0.14), in: Capsule())
+            }
+
+            HStack(spacing: 10) {
+                Image(systemName: measurementInstructionIcon)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(
+                        measurementInstruction == .holdStill
+                            ? Color.white
+                            : measurementInstructionColor
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(measurementInstructionTitle)
+                        .font(.headline)
+                        .foregroundStyle(measurementInstruction == .holdStill ? .white : .primary)
+                    Text(measurementInstructionDetail)
+                        .font(.caption)
+                        .foregroundStyle(
+                            measurementInstruction == .holdStill
+                                ? Color.white.opacity(0.9)
+                                : Color.secondary
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(
+            measurementInstruction == .holdStill
+                ? Color.red.opacity(0.92)
+                : measurementInstructionColor.opacity(0.12),
+            in: RoundedRectangle(cornerRadius: 16)
+        )
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: - Bottom status
@@ -703,7 +969,15 @@ struct MesOverlayView: View {
     /// being tracked and any advice would be guesswork.
     private var measuringGuidance: ObjectFramingGuidance? {
         guard captureEngine.activeObjectID != nil else { return nil }
-        return captureEngine.framingGuidance
+        switch measurementDistanceGuidance {
+        case .moveFarther:
+            return .moveFarther
+        case .moveCloser:
+            return .moveCloser
+        case .ready, .unavailable:
+            // Keep centring advice, but do not turn screen occupancy back into a distance rule.
+            return captureEngine.framingGuidance == .centre ? .centre : nil
+        }
     }
 
     /// Distance first, because nothing else can be judged from the wrong distance; after that it is
@@ -714,7 +988,7 @@ struct MesOverlayView: View {
     private var measuringTitle: String {
         switch measuringGuidance {
         case .moveCloser: "Move closer"
-        case .moveFarther: "Move back"
+        case .moveFarther: "Move farther away"
         case .centre: "Aim at it"
         default:
             switch captureEngine.convergence.limitingFactor {
@@ -729,8 +1003,8 @@ struct MesOverlayView: View {
 
     private var measuringAdvice: String {
         switch measuringGuidance {
-        case .moveCloser: "Bring the phone nearer the object."
-        case .moveFarther: "Pull the phone back a little."
+        case .moveCloser: "Move toward the object until the phone is 40–50 cm away."
+        case .moveFarther: "Move back until the phone is 40–50 cm away."
         case .centre: "The object runs off the edge. Point at the middle of it."
         default:
             switch captureEngine.convergence.limitingFactor {
@@ -807,7 +1081,7 @@ struct MesOverlayView: View {
     private var topGuideDetail: String {
         if captureEngine.activeObjectID == nil {
             return captureEngine.isTopViewAligned
-                ? "Hold this angle and tap the object."
+                ? "Hold this angle. Measurement starts automatically at 40–50 cm."
                 : "Hold the phone above the object with the camera facing the floor."
         }
         if captureEngine.topMeasurementStable {
@@ -880,6 +1154,9 @@ struct MesOverlayView: View {
                 .gesture(
                     SpatialTapGesture()
                         .onEnded { value in
+                            // LiDAR studies start automatically after a stable 40–50 cm preflight.
+                            // Manual tapping remains only for the RGB fallback, which has no depth.
+                            guard !isAutomaticCaptureSupported else { return }
                             guard captureEngine.activeObjectID == nil,
                                   !captureEngine.isObjectSelectionPending else {
                                 return
@@ -907,12 +1184,16 @@ struct MesOverlayView: View {
                         }
                 )
                 .accessibilityLabel(
-                    captureEngine.activeObjectID == nil
+                    isAutomaticCaptureSupported
+                        ? "Automatic object selection area"
+                    : captureEngine.activeObjectID == nil
                         ? "Tap an object to select it for measurement"
                         : "Current object selected for measurement"
                 )
                 .accessibilityHint(
-                    captureEngine.activeObjectID == nil
+                    isAutomaticCaptureSupported
+                        ? "Keep an unmeasured object in view at 40 to 50 centimetres."
+                    : captureEngine.activeObjectID == nil
                         ? "Only one object can be measured at a time."
                         : "Finish the current object before selecting another."
                 )
@@ -1091,6 +1372,33 @@ struct MesOverlayView: View {
 
                 Divider()
 
+                DisclosureGroup("Scan visuals") {
+                    VStack(alignment: .leading, spacing: 9) {
+                        visualToggleButton(
+                            title: "Mask",
+                            systemImage: "viewfinder",
+                            isVisible: captureEngine.showsSegmentationOverlays,
+                            action: captureEngine.toggleSegmentationOverlays
+                        )
+                        visualToggleButton(
+                            title: "Points",
+                            systemImage: "circle.grid.3x3.fill",
+                            isVisible: captureEngine.showsSelectedPoints,
+                            action: captureEngine.toggleSelectedPoints
+                        )
+                        visualToggleButton(
+                            title: "Box",
+                            systemImage: "cube.transparent",
+                            isVisible: captureEngine.showsBoundingBoxes,
+                            action: captureEngine.toggleBoundingBoxes
+                        )
+                    }
+                    .padding(.top, 7)
+                }
+                .accessibilityHint("Shows or hides measurement overlays on the camera view.")
+
+                Divider()
+
                 Text(sessionManager.trackingStatus.detail)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1210,9 +1518,9 @@ struct MesOverlayView: View {
                 return "\(captureEngine.statusText) Only this object is being measured. Move around all sides, then tap Finish."
             }
             if !captureEngine.finalizedObjectIDs.isEmpty {
-                return "\(captureEngine.statusText) Finished measurements stay fixed. Tap another highlighted object to measure it."
+                return "\(captureEngine.statusText) Finished measurements stay fixed. Aim at the next object; measurement starts automatically at 40–50 cm."
             }
-            return "\(captureEngine.statusText) Tap a highlighted object to select it for measurement."
+            return "\(captureEngine.statusText) Aim at a highlighted object; measurement starts automatically at 40–50 cm."
         }
 
         if captureEngine.activeObjectID != nil {
@@ -1254,15 +1562,9 @@ struct MesOverlayView: View {
     @ViewBuilder
     private var bottomActionRow: some View {
         if dynamicTypeSize.isAccessibilitySize {
-            VStack(alignment: .leading, spacing: 8) {
-                if !finalizedMeasuredObjectIDs.isEmpty {
-                    savedObjectsButton
-                }
-
-                ViewThatFits(in: .horizontal) {
-                    accessibilityActionRow(showsTitles: true)
-                    accessibilityActionRow(showsTitles: false)
-                }
+            ViewThatFits(in: .horizontal) {
+                accessibilityActionRow(showsTitles: true)
+                accessibilityActionRow(showsTitles: false)
             }
         } else {
             // Every button here is optional, so the row's width swings a lot. Rather than let it
@@ -1284,61 +1586,10 @@ struct MesOverlayView: View {
 
     private func actionRow(showsTitles: Bool) -> some View {
         HStack(spacing: 8) {
-            if !finalizedMeasuredObjectIDs.isEmpty {
-                savedObjectsButton
-            }
             Spacer(minLength: 0)
             cancelMeasurementButton(showsTitle: showsTitles)
             workflowButtonIfAvailable(showsTitle: showsTitles)
         }
-    }
-
-    /// The one thing the operator presses to start measuring. It replaces tapping the object: the
-    /// aimer already says what is being pointed at, so a button is unambiguous and does not fight
-    /// the drag gestures. Blue invites; the grey Remeasure says "you can, but you should not need
-    /// to". Top mode waits for overhead alignment; 3D mode stays available because its second view
-    /// is intentionally isometric or lateral.
-    @ViewBuilder
-    private var measureButton: some View {
-        if isAutomaticCaptureSupported,
-           captureEngine.activeObjectID == nil,
-           !showsPanel,
-           (workflowMode == .spatial3D || captureEngine.isTopViewAligned) {
-            // Pointing at something already measured greys the button out and says so. There is no
-            // remeasure: a participant who is unsure re-does the whole payload from the info panel, and
-            // dropping it is what lets finished objects stop being tracked at all — see
-            // ObjectCaptureEngine.isTrackingFinishedObjects.
-            let isDone = captureEngine.isPointingAtFinishedObject
-            Button {
-                showsSavedObjects = false
-                captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
-            } label: {
-                Text(isDone ? "Already measured" : "Measure")
-                    .font(.headline)
-                    .foregroundStyle(isDone ? Color.secondary : Color.white)
-                    .frame(maxWidth: .infinity, minHeight: 54)
-                    .background(
-                        isDone ? AnyShapeStyle(.regularMaterial) : AnyShapeStyle(Color.accentColor),
-                        in: Capsule()
-                    )
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .disabled(isDone || captureEngine.isObjectSelectionPending || !measurementCanStart)
-            .opacity(isDone || measurementCanStart ? 1 : 0.5)
-            .accessibilityLabel(
-                isDone
-                    ? "This object has already been measured"
-                    : "Measure the object in the centre"
-            )
-            .transition(.opacity.combined(with: .scale(scale: 0.96)))
-        }
-    }
-
-    private var measurementCanStart: Bool {
-        sessionManager.isTrackingReady
-            && sessionManager.isObjectTrackingEnvironmentReady
-            && captureEngine.hasCompletedObjectRecognitionWarmup
     }
 
     /// Shown over the live camera until the environment is ready. The camera is deliberately visible
@@ -1470,7 +1721,8 @@ struct MesOverlayView: View {
         if captureEngine.activeObjectID != nil {
             Button {
                 guard sessionManager.isTrackingReady,
-                      sessionManager.isObjectTrackingEnvironmentReady else {
+                      sessionManager.isObjectTrackingEnvironmentReady,
+                      !isTooCloseForMeasurement else {
                     return
                 }
                 showsSavedObjects = false
@@ -1484,11 +1736,14 @@ struct MesOverlayView: View {
                 !captureEngine.canFinalizeActiveObject
                     || !sessionManager.isTrackingReady
                     || !sessionManager.isObjectTrackingEnvironmentReady
+                    || isTooCloseForMeasurement
             )
             .accessibilityLabel("Finish measuring this object")
             .accessibilityHint(
                 !sessionManager.isTrackingReady
                     ? "Wait for normal camera tracking before finishing."
+                    : isTooCloseForMeasurement
+                        ? "Move the phone at least 35 centimetres from the object before finishing."
                     : !sessionManager.isObjectTrackingEnvironmentReady
                         ? "Scan the floor or table until its supporting plane is ready."
                     : !captureEngine.hasDefinitiveSupportPlaneForActiveObject
@@ -1605,7 +1860,6 @@ struct MesOverlayView: View {
             )
             .frame(height: savedObjectsListHeight)
 
-            arrangePayloadButton
         }
         .padding(10)
         .frame(maxWidth: .infinity)
@@ -1613,58 +1867,27 @@ struct MesOverlayView: View {
         .accessibilityElement(children: .contain)
     }
 
-    private var arrangePayloadButton: some View {
-        let isMeasuring = captureEngine.activeObjectID != nil
-        let needsPreparation = packingStore
-            .packagesMissingPreparation(from: captureEngine)
-            .count
-        let noFittingBoxCount = finalizedMeasuredObjectIDs.count(where: { id in
-            packingStore.fittingBoxPresets(for: id, in: captureEngine).isEmpty
-        })
-
-        return VStack(alignment: .leading, spacing: 4) {
-            Button {
-                showsSavedObjects = false
-                showsPackingWorkflow = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "shippingbox.and.arrow.backward")
-                        .foregroundStyle(.cyan)
-                    Text("Prepare & arrange")
-                        .foregroundStyle(.primary)
-                }
-                .font(.subheadline.weight(.semibold))
-                .frame(maxWidth: .infinity, minHeight: 44)
-                .contentShape(Capsule())
+    private var startPackingSection: some View {
+        Button {
+            showsSavedObjects = false
+            showsPackingConfirmation = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "shippingbox.fill")
+                Text("Start packing")
+                Spacer(minLength: 8)
+                Image(systemName: "arrow.right")
             }
-            .buttonStyle(.glass)
-            .buttonBorderShape(.capsule)
-            .disabled(isMeasuring)
-            .opacity(isMeasuring ? 0.5 : 1)
-            .accessibilityLabel("Prepare packages and arrange the payload")
-            .accessibilityHint(
-                isMeasuring
-                    ? "Finish the object being measured first."
-                    : "Guides you through naming, choosing an outer box and weighing each package before creating the loading plan."
-            )
-
-            if noFittingBoxCount > 0 {
-                Text("\(noFittingBoxCount) object\(noFittingBoxCount == 1 ? " does" : "s do") not fit available boxes and will be left out during preparation.")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else if needsPreparation > 0 {
-                Text("You will choose a fitting outer box and enter the packed weight in grams for each object.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Text("Review every prepared package before rebuilding the loading plan.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            .font(.headline)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity, minHeight: 54)
+            .background(Color.accentColor, in: Capsule())
+            .contentShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Start packing")
+        .accessibilityHint("Confirms every object was scanned, then opens the untimed packing start screen.")
     }
 
     private func savedObjectRow(for id: UUID) -> some View {
@@ -1865,12 +2088,27 @@ struct MesOverlayView: View {
         return "Remove \(name)?"
     }
 
+    /// Entering the preferred band does not fire on a single noisy depth sample. The red hold-still
+    /// stage must remain valid briefly, then the latest mask point is selected automatically.
+    private func startMeasurementWhenDistanceIsStable() async {
+        guard automaticMeasurementCandidate != nil else { return }
+        try? await Task.sleep(for: .milliseconds(650))
+        guard !Task.isCancelled,
+              let candidate = automaticMeasurementCandidate,
+              measurementInstruction == .holdStill else {
+            return
+        }
+        showsSavedObjects = false
+        captureEngine.requestObjectMaskToggle(at: candidate.point)
+    }
+
     private func presentAutomaticLockIfRequested() {
         guard let id = captureEngine.automaticLockRequest,
               captureEngine.activeObjectID == id,
               objectDetailsContext == nil,
               sessionManager.isTrackingReady,
-              sessionManager.isObjectTrackingEnvironmentReady else {
+              sessionManager.isObjectTrackingEnvironmentReady,
+              !isTooCloseForMeasurement else {
             return
         }
         showsSavedObjects = false
@@ -1879,6 +2117,9 @@ struct MesOverlayView: View {
     }
 
     private func lockAndPresentDetails() {
+        guard !isTooCloseForMeasurement else {
+            return
+        }
         guard let id = captureEngine.lockActiveObject() else {
             return
         }

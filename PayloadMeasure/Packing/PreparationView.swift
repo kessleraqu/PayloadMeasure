@@ -3,7 +3,7 @@ import UIKit
 
 // Step-by-step screen the operator works through before loading. The system assigns the smallest
 // fitting box to every object; the operator is told which one to use, weighs the sealed package,
-// and moves on. From here it goes straight into the arrangement without leaving the sheet.
+// and moves on. Neutral handoff screens separate measuring, packing and loading inside the sheet.
 //
 // In:  PackingStore and the capture engine.
 // Out: on screen only. Writes names, packed weights, own-box marks and exclusions into the store.
@@ -15,29 +15,61 @@ struct PreparationView: View {
     var allowsRoomScaleAR = true
     let onBoxFinished: () -> Void
 
-    @State private var stage: Stage = .preparation
+    @State private var stage: Stage = .packingHandoff
 
     private enum Stage {
+        case packingHandoff
         case preparation
+        case payloadHandoff
         case arrangement
     }
 
     var body: some View {
         switch stage {
+        case .packingHandoff:
+            StudyPhaseHandoffView(
+                title: "Packing",
+                detail: "The measuring timer is stopped. Start when you are ready to prepare and weigh every package.",
+                buttonTitle: "Start packing",
+                study: study
+            ) {
+                study.beginPhase(.pack)
+                withAnimation(.snappy(duration: 0.25)) {
+                    stage = .preparation
+                }
+            }
+            .onAppear { study.endCurrentPhase() }
+
         case .preparation:
             PackingPreparationView(
                 captureEngine: captureEngine,
                 store: store
             ) {
+                study.endCurrentPhase()
+                withAnimation(.snappy(duration: 0.25)) {
+                    stage = .payloadHandoff
+                }
+            }
+            .transition(.opacity)
+            .safeAreaInset(edge: .top) {
+                StudyTimerStrip(study: study)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+            }
+
+        case .payloadHandoff:
+            StudyPhaseHandoffView(
+                title: "Loading",
+                detail: "The packing timer is stopped. Start when you are ready to optimise and load the payload.",
+                buttonTitle: "Start loading",
+                study: study
+            ) {
+                study.beginPhase(.payload)
                 withAnimation(.snappy(duration: 0.25)) {
                     stage = .arrangement
                 }
             }
-            .transition(.opacity)
-            // The two stages are the study's last two timed phases, so each one clocks itself in.
-            // Phases accumulate, so going back and forth adds to the right total instead of
-            // overwriting it.
-            .onAppear { study.beginPhase(.pack) }
+            .onAppear { study.endCurrentPhase() }
 
         case .arrangement:
             ArrangementView(
@@ -48,7 +80,11 @@ struct PreparationView: View {
                 onBoxFinished: onBoxFinished
             )
             .transition(.opacity)
-            .onAppear { study.beginPhase(.payload) }
+            .safeAreaInset(edge: .top) {
+                StudyTimerStrip(study: study)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+            }
         }
     }
 }

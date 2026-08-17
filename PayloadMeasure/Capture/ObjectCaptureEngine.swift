@@ -192,7 +192,7 @@ final class ObjectCaptureEngine {
         automaticLockRequestRevision += 1
     }
 
-    private static let defaultPrompt = "Center or tap a highlighted object to select it for measurement."
+    private static let defaultPrompt = "Aim at a highlighted object and follow the distance guide."
 
     private var activeMeasurementPrompt: String {
         switch measurementMode {
@@ -388,6 +388,17 @@ final class ObjectCaptureEngine {
         showsObjectMaskMarkers.toggle()
     }
 
+    /// Restores the live measurement presentation used by the framing test: segmentation mask,
+    /// cyan admitted points, detected-object marker, and the fitted 3D box.
+    func showMeasurementVisuals() {
+        showsLiveMaskPreview = true
+        showsSelectedObjectMaskPreview = true
+        showsBoundingBoxes = true
+        showsSelectedPoints = true
+        showsObjectMaskMarkers = true
+        isMeshVisible = false
+    }
+
     func hideAllScanVisuals() {
         showsLiveMaskPreview = false
         showsSelectedObjectMaskPreview = false
@@ -406,9 +417,17 @@ final class ObjectCaptureEngine {
         showsObjectMaskMarkers = false
     }
 
-    func showObjectMaskPreview(_ preview: ObjectMaskPreview) {
+    func showObjectMaskPreview(
+        _ preview: ObjectMaskPreview,
+        viewportSize: CGSize? = nil
+    ) {
         guard preview.timestamp >= latestObjectMaskPreviewTimestamp else {
             return
+        }
+        if let viewportSize,
+           viewportSize.width > 0,
+           viewportSize.height > 0 {
+            objectMaskViewportSize = viewportSize
         }
         latestObjectMaskPreviewTimestamp = preview.timestamp
         for layer in preview.layers {
@@ -537,7 +556,7 @@ final class ObjectCaptureEngine {
 
     func reportObjectLockNeedsSurface() {
         isObjectSelectionPending = false
-        objectMaskFeedbackText = "No stable surface was found at that point. Move slowly around it, then tap again."
+        objectMaskFeedbackText = "No stable surface was found. Move slowly around the object and hold it in view."
     }
 
     func reportObjectSelectionNotReady() {
@@ -552,7 +571,7 @@ final class ObjectCaptureEngine {
 
     func reportObjectRecognitionFailure() {
         isObjectSelectionPending = false
-        objectMaskFeedbackText = "Object recognition had a temporary problem. Hold steady and tap the object again."
+        objectMaskFeedbackText = "Object recognition had a temporary problem. Keep the object visible and hold steady."
     }
 
     func markObjectRecognitionWarmupCompleted() {
@@ -561,7 +580,7 @@ final class ObjectCaptureEngine {
 
     func reportObjectLockNotFound() {
         isObjectSelectionPending = false
-        objectMaskFeedbackText = "No separate object mask was found there. Keep the object fully visible and tap near its center."
+        objectMaskFeedbackText = "No separate object mask was found. Keep one object fully visible near the centre."
     }
 
     func reportObjectLimitReached() {
@@ -591,7 +610,7 @@ final class ObjectCaptureEngine {
             return
         }
         isObjectSelectionPending = false
-        objectMaskFeedbackText = "Object selection was interrupted. Tap the object again."
+        objectMaskFeedbackText = "Object selection was interrupted. Keep the object visible to try again."
     }
 
     func beginObjectMeasurement(id: UUID) {
@@ -697,7 +716,7 @@ final class ObjectCaptureEngine {
             : finalizedObjectIDs.count == 1
                 ? "1 object measured."
                 : "\(finalizedObjectIDs.count) objects measured."
-        objectMaskFeedbackText = "Measurement cancelled. Tap an object to start again."
+        objectMaskFeedbackText = "Measurement cancelled. Aim at an object to start again."
     }
 
     /// Two packages with the same name are indistinguishable in a loading plan.

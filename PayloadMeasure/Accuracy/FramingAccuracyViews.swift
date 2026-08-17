@@ -5,6 +5,7 @@ struct FramingAccuracySiteView: View {
     let store: FramingAccuracyStore
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.sharedARViewHost) private var sharedARViewHost
 
     var body: some View {
         NavigationStack {
@@ -23,6 +24,11 @@ struct FramingAccuracySiteView: View {
                 }
             }
         }
+        .onAppear {
+            // Accuracy runs must begin in a fresh AR world, but use the same persistent renderer as
+            // the study so RealityKit cannot leave this full-screen cover with a black/stale feed.
+            sharedARViewHost?.requestNewMeasurementWorld()
+        }
     }
 }
 
@@ -30,7 +36,7 @@ private struct FramingAccuracySetupView: View {
     let store: FramingAccuracyStore
 
     @State private var label = ""
-    @State private var rounds = 5
+    @State private var objectCount = 4
     @State private var workflowMode: MeasurementWorkflowMode = .top
 
     var body: some View {
@@ -43,17 +49,18 @@ private struct FramingAccuracySetupView: View {
                     }
                 }
                 Stepper(
-                    "Repeated rounds: \(rounds)",
-                    value: $rounds,
-                    in: 1...FramingAccuracyStore.maximumRounds
+                    "Objects: \(objectCount)",
+                    value: $objectCount,
+                    in: 1...FramingAccuracyStore.maximumObjects
                 )
             }
 
             Section("Protocol") {
-                Label("Use the same object throughout", systemImage: "shippingbox")
-                Label("Five framing squares per round", systemImage: "viewfinder")
+                Label("Measure each object at all five sizes", systemImage: "shippingbox")
+                Label("One pass through the sizes per object", systemImage: "viewfinder")
+                Label("You decide when the object is positioned correctly", systemImage: "hand.tap")
                 Label("Full AR reset after every reading", systemImage: "arrow.clockwise")
-                Text("Frames: 20%, 35%, 50%, 65%, and 80% of the screen's shorter side.")
+                Text("Position the object inside each rectangle, then tap Start measuring whenever you are ready. The mask, cyan points, and measured box remain visible while measuring.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -62,14 +69,14 @@ private struct FramingAccuracySetupView: View {
                 Button {
                     store.startTest(
                         label: label,
-                        rounds: rounds,
+                        objectCount: objectCount,
                         workflowMode: workflowMode
                     )
                 } label: {
                     Text("Start framing test").font(.headline)
                 }
             } footer: {
-                Text("\(rounds * FramingCalibrationProtocol.targetFillPercentages.count) independent measurements. Odd rounds run far-to-near; even rounds reverse the order. Enter the object's true size after the final reading.")
+                Text("\(objectCount * FramingCalibrationProtocol.targetFillPercentages.count) measurements: all five visible sizes once per object. Enter each object's true size after the final reading.")
             }
 
             if !store.saved.isEmpty {
@@ -99,6 +106,11 @@ private struct FramingAccuracySetupView: View {
 }
 
 private struct FramingAccuracyMeasureView: View {
+    private struct MaskCandidate {
+        var boundingBox: CGRect
+        var selectionPoint: CGPoint
+    }
+
     let store: FramingAccuracyStore
 
     @State private var sessionManager = ARSessionManager()
@@ -108,7 +120,10 @@ private struct FramingAccuracyMeasureView: View {
     @State private var lastRecorded: String?
     @State private var resetMessage: String?
     @State private var showsFailureConfirmation = false
+    @State private var startBoundingBox: CGRect?
+    @State private var startViewportSize: CGSize = .zero
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.sharedARViewHost) private var sharedARViewHost
 
     private var workflowMode: MeasurementWorkflowMode {
         store.activeTest?.workflowMode ?? .top
@@ -123,9 +138,12 @@ private struct FramingAccuracyMeasureView: View {
                     sessionManager: sessionManager,
                     aimerState: aimerState,
                     captureEngine: captureEngine,
-                    workflowMode: workflowMode
+                    workflowMode: workflowMode,
+                    sharedViewHost: sharedARViewHost
                 )
                 .ignoresSafeArea()
+
+                objectMaskPreview
 
                 if let slot {
                     framingSquare(targetFillPercent: slot.targetFillPercent, in: geometry.size)
@@ -142,12 +160,20 @@ private struct FramingAccuracyMeasureView: View {
                 }
                 .padding(16)
             }
-            .onAppear { viewportSize = geometry.size }
-            .onChange(of: geometry.size) { _, size in viewportSize = size }
+            .onAppear {
+                viewportSize = geometry.size
+            }
+            .onChange(of: geometry.size) { _, size in
+                viewportSize = size
+            }
         }
         .navigationTitle("Framing test")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { captureEngine.setMeasurementMode(workflowMode) }
+        .onAppear {
+            sessionManager.setApplicationActive(scenePhase == .active)
+            captureEngine.setMeasurementMode(workflowMode)
+            captureEngine.showMeasurementVisuals()
+        }
         .onChange(of: scenePhase) { _, phase in
             sessionManager.setApplicationActive(phase == .active)
         }
@@ -158,7 +184,7 @@ private struct FramingAccuracyMeasureView: View {
         ) {
             Button("Record failed attempt and continue", role: .destructive) {
                 if store.recordFailure(
-                    reason: "No stable measurement could be completed at the target framing."
+                    reason: "No stable measurement could be completed for this guide size."
                 ) {
                     resetCapture(reason: "Failed attempt recorded. AR reset for the next frame.")
                 }
@@ -173,11 +199,9 @@ private struct FramingAccuracyMeasureView: View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.progressText).font(.headline)
-                if let slot {
-                    Text("Target frame \(AccuracyTestRun.number(slot.targetFillPercent))%")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
+                Text("Position the object, then start when ready")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
             Text(workflowMode.shortTitle)
@@ -196,14 +220,10 @@ private struct FramingAccuracyMeasureView: View {
     private var measurementCard: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Image(systemName: fillIsWithinTarget ? "checkmark.viewfinder" : "viewfinder")
-                    .foregroundStyle(fillIsWithinTarget ? .green : methodColor)
+                Image(systemName: "viewfinder")
+                    .foregroundStyle(methodColor)
                 Text(cardHeadline).font(.subheadline.weight(.semibold))
                 Spacer()
-                if let actualFillPercent {
-                    Text("\(AccuracyTestRun.number(actualFillPercent))% actual")
-                        .font(.caption.monospacedDigit().weight(.semibold))
-                }
             }
             Text(cardDetail)
                 .font(.caption)
@@ -235,10 +255,8 @@ private struct FramingAccuracyMeasureView: View {
     private var controls: some View {
         VStack(spacing: 10) {
             if captureEngine.activeObjectID == nil {
-                Button {
-                    captureEngine.requestObjectMaskToggle(at: CGPoint(x: 0.5, y: 0.5))
-                } label: {
-                    Text("Measure inside this frame")
+                Button(action: startMeasurement) {
+                    Text(startButtonTitle)
                         .font(.headline)
                         .frame(maxWidth: .infinity, minHeight: 48)
                 }
@@ -255,16 +273,14 @@ private struct FramingAccuracyMeasureView: View {
                 }
             } else {
                 Button(action: saveReading) {
-                    Text(fillIsWithinTarget
-                        ? "Save and reset for next frame"
-                        : "Match the square to save")
+                    Text("Save measurement and continue")
                         .font(.headline)
                         .frame(maxWidth: .infinity, minHeight: 48)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(!canSave)
-                .tint(captureEngine.convergence.isConverged && fillIsWithinTarget ? .green : .accentColor)
+                .tint(captureEngine.convergence.isConverged ? .green : .accentColor)
 
                 Button("Cancel and reset this reading") {
                     resetCapture(reason: "Reading cancelled. AR reset for the same frame.")
@@ -280,103 +296,184 @@ private struct FramingAccuracyMeasureView: View {
         }
     }
 
+    /// ARCameraView produces the Vision mask but does not draw it itself. The normal measurement
+    /// screen owns this presentation layer; the framing test needs the same layer explicitly.
+    @ViewBuilder
+    private var objectMaskPreview: some View {
+        if let preview = captureEngine.objectMaskPreview {
+            ZStack {
+                ForEach(preview.layers, id: \.id) { layer in
+                    if let trackedObjectID = layer.trackedObjectID {
+                        if captureEngine.showsSelectedObjectMaskPreview,
+                           captureEngine.activeObjectID == trackedObjectID,
+                           !captureEngine.finalizedObjectIDs.contains(trackedObjectID),
+                           let marker = captureEngine.objectMaskMarkers.first(where: {
+                               $0.id == trackedObjectID
+                           }) {
+                            trackedObjectMaskPreview(
+                                layer,
+                                marker: marker,
+                                currentBoundingBox: captureEngine
+                                    .objectMaskDisplayBoundingBoxes[layer.id]
+                            )
+                        }
+                    } else if captureEngine.showsLiveMaskPreview {
+                        trackedObjectMaskPreview(
+                            layer,
+                            marker: nil,
+                            currentBoundingBox: captureEngine
+                                .objectMaskDisplayBoundingBoxes[layer.id]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func trackedObjectMaskPreview(
+        _ layer: ObjectMaskPreviewLayer,
+        marker: ObjectMaskMarker?,
+        currentBoundingBox: CGRect?
+    ) -> some View {
+        GeometryReader { proxy in
+            let referencePoint = layer.referenceAnchorPoint ?? CGPoint(x: 0.5, y: 0.5)
+            let currentPoint = marker?.normalizedViewportPoint ?? referencePoint
+            let trackedTransform: (xOffset: CGFloat, yOffset: CGFloat)? = {
+                guard let reference = layer.referenceViewportBoundingBox,
+                      let current = currentBoundingBox,
+                      reference.width >= 0.005,
+                      reference.height >= 0.005,
+                      current.width >= 0.005,
+                      current.height >= 0.005 else {
+                    return nil
+                }
+                return (
+                    (current.midX - reference.midX) * proxy.size.width,
+                    (current.midY - reference.midY) * proxy.size.height
+                )
+            }()
+            let xOffset = trackedTransform?.xOffset
+                ?? (currentPoint.x - referencePoint.x) * proxy.size.width
+            let yOffset = trackedTransform?.yOffset
+                ?? (currentPoint.y - referencePoint.y) * proxy.size.height
+
+            Image(decorative: layer.image, scale: 1, orientation: .up)
+                .resizable()
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .offset(x: xOffset, y: yOffset)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .clipped()
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     private func framingSquare(targetFillPercent: Double, in size: CGSize) -> some View {
-        let side = min(size.width, size.height) * targetFillPercent / 100
+        let normalizedGuide = FramingCalibrationProtocol.guideRect(
+            targetFillPercent: targetFillPercent,
+            viewportSize: size
+        )
+        let width = size.width * (normalizedGuide?.width
+            ?? CGFloat(targetFillPercent / 100))
+        let height = size.height * (normalizedGuide?.height
+            ?? CGFloat(targetFillPercent / 100))
         return ZStack {
             RoundedRectangle(cornerRadius: 10)
-                .fill((fillIsWithinTarget ? Color.green : Color.cyan).opacity(0.07))
+                .fill(Color.cyan.opacity(0.04))
             RoundedRectangle(cornerRadius: 10)
                 .stroke(
-                    fillIsWithinTarget ? Color.green : Color.cyan,
-                    style: StrokeStyle(lineWidth: 3, dash: [10, 6])
+                    Color.cyan,
+                    style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round)
                 )
-            Text("Fit the object's longest visible side to this frame")
-                .font(.caption2.weight(.semibold))
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.white)
-                .shadow(radius: 2)
-                .padding(8)
-                .frame(maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: side, height: side)
+        .frame(width: width, height: height)
     }
 
-    private var activeBoundingBox: CGRect? {
-        captureEngine.activeObjectID.flatMap {
-            captureEngine.objectMaskDisplayBoundingBoxes[$0]
+    private var previewCandidate: MaskCandidate? {
+        guard let layers = captureEngine.objectMaskPreview?.layers else { return nil }
+        let viewportCentre = CGPoint(x: 0.5, y: 0.5)
+        return layers.compactMap { layer -> (MaskCandidate, CGFloat)? in
+            guard layer.trackedObjectID == nil,
+                  let box = captureEngine.objectMaskDisplayBoundingBoxes[layer.id]
+                    ?? layer.referenceViewportBoundingBox else {
+                return nil
+            }
+            let point = layer.referenceAnchorPoint
+                ?? CGPoint(x: box.midX, y: box.midY)
+            let distance = hypot(point.x - viewportCentre.x, point.y - viewportCentre.y)
+            return (MaskCandidate(boundingBox: box, selectionPoint: point), distance)
         }
-    }
-
-    private var actualFillPercent: Double? {
-        guard let activeBoundingBox else { return nil }
-        return FramingCalibrationProtocol.fillPercent(
-            boundingBox: activeBoundingBox,
-            viewportSize: measurementViewportSize
-        )
+        .min { $0.1 < $1.1 }?.0
     }
 
     private var measurementViewportSize: CGSize {
-        let measured = captureEngine.objectMaskViewportSize
-        return measured.width > 0 && measured.height > 0 ? measured : viewportSize
-    }
-
-    private var fillIsWithinTarget: Bool {
-        guard let target = slot?.targetFillPercent,
-              let actualFillPercent else { return false }
-        return abs(actualFillPercent - target)
-            <= FramingCalibrationProtocol.allowedFillErrorPercentagePoints
+        viewportSize
     }
 
     private var canStart: Bool {
-        sessionManager.isTrackingReady
-            && sessionManager.isObjectTrackingEnvironmentReady
-            && captureEngine.hasCompletedObjectRecognitionWarmup
-            && !captureEngine.isObjectSelectionPending
-            && captureEngine.measurementMode == workflowMode
-            && (workflowMode != .top || captureEngine.isTopViewAligned)
+        !captureEngine.isObjectSelectionPending
     }
 
     private var canSave: Bool {
         captureEngine.canFinalizeActiveObject
-            && activeBoundingBox != nil
-            && fillIsWithinTarget
+            && recordingBoundingBox != nil
+    }
+
+    private var recordingBoundingBox: CGRect? {
+        if let startBoundingBox { return startBoundingBox }
+        guard let activeID = captureEngine.activeObjectID else { return nil }
+        return captureEngine.objectMaskDisplayBoundingBoxes[activeID]
     }
 
     private var methodColor: Color { workflowMode == .top ? .cyan : .orange }
 
+    private var startButtonTitle: String {
+        if captureEngine.isObjectSelectionPending { return "Starting measurement…" }
+        return "Start measuring"
+    }
+
     private var cardHeadline: String {
         if captureEngine.activeObjectID == nil {
-            if workflowMode == .top, !captureEngine.isTopViewAligned {
-                return "Point straight down"
-            }
-            return "Place the object inside the square"
+            if captureEngine.isObjectSelectionPending { return "Starting measurement" }
+            return "Start when you are ready"
         }
-        if !fillIsWithinTarget { return "Adjust distance to match the square" }
-        if captureEngine.convergence.isConverged { return "Frame and measurement settled" }
-        return "Keep measuring at this frame size"
+        if captureEngine.convergence.isConverged { return "Measurement settled" }
+        return "Keep measuring the same object"
     }
 
     private var cardDetail: String {
         if captureEngine.activeObjectID == nil {
-            return "Keep the same object centred. Move the phone until its longest visible side matches the square, then begin."
-        }
-        if let target = slot?.targetFillPercent,
-           let actualFillPercent,
-           !fillIsWithinTarget {
-            return "Match the object's longest visible side to the square. Saving unlocks within ±\(AccuracyTestRun.number(FramingCalibrationProtocol.allowedFillErrorPercentagePoints)) percentage points of \(AccuracyTestRun.number(target))%; current fill is \(AccuracyTestRun.number(actualFillPercent))%."
+            if captureEngine.isObjectSelectionPending {
+                return "Hold the phone steady while the measurement starts."
+            }
+            return "Place the object inside the rectangle, then tap Start measuring."
         }
         if workflowMode == .spatial3D {
-            return "Capture the top and an isometric or lateral view while keeping approximately the same framing."
+            return "Capture the top and an isometric or lateral view. Keep the mask, cyan points, and fitted box on the same object."
         }
         return captureEngine.convergence.isConverged
             ? "Save now. The app will clear the object and restart AR tracking."
             : captureEngine.statusText
     }
 
+    private func startMeasurement() {
+        guard canStart else { return }
+        let candidate = previewCandidate
+        startBoundingBox = candidate?.boundingBox
+        startViewportSize = measurementViewportSize
+        captureEngine.requestObjectMaskToggle(
+            at: candidate?.selectionPoint ?? CGPoint(x: 0.5, y: 0.5)
+        )
+    }
+
     private func saveReading() {
+        let measuredObjectNumber = slot?.round
         guard let activeID = captureEngine.activeObjectID,
               let captured = captureEngine.capturedObjectsByID[activeID],
-              let activeBoundingBox else {
+              let recordingBoundingBox,
+              startViewportSize.width > 0,
+              startViewportSize.height > 0 else {
             return
         }
         let distance = sessionManager.cameraDistanceMetres(to: captured.center)
@@ -384,22 +481,34 @@ private struct FramingAccuracyMeasureView: View {
         let size = captured.sizeMillimetres
         guard store.record(
             sizeMillimetres: size,
-            viewportBoundingBox: activeBoundingBox,
-            viewportSize: measurementViewportSize,
+            viewportBoundingBox: recordingBoundingBox,
+            viewportSize: startViewportSize,
             cameraDistanceMetres: distance
         ) else {
             captureEngine.removeFinalizedObject(id: id)
-            resetCapture(reason: "The object moved outside the target tolerance. AR reset; repeat this frame.")
+            resetCapture(reason: "The reading could not be recorded. AR reset; repeat this size.")
             return
         }
         lastRecorded = "Recorded \(AccuracyTestRun.sizeText([size.x, size.y, size.z]))"
-        resetCapture(reason: "Capture, masks, anchors, and AR tracking reset for independence.")
+        if store.activeTest?.usesObjectProtocol == true,
+           let completedObject = measuredObjectNumber,
+           let next = store.nextSlot,
+           next.round != completedObject {
+            resetCapture(
+                reason: "Object \(completedObject) complete. Place object \(next.round); AR has been reset."
+            )
+        } else {
+            resetCapture(reason: "Capture, masks, anchors, and AR tracking reset for independence.")
+        }
     }
 
     private func resetCapture(reason: String) {
         captureEngine.reset()
         sessionManager.restartTracking()
         captureEngine.setMeasurementMode(workflowMode)
+        captureEngine.showMeasurementVisuals()
+        startBoundingBox = nil
+        startViewportSize = .zero
         resetMessage = reason
     }
 }
@@ -407,9 +516,7 @@ private struct FramingAccuracyMeasureView: View {
 private struct FramingAccuracyResultsView: View {
     let store: FramingAccuracyStore
 
-    @State private var first = ""
-    @State private var second = ""
-    @State private var third = ""
+    @State private var referenceInputs: [Int: [String]] = [:]
     @State private var showsDownload = false
     @State private var downloadURL: URL?
 
@@ -425,18 +532,22 @@ private struct FramingAccuracyResultsView: View {
 
     var body: some View {
         List {
-            Section {
-                HStack(spacing: 8) {
-                    referenceField(text: $first)
-                    Text("×").foregroundStyle(.secondary)
-                    referenceField(text: $second)
-                    Text("×").foregroundStyle(.secondary)
-                    referenceField(text: $third)
+            ForEach(referenceObjectNumbers, id: \.self) { objectNumber in
+                Section {
+                    HStack(spacing: 8) {
+                        referenceField(text: referenceBinding(objectNumber, dimension: 0))
+                        Text("×").foregroundStyle(.secondary)
+                        referenceField(text: referenceBinding(objectNumber, dimension: 1))
+                        Text("×").foregroundStyle(.secondary)
+                        referenceField(text: referenceBinding(objectNumber, dimension: 2))
+                    }
+                } header: {
+                    Text(test.usesObjectProtocol
+                        ? "True size for object \(objectNumber) in millimetres"
+                        : "True object size in millimetres")
+                } footer: {
+                    Text("Enter the three calliper or ruler dimensions. Order does not matter.")
                 }
-            } header: {
-                Text("True object size in millimetres")
-            } footer: {
-                Text("Enter the same object's three calliper or ruler dimensions. Order does not matter.")
             }
 
             Section("Attempts") {
@@ -453,6 +564,13 @@ private struct FramingAccuracyResultsView: View {
             }
 
             if let summary = store.summary {
+                if !hasAllReferences {
+                    Section {
+                        Text("Enter the remaining object reference sizes to include every object in these statistics.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Section("Overall") {
                     figure("Bias", summary.bias, suffix: " mm")
                     figure("Mean absolute error", summary.meanAbsoluteError, suffix: " mm")
@@ -461,14 +579,13 @@ private struct FramingAccuracyResultsView: View {
                 }
 
                 ForEach(summary.levels, id: \.targetFillPercent) { level in
-                    Section("Target \(AccuracyTestRun.number(level.targetFillPercent))%") {
+                    Section(test.frameName(targetFillPercent: level.targetFillPercent)) {
                         HStack {
                             Text("Successful / failed")
                             Spacer()
                             Text("\(level.readings.count) / \(test.failures(targetFillPercent: level.targetFillPercent).count)")
                                 .foregroundStyle(.secondary)
                         }
-                        figure("Mean actual fill", level.meanActualFillPercent, suffix: "%")
                         if level.meanCameraDistanceMillimetres.isFinite {
                             figure("Mean camera distance", level.meanCameraDistanceMillimetres, suffix: " mm")
                         }
@@ -480,8 +597,8 @@ private struct FramingAccuracyResultsView: View {
                 }
             } else {
                 Section {
-                    Text(test.referenceSize == nil
-                        ? "Enter all three true dimensions to calculate error at each framing level."
+                    Text(!hasAllReferences
+                        ? "Enter all three true dimensions for every object to calculate the complete error at each framing level."
                         : "No successful measurements are available to compare. Failed attempts remain in the report.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -491,7 +608,7 @@ private struct FramingAccuracyResultsView: View {
             Section("Raw readings") {
                 ForEach(test.readings) { reading in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Round \(reading.round) · target \(AccuracyTestRun.number(reading.targetFillPercent))% · actual \(AccuracyTestRun.number(reading.actualFillPercent))%")
+                        Text("\(test.usesObjectProtocol ? "Object" : "Round") \(reading.round) · \(test.frameName(targetFillPercent: reading.targetFillPercent))")
                             .font(.subheadline.weight(.semibold))
                         Text(reading.sizeText)
                             .font(.caption.monospacedDigit())
@@ -506,7 +623,7 @@ private struct FramingAccuracyResultsView: View {
                 }
                 ForEach(test.failures) { failure in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Round \(failure.round) · target \(AccuracyTestRun.number(failure.targetFillPercent))% · no reading")
+                        Text("\(test.usesObjectProtocol ? "Object" : "Round") \(failure.round) · \(test.frameName(targetFillPercent: failure.targetFillPercent)) · no reading")
                             .font(.subheadline.weight(.semibold))
                         Text(failure.reason)
                             .font(.caption)
@@ -530,21 +647,26 @@ private struct FramingAccuracyResultsView: View {
                 }
                 Button("Close this framing test") { store.closeActiveTest() }
             } footer: {
-                Text("This screen reports the evidence but does not choose a threshold automatically. Define the acceptable error first, then select and validate the passing interval on other objects.")
+                Text("Compare the measurement error and camera distance across the five frame sizes. The downloaded report retains the recorded mask position for auditability.")
             }
         }
         .navigationTitle("Framing results")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: loadReference)
-        .onChange(of: first) { _, _ in commitReference() }
-        .onChange(of: second) { _, _ in commitReference() }
-        .onChange(of: third) { _, _ in commitReference() }
         .sheet(isPresented: $showsDownload) {
             if let downloadURL {
                 DocumentExporter(url: downloadURL) { _ in showsDownload = false }
                     .ignoresSafeArea()
             }
         }
+    }
+
+    private var referenceObjectNumbers: [Int] {
+        test.usesObjectProtocol ? Array(1...test.configuredObjectCount) : [1]
+    }
+
+    private var hasAllReferences: Bool {
+        referenceObjectNumbers.allSatisfy { test.referenceSize(forObject: $0) != nil }
     }
 
     private func referenceField(text: Binding<String>) -> some View {
@@ -568,18 +690,44 @@ private struct FramingAccuracyResultsView: View {
     }
 
     private func loadReference() {
-        guard let values = test.referenceSize else { return }
-        first = PositiveDecimalText.format(values[0], maximumFractionDigits: 2) ?? ""
-        second = PositiveDecimalText.format(values[1], maximumFractionDigits: 2) ?? ""
-        third = PositiveDecimalText.format(values[2], maximumFractionDigits: 2) ?? ""
+        for objectNumber in referenceObjectNumbers {
+            guard let values = test.referenceSize(forObject: objectNumber) else { continue }
+            referenceInputs[objectNumber] = values.map {
+                PositiveDecimalText.format($0, maximumFractionDigits: 2) ?? ""
+            }
+        }
     }
 
-    private func commitReference() {
-        let values = [first, second, third].compactMap(PositiveDecimalText.parse)
+    private func referenceBinding(_ objectNumber: Int, dimension: Int) -> Binding<String> {
+        Binding(
+            get: {
+                let values = referenceInputs[objectNumber] ?? ["", "", ""]
+                return values.indices.contains(dimension) ? values[dimension] : ""
+            },
+            set: { newValue in
+                var values = referenceInputs[objectNumber] ?? ["", "", ""]
+                values[dimension] = newValue
+                referenceInputs[objectNumber] = values
+                commitReference(for: objectNumber, inputs: values)
+            }
+        )
+    }
+
+    private func commitReference(for objectNumber: Int, inputs: [String]) {
+        let values = inputs.compactMap(PositiveDecimalText.parse)
         guard values.count == 3 else {
-            store.setReference(nil)
+            if test.usesObjectProtocol {
+                store.setReference(nil, forObject: objectNumber)
+            } else {
+                store.setReference(nil)
+            }
             return
         }
-        store.setReference(SIMD3(values[0], values[1], values[2]))
+        let size = SIMD3(values[0], values[1], values[2])
+        if test.usesObjectProtocol {
+            store.setReference(size, forObject: objectNumber)
+        } else {
+            store.setReference(size)
+        }
     }
 }

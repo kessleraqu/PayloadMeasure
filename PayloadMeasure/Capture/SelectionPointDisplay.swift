@@ -80,6 +80,71 @@ nonisolated enum SelectionPointDisplay {
         return kept
     }
 
+    /// The measured box is fitted to the complete cloud, while only a small cloud is rendered.
+    /// Always retain the coordinate extremes so the visible dots still show the evidence that sets
+    /// the box boundary; fill the rest of the budget with the stable hash selection above.
+    static func subsetPreservingCoordinateExtrema(
+        _ points: [SIMD3<Float>],
+        limit: Int,
+        hash: (SIMD3<Float>) -> UInt64
+    ) -> [SIMD3<Float>] {
+        guard limit > 0 else { return [] }
+        guard points.count > limit else { return points }
+
+        func component(_ point: SIMD3<Float>, _ axis: Int) -> Float {
+            switch axis {
+            case 0: point.x
+            case 1: point.y
+            default: point.z
+            }
+        }
+
+        func extremeIndex(axis: Int, maximum: Bool) -> Int {
+            points.indices.dropFirst().reduce(points.startIndex) { best, candidate in
+                let bestValue = component(points[best], axis)
+                let candidateValue = component(points[candidate], axis)
+                if maximum ? candidateValue > bestValue : candidateValue < bestValue {
+                    return candidate
+                }
+                if candidateValue == bestValue,
+                   rank(hash(points[candidate]), precedes: hash(points[best])) {
+                    return candidate
+                }
+                return best
+            }
+        }
+
+        // Height first: this is the least visually obvious boundary when the upper point is lost in
+        // a thinned cloud. The remaining coordinate extremes make the same guarantee horizontally.
+        var requiredIndices: [Int] = []
+        for descriptor in [
+            (axis: 1, maximum: true),
+            (axis: 1, maximum: false),
+            (axis: 0, maximum: true),
+            (axis: 0, maximum: false),
+            (axis: 2, maximum: true),
+            (axis: 2, maximum: false)
+        ] {
+            let index = extremeIndex(axis: descriptor.axis, maximum: descriptor.maximum)
+            if !requiredIndices.contains(index) {
+                requiredIndices.append(index)
+            }
+        }
+        if requiredIndices.count >= limit {
+            return requiredIndices.prefix(limit).map { points[$0] }
+        }
+
+        let required = Set(requiredIndices)
+        let candidates = points.indices.filter { !required.contains($0) }
+        let additional = subset(
+            candidates,
+            limit: limit - required.count,
+            hash: { hash(points[$0]) }
+        )
+        let selected = required.union(additional)
+        return points.indices.compactMap { selected.contains($0) ? points[$0] : nil }
+    }
+
     /// Remainder first, then the whole hash to settle ties. Two different items can share a remainder
     /// once there are thousands of them, and `sort` is not stable, so without the tie-break a pair of
     /// dots either side of the cut-off could swap places from one update to the next.

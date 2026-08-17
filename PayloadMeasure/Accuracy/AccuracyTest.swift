@@ -269,6 +269,21 @@ struct AccuracySummary: Sendable {
     }
 }
 
+/// Pairs unlabeled side lengths with the reference assignment that produces the least dimensional
+/// error. For values on one number line, pairing both lists in the same sorted order minimizes both
+/// the sum of absolute errors and the sum of squared errors. Consequently a 10 × 5 reference and an
+/// 11 × 4 reading are paired as 10↔11 and 5↔4, not treated as errors of −6 and +6. Raw readings and
+/// references remain untouched.
+nonisolated enum AccuracySideMatching {
+    static func minimumErrorPairs(
+        measured: [Double],
+        reference: [Double]
+    ) -> [(measured: Double, reference: Double)] {
+        guard measured.count == reference.count else { return [] }
+        return Array(zip(measured.sorted(by: >), reference.sorted(by: >)))
+    }
+}
+
 enum AccuracyStatistics {
     static func mean(_ values: [Double]) -> Double {
         guard !values.isEmpty else { return .nan }
@@ -313,11 +328,17 @@ enum AccuracyStatistics {
             guard !readings.isEmpty else { continue }
 
             let sortedReference = reference.sorted(by: >)
+            let matchedReadings = readings.map {
+                AccuracySideMatching.minimumErrorPairs(
+                    measured: $0.sizeMillimetres,
+                    reference: reference
+                )
+            }
             let axes = (0..<3).map { axisIndex in
                 AccuracyAxisStatistics(
                     axisIndex: axisIndex,
                     reference: sortedReference[axisIndex],
-                    values: readings.map { $0.sortedSizeMillimetres[axisIndex] }
+                    values: matchedReadings.map { $0[axisIndex].measured }
                 )
             }
             objects.append(

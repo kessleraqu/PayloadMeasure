@@ -14,6 +14,7 @@ struct AccuracySiteView: View {
     let store: AccuracyStore
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.sharedARViewHost) private var sharedARViewHost
 
     var body: some View {
         NavigationStack {
@@ -31,6 +32,9 @@ struct AccuracySiteView: View {
                     Button("Main page") { dismiss() }
                 }
             }
+        }
+        .onAppear {
+            sharedARViewHost?.requestNewMeasurementWorld()
         }
     }
 }
@@ -98,13 +102,14 @@ private struct AccuracySetupView: View {
 private struct AccuracyMeasureView: View {
     let store: AccuracyStore
 
-    // Its own session and engine. Nothing else is on screen while this is up, and keeping them
-    // separate means an accuracy test can never leave state behind in a study.
+    // Its own session manager and engine keep accuracy data separate from a study. The underlying
+    // RealityKit renderer is shared, because creating a second renderer is unreliable on iOS 26.
     @State private var sessionManager = ARSessionManager()
     @State private var aimerState = AimerState()
     @State private var captureEngine = ObjectCaptureEngine()
     @State private var lastRecorded: String?
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.sharedARViewHost) private var sharedARViewHost
 
     private var workflowMode: MeasurementWorkflowMode {
         store.nextSlot?.workflowMode ?? .spatial3D
@@ -116,7 +121,8 @@ private struct AccuracyMeasureView: View {
                 sessionManager: sessionManager,
                 aimerState: aimerState,
                 captureEngine: captureEngine,
-                workflowMode: workflowMode
+                workflowMode: workflowMode,
+                sharedViewHost: sharedARViewHost
             )
             .ignoresSafeArea()
 
@@ -132,7 +138,10 @@ private struct AccuracyMeasureView: View {
         }
         .navigationTitle("Measuring")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { captureEngine.setMeasurementMode(workflowMode) }
+        .onAppear {
+            sessionManager.setApplicationActive(scenePhase == .active)
+            captureEngine.setMeasurementMode(workflowMode)
+        }
         .onChange(of: scenePhase) { _, phase in
             sessionManager.setApplicationActive(phase == .active)
         }

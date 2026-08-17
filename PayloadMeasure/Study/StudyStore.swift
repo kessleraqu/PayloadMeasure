@@ -35,7 +35,7 @@ final class StudyStore {
     /// neutral Start screen. No study timer or measuring workflow is active in this state.
     private(set) var isAwaitingParticipantStart = false
     private var phaseStartedAt: Date?
-    private var currentPhase: StudyPhase?
+    private(set) var currentPhase: StudyPhase?
 
     /// The practice payload is the same size as the small module, so the participant has met the
     /// screens and the AR view before anything is measured for real. Deliberately derived rather than
@@ -50,10 +50,11 @@ final class StudyStore {
 
     // MARK: - Current position
 
-    /// Nil during the practice run, which is why nothing measured there is ever recorded: every write
-    /// path resolves the box first and gives up when there is none.
+    /// Nil during the practice run and before the participant's Start tap. Nothing measured in
+    /// practice is recorded, and the configured payload cannot leak into a pre-start timer.
     var currentBox: StudyBox? {
         guard !isPractice,
+              !isAwaitingParticipantStart,
               let activeRun,
               activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
@@ -298,14 +299,14 @@ final class StudyStore {
 
     // MARK: - Timing
 
-    func beginPhase(_ phase: StudyPhase) {
+    func beginPhase(_ phase: StudyPhase, at date: Date = Date()) {
         guard currentPhase != phase else { return }
-        endCurrentPhase()
+        endCurrentPhase(at: date)
         currentPhase = phase
-        phaseStartedAt = Date()
+        phaseStartedAt = date
     }
 
-    func endCurrentPhase() {
+    func endCurrentPhase(at date: Date = Date()) {
         guard let currentPhase, let phaseStartedAt, let box = currentBox,
               var run = activeRun,
               let index = run.boxes.firstIndex(where: { $0.box == box }) else {
@@ -313,13 +314,25 @@ final class StudyStore {
             self.phaseStartedAt = nil
             return
         }
-        let elapsed = Date().timeIntervalSince(phaseStartedAt)
+        let elapsed = date.timeIntervalSince(phaseStartedAt)
         run.boxes[index].phaseSeconds[currentPhase.rawValue] =
             (run.boxes[index].phaseSeconds[currentPhase.rawValue] ?? 0) + max(0, elapsed)
         activeRun = run
         self.currentPhase = nil
         self.phaseStartedAt = nil
         persistActiveRun()
+    }
+
+    /// Includes both already-persisted seconds and the live interval. Passing the TimelineView date
+    /// keeps rendering read-only and makes the boundary behaviour directly testable.
+    func elapsedSeconds(for phase: StudyPhase, at date: Date = Date()) -> Double {
+        let recorded = currentBox
+            .flatMap { activeRun?.result(for: $0)?.seconds(for: phase) }
+            ?? 0
+        guard currentPhase == phase, let phaseStartedAt else {
+            return max(0, recorded)
+        }
+        return max(0, recorded + date.timeIntervalSince(phaseStartedAt))
     }
 
     // MARK: - Recording a box

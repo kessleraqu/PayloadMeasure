@@ -27,7 +27,7 @@ struct ContentView: View {
     var body: some View {
         Group {
             if study.isAwaitingParticipantStart {
-                StudyParticipantStartView {
+                StudyParticipantStartView(store: study) {
                     study.beginParticipantSession()
                 }
             } else if let run = study.activeRun, study.hasFinishedAllBoxes {

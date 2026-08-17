@@ -174,6 +174,17 @@ final class AccuracyTestStatisticsTests: XCTestCase {
         XCTAssertEqual(summary.bias, 0, accuracy: 1e-9)
     }
 
+    func testLengthAndWidthUseTheMinimumErrorAssignment() {
+        let pairs = AccuracySideMatching.minimumErrorPairs(
+            measured: [4, 11, 2],
+            reference: [10, 5, 2]
+        )
+
+        XCTAssertEqual(pairs.map(\.measured), [11, 4, 2])
+        XCTAssertEqual(pairs.map(\.reference), [10, 5, 2])
+        XCTAssertEqual(pairs.map { $0.measured - $0.reference }, [1, -1, 0])
+    }
+
     // MARK: - Overall figures
 
     func testLimitsOfAgreementFollowBiasAndErrorSpread() {
@@ -279,7 +290,7 @@ final class AccuracyTestStatisticsTests: XCTestCase {
 
     // MARK: - Store
 
-    func testStoreFillsSlotsInOrderRefusesExtrasAndCanUndo() {
+    func testStoreFillsBothMethodBlocksRefusesExtrasAndCanUndo() {
         let store = AccuracyStore()
         store.startTest(label: "unit", objectCount: 2, passes: 2)
 
@@ -293,16 +304,25 @@ final class AccuracyTestStatisticsTests: XCTestCase {
 
         XCTAssertTrue(store.record(sizeMillimetres: SIMD3(10, 20, 30)))
         XCTAssertTrue(store.record(sizeMillimetres: SIMD3(10, 20, 30)))
+        XCTAssertEqual(store.nextSlot?.workflowMode, .spatial3D)
+        XCTAssertEqual(store.nextSlot?.objectNumber, 1)
+        XCTAssertEqual(store.nextSlot?.pass, 1)
+
+        for _ in 0..<4 {
+            XCTAssertTrue(store.record(sizeMillimetres: SIMD3(10, 20, 30)))
+        }
         XCTAssertNil(store.nextSlot)
         XCTAssertFalse(
             store.record(sizeMillimetres: SIMD3(10, 20, 30)),
-            "A full test must not take a fifth reading."
+            "A full two-method test must not take a ninth reading."
         )
-        XCTAssertEqual(store.activeTest?.readings.count, 4)
+        XCTAssertEqual(store.activeTest?.readings.count, 8)
 
         store.undoLastReading()
-        XCTAssertEqual(store.activeTest?.readings.count, 3)
+        XCTAssertEqual(store.activeTest?.readings.count, 7)
         XCTAssertEqual(store.nextSlot?.objectNumber, 2, "Undo puts the test back where it was.")
+        XCTAssertEqual(store.nextSlot?.pass, 2)
+        XCTAssertEqual(store.nextSlot?.workflowMode, .spatial3D)
 
         XCTAssertFalse(
             store.record(sizeMillimetres: SIMD3(0, 20, 30)),

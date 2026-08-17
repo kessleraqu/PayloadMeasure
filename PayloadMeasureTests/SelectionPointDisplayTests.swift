@@ -143,4 +143,40 @@ final class SelectionPointDisplayTests: XCTestCase {
     func testAZeroBudgetDrawsNothingRatherThanCrashing() {
         XCTAssertTrue(subset(Array(0..<10), limit: 0).isEmpty)
     }
+
+    func testRenderedCloudKeepsEveryCoordinateExtremeThatCanDefineItsBox() {
+        var points: [SIMD3<Float>] = []
+        points.reserveCapacity(1_006)
+        for index in 0..<1_000 {
+            let x = Float(index % 10) / 1_000
+            let y = Float((index / 10) % 10) / 1_000
+            let z = Float((index / 100) % 10) / 1_000
+            points.append(SIMD3<Float>(x, y, z))
+        }
+        let extremes = [
+            SIMD3<Float>(-1, 0, 0),
+            SIMD3<Float>(1, 0, 0),
+            SIMD3<Float>(0, -1, 0),
+            SIMD3<Float>(0, 1, 0),
+            SIMD3<Float>(0, 0, -1),
+            SIMD3<Float>(0, 0, 1)
+        ]
+        points.append(contentsOf: extremes)
+
+        let drawn = SelectionPointDisplay.subsetPreservingCoordinateExtrema(
+            points,
+            limit: 20
+        ) { point in
+            SelectionPointDisplay.hash(
+                x: Int32((point.x * 1_000).rounded()),
+                y: Int32((point.y * 1_000).rounded()),
+                z: Int32((point.z * 1_000).rounded())
+            )
+        }
+
+        XCTAssertLessThanOrEqual(drawn.count, 20)
+        for extreme in extremes {
+            XCTAssertTrue(drawn.contains(extreme), "The rendered cloud dropped extreme \(extreme).")
+        }
+    }
 }

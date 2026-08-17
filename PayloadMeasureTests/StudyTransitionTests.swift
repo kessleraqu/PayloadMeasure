@@ -210,4 +210,52 @@ final class StudyTransitionTests: XCTestCase {
             XCTAssertFalse(line.contains("—"), "No timing was recorded for: \(line)")
         }
     }
+
+    func testHandoffsStopOneTimerAndDoNotStartTheNextUntilExplicitStart() {
+        let store = StudyStore()
+        store.startRun(
+            participantName: "timing-\(UUID().uuidString)",
+            studyDate: Date(),
+            flow: .batch,
+            firstBox: .big,
+            includesPractice: false,
+            inputPlan: .arOnly,
+            firstInputMode: .augmentedReality
+        )
+
+        XCTAssertNil(store.currentPhase, "Configuring the run must not start a timer.")
+        XCTAssertEqual(store.elapsedSeconds(for: .measure), 0)
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentPhase, .measure, "Only the participant's Start tap begins measuring.")
+
+        // Remove the tiny real interval opened by beginParticipantSession, then use controlled dates.
+        store.endCurrentPhase()
+        let baseline = store.elapsedSeconds(for: .measure)
+        let start = Date().addingTimeInterval(100)
+        store.beginPhase(.measure, at: start)
+        store.endCurrentPhase(at: start.addingTimeInterval(12))
+        let stoppedMeasure = store.elapsedSeconds(for: .measure)
+        XCTAssertEqual(stoppedMeasure - baseline, 12, accuracy: 0.0001)
+        XCTAssertNil(store.currentPhase, "The packing handoff has no running timer.")
+        XCTAssertEqual(
+            store.elapsedSeconds(for: .measure, at: start.addingTimeInterval(1_000)),
+            stoppedMeasure,
+            accuracy: 0.0001,
+            "Measuring must remain stopped while the white packing screen is waiting."
+        )
+        XCTAssertEqual(store.elapsedSeconds(for: .pack), 0)
+
+        let packingStart = start.addingTimeInterval(200)
+        store.beginPhase(.pack, at: packingStart)
+        XCTAssertEqual(store.currentPhase, .pack)
+        XCTAssertEqual(store.elapsedSeconds(for: .pack, at: packingStart), 0, accuracy: 0.0001)
+        store.endCurrentPhase(at: packingStart.addingTimeInterval(7))
+        XCTAssertEqual(store.elapsedSeconds(for: .pack), 7, accuracy: 0.0001)
+        XCTAssertNil(store.currentPhase, "The loading handoff also has no running timer.")
+
+        let loadingStart = packingStart.addingTimeInterval(100)
+        store.beginPhase(.payload, at: loadingStart)
+        XCTAssertEqual(store.currentPhase, .payload)
+        XCTAssertEqual(store.elapsedSeconds(for: .payload, at: loadingStart), 0, accuracy: 0.0001)
+    }
 }

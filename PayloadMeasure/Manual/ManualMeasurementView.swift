@@ -27,6 +27,7 @@ struct ManualMeasurementView: View {
     @State private var pendingRemovalID: UUID?
     @State private var validationMessage: String?
     @State private var showsPackingWorkflow = false
+    @State private var showsPackingConfirmation = false
     @State private var showsCancelPassword = false
     @State private var showsResetConfirmation = false
     @FocusState private var focusedField: FocusedField?
@@ -48,6 +49,11 @@ struct ManualMeasurementView: View {
             .navigationTitle("Enter measurements")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
+            .safeAreaInset(edge: .top) {
+                StudyTimerStrip(study: study)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 4)
+            }
             .safeAreaInset(edge: .bottom) { preparationButton }
         }
         .onAppear(perform: configurePackingStore)
@@ -71,6 +77,21 @@ struct ManualMeasurementView: View {
                 confirmTitle: "Cancel the run",
                 onUnlocked: onRunCancelled
             )
+        }
+        .confirmationDialog(
+            "Did you measure all the objects?",
+            isPresented: $showsPackingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Continue to packing") {
+                focusedField = nil
+                clearDraft()
+                study.endCurrentPhase()
+                showsPackingWorkflow = true
+            }
+            Button("Keep measuring", role: .cancel) {}
+        } message: {
+            Text("Check that every object has a name and all three dimensions before continuing.")
         }
         .confirmationDialog(
             "Reset all manual measurements?",
@@ -294,11 +315,10 @@ struct ManualMeasurementView: View {
         VStack(spacing: 5) {
             Button {
                 focusedField = nil
-                clearDraft()
-                showsPackingWorkflow = true
+                showsPackingConfirmation = true
             } label: {
                 HStack {
-                    Text("Finish measurements · prepare & weigh")
+                    Text("Start packing")
                     Spacer()
                     Image(systemName: "arrow.right")
                 }
@@ -308,7 +328,7 @@ struct ManualMeasurementView: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(objectIDs.isEmpty)
-            .accessibilityHint("Starts package selection and packed-weight entry for every manually measured object.")
+            .accessibilityHint("Confirms every object was measured, then opens the untimed packing start screen.")
 
             Text("Add every object first. Weights are entered on the next screen.")
                 .font(.caption2)
