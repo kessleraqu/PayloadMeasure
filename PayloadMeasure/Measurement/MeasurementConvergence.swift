@@ -215,6 +215,11 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
     /// Highest progress the HUD may show while the support plane is still missing.
     private static let progressCeilingWithoutSupport = 0.9
 
+    private static func wholePercent(_ value: Double) -> Double {
+        guard value.isFinite else { return 0 }
+        return (min(max(value, 0), 1) * 100).rounded(.down) / 100
+    }
+
     private struct AxisState: Sendable {
         var values: [Float] = []
         var timestamps: [TimeInterval] = []
@@ -329,9 +334,15 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         // Without a support plane no exit can fire, so the bar must not read as finished. It used to:
         // the time term drove it to 100% after ten seconds while the finish was refused, which is
         // exactly the stall a full bar promises is over.
-        result.progress = coverage.hasSupportPlane
-            ? highWaterProgress
-            : min(highWaterProgress, Self.progressCeilingWithoutSupport)
+        // Published in whole percent, which is all the HUD shows. The underlying value moves with the
+        // clock, so publishing it exactly meant this state changed on every camera frame and redrew the
+        // whole overlay — the mask included — sixty times a second for a number that only ever appears
+        // rounded.
+        result.progress = Self.wholePercent(
+            coverage.hasSupportPlane
+                ? highWaterProgress
+                : min(highWaterProgress, Self.progressCeilingWithoutSupport)
+        )
 
         let hasFullWindows = result.sampleCount >= configuration.minimumSampleCount
         let precisionSatisfied = hasFullWindows

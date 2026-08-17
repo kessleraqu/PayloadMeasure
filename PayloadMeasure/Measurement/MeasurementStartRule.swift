@@ -41,7 +41,9 @@ nonisolated enum MeasurementStartRule {
     /// Whole seconds still to wait before Cancel appears, for the button's own label.
     static func cancelCountdown(secondsActive: TimeInterval) -> Int? {
         guard !allowsCancel(secondsActive: secondsActive) else { return nil }
-        let remaining = Int((cancelLockoutSeconds - secondsActive).rounded(.up))
-        return max(remaining, 1)
+        // Clamped before it becomes an Int. Converting an out-of-range Double to Int is a trap, and a
+        // clock that has gone backwards is exactly the sort of thing that would hand one over.
+        let remaining = (cancelLockoutSeconds - secondsActive).rounded(.up)
+        return Int(min(max(remaining, 1), cancelLockoutSeconds.rounded(.up)))
     }
 }

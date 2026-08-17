@@ -1,15 +1,24 @@
 import SwiftUI
 import simd
 
-// The outer boxes the system chooses from for one payload, and the form for adding more.
+// The boxes the system chooses from for one payload, and the form for adding more.
 //
 // In:  a BoxCatalogue, which is per payload.
-// Out: on screen only. A box is identified by its size, so a size is all there is to enter. The
-//      list survives relaunch, every box can be deleted, and changing it invalidates the current
-//      arrangement.
+// Out: on screen only. The list survives relaunch, every box can be deleted, and changing it invalidates
+//      the current arrangement.
 //
-// Reached both from the setup screen, before a run starts, and from the measuring screens. Both edit
-// the same saved list for that payload; `onChange` is how the measuring side learns to re-solve.
+// Every box carries two sizes, and this is the one screen that shows both, because it is the one screen
+// where they can be edited:
+//
+//   • the size it takes up  — what the loading plan places in the payload, and the box's name
+//   • the size it holds     — what an object has to fit inside to be assigned this box
+//
+// They are the same figure for almost every box. Two of the stocked ones were measured and are not what
+// their size suggests, which is the whole reason the two are kept apart. Nowhere else in the app mentions
+// the distinction: the packing instruction says one size, the one written on the box.
+//
+// Reached both from the setup screen, before a run starts, and from the measuring screens. Both edit the
+// same saved list for that payload; `onChange` is how the measuring side learns to re-solve.
 
 struct BoxCatalogView: View {
     let catalogue: BoxCatalogue
@@ -21,6 +30,10 @@ struct BoxCatalogView: View {
     @State private var length: Double = 200
     @State private var width: Double = 150
     @State private var height: Double = 100
+    @State private var holdsADifferentSize = false
+    @State private var innerLength: Double = 200
+    @State private var innerWidth: Double = 150
+    @State private var innerHeight: Double = 100
     @State private var message: String?
 
     var body: some View {
@@ -33,10 +46,9 @@ struct BoxCatalogView: View {
                             .foregroundStyle(.secondary)
                     }
                     ForEach(catalogue.presets) { preset in
-                        HStack {
-                            Text(preset.name)
-                                .monospacedDigit()
-                            Spacer(minLength: 0)
+                        HStack(alignment: .firstTextBaseline) {
+                            presetRow(preset)
+                            Spacer(minLength: 8)
                             Button(role: .destructive) {
                                 remove(preset.id)
                             } label: {
@@ -54,14 +66,35 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("Boxes")
                 } footer: {
-                    Text("Every size here is the usable space **inside** the box. For most boxes that is what is written on them; two of the standard ones are smaller inside than their label says and are listed at their measured inside size. Tap the bin, or swipe, to delete a box. An object fits when it fits inside in any of the six orientations, and the system always assigns the smallest box that fits.")
+                    Text("Takes up is what the loading plan places in the payload. Holds is what an object has to fit inside to be given this box. Tap the bin, or swipe, to delete a box. An object fits when it fits in any of the six orientations, and the system always assigns the smallest box that fits.")
                 }
 
                 Section {
                     millimetres("Length", value: $length)
                     millimetres("Width", value: $width)
                     millimetres("Height", value: $height)
+                } header: {
+                    Text("New box · size it takes up")
+                } footer: {
+                    Text("This is the box's name, and the space it occupies in the payload.")
+                }
 
+                Section {
+                    Toggle("It holds less than its size suggests", isOn: $holdsADifferentSize)
+                    if holdsADifferentSize {
+                        millimetres("Length inside", value: $innerLength)
+                        millimetres("Width inside", value: $innerWidth)
+                        millimetres("Height inside", value: $innerHeight)
+                    }
+                } header: {
+                    Text("New box · size it holds")
+                } footer: {
+                    Text(holdsADifferentSize
+                        ? "Measured, rather than read off the box. Only the fit test uses it; the box is still named and packed at the size above."
+                        : "Off for almost every box: what it holds is its size.")
+                }
+
+                Section {
                     Button("Add box", action: add)
                         .disabled(!canAdd)
 
@@ -70,10 +103,6 @@ struct BoxCatalogView: View {
                             .font(.footnote)
                             .foregroundStyle(.orange)
                     }
-                } header: {
-                    Text("New box")
-                } footer: {
-                    Text("Enter the space available inside the box, measured rather than read off the label. The size is also the box's name, and nothing is subtracted for walls.")
                 }
 
                 resetSection
@@ -85,34 +114,67 @@ struct BoxCatalogView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onChange(of: enteredSize) { _, size in
+                guard !holdsADifferentSize else { return }
+                innerLength = size.x
+                innerWidth = size.y
+                innerHeight = size.z
+            }
         }
+    }
+
+    private func presetRow(_ preset: PackingBoxPreset) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(preset.name)
+                .monospacedDigit()
+            if preset.usableInnerSizeMillimetres == preset.outerSizeMillimetres {
+                Text("Takes up and holds the same")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Holds \(PackingBoxPreset.sizeName(preset.usableInnerSizeMillimetres))")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.orange)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            preset.usableInnerSizeMillimetres == preset.outerSizeMillimetres
+                ? "\(preset.name), takes up and holds the same"
+                : "Takes up \(preset.name), holds \(PackingBoxPreset.sizeName(preset.usableInnerSizeMillimetres))"
+        )
     }
 
     private var titleText: String {
         catalogue.payload == .big ? "Boxes · big payload" : "Boxes · small payload"
     }
 
-    private var outerSize: SIMD3<Double> {
+    private var enteredSize: SIMD3<Double> {
         SIMD3(length, width, height)
     }
 
-    private var innerSize: SIMD3<Double> {
-        outerSize - SIMD3(repeating: 2 * PackingBoxPreset.wallThicknessMillimetres)
+    private var enteredInnerSize: SIMD3<Double>? {
+        holdsADifferentSize ? SIMD3(innerLength, innerWidth, innerHeight) : nil
     }
 
     private var isDuplicate: Bool {
-        catalogue.presets.contains { $0.outerSizeMillimetres == outerSize }
+        catalogue.presets.contains { $0.outerSizeMillimetres == enteredSize }
     }
 
     private var canAdd: Bool {
-        innerSize.allFiniteAndPositive && !isDuplicate
+        enteredSize.allFiniteAndPositive
+            && (enteredInnerSize?.allFiniteAndPositive ?? true)
+            && !isDuplicate
     }
 
     private func add() {
-        guard catalogue.add(outerSizeMillimetres: outerSize) != nil else {
+        guard catalogue.add(
+            outerSizeMillimetres: enteredSize,
+            usableInnerSizeMillimetres: enteredInnerSize
+        ) != nil else {
             message = isDuplicate
                 ? "That size is already in the list."
-                : "This size is too small to have 1 mm walls."
+                : "That size cannot be used. Every side has to be more than zero."
             return
         }
         message = nil

@@ -152,6 +152,68 @@ final class StudyStore {
         persistActiveRun()
     }
 
+    // MARK: - Picking a run back up
+
+    /// A run on disk that was started and never finished, if there is one. A run is written from the
+    /// moment it is created and rewritten after every phase, so one of these is what a crash — or a
+    /// force-quit, or a flat battery — leaves behind.
+    ///
+    /// Only ever one is offered: the most recent. Two unfinished runs means something stranger has
+    /// happened than a crash, and guessing between them is worse than saying nothing.
+    var resumableRun: StudyRun? {
+        guard activeRun == nil else { return nil }
+        return saved.first {
+            !$0.isComplete && !$0.boxes.isEmpty && $0.abandonedAt == nil
+        }
+    }
+
+    /// Puts an unfinished run back in progress, on the first payload it had not finished.
+    ///
+    /// Everything already recorded is kept: the finished payloads, and the seconds already spent on
+    /// this one. What cannot be kept is the payload in progress — its measurements live in the AR
+    /// session's own coordinate system, which the relaunch threw away — so that payload is measured
+    /// again from the start. The participant is put back on the neutral Start screen rather than
+    /// straight into the camera.
+    @discardableResult
+    func resumeRun(_ run: StudyRun) -> Bool {
+        guard activeRun == nil, !run.isComplete else { return false }
+        let firstUnfinished = run.boxOrder.firstIndex {
+            run.result(for: $0)?.completedAt == nil
+        }
+        guard let firstUnfinished else { return false }
+        endCurrentPhase()
+        activeRun = run
+        currentBoxIndex = firstUnfinished
+        isPractice = false
+        isAwaitingParticipantStart = true
+        currentPhase = nil
+        phaseStartedAt = nil
+        lastExportURL = nil
+        exportMessage = nil
+        if let index = saved.firstIndex(where: { $0.id == run.id }) {
+            saved[index] = run
+        }
+        persistActiveRun()
+        return true
+    }
+
+    /// Snapshots the objects measured so far for the payload in progress, without touching anything the
+    /// loading plan owns. Called as each object is finished, so a crash costs at most the object being
+    /// measured at the time rather than the whole payload's dimensions.
+    func recordMeasurementProgress(objects: [StudyObjectRecord]) {
+        guard let box = currentBox,
+              var run = activeRun,
+              let index = run.boxes.firstIndex(where: { $0.box == box }) else { return }
+        guard run.boxes[index].objects.map(\.id) != objects.map(\.id)
+                || run.boxes[index].objects.count != objects.count else {
+            return
+        }
+        run.boxes[index].objects = objects
+        run.boxes[index].inputMode = currentInputMode
+        activeRun = run
+        persistActiveRun()
+    }
+
     /// Leaves the administrator-free handoff screen and starts the selected workflow. This is the
     /// exact point at which the first timer starts.
     func beginParticipantSession() {
@@ -289,8 +351,17 @@ final class StudyStore {
     }
 
     /// Clears the run in progress without touching anything already saved.
+    ///
+    /// The run is marked abandoned on the way out. It stays on disk with everything it recorded, but the
+    /// setup screen will not offer to continue it: this path is the operator saying the session is over,
+    /// which is a different thing from the app disappearing mid-measurement.
     func clearActiveRun() {
         endCurrentPhase()
+        if var run = activeRun, !run.isComplete {
+            run.abandonedAt = Date()
+            activeRun = run
+            persistActiveRun()
+        }
         activeRun = nil
         currentBoxIndex = 0
         isPractice = false

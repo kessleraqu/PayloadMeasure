@@ -120,9 +120,61 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
             ObjectMaskCandidatePolicy.continuation(
                 of: CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20),
                 among: [
-                    (instance: 4, boundingBox: CGRect(x: 0.55, y: 0.55, width: 0.20, height: 0.20))
+                    (instance: 4, boundingBox: CGRect(x: 0.56, y: 0.56, width: 0.20, height: 0.20))
                 ]
             )
+        )
+    }
+
+    /// Vision splits a complex object differently every frame. A piece of what was on screen shares little
+    /// of the *union* but sits almost wholly inside it, and is obviously the same object; judging by the
+    /// union made the preview swap between the whole and the piece.
+    func testAPieceOfTheMaskOnScreenIsTheSameObject() {
+        let onScreen = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
+        let piece = CGRect(x: 0.42, y: 0.50, width: 0.16, height: 0.09)
+        XCTAssertLessThan(
+            ObjectMaskCandidatePolicy.intersectionOverUnion(onScreen, piece),
+            ObjectMaskCandidatePolicy.continuationOverlap
+        )
+        XCTAssertEqual(
+            ObjectMaskCandidatePolicy.continuation(
+                of: onScreen,
+                among: [(instance: 6, boundingBox: piece)]
+            ),
+            6
+        )
+    }
+
+    /// When the object comes back in pieces, the re-pick takes the largest of them rather than the first.
+    func testTheMostCompletePieceWins() {
+        let onScreen = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
+        XCTAssertEqual(
+            ObjectMaskCandidatePolicy.continuation(
+                of: onScreen,
+                among: [
+                    (instance: 1, boundingBox: CGRect(x: 0.41, y: 0.41, width: 0.05, height: 0.05)),
+                    (instance: 2, boundingBox: CGRect(x: 0.41, y: 0.47, width: 0.17, height: 0.12))
+                ]
+            ),
+            2
+        )
+    }
+
+    func testOverlapOfTheSmallerIsOneWhenContained() {
+        let big = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let inside = CGRect(x: 0.2, y: 0.2, width: 0.2, height: 0.2)
+        XCTAssertEqual(
+            ObjectMaskCandidatePolicy.overlapOfSmaller(big, inside),
+            1,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            ObjectMaskCandidatePolicy.overlapOfSmaller(
+                big,
+                CGRect(x: 2, y: 2, width: 0.2, height: 0.2)
+            ),
+            0,
+            accuracy: 1e-9
         )
     }
 

@@ -33,6 +33,8 @@ struct StudySetupView: View {
     var body: some View {
         NavigationStack {
             Form {
+                resumeSection
+
                 Section("Participant") {
                     TextField("Name or code", text: $name)
                         .textInputAutocapitalization(.words)
@@ -171,6 +173,48 @@ struct StudySetupView: View {
                 }
             }
         }
+    }
+
+    /// The first thing on the screen when a run was left unfinished — because after a crash, this is the
+    /// screen the operator is looking at while wondering whether the session is gone.
+    @ViewBuilder
+    private var resumeSection: some View {
+        if let run = store.resumableRun {
+            Section {
+                Button {
+                    store.resumeRun(run)
+                } label: {
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Continue \(run.participantName)")
+                                .font(.headline)
+                            Text(resumeDetail(for: run))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Image(systemName: "arrow.clockwise.circle.fill")
+                            .font(.title2)
+                    }
+                }
+            } header: {
+                Text("Unfinished run")
+            } footer: {
+                Text("Everything already saved is kept, including the time recorded for finished payloads. The payload that was in progress is measured again — its measurements belonged to the camera session that ended.")
+            }
+        }
+    }
+
+    private func resumeDetail(for run: StudyRun) -> String {
+        let finished = run.boxOrder.filter { run.result(for: $0)?.completedAt != nil }
+        let next = run.boxOrder.first { run.result(for: $0)?.completedAt == nil }
+        let condition = run.inputModeOrder.first?.title ?? "AR measurement"
+        let progress = finished.isEmpty
+            ? "nothing finished yet"
+            : "\(finished.count) of \(run.boxOrder.count) payloads finished"
+        return "\(condition) · \(progress) · continues on the \(next?.shortTitle.lowercased() ?? "next payload")"
     }
 
     private var duplicateIsPresented: Binding<Bool> {

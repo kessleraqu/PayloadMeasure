@@ -91,6 +91,9 @@ final class ObjectCaptureEngine {
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
     private var liveMaskLayer: ObjectMaskPreviewLayer?
+    /// Where the live mask's own point in the room currently projects to. This, and not Vision's object
+    /// tracker, is what keeps the live mask on its object between segmentations.
+    private(set) var liveMaskTracking: ObjectMaskWorldTracking?
     private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
     enum ScanViewHint: Equatable {
@@ -122,8 +125,9 @@ final class ObjectCaptureEngine {
     /// When the active measurement began, on the monotonic clock. Both the "it never started" rule and
     /// the cancel lock-out are read off it.
     private var activeMeasurementStartedAt: TimeInterval?
-    /// How long the active measurement has been running, published so the Cancel button can count down.
-    private(set) var secondsSinceMeasurementStarted: TimeInterval = 0
+    /// Whole seconds until Cancel is offered, or nil once it is. Coarse on purpose: every published
+    /// change here redraws the camera overlay.
+    private(set) var cancelCountdownSeconds: Int?
     /// False for the first few seconds of a measurement. Cancelling instantly was the wrong habit to
     /// teach: a measurement barely under way looks stuck, and the app already restarts one that is.
     private(set) var canCancelActiveMeasurement = false
@@ -209,7 +213,13 @@ final class ObjectCaptureEngine {
         if canCancelActiveMeasurement != allowsCancel {
             canCancelActiveMeasurement = allowsCancel
         }
-        secondsSinceMeasurementStarted = max(secondsActive, 0)
+        // Published as whole seconds, and only while something is waiting on them. This runs on every
+        // camera frame: publishing a Double here redrew the entire overlay — mask included — sixty times
+        // a second, which is both the flicker and a great deal of work for a number nobody reads.
+        let countdown = MeasurementStartRule.cancelCountdown(secondsActive: secondsActive)
+        if cancelCountdownSeconds != countdown {
+            cancelCountdownSeconds = countdown
+        }
         guard MeasurementStartRule.abandonsMeasurement(
             secondsActive: secondsActive,
             hasMeasurement: capturedObjectsByID[id] != nil
@@ -492,6 +502,9 @@ final class ObjectCaptureEngine {
                 }
                 lockedMaskLayersByID[id] = layer
             } else {
+                // Whether an unchanged live mask is held back is decided on the AR side, where the
+                // picture, the point it is followed by and the tracker seed are held or replaced
+                // together. Anything that arrives here is meant to be shown.
                 if let liveMaskLayer, liveMaskLayer.id != layer.id {
                     objectMaskDisplayBoundingBoxes.removeValue(
                         forKey: liveMaskLayer.id
@@ -511,6 +524,28 @@ final class ObjectCaptureEngine {
         rebuildObjectMaskPreview(timestamp: preview.timestamp)
         refreshFramingGuidance()
     }
+
+    /// Where the live mask's point in the room is on screen now. Published only when it has actually
+    /// moved a little: it is refreshed every camera frame, and the overlay redraws whenever it changes.
+    func updateLiveMaskTracking(_ tracking: ObjectMaskWorldTracking?) {
+        guard let tracking else {
+            if liveMaskTracking != nil { liveMaskTracking = nil }
+            return
+        }
+        if let existing = liveMaskTracking,
+           abs(existing.normalizedViewportPoint.x - tracking.normalizedViewportPoint.x)
+               < Self.liveMaskTrackingEpsilon,
+           abs(existing.normalizedViewportPoint.y - tracking.normalizedViewportPoint.y)
+               < Self.liveMaskTrackingEpsilon,
+           abs(existing.cameraDistance - tracking.cameraDistance) < 0.002 {
+            return
+        }
+        liveMaskTracking = tracking
+    }
+
+    /// A fifth of a percent of the screen. Below that, moving the mask is invisible and republishing it
+    /// only costs a redraw.
+    private static let liveMaskTrackingEpsilon: CGFloat = 0.002
 
     func updateObjectMaskDisplayBoundingBoxes(
         _ boundingBoxes: [UUID: CGRect],
@@ -690,13 +725,13 @@ final class ObjectCaptureEngine {
 
     private func startMeasurementClock() {
         activeMeasurementStartedAt = ProcessInfo.processInfo.systemUptime
-        secondsSinceMeasurementStarted = 0
+        cancelCountdownSeconds = MeasurementStartRule.cancelCountdown(secondsActive: 0)
         canCancelActiveMeasurement = false
     }
 
     private func stopMeasurementClock() {
         activeMeasurementStartedAt = nil
-        secondsSinceMeasurementStarted = 0
+        cancelCountdownSeconds = nil
         canCancelActiveMeasurement = false
     }
 
@@ -1129,6 +1164,7 @@ final class ObjectCaptureEngine {
     }
 
     func clearObjectMaskPreview() {
+        liveMaskTracking = nil
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()
         lockedMaskLayerOrder.removeAll()
@@ -1140,6 +1176,7 @@ final class ObjectCaptureEngine {
     }
 
     func clearLiveObjectMaskPreview() {
+        liveMaskTracking = nil
         if let liveMaskLayer {
             objectMaskDisplayBoundingBoxes.removeValue(forKey: liveMaskLayer.id)
         }

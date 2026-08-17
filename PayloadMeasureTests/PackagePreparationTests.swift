@@ -71,9 +71,9 @@ final class PackagePreparationTests: XCTestCase {
         let store = PackingStore()
 
         XCTAssertNil(engine.name(for: objectID), "A lock must not invent an object name.")
-        XCTAssertEqual(store.recommendedBoxPreset(for: objectID, in: engine)?.id, "120x90x30")
+        XCTAssertEqual(store.recommendedBoxPreset(for: objectID, in: engine)?.id, "120x90x40")
         XCTAssertTrue(
-            store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine)
+            store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine)
         )
         engine.updateName(id: objectID, name: "  Camera  ")
         engine.updatePackedWeight(id: objectID, weightInGrams: 43.7)
@@ -84,11 +84,11 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
 
         let package = try! XCTUnwrap(store.packages(from: engine).first)
-        XCTAssertEqual(package.size, SIMD3(120, 90, 30))
+        XCTAssertEqual(package.size, SIMD3(120, 90, 40))
         XCTAssertEqual(package.massKilograms, 0.0437, accuracy: 1e-12)
 
         let baldiItem = try! XCTUnwrap(store.baldiItems(from: engine).first)
-        XCTAssertEqual(baldiItem.size, SIMD3(120, 90, 30))
+        XCTAssertEqual(baldiItem.size, SIMD3(120, 90, 40))
         XCTAssertEqual(baldiItem.mass, 0.0437, accuracy: 1e-12)
     }
 
@@ -99,7 +99,7 @@ final class PackagePreparationTests: XCTestCase {
         let store = PackingStore()
 
         XCTAssertFalse(
-            store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine)
+            store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine)
         )
         XCTAssertNil(store.selectedBoxPreset(for: objectID))
         XCTAssertTrue(
@@ -182,7 +182,7 @@ final class PackagePreparationTests: XCTestCase {
         )
         let store = PackingStore()
 
-        XCTAssertTrue(store.selectBoxPreset(id: "120x90x30", for: preparedID, in: engine))
+        XCTAssertTrue(store.selectBoxPreset(id: "120x90x40", for: preparedID, in: engine))
         engine.updateName(id: preparedID, name: "Camera")
         engine.updatePackedWeight(id: preparedID, weightInGrams: 250)
         XCTAssertTrue(
@@ -194,10 +194,10 @@ final class PackagePreparationTests: XCTestCase {
         let packages = store.packages(from: engine)
         let baldiItems = store.baldiItems(from: engine)
         XCTAssertEqual(packages.map(\.id), [preparedID])
-        XCTAssertEqual(packages.first?.size, SIMD3(120, 90, 30))
+        XCTAssertEqual(packages.first?.size, SIMD3(120, 90, 40))
         XCTAssertEqual(packages.first?.massKilograms ?? 0, 0.25, accuracy: 1e-12)
         XCTAssertEqual(baldiItems.map(\.id), [preparedID])
-        XCTAssertEqual(baldiItems.first?.size, SIMD3(120, 90, 30))
+        XCTAssertEqual(baldiItems.first?.size, SIMD3(120, 90, 40))
         XCTAssertEqual(baldiItems.first?.mass ?? 0, 0.25, accuracy: 1e-12)
     }
 
@@ -253,7 +253,7 @@ final class PackagePreparationTests: XCTestCase {
         )
         XCTAssertTrue(store.packagesMissingPreparation(from: engine).contains(objectID))
         store.reconcilePreparationState(with: engine)
-        XCTAssertTrue(store.selectBoxPreset(id: "120x90x30", for: objectID, in: engine))
+        XCTAssertTrue(store.selectBoxPreset(id: "120x90x40", for: objectID, in: engine))
         engine.updateName(id: objectID, name: "Remeasured object")
         engine.updatePackedWeight(id: objectID, weightInGrams: 100)
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .ready)
@@ -290,7 +290,7 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .needsFittingBox)
         store.assignBoxesAutomatically(in: engine)
 
-        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x30")
+        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x40")
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .needsName)
     }
 
@@ -323,8 +323,8 @@ final class PackagePreparationTests: XCTestCase {
 
         store.setIsItsOwnBox(false, for: objectID, in: engine)
         store.assignBoxesAutomatically(in: engine)
-        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x30")
-        XCTAssertEqual(store.packagedSizeMillimetres(for: objectID, in: engine), SIMD3(120, 90, 30))
+        XCTAssertEqual(store.selectedBoxPreset(for: objectID)?.id, "120x90x40")
+        XCTAssertEqual(store.packagedSizeMillimetres(for: objectID, in: engine), SIMD3(120, 90, 40))
     }
 
     func testAddedBoxBecomesAvailableToAssignmentAndRemovingItReleasesTheObject() {
@@ -365,36 +365,102 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(store.boxPresets.map(\.id), starting.map(\.id))
     }
 
-    func testBoxIsNamedAfterItsSizeAndNeedsRoomForItsWalls() {
+    func testBoxIsNamedAfterItsSizeAndTakesThatSizeAsItsCapacity() {
         let box = PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(120, 80, 60))
         XCTAssertEqual(box?.name, "120 × 80 × 60 mm")
         XCTAssertEqual(box?.usableInnerSizeMillimetres, SIMD3(120, 80, 60))
 
-        
         XCTAssertNil(PackingBoxPreset.sized(outerSizeMillimetres: SIMD3(0, 40, 40)))
-
     }
 
-    /// The two payloads are stocked differently, so a shared list would offer the small module boxes
-    /// that cannot go in it. These are the sizes the study uses; nothing else may be in the list.
+    /// A box that was measured and turned out not to hold what its size suggests. Only the fits-or-not
+    /// test may use the measured capacity: the name, and the space the box takes up in the payload,
+    /// stay the box's own size. Anything else and the loading plan would be built out of figures the
+    /// operator was never shown.
+    func testMeasuredCapacityDecidesTheFitWhileTheSizeIsWhatIsShownAndPacked() {
+        let box = try! XCTUnwrap(
+            PackingBoxPreset.sized(
+                outerSizeMillimetres: SIMD3(120, 90, 40),
+                usableInnerSizeMillimetres: SIMD3(120, 90, 30)
+            )
+        )
+
+        XCTAssertEqual(box.name, "120 × 90 × 40 mm")
+        XCTAssertEqual(box.id, "120x90x40")
+        XCTAssertEqual(box.outerSizeMillimetres, SIMD3(120, 90, 40))
+        // 35 mm would go in a box of that size, but not in this one.
+        XCTAssertFalse(box.fits(objectSizeMillimetres: SIMD3(100, 80, 35)))
+        XCTAssertTrue(box.fits(objectSizeMillimetres: SIMD3(100, 80, 30)))
+
+        // And the other way round: the deep one holds more than its size says.
+        let deep = try! XCTUnwrap(
+            PackingBoxPreset.sized(
+                outerSizeMillimetres: SIMD3(75, 75, 230),
+                usableInnerSizeMillimetres: SIMD3(75, 75, 235)
+            )
+        )
+        XCTAssertEqual(deep.name, "75 × 75 × 230 mm")
+        XCTAssertTrue(deep.fits(objectSizeMillimetres: SIMD3(70, 70, 234)))
+    }
+
+    /// The two stocked boxes whose capacity was measured, pinned end to end: what is displayed and
+    /// packed is the size, what is tested against is the capacity.
+    func testTheTwoMeasuredStockBoxesKeepTheirSizesAndTheirCapacities() {
+        let deep = try! XCTUnwrap(
+            PackingBoxPreset.defaultCatalog(for: .big).first { $0.id == "75x75x230" }
+        )
+        XCTAssertEqual(deep.name, "75 × 75 × 230 mm")
+        XCTAssertEqual(deep.outerSizeMillimetres, SIMD3(75, 75, 230))
+        XCTAssertEqual(deep.usableInnerSizeMillimetres, SIMD3(75, 75, 235))
+
+        let shallow = try! XCTUnwrap(
+            PackingBoxPreset.defaultCatalog(for: .small).first { $0.id == "120x90x40" }
+        )
+        XCTAssertEqual(shallow.name, "120 × 90 × 40 mm")
+        XCTAssertEqual(shallow.outerSizeMillimetres, SIMD3(120, 90, 40))
+        XCTAssertEqual(shallow.usableInnerSizeMillimetres, SIMD3(120, 90, 30))
+
+        // The box stocked for both payloads holds exactly its size, in both lists.
+        for list in [StudyBox.big, .small] {
+            let shared = try! XCTUnwrap(
+                PackingBoxPreset.defaultCatalog(for: list).first { $0.id == "130x100x105" }
+            )
+            XCTAssertEqual(shared.name, "130 × 100 × 105 mm")
+            XCTAssertEqual(
+                shared.usableInnerSizeMillimetres,
+                shared.outerSizeMillimetres
+            )
+        }
+
+        // Everything else holds exactly what its size says.
+        for preset in PackingBoxPreset.defaultCatalog(for: .big)
+            + PackingBoxPreset.defaultCatalog(for: .small)
+        where !["75x75x230", "120x90x40"].contains(preset.id) {
+            XCTAssertEqual(
+                preset.usableInnerSizeMillimetres,
+                preset.outerSizeMillimetres,
+                "\(preset.name) should not have a separate capacity."
+            )
+        }
+    }
+
+    /// The two payloads are stocked separately, so the list offered is always the one for the payload in
+    /// hand. These are the sizes the study uses; nothing else may be in either list. They may overlap —
+    /// the same physical box can be stocked for both — but each list is still its own.
     func testEachPayloadHasItsOwnBoxesAndNoOthers() {
         let big = PackingBoxPreset.defaultCatalog(for: .big)
         let small = PackingBoxPreset.defaultCatalog(for: .small)
 
         XCTAssertEqual(
             big.map(\.id),
-            ["35x22x115", "75x75x235", "95x95x160", "100x95x85", "130x100x105"]
+            ["35x22x115", "75x75x230", "95x95x160", "100x95x85", "130x100x105"]
         )
         XCTAssertEqual(
             small.map(\.id),
-            ["100x75x90", "120x90x30"]
+            ["100x75x90", "120x90x40", "130x100x105"]
         )
         XCTAssertEqual(Set(big.map(\.id)).count, big.count)
         XCTAssertEqual(Set(small.map(\.id)).count, small.count)
-        XCTAssertTrue(
-            Set(big.map(\.id)).isDisjoint(with: Set(small.map(\.id))),
-            "The two lists share no box, so neither can be mistaken for the other."
-        )
 
         // Every box has to physically go into its own module in some orientation, or it could never
         // be used.

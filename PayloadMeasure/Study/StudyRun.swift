@@ -194,6 +194,10 @@ struct StudyRun: Codable, Identifiable, Sendable {
     /// already taken on disk. Nil for runs written before this existed: those still live in a folder
     /// named after their id, and are still read from it.
     var folderName: String?
+    /// Set when the operator ends a run without finishing it. It is what separates a run the app was
+    /// *told* to stop from one it simply vanished in the middle of, and only the latter is offered for
+    /// resuming. Everything recorded is kept either way.
+    var abandonedAt: Date?
 
     var isComplete: Bool {
         boxOrder.allSatisfy { box in

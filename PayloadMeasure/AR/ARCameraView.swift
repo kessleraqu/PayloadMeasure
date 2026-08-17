@@ -272,6 +272,11 @@ struct ARCameraView: UIViewRepresentable {
         private static let supportPlaneMissTolerance = 6
         /// Idle segmentation runs at roughly 6 Hz. Retain a small/far live object through brief
         /// Vision misses while the participant changes distance, but still clear a stale mask.
+        ///
+        /// Back to twelve, about two seconds. It was cut to six when a stale mask also meant a mask stuck
+        /// at the wrong size and place; now that the mask is followed through the world, a retained one
+        /// stays on its object and only its silhouette is slightly old. Clearing it sooner than Vision
+        /// recovers is what made the mask blink out and come back.
         private static let liveMaskMissTolerance = 12
         private static let topAlignmentEnterDegrees: Float = 12
         private static let topAlignmentExitDegrees: Float = 18
@@ -299,6 +304,16 @@ struct ARCameraView: UIViewRepresentable {
         private var objectMaskDisplayTask: Task<Void, Never>?
         private var objectMaskDisplayTaskGeneration = 0
         private var objectMaskDisplaySeedsByID: [UUID: ObjectMaskDisplaySeed] = [:]
+        /// The point in the room that the live mask on screen was sampled at, kept so it can be
+        /// reprojected every frame. Cleared with the live mask itself.
+        private var liveMaskWorldPoint: SIMD3<Float>?
+        /// The point sampled by the newest segmentation, which becomes the one above only if that
+        /// segmentation's mask is actually put on screen. Holding the picture while moving the point it is
+        /// positioned by is what made a held mask twitch.
+        private var pendingLiveMaskWorldPoint: SIMD3<Float>?
+        /// When the mask now on screen was accepted, and whether the newest segmentation was held back.
+        private var liveMaskAcceptedTimestamp: TimeInterval = -.greatestFiniteMagnitude
+        private var isHoldingLiveMask = false
         private var liveObjectMaskDisplayID: UUID?
         private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
@@ -692,7 +707,40 @@ struct ARCameraView: UIViewRepresentable {
             sessionManager.restartTracking(arView.session)
         }
 
+        /// Frees the point clouds and voxel bookkeeping an object needed *while it was being measured*.
+        ///
+        /// These are the largest things the scan holds — the accumulated depth points, the selected and
+        /// surface point arrays of the last fit, the accepted/rejected voxel keys — and they were being
+        /// kept for every finished object until the payload ended. Ten objects into a payload that is a
+        /// great deal of memory held for nothing, on a screen that is also running ARKit, LiDAR depth,
+        /// Vision segmentation and RealityKit. Nothing reads them once the object is finished: editing it
+        /// again calls `rebaseAndRestartMeasurement`, which clears exactly this set and starts over.
+        ///
+        /// Deliberately *not* freed: the support height and plane bindings, the fitted footprint and
+        /// height, the anchors and the drawn box. A finished object still gets re-snapped when its plane
+        /// is refined, and that needs them.
+        private func releaseMeasurementScratch(for id: UUID) {
+            supportAccumulators.removeValue(forKey: id)
+            maskedAccumulators.removeValue(forKey: id)
+            liveResultsByObject.removeValue(forKey: id)
+            acceptedSurfaceVoxelKeysByObject.removeValue(forKey: id)
+            manuallyRejectedVoxelKeysByObject.removeValue(forKey: id)
+            automaticPointCleanupCursorByObject.removeValue(forKey: id)
+            newestMaskedPointTimestamp.removeValue(forKey: id)
+            fittedMaskedPointTimestamp.removeValue(forKey: id)
+            footprintStableTicks.removeValue(forKey: id)
+            heightStableTicks.removeValue(forKey: id)
+            footprintFromTopObjects.remove(id)
+            heightFromSideObjects.remove(id)
+        }
+
         private func releaseRebuildableScanCaches() {
+            // Under memory pressure, every object that is not being measured right now gives up its
+            // scratch immediately rather than waiting for the payload to end.
+            for id in captureEngine.finalizedObjectIDs
+            where id != captureEngine.activeObjectID {
+                releaseMeasurementScratch(for: id)
+            }
             objectMaskTask?.cancel()
             objectMaskTaskGeneration &+= 1
             objectMaskTask = nil
@@ -878,6 +926,7 @@ struct ARCameraView: UIViewRepresentable {
                     )
                 }
                 selectionPointsByObject.removeValue(forKey: request.id)
+                releaseMeasurementScratch(for: request.id)
                 updateSelectionVisualization()
                 objectMaskDisplayTask?.cancel()
                 objectMaskDisplayTaskGeneration &+= 1
@@ -1695,15 +1744,22 @@ struct ARCameraView: UIViewRepresentable {
                        $0.trackingOrientation
                            == self.objectMaskDisplayOrientation
                    }) {
-                    let preview = self.previewByAddingLiveObjectDistance(
-                        preview,
-                        frame: currentFrame,
-                        in: arView
+                    // The whole live mask — picture, its reference point, the point in the room it is
+                    // followed by, and the tracker seed — is one set of facts from one segmentation. If
+                    // the new mask is the same view as the one on screen, *none* of it is replaced. Taking
+                    // some and holding the rest is what left the mask twitching: the picture stayed put
+                    // while the point it was being positioned by moved to a new sample.
+                    let preview = self.previewByHoldingUnchangedLiveMask(
+                        self.previewByAddingLiveObjectDistance(
+                            preview,
+                            frame: currentFrame,
+                            in: arView
+                        )
                     )
                     self.consecutiveMaskMisses = 0
                     let includesLiveMask = preview.layers.contains {
                         $0.trackedObjectID == nil
-                    }
+                    } || self.isHoldingLiveMask
                     let didAddLock = result.lockChange.map {
                         if case .added = $0.kind {
                             return true
@@ -1755,6 +1811,10 @@ struct ARCameraView: UIViewRepresentable {
             let orientation = interfaceOrientation(in: arView)
             let viewportSize = arView.bounds.size
             let sampleFractions: [CGFloat] = [0.28, 0.5, 0.72]
+            // Cleared first. A segmentation that finds no depth inside its mask must not leave the
+            // previous one's point behind to be adopted: the mask would then be positioned by a point
+            // belonging to somewhere else, which is a jump rather than a wobble.
+            pendingLiveMaskWorldPoint = nil
 
             let layers = preview.layers.map { layer in
                 guard layer.trackedObjectID == nil,
@@ -1763,7 +1823,7 @@ struct ARCameraView: UIViewRepresentable {
                     return layer
                 }
 
-                var samples: [(point: CGPoint, distance: Float)] = []
+                var samples: [(point: CGPoint, distance: Float, world: SIMD3<Float>)] = []
                 for yFraction in sampleFractions {
                     for xFraction in sampleFractions {
                         let point = CGPoint(
@@ -1781,13 +1841,18 @@ struct ARCameraView: UIViewRepresentable {
                         }
                         samples.append((
                             point: point,
-                            distance: simd_distance(cameraPosition, worldPoint)
+                            distance: simd_distance(cameraPosition, worldPoint),
+                            world: worldPoint
                         ))
                     }
                 }
                 guard !samples.isEmpty else { return layer }
                 samples.sort { $0.distance < $1.distance }
                 let sample = samples[samples.count / 2]
+                // Where this mask is in the room. From here on the mask is kept on the object by
+                // reprojecting this point every frame, which works at any distance and any apparent size
+                // — unlike Vision's object tracker, which gives up once the target is small in frame.
+                pendingLiveMaskWorldPoint = sample.world
 
                 return ObjectMaskPreviewLayer(
                     id: layer.id,
@@ -1801,6 +1866,41 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             return ObjectMaskPreview(layers: layers, timestamp: preview.timestamp)
+        }
+
+        /// Drops the incoming live mask when it is the same view of the same object as the one already on
+        /// screen, leaving that one — and everything that positions it — exactly as it is.
+        ///
+        /// Vision re-segments several times a second and its silhouette is never quite the same twice, so
+        /// replacing the picture every time is a permanent shimmer. Size and position do not need the new
+        /// picture: the mask is followed through the world, which resizes and moves it continuously
+        /// between segmentations. Only a genuinely different view is worth swapping in, and a hold is
+        /// capped in time so a mask cannot go stale.
+        private func previewByHoldingUnchangedLiveMask(
+            _ preview: ObjectMaskPreview
+        ) -> ObjectMaskPreview {
+            guard let incoming = preview.layers.first(where: { $0.trackedObjectID == nil }) else {
+                isHoldingLiveMask = false
+                return preview
+            }
+            let onScreen = captureEngine.objectMaskPreview?.layers.first {
+                $0.trackedObjectID == nil
+            }
+            guard ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen?.referenceViewportBoundingBox,
+                incoming: incoming.referenceViewportBoundingBox,
+                secondsHeld: preview.timestamp - liveMaskAcceptedTimestamp
+            ) else {
+                isHoldingLiveMask = false
+                liveMaskAcceptedTimestamp = preview.timestamp
+                liveMaskWorldPoint = pendingLiveMaskWorldPoint
+                return preview
+            }
+            isHoldingLiveMask = true
+            return ObjectMaskPreview(
+                layers: preview.layers.filter { $0.trackedObjectID != nil },
+                timestamp: preview.timestamp
+            )
         }
 
         private func updateFastObjectMaskPreview(in arView: ARView) {
@@ -1900,6 +2000,18 @@ struct ARCameraView: UIViewRepresentable {
                 guard let boundingBox = layer.trackingBoundingBox else {
                     continue
                 }
+                // A mask too small for Vision to track is followed through the world instead. Seeding the
+                // tracker with it only produces a decaying box, which is worse than no box at all.
+                //
+                // The tracker is deliberately still run for everything above that size: its box is no
+                // longer what places the mask, but it is what the centring advice and the finished
+                // object's snapshot bounds are read from.
+                guard MaskTrackerEligibility.isTrackable(
+                    boundingBox: layer.referenceViewportBoundingBox
+                ) else {
+                    objectMaskDisplaySeedsByID.removeValue(forKey: layer.id)
+                    continue
+                }
                 objectMaskDisplaySeedsByID[layer.id] = ObjectMaskDisplaySeed(
                     id: layer.id,
                     boundingBox: boundingBox,
@@ -1911,6 +2023,11 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func removeLiveObjectMaskDisplaySeed() {
+            liveMaskWorldPoint = nil
+            pendingLiveMaskWorldPoint = nil
+            isHoldingLiveMask = false
+            liveMaskAcceptedTimestamp = -.greatestFiniteMagnitude
+            captureEngine.updateLiveMaskTracking(nil)
             guard let liveObjectMaskDisplayID else {
                 return
             }
@@ -1925,9 +2042,58 @@ struct ARCameraView: UIViewRepresentable {
                   let frame = arView.session.currentFrame,
                   case .normal = frame.camera.trackingState else {
                 captureEngine.updateObjectMaskMarkers([])
+                captureEngine.updateLiveMaskTracking(nil)
                 return
             }
             captureEngine.updateObjectMaskMarkers(currentObjectMaskMarkers(in: arView))
+            updateLiveMaskTracking(frame: frame, in: arView)
+        }
+
+        /// Reprojects the live mask's own point in the room, every frame. This is what keeps a small
+        /// object's mask on the object at the distance the accuracy rule asks for: ARKit can place a
+        /// world point on screen however few pixels the object covers.
+        private func updateLiveMaskTracking(frame: ARFrame, in arView: ARView) {
+            guard let worldPoint = liveMaskWorldPoint,
+                  captureEngine.objectMaskPreview?.layers.contains(where: {
+                      $0.trackedObjectID == nil
+                  }) == true else {
+                captureEngine.updateLiveMaskTracking(nil)
+                return
+            }
+            let viewportSize = arView.bounds.size
+            guard viewportSize.width > 0, viewportSize.height > 0 else { return }
+            // A point behind the camera still projects, to nonsense. Turning away from the object would
+            // otherwise fling its mask across the screen before the mask was dropped.
+            let inCamera = frame.camera.transform.inverse * SIMD4<Float>(worldPoint, 1)
+            guard inCamera.z < -0.01 else {
+                captureEngine.updateLiveMaskTracking(nil)
+                return
+            }
+            let projected = frame.camera.projectPoint(
+                worldPoint,
+                orientation: interfaceOrientation(in: arView),
+                viewportSize: viewportSize
+            )
+            let point = CGPoint(
+                x: projected.x / viewportSize.width,
+                y: projected.y / viewportSize.height
+            )
+            guard point.x.isFinite,
+                  point.y.isFinite,
+                  (-0.5 ... 1.5).contains(point.x),
+                  (-0.5 ... 1.5).contains(point.y) else {
+                captureEngine.updateLiveMaskTracking(nil)
+                return
+            }
+            captureEngine.updateLiveMaskTracking(
+                ObjectMaskWorldTracking(
+                    normalizedViewportPoint: point,
+                    cameraDistance: simd_distance(
+                        frame.camera.transform.translation,
+                        worldPoint
+                    )
+                )
+            )
         }
 
         private func currentObjectMaskMarkers(in arView: ARView) -> [ObjectMaskMarker] {

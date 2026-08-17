@@ -17,12 +17,13 @@ struct MesOverlayView: View {
         case edit(UUID)
     }
 
+    /// What the banner is telling the operator to do. There is deliberately no "move closer" or "move
+    /// farther" state: distance is a recommendation carried in the detail line, not an instruction that
+    /// has to be obeyed before anything can happen.
     private enum MeasurementInstruction: Equatable {
         case preparing
         case findObject
         case findNextObject
-        case moveFarther
-        case moveCloser
         case readyToMeasure
         case holdStill
         case pointDown
@@ -101,7 +102,6 @@ struct MesOverlayView: View {
                 .snappy(duration: 0.25),
                 value: sessionManager.isObjectTrackingEnvironmentReady
             )
-            .animation(.snappy(duration: 0.2), value: isTooCloseForMeasurement)
         )
     }
 
@@ -136,19 +136,46 @@ struct MesOverlayView: View {
         .onChange(of: captureEngine.automaticLockRequestRevision) { _, _ in
             presentAutomaticLockIfRequested()
         }
-        .onChange(of: isTooCloseForMeasurement) { wasTooClose, isTooClose in
-            // Auto-lock may have become ready while the operator was inside the unsafe range. The
-            // engine will not issue a second request, so honour the existing one upon moving back.
-            if wasTooClose, !isTooClose {
-                presentAutomaticLockIfRequested()
-            }
-        }
         .onChange(of: captureEngine.canFinalizeActiveObject) { _, canLock in
             if canLock {
                 lockFeedback.prepare()
             }
         }
+        .onChange(of: captureEngine.measuredObjectIDs.count) { _, _ in
+            recordMeasurementProgress()
+        }
         )
+    }
+
+    /// Writes the dimensions of everything measured so far into the run on disk, as each object is
+    /// finished. The full record — names, weights, where each package ended up — is written when the
+    /// payload is closed; this is so that a crash in the middle of a payload costs the object being
+    /// measured at the time rather than all of them.
+    private func recordMeasurementProgress() {
+        guard !study.isPractice, study.currentBox != nil else { return }
+        let records = captureEngine.measuredObjectIDs.map { id in
+            StudyObjectRecord(
+                id: id,
+                name: captureEngine.name(for: id) ?? "Unnamed",
+                measuredSizeMillimetres: packingStore
+                    .measuredSizeMillimetres(for: id, in: captureEngine)
+                    .map { [$0.x, $0.y, $0.z] } ?? [],
+                packagedSizeMillimetres: [],
+                assignedBoxName: nil,
+                isOwnBox: false,
+                hasEnforcedSize: packingStore.forcedSize(for: id, in: captureEngine) != nil,
+                massKilograms: captureEngine.weightInKilograms(for: id),
+                photoFileName: captureEngine.snapshotJPEGData(for: id).flatMap {
+                    study.storePhoto(
+                        $0,
+                        objectID: id,
+                        objectName: captureEngine.name(for: id)
+                    )
+                },
+                placementOriginMillimetres: nil
+            )
+        }
+        study.recordMeasurementProgress(objects: records)
     }
 
     private var applicationLifecycleLayer: AnyView {
@@ -562,18 +589,17 @@ struct MesOverlayView: View {
         return liveMeasurementCandidateLayer?.referenceCameraDistance.map(Double.init)
     }
 
-    private var isTooCloseForMeasurement: Bool {
-        MeasurementFramingRule.isTooClose(
-            distanceMetres: estimatedCameraToObjectCentreDistanceMetres
-        )
-    }
-
     private var measurementDistanceGuidance: MeasurementFramingRule.Guidance {
         MeasurementFramingRule.guidance(
             distanceMetres: estimatedCameraToObjectCentreDistanceMetres
         )
     }
 
+    /// Anything masked can be measured. Distance is advice, not a gate: the 40–50 cm band is where the
+    /// framing study found the best accuracy, and it is said plainly on screen — but an object whose mask
+    /// is on screen can be measured from wherever the operator is standing. Enforcing the band meant a
+    /// small object, which has to be closer before there is anything to work with, could be masked and
+    /// still refuse to be measured, which is not a rule the operator can do anything about.
     private var automaticMeasurementCandidate: AutomaticMeasurementCandidate? {
         guard isAutomaticCaptureSupported,
               showsLiveOverlay,
@@ -586,7 +612,6 @@ struct MesOverlayView: View {
               sessionManager.isObjectTrackingEnvironmentReady,
               captureEngine.hasCompletedObjectRecognitionWarmup,
               workflowMode == .spatial3D || captureEngine.isTopViewAligned,
-              measurementDistanceGuidance == .ready,
               let layer = liveMeasurementCandidateLayer else {
             return nil
         }
@@ -603,36 +628,44 @@ struct MesOverlayView: View {
         if captureEngine.isObjectSelectionPending {
             return .holdStill
         }
+        // A masked object is measurable, so that is what the banner says. The distance is carried in the
+        // detail line underneath instead of replacing the instruction with one the operator is not
+        // required to follow.
         if automaticMeasurementCandidate != nil { return .readyToMeasure }
         if captureEngine.activeObjectID != nil {
-            switch measurementDistanceGuidance {
-            case .moveFarther: return .moveFarther
-            case .moveCloser: return .moveCloser
-            case .ready, .unavailable:
-                if workflowMode == .top, !captureEngine.isTopViewAligned {
-                    return .pointDown
-                }
-                switch captureEngine.convergence.limitingFactor {
-                case .waitingForSupportPlane: return .findSurface
-                case .needsTopView: return .pointDown
-                case .needsSideView: return .useSideView
-                default: return .holdStill
-                }
+            if workflowMode == .top, !captureEngine.isTopViewAligned {
+                return .pointDown
+            }
+            switch captureEngine.convergence.limitingFactor {
+            case .waitingForSupportPlane: return .findSurface
+            case .needsTopView: return .pointDown
+            case .needsSideView: return .useSideView
+            default: return .holdStill
             }
         }
         if captureEngine.isPointingAtFinishedObject {
             return .findNextObject
         }
+        if workflowMode == .top, !captureEngine.isTopViewAligned {
+            return .pointDown
+        }
+        return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
+    }
+
+    /// The recommended distance, as a sentence to add to whatever the banner is already saying. Nil when
+    /// the phone is in the band, or when there is no depth reading to talk about.
+    private var distanceAdvice: String? {
+        guard let distance = estimatedCameraToObjectCentreDistanceMetres else { return nil }
+        let centimetres = Int((distance * 100).rounded())
         switch measurementDistanceGuidance {
-        case .moveFarther: return .moveFarther
-        case .moveCloser: return .moveCloser
-        case .ready:
-            if workflowMode == .top, !captureEngine.isTopViewAligned {
-                return .pointDown
-            }
-            return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
-        case .unavailable:
-            return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
+        case .moveFarther:
+            return MeasurementFramingRule.isBelowAccuracyThreshold(distanceMetres: distance)
+                ? "You are at \(centimetres) cm. Readings are least accurate this close — 40–50 cm is best."
+                : "You are at \(centimetres) cm. 40–50 cm is best."
+        case .moveCloser:
+            return "You are at \(centimetres) cm. 40–50 cm is best."
+        case .ready, .unavailable:
+            return nil
         }
     }
 
@@ -641,8 +674,6 @@ struct MesOverlayView: View {
         case .preparing: "Getting ready"
         case .findObject: "Look for an object"
         case .findNextObject: "Look for the next object"
-        case .moveFarther: "Move farther away"
-        case .moveCloser: "Move closer"
         case .readyToMeasure: "Ready to measure"
         case .holdStill: "DON’T MOVE"
         case .pointDown: "Point straight down"
@@ -652,9 +683,12 @@ struct MesOverlayView: View {
     }
 
     private var measurementInstructionDetail: String {
-        let distance = estimatedCameraToObjectCentreDistanceMetres.map {
-            " Estimated distance: \(Int(($0 * 100).rounded())) cm."
-        } ?? ""
+        [instructionDetailText, distanceAdvice]
+            .compactMap { $0 }
+            .joined(separator: " ")
+    }
+
+    private var instructionDetailText: String {
         switch measurementInstruction {
         case .preparing:
             return "The app is preparing the camera and object recognition."
@@ -664,15 +698,11 @@ struct MesOverlayView: View {
                 : "Aim at one complete object and keep it fully visible."
         case .findNextObject:
             return "Aim at the next unmeasured object and keep it fully visible."
-        case .moveFarther:
-            return "The phone is too close. Move back toward 40–50 cm.\(distance)"
-        case .moveCloser:
-            return "The phone is too far away. Move toward the object until 40–50 cm.\(distance)"
         case .readyToMeasure:
             return "Keep the complete object visible, then tap Measure to begin."
         case .holdStill:
             return captureEngine.activeObjectID == nil
-                ? "Distance is correct. Hold the phone still while the app starts measuring."
+                ? "Hold the phone still while the app starts measuring."
                 : "Hold the phone steady while the app collects and stabilises the measurement."
         case .pointDown:
             if let degrees = captureEngine.topViewDeviationDegrees {
@@ -689,7 +719,6 @@ struct MesOverlayView: View {
     private var measurementInstructionColor: Color {
         switch measurementInstruction {
         case .holdStill: .red
-        case .moveCloser, .moveFarther: .orange
         case .pointDown, .useSideView, .findSurface: .yellow
         case .readyToMeasure: .green
         case .findObject, .findNextObject: .blue
@@ -701,8 +730,6 @@ struct MesOverlayView: View {
         switch measurementInstruction {
         case .preparing: "camera.aperture"
         case .findObject, .findNextObject: "viewfinder"
-        case .moveFarther: "arrow.up.left.and.arrow.down.right"
-        case .moveCloser: "arrow.down.right.and.arrow.up.left"
         case .readyToMeasure: "ruler"
         case .holdStill: "hand.raised.fill"
         case .pointDown: "arrow.down.to.line"
@@ -968,28 +995,20 @@ struct MesOverlayView: View {
 
     /// Distance advice, but only once a measurement is under way — before that the object is not
     /// being tracked and any advice would be guesswork.
+    /// Only the centring advice remains here. Distance is no longer one of the things this card tells the
+    /// operator to fix, because the measurement is not waiting on it.
     private var measuringGuidance: ObjectFramingGuidance? {
         guard captureEngine.activeObjectID != nil else { return nil }
-        switch measurementDistanceGuidance {
-        case .moveFarther:
-            return .moveFarther
-        case .moveCloser:
-            return .moveCloser
-        case .ready, .unavailable:
-            // Keep centring advice, but do not turn screen occupancy back into a distance rule.
-            return captureEngine.framingGuidance == .centre ? .centre : nil
-        }
+        return captureEngine.framingGuidance == .centre ? .centre : nil
     }
 
-    /// Distance first, because nothing else can be judged from the wrong distance; after that it is
-    /// whatever the stopping rule is actually waiting for. Width and depth are only measured looking
+    /// Whatever the stopping rule is actually waiting for. Width and depth are only measured looking
     /// down and height only from the side, so a measurement can sit at the same percentage for a long
     /// time purely because the phone has not been where it needs to be — and saying "hold steady"
-    /// then is worse than saying nothing.
+    /// then is worse than saying nothing. The recommended distance is added underneath rather than
+    /// replacing any of it.
     private var measuringTitle: String {
         switch measuringGuidance {
-        case .moveCloser: "Move closer"
-        case .moveFarther: "Move farther away"
         case .centre: "Aim at it"
         default:
             switch captureEngine.convergence.limitingFactor {
@@ -1003,9 +1022,13 @@ struct MesOverlayView: View {
     }
 
     private var measuringAdvice: String {
+        [measuringAdviceText, distanceAdvice]
+            .compactMap { $0 }
+            .joined(separator: " ")
+    }
+
+    private var measuringAdviceText: String {
         switch measuringGuidance {
-        case .moveCloser: "Move toward the object until the phone is 40–50 cm away."
-        case .moveFarther: "Move back until the phone is 40–50 cm away."
         case .centre: "The object runs off the edge. Point at the middle of it."
         default:
             switch captureEngine.convergence.limitingFactor {
@@ -1025,8 +1048,6 @@ struct MesOverlayView: View {
 
     private var measuringIcon: String {
         switch measuringGuidance {
-        case .moveCloser: "arrow.down.right.and.arrow.up.left"
-        case .moveFarther: "arrow.up.left.and.arrow.down.right"
         case .centre: "viewfinder"
         default:
             switch captureEngine.convergence.limitingFactor {
@@ -1041,7 +1062,7 @@ struct MesOverlayView: View {
 
     private var measuringColor: Color {
         switch measuringGuidance {
-        case .moveCloser, .moveFarther, .centre: .orange
+        case .centre: .orange
         default:
             switch captureEngine.convergence.limitingFactor {
             case .needsTopView, .needsSideView, .waitingForSupportPlane: .yellow
@@ -1208,6 +1229,8 @@ struct MesOverlayView: View {
         if            let preview = captureEngine.objectMaskPreview {
             ZStack {
                 ForEach(preview.layers, id: \.id) { layer in
+                    // Only the presence of a mask is animated, never where it is: see the transition on
+                    // `trackedObjectMaskPreview`.
                     if let trackedObjectID = layer.trackedObjectID {
                         if captureEngine.showsSelectedObjectMaskPreview,
                            captureEngine.activeObjectID == trackedObjectID,
@@ -1232,7 +1255,48 @@ struct MesOverlayView: View {
                     }
                 }
             }
+            .animation(.easeOut(duration: 0.18), value: maskPresenceKey)
         }
+    }
+
+    /// Which masks are on screen, and nothing about where they are. Scoping the fade to this is what keeps
+    /// it from animating the mask's position, which would leave it trailing the object.
+    private var maskPresenceKey: [UUID] {
+        captureEngine.objectMaskPreview?.layers.map(\.id) ?? []
+    }
+
+    /// How to place this mask picture on the camera image in this frame.
+    ///
+    /// World tracking first, always: the mask's own point in the room, reprojected by ARKit, with the
+    /// apparent size following the change in how far away it is. Vision's object tracker is the fallback
+    /// and contributes position only. It has a minimum target size in frame, and a small object at the
+    /// 40–50 cm the accuracy rule asks for is under it — so its box stops following and decays, which is
+    /// what made the mask lag on small objects and pulse between two sizes when its size was believed.
+    private func maskTransform(
+        for layer: ObjectMaskPreviewLayer,
+        marker: ObjectMaskMarker?,
+        currentBoundingBox: CGRect?
+    ) -> MaskDisplayTransform? {
+        let world: ObjectMaskWorldTracking? = layer.trackedObjectID == nil
+            ? captureEngine.liveMaskTracking
+            : marker.map {
+                ObjectMaskWorldTracking(
+                    normalizedViewportPoint: $0.normalizedViewportPoint,
+                    cameraDistance: $0.cameraDistance
+                )
+            }
+        if let transform = MaskDisplayTransform.following(
+            referencePoint: layer.referenceAnchorPoint,
+            referenceDistanceMetres: layer.referenceCameraDistance,
+            currentPoint: world?.normalizedViewportPoint,
+            currentDistanceMetres: world?.cameraDistance
+        ) {
+            return transform
+        }
+        return MaskDisplayTransform.sliding(
+            reference: layer.referenceViewportBoundingBox,
+            current: currentBoundingBox
+        )
     }
 
     private func trackedObjectMaskPreview(
@@ -1243,32 +1307,26 @@ struct MesOverlayView: View {
         GeometryReader { proxy in
             let referencePoint = layer.referenceAnchorPoint ?? CGPoint(x: 0.5, y: 0.5)
             let currentPoint = marker?.normalizedViewportPoint ?? referencePoint
-            let trackedTransform: (
-                xOffset: CGFloat,
-                yOffset: CGFloat
-            )? = {
-                guard let reference = layer.referenceViewportBoundingBox,
-                      let current = currentBoundingBox,
-                      reference.width >= 0.005,
-                      reference.height >= 0.005,
-                      current.width >= 0.005,
-                      current.height >= 0.005 else {
-                    return nil
-                }
-                return (
-                    (current.midX - reference.midX) * proxy.size.width,
-                    (current.midY - reference.midY) * proxy.size.height
-                )
-            }()
-            let xOffset = trackedTransform?.xOffset
+            let tracked = maskTransform(
+                for: layer,
+                marker: marker,
+                currentBoundingBox: currentBoundingBox
+            )
+            let xOffset = tracked?.translation.x.scaled(by: proxy.size.width)
                 ?? (currentPoint.x - referencePoint.x) * proxy.size.width
-            let yOffset = trackedTransform?.yOffset
+            let yOffset = tracked?.translation.y.scaled(by: proxy.size.height)
                 ?? (currentPoint.y - referencePoint.y) * proxy.size.height
+            let anchor = tracked?.anchor ?? UnitPoint(x: 0.5, y: 0.5)
 
             ZStack {
                 Image(decorative: layer.image, scale: 1, orientation: .up)
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
+                    .scaleEffect(
+                        x: tracked?.scale.width ?? 1,
+                        y: tracked?.scale.height ?? 1,
+                        anchor: anchor
+                    )
                     .offset(
                         x: xOffset,
                         y: yOffset
@@ -1280,6 +1338,11 @@ struct MesOverlayView: View {
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+        // A short fade on the way in and out. Vision does lose an object for a moment now and then, and
+        // an instant cut to nothing and back is read as a fault; the same gap crossfaded is read as the
+        // mask settling. Deliberately a transition and not an animation on the position: animating that
+        // would put the mask permanently a fraction of a second behind the object.
+        .transition(.opacity)
     }
 
     private var infoPanel: some View {
@@ -1747,9 +1810,7 @@ struct MesOverlayView: View {
                 .buttonBorderShape(.capsule)
                 .accessibilityLabel("Cancel measurement")
                 .accessibilityHint("Discards this measurement and deselects the object.")
-            } else if let countdown = MeasurementStartRule.cancelCountdown(
-                secondsActive: captureEngine.secondsSinceMeasurementStarted
-            ) {
+            } else if let countdown = captureEngine.cancelCountdownSeconds {
                 actionLabel(
                     "Cancel in \(countdown) s",
                     systemImage: "clock",
@@ -2097,12 +2158,14 @@ struct MesOverlayView: View {
         return "Remove \(name)?"
     }
 
+    /// Distance is not checked here either. A measurement taken from wherever the operator was standing
+    /// has to be allowed to finish there: refusing the finish because the phone is close is how a
+    /// measurement ended up complete and unable to end.
     private func presentAutomaticLockIfRequested() {
         guard let id = captureEngine.automaticLockRequest,
               captureEngine.activeObjectID == id,
               sessionManager.isTrackingReady,
-              sessionManager.isObjectTrackingEnvironmentReady,
-              !isTooCloseForMeasurement else {
+              sessionManager.isObjectTrackingEnvironmentReady else {
             return
         }
         showsSavedObjects = false

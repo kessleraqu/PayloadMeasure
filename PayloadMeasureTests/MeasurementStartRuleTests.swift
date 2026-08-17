@@ -54,4 +54,18 @@ final class MeasurementStartRuleTests: XCTestCase {
         XCTAssertEqual(MeasurementStartRule.cancelCountdown(secondsActive: 3.95), 1)
         XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: 4))
     }
+
+    /// A clock that has gone backwards, or a value that is not a number at all, must not reach an Int
+    /// conversion: that traps, and trapping in the middle of a measurement is a crash.
+    func testAbsurdElapsedTimesAreSurvivedRatherThanConverted() {
+        XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: .nan))
+        XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: .infinity))
+        XCTAssertEqual(MeasurementStartRule.cancelCountdown(secondsActive: -1e30), 4)
+        XCTAssertFalse(
+            MeasurementStartRule.abandonsMeasurement(
+                secondsActive: .nan,
+                hasMeasurement: false
+            )
+        )
+    }
 }

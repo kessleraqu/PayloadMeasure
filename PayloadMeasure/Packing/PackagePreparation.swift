@@ -31,23 +31,36 @@ nonisolated enum PackagePreparationState: Sendable, Equatable {
 nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
     let id: String
     let name: String
+    /// The box's size, full stop, as far as anything the operator sees is concerned: it is the name, and
+    /// it is the space the box takes up in the payload.
     let outerSizeMillimetres: SIMD3<Double>
+    /// What actually fits in it. Normally the same figure; a couple of the stocked boxes were measured
+    /// and turned out not to be, and only the fits-or-not test ever reads this.
     let usableInnerSizeMillimetres: SIMD3<Double>
 
-    /// Box sizes are taken as given: what is written on the box is what fits in it. No wall
-    /// allowance is subtracted, so the usable inside equals the outer size.
+    /// Box sizes are taken as given: what is written on the box is its size. No wall allowance is
+    /// subtracted.
     static let wallThicknessMillimetres: Double = 0
 
     /// A box is identified by its size, so that is its name.
-    static func sized(outerSizeMillimetres: SIMD3<Double>) -> PackingBoxPreset? {
-        sized(id: identifier(for: outerSizeMillimetres), outerSizeMillimetres: outerSizeMillimetres)
+    static func sized(
+        outerSizeMillimetres: SIMD3<Double>,
+        usableInnerSizeMillimetres: SIMD3<Double>? = nil
+    ) -> PackingBoxPreset? {
+        sized(
+            id: identifier(for: outerSizeMillimetres),
+            outerSizeMillimetres: outerSizeMillimetres,
+            usableInnerSizeMillimetres: usableInnerSizeMillimetres
+        )
     }
 
     static func sized(
         id: String,
-        outerSizeMillimetres: SIMD3<Double>
+        outerSizeMillimetres: SIMD3<Double>,
+        usableInnerSizeMillimetres: SIMD3<Double>? = nil
     ) -> PackingBoxPreset? {
-        let inner = outerSizeMillimetres - SIMD3(repeating: 2 * wallThicknessMillimetres)
+        let inner = usableInnerSizeMillimetres
+            ?? outerSizeMillimetres - SIMD3(repeating: 2 * wallThicknessMillimetres)
         guard outerSizeMillimetres.allFiniteAndPositive, inner.allFiniteAndPositive else {
             return nil
         }
@@ -74,26 +87,31 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
     /// The boxes available for one payload module. The two modules carry different boxes, and the
     /// practice payload uses the small module's, being the same size — see `catalogueOwner`.
     static func defaultCatalog(for payload: StudyBox) -> [PackingBoxPreset] {
-        let sizes: [SIMD3<Double>]
+        // Size, then what fits in it where the two differ. Two of these boxes were measured and are not
+        // what their size suggests: the 230 one takes 235, and the 40 one only takes 30.
+        let stock: [(size: SIMD3<Double>, fits: SIMD3<Double>?)]
         switch payload {
         case .big:
-            sizes = [
-                SIMD3(35, 22, 115),
-                // Measured inside rather than taken from the label: this one is 235 mm deep inside.
-                SIMD3(75, 75, 235),
-                SIMD3(95, 95, 160),
-                SIMD3(100, 95, 85),
-                SIMD3(130, 100, 105),
+            stock = [
+                (SIMD3(35, 22, 115), nil),
+                (SIMD3(75, 75, 230), SIMD3(75, 75, 235)),
+                (SIMD3(95, 95, 160), nil),
+                (SIMD3(100, 95, 85), nil),
+                (SIMD3(130, 100, 105), nil),
             ]
         case .small:
-            sizes = [
-                SIMD3(100, 75, 90),
-                // Also an inside measurement: the label says 40 mm, only 30 mm is usable.
-                SIMD3(120, 90, 30),
+            stock = [
+                (SIMD3(100, 75, 90), nil),
+                (SIMD3(120, 90, 40), SIMD3(120, 90, 30)),
+                (SIMD3(130, 100, 105), nil),
             ]
         }
-        return sizes.compactMap {
-            PackingBoxPreset.sized(id: identifier(for: $0), outerSizeMillimetres: $0)
+        return stock.compactMap {
+            PackingBoxPreset.sized(
+                id: identifier(for: $0.size),
+                outerSizeMillimetres: $0.size,
+                usableInnerSizeMillimetres: $0.fits
+            )
         }
     }
 

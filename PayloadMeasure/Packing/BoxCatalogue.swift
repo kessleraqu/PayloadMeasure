@@ -38,9 +38,16 @@ final class BoxCatalogue {
     }
 
     @discardableResult
-    func add(outerSizeMillimetres size: SIMD3<Double>) -> PackingBoxPreset? {
-        guard let preset = PackingBoxPreset.sized(outerSizeMillimetres: size),
+    func add(
+        outerSizeMillimetres size: SIMD3<Double>,
+        usableInnerSizeMillimetres inner: SIMD3<Double>? = nil
+    ) -> PackingBoxPreset? {
+        guard let preset = PackingBoxPreset.sized(
+            outerSizeMillimetres: size,
+            usableInnerSizeMillimetres: inner
+        ),
               size.allFiniteAndPositive,
+              inner.map(\.allFiniteAndPositive) ?? true,
               !presets.contains(where: { $0.outerSizeMillimetres == size }) else {
             return nil
         }
@@ -66,10 +73,10 @@ final class BoxCatalogue {
 
     // MARK: - Persistence
 
-    /// v3: two boxes were remeasured inside (235 mm deep and 30 mm high). A saved v2 list would have
-    /// restored the label sizes on upgrade, so the generation moves with the numbers.
+    /// The generation moves whenever the stocked sizes change, because a saved list would otherwise
+    /// restore the old ones on upgrade. v5: the 130 × 100 × 105 box is stocked for the small payload too.
     private static func key(for payload: StudyBox) -> String {
-        "packing.boxes.v3.\(payload.rawValue)"
+        "packing.boxes.v5.\(payload.rawValue)"
     }
 
     private static func load(for payload: StudyBox) -> [PackingBoxPreset] {

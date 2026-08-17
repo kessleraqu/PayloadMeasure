@@ -301,7 +301,7 @@ private struct PackingPreparationView: View {
                             .foregroundStyle(.secondary)
                         Text(assigned.name)
                             .font(.title2.monospacedDigit().weight(.bold))
-                        Text("Smallest available box that fits · inside measurements")
+                        Text("Smallest available box that fits")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -371,7 +371,7 @@ private struct PackingPreparationView: View {
                                 .stroke(fieldStroke(.weight), lineWidth: 2)
                         }
                         .accessibilityLabel("Total packed weight in grams")
-                        .accessibilityHint("Include the object, outer box and all packing material.")
+                        .accessibilityHint("Include the object, the box and all packing material.")
 
                     Text("g")
                         .font(.title3.weight(.semibold))

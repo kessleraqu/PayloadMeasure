@@ -25,10 +25,10 @@ nonisolated enum ObjectMaskCandidatePolicy {
     /// both makes the mask blink on and off while the crosshair sits on the boundary; letting go later
     /// than it takes hold is what stops that.
     static let heldAimBoundsSlack: CGFloat = 0.11
-    /// How much of the mask already on screen a candidate must cover to count as the same object from
-    /// one segmentation to the next. Vision renumbers its instances every frame, so sameness can only
-    /// be judged geometrically.
-    static let continuationOverlap: CGFloat = 0.45
+    /// How much of the smaller of the two masks the overlap must cover for a candidate to count as the
+    /// same object from one segmentation to the next. Vision renumbers its instances every frame, so
+    /// sameness can only be judged geometrically.
+    static let continuationOverlap: CGFloat = 0.5
     /// After this long with no live mask, there is nothing left to continue: the phone has been pointed
     /// somewhere else and the next mask is a fresh decision.
     static let continuationTimeout: TimeInterval = 0.7
@@ -77,21 +77,51 @@ nonisolated enum ObjectMaskCandidatePolicy {
     /// Without this the preview is a fresh decision every segmentation, and two candidates whose scores
     /// are all but identical — an object and the object plus its shadow, two touching objects — swap
     /// places several times a second. That is the flicker, and the jump from one object to the other.
+    ///
+    /// Sameness is judged by how much of the *smaller* of the two the overlap covers, not by
+    /// intersection-over-union. Vision does not segment a complex object the same way twice: one frame it
+    /// is one instance, the next it is split into the body and the handle. A part of what was on screen has
+    /// a poor union score but sits almost entirely inside it, and it is plainly the same object — under a
+    /// union rule it read as something new, and the preview swapped between the whole and the part. Of the
+    /// candidates that qualify, the one sharing the most area wins, so a re-pick lands on the most complete
+    /// piece rather than the first fragment.
     static func continuation(
         of previous: CGRect,
         among candidates: [(instance: Int, boundingBox: CGRect)],
         minimumOverlap: CGFloat = continuationOverlap
     ) -> Int? {
         guard previous.width > 0, previous.height > 0 else { return nil }
-        var best: (instance: Int, overlap: CGFloat)?
+        var best: (instance: Int, sharedArea: CGFloat)?
         for candidate in candidates {
-            let overlap = intersectionOverUnion(previous, candidate.boundingBox)
-            guard overlap >= minimumOverlap else { continue }
-            if best == nil || overlap > best!.overlap {
-                best = (candidate.instance, overlap)
+            guard overlapOfSmaller(previous, candidate.boundingBox) >= minimumOverlap else {
+                continue
+            }
+            let shared = sharedArea(previous, candidate.boundingBox)
+            if best == nil || shared > best!.sharedArea {
+                best = (candidate.instance, shared)
             }
         }
         return best?.instance
+    }
+
+    /// The overlap as a fraction of the smaller rectangle: 1 when either is wholly inside the other.
+    static func overlapOfSmaller(_ first: CGRect, _ second: CGRect) -> CGFloat {
+        let firstArea = first.width * first.height
+        let secondArea = second.width * second.height
+        guard firstArea > 0, secondArea > 0 else { return 0 }
+        let shared = sharedArea(first, second)
+        guard shared > 0 else { return 0 }
+        return shared / min(firstArea, secondArea)
+    }
+
+    static func sharedArea(_ first: CGRect, _ second: CGRect) -> CGFloat {
+        let intersection = first.intersection(second)
+        guard !intersection.isNull,
+              intersection.width > 0,
+              intersection.height > 0 else {
+            return 0
+        }
+        return intersection.width * intersection.height
     }
 
     /// Whether to stay on the mask already on screen rather than take the best-scoring candidate.
@@ -125,6 +155,61 @@ nonisolated enum ObjectMaskCandidatePolicy {
     }
 }
 
+/// Whether a freshly segmented live mask is worth swapping in for the one already on screen.
+///
+/// Vision re-segments every frame and its silhouette is never quite the same twice: a few pixels here,
+/// a notch there. Redrawing the mask each time turns that into a visible shimmer even while the phone
+/// and the object are both still. When the new mask is in the same place as the one on screen, the one
+/// on screen is already the right answer and is left alone — the display tracker keeps it aligned in
+/// the meantime. A hold is capped in time so a mask can never go stale.
+nonisolated enum ObjectMaskPreviewHold {
+    /// However steady the scene, the picture is refreshed at least this often.
+    static let maximumHoldSeconds: TimeInterval = 1.2
+    /// How far outside the mask on screen the new mask's centre may fall and still be the same object.
+    static let sameObjectCentreSlack: CGFloat = 0.05
+    /// A new mask bigger than this multiple of the one on screen is a better look at the object, and worth
+    /// showing even mid-hold.
+    static let materiallyLargerRatio: CGFloat = 1.15
+
+    /// Whether the mask on screen should stay, rather than be replaced by the one just segmented.
+    ///
+    /// The policy is: show the most complete recent silhouette of whatever is at the aim point. A new mask
+    /// centred on the same object is not automatically better than the one already up — Vision segments a
+    /// complex object differently every time, so half of those are a *fragment* of what is on screen, and
+    /// taking them is what makes the preview pulse between the whole object and a piece of it. So a mask
+    /// that is smaller or the same is held; a mask that is materially bigger is taken, because more of the
+    /// object has been found; a mask centred somewhere else is taken, because the aim has moved.
+    ///
+    /// Nothing is lost by holding: position and size are followed through the world every frame, so a
+    /// silhouette up to `maximumHoldSeconds` old is still drawn in the right place at the right size. This
+    /// is deliberately close to what a *selected* object does — one tracked instance, held while the phone
+    /// moves — which is the case that is already rock steady on screen.
+    static func holdsExistingLayer(
+        existing: CGRect?,
+        incoming: CGRect?,
+        secondsHeld: TimeInterval
+    ) -> Bool {
+        guard let existing,
+              let incoming,
+              secondsHeld.isFinite,
+              secondsHeld >= 0,
+              secondsHeld < maximumHoldSeconds else {
+            return false
+        }
+        let existingArea = existing.width * existing.height
+        let incomingArea = incoming.width * incoming.height
+        guard existingArea > 0, incomingArea > 0 else { return false }
+        // Somewhere else: the aim has moved to another object.
+        guard existing
+            .insetBy(dx: -sameObjectCentreSlack, dy: -sameObjectCentreSlack)
+            .contains(CGPoint(x: incoming.midX, y: incoming.midY)) else {
+            return false
+        }
+        // A better look at the same object.
+        return incomingArea <= existingArea * materiallyLargerRatio
+    }
+}
+
 nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let id: UUID
     let image: CGImage
@@ -134,6 +219,16 @@ nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let referenceViewportBoundingBox: CGRect?
     let trackingBoundingBox: NormalizedRect?
     let trackingOrientation: CGImagePropertyOrientation
+}
+
+/// Where a mask's own point in the room is on screen right now, and how far away it is.
+///
+/// The pair is everything needed to keep a mask picture on its object between segmentations: the point
+/// gives the position, and the change in distance gives the apparent size. It comes from ARKit's world
+/// tracking, so it holds at any distance and at any apparent size — which is the whole reason it exists.
+nonisolated struct ObjectMaskWorldTracking: Equatable, Sendable {
+    let normalizedViewportPoint: CGPoint
+    let cameraDistance: Float
 }
 
 nonisolated struct ObjectMaskPreview: @unchecked Sendable {

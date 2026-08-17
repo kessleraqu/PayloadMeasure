@@ -28,6 +28,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private var suspensionReasons: Set<SuspensionReason> = []
     private var isSessionRunning = false
     private var automaticRecoveryAttempts = 0
+    /// When tracking last became normal, on the monotonic clock. Cleared whenever it stops being normal,
+    /// so the settling time is always the *continuous* run of good tracking.
+    private var normalTrackingSince: TimeInterval?
     private var horizontalPlaneAnchorIDs: Set<UUID> = []
     private var verticalPlaneAnchorIDs: Set<UUID> = []
 
@@ -604,8 +607,11 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         let depthResolutionText = depthData.map {
             "\(CVPixelBufferGetWidth($0.depthMap)) × \(CVPixelBufferGetHeight($0.depthMap)) px"
         }
+        // While still preparing, readiness is re-examined on every frame: part of it is how long
+        // tracking has been normal, and a clock does not announce itself with a state change.
         guard worldMappingStatus != mappingStatus
                 || (receivedDepth && !hasReceivedSceneDepth)
+                || !environmentReadiness.isReady
                 || (depthResolutionText != nil
                     && depthResolutionText != sceneDepthResolutionText) else {
             return
@@ -719,8 +725,15 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             return
         }
         guard trackingStatus == .normal else {
+            normalTrackingSince = nil
             setEnvironmentReadiness(.preparing(trackingStatus.detail))
             return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let normalTrackingSeconds = now - (normalTrackingSince ?? now)
+        if normalTrackingSince == nil {
+            normalTrackingSince = now
         }
 
         if isSceneDepthSupported {
@@ -735,6 +748,21 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         guard hasDetectedHorizontalPlane else {
             setEnvironmentReadiness(.preparing(
                 "Move slowly across the floor or table until its horizontal support plane is detected."
+            ))
+            return
+        }
+
+        // Tracking says normal within a frame or two of starting, while anchors and planes are still
+        // being corrected underneath whatever is measured against them. Wait for the world to settle.
+        guard WorldSettlingRule.isSettled(
+            normalTrackingSeconds: normalTrackingSeconds,
+            mappingStatus: worldMappingStatus
+        ) else {
+            setEnvironmentReadiness(.preparing(
+                WorldSettlingRule.waitingDetail(
+                    normalTrackingSeconds: normalTrackingSeconds,
+                    mappingStatus: worldMappingStatus
+                )
             ))
             return
         }
