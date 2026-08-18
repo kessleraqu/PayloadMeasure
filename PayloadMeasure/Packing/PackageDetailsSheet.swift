@@ -9,6 +9,11 @@ import simd
 //      Calls onRescan when the operator wants to measure the object again.
 
 struct PackageDetailsSheet: View {
+    private enum FocusedField: Hashable {
+        case name
+        case weight
+    }
+
     let objectID: UUID
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
@@ -18,6 +23,7 @@ struct PackageDetailsSheet: View {
     @State private var name = ""
     @State private var weightText = ""
     @State private var message: String?
+    @FocusState private var focusedField: FocusedField?
 
     var body: some View {
         NavigationStack {
@@ -29,6 +35,9 @@ struct PackageDetailsSheet: View {
                     }
                     TextField("Name", text: $name)
                         .textInputAutocapitalization(.words)
+                        .focused($focusedField, equals: .name)
+                        .submitLabel(.next)
+                        .onSubmit { focusedField = .weight }
                 }
 
                 Section {
@@ -56,6 +65,8 @@ struct PackageDetailsSheet: View {
                         TextField("Weight", text: $weightText)
                             .keyboardType(.decimalPad)
                             .monospacedDigit()
+                            .focused($focusedField, equals: .weight)
+                            .submitLabel(.done)
                         Text("g").foregroundStyle(.secondary)
                     }
                 }

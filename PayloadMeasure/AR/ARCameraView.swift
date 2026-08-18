@@ -283,6 +283,9 @@ struct ARCameraView: UIViewRepresentable {
         private var topAlignmentAccepted = false
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
+        /// Consecutive frames whose silhouette placed a retained voxel outside the object. Reset the
+        /// moment a frame agrees with the voxel; see `carvePointsOutside`.
+        private var silhouetteDisagreementsByObject: [UUID: [SelectionVoxelKey: Int]] = [:]
         private let objectCaptureFitter = ObjectCaptureFitter()
         private var captureFitTask: Task<Void, Never>?
         private var captureFitTaskGeneration = 0
@@ -725,6 +728,7 @@ struct ARCameraView: UIViewRepresentable {
             liveResultsByObject.removeValue(forKey: id)
             acceptedSurfaceVoxelKeysByObject.removeValue(forKey: id)
             manuallyRejectedVoxelKeysByObject.removeValue(forKey: id)
+            silhouetteDisagreementsByObject.removeValue(forKey: id)
             automaticPointCleanupCursorByObject.removeValue(forKey: id)
             newestMaskedPointTimestamp.removeValue(forKey: id)
             fittedMaskedPointTimestamp.removeValue(forKey: id)
@@ -1392,6 +1396,7 @@ struct ARCameraView: UIViewRepresentable {
             liveResultsByObject.removeValue(forKey: id)
             acceptedSurfaceVoxelKeysByObject.removeValue(forKey: id)
             manuallyRejectedVoxelKeysByObject.removeValue(forKey: id)
+            silhouetteDisagreementsByObject.removeValue(forKey: id)
             automaticPointCleanupCursorByObject.removeValue(forKey: id)
             selectionPointsByObject.removeValue(forKey: id)
             capturedFootprintByObject.removeValue(forKey: id)
@@ -1688,6 +1693,9 @@ struct ARCameraView: UIViewRepresentable {
                             self.newestMaskedPointTimestamp[cloud.id] ?? -.greatestFiniteMagnitude,
                             cloud.timestamp
                         )
+                    }
+                    if let silhouette = cloud.silhouette {
+                        self.carvePointsOutside(silhouette, for: cloud.id)
                     }
                     self.captureEngine.updateActiveMeasurementDetail(
                         id: cloud.id,
@@ -2115,6 +2123,84 @@ struct ARCameraView: UIViewRepresentable {
                     color: state.color,
                     isMaskVisible: state.isMaskVisible
                 )
+            }
+        }
+
+        /// Space carving against one frame's silhouette, exactly.
+        ///
+        /// Points are only ever added to an accumulator, so a frame on which the mask jumped to the
+        /// wrong segment leaves foreign points behind for the rest of the scan, and the box — the
+        /// literal extent of the points — grows to contain them. This is the standard silhouette
+        /// argument (visual hull / space carving): a point inside the frustum, unoccluded, and outside
+        /// the object's silhouette cannot be part of the object.
+        ///
+        /// Unlike `removeVisiblePointsOutsideCurrentMask`, which warps viewport coordinates by an
+        /// approximate scale-and-offset because its mask may be up to 0.2 s stale, everything used here
+        /// comes from one frame — silhouette, pose, intrinsics, depth — so the projection is exact and
+        /// needs no motion compensation at all.
+        ///
+        /// A point is removed after `minObservations` frames have independently placed it outside the
+        /// silhouette, mirroring the same constant that a point needs to be trusted in the first place:
+        /// evidence to drop a point is held to the standard as evidence to keep one. A single frame is
+        /// never enough, so one bad segmentation cannot erase a real surface.
+        private func carvePointsOutside(_ silhouette: ObjectMaskSilhouette, for objectID: UUID) {
+            guard var accumulator = maskedAccumulators[objectID] else {
+                return
+            }
+            let retained = accumulator.stablePointsSnapshot()
+            guard !retained.isEmpty else {
+                return
+            }
+
+            var carved: [SIMD3<Float>] = []
+            var stillOutside: Set<SelectionVoxelKey> = []
+
+            for point in retained {
+                guard let hit = silhouette.pixel(for: point.position) else {
+                    continue
+                }
+                guard silhouette.isClearlyOutside(column: hit.column, row: hit.row) else {
+                    continue
+                }
+                // Depth is measured to the nearest surface along the ray, so anything nearer than the
+                // point means the point is hidden this frame — including by the object's own front face
+                // when the point is on its far side. A hidden point is not evidence of empty space, so
+                // this frame says nothing about it and it keeps whatever doubt it already had. One voxel
+                // of slack absorbs sensor noise about "same surface".
+                let measured = silhouette.depths[hit.row * silhouette.width + hit.column]
+                if measured > 0, measured < hit.depth - ObjectCapturePipeline.voxelSize {
+                    continue
+                }
+                let key = selectionVoxelKey(for: point.position)
+                stillOutside.insert(key)
+                if (silhouetteDisagreementsByObject[objectID]?[key] ?? 0) + 1
+                    >= ObjectCapturePipeline.minObservations {
+                    carved.append(point.position)
+                    carved.append(point.observedPosition)
+                }
+            }
+
+            var counts = silhouetteDisagreementsByObject[objectID] ?? [:]
+            // A point that this frame agrees with loses its accumulated doubt: only *repeated*
+            // disagreement carves, and it has to be repeated without a frame vouching for the point
+            // in between.
+            for key in Array(counts.keys) where !stillOutside.contains(key) {
+                counts.removeValue(forKey: key)
+            }
+            for key in stillOutside {
+                counts[key, default: 0] += 1
+            }
+            silhouetteDisagreementsByObject[objectID] = counts
+
+            guard !carved.isEmpty else {
+                return
+            }
+            cancelCaptureFit()
+            accumulator.removeVoxels(containing: carved)
+            maskedAccumulators[objectID] = accumulator
+            for point in carved {
+                silhouetteDisagreementsByObject[objectID]?
+                    .removeValue(forKey: selectionVoxelKey(for: point))
             }
         }
 
@@ -2766,6 +2852,7 @@ struct ARCameraView: UIViewRepresentable {
                 heightStableTicks.removeValue(forKey: change.id)
                 acceptedSurfaceVoxelKeysByObject.removeValue(forKey: change.id)
                 manuallyRejectedVoxelKeysByObject.removeValue(forKey: change.id)
+                silhouetteDisagreementsByObject.removeValue(forKey: change.id)
                 let anchor = ARAnchor(name: "payload-mask-\(change.id.uuidString)", transform: transform)
                 captureAnchorEntitiesByObject.removeValue(forKey: change.id)?
                     .removeFromParent()
@@ -3353,6 +3440,7 @@ struct ARCameraView: UIViewRepresentable {
             liveResultsByObject.removeAll()
             acceptedSurfaceVoxelKeysByObject.removeAll()
             manuallyRejectedVoxelKeysByObject.removeAll()
+            silhouetteDisagreementsByObject.removeAll()
             scanTickCounter = 0
             lastSupportBindingRefreshTimestamp = -.greatestFiniteMagnitude
             lastAutomaticPointCleanupTimestamp = -.greatestFiniteMagnitude
@@ -3393,6 +3481,7 @@ struct ARCameraView: UIViewRepresentable {
             liveResultsByObject.removeAll()
             acceptedSurfaceVoxelKeysByObject.removeAll()
             manuallyRejectedVoxelKeysByObject.removeAll()
+            silhouetteDisagreementsByObject.removeAll()
             removeAllObjectMaskAnchors()
             objectMaskMarkerStates.removeAll()
             objectMaskColorsByID.removeAll()
@@ -4002,9 +4091,12 @@ struct ARCameraView: UIViewRepresentable {
                 capturedHeightByObject[id] = candidateHeight
             }
 
+            // The footprint of the current fit, expressed in the stored footprint's axis convention
+            // so that width and depth cannot swap places between frames.
+            let aligned = alignFootprint(candidateFootprint, to: capturedFootprintByObject[id])
+
             switch view {
             case .topDown:
-                let aligned = alignFootprint(candidateFootprint, to: capturedFootprintByObject[id])
                 if isActive {
                     captureEngine.recordDimensionObservation(.width, value: aligned.width)
                     captureEngine.recordDimensionObservation(.depth, value: aligned.depth)
@@ -4026,7 +4118,6 @@ struct ARCameraView: UIViewRepresentable {
                 // Stabilization decides only whether the scan has settled. Drawing or publishing
                 // its blended/deadband value makes the box geometrically different from the current
                 // full-cloud rectangle, which is visible at the far edge in a top view.
-                capturedFootprintByObject[id] = aligned
                 if (footprintStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
                     footprintFromTopObjects.insert(id)
                 }
@@ -4066,6 +4157,19 @@ struct ARCameraView: UIViewRepresentable {
             // uses its observation window; only the geometric box is kept exact. The paper-derived
             // 2D footprint orientation and extents are untouched.
             capturedHeightByObject[id] = candidateHeight
+            // The drawn footprint follows the current fit for exactly the same reason, and used to
+            // carry exactly the same defect: it was published only while the view was classified
+            // `.topDown`, so approaching an object from any other angle drew whatever rectangle the
+            // first frame guessed — over a cloud that had since filled in and settled underneath it.
+            // That is the box standing off the dots on every side.
+            //
+            // Publishing it every frame cannot make the box shrink as the phone moves, because
+            // `fitted` is the fit over the *accumulated* cloud, not the current frame's: the masked
+            // accumulator retains points from every earlier view and is only ever `pruneTransient`-ed,
+            // so a face that has been seen stays seen. The view classification keeps its real job,
+            // which is deciding when width/depth have been observed well enough to call the scan
+            // settled — it just no longer decides what geometry is drawn.
+            capturedFootprintByObject[id] = aligned
 
             if isActive {
                 captureEngine.updateScanGuidance(

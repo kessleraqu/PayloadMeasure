@@ -319,6 +319,76 @@ nonisolated struct ObjectMaskDepthPointCloud: @unchecked Sendable {
     let id: UUID
     let points: [SIMD3<Float>]
     let timestamp: TimeInterval
+    /// Negative evidence from the same frame the points came from: see `ObjectMaskSilhouette`.
+    let silhouette: ObjectMaskSilhouette?
+}
+
+/// One frame's answer to "which directions is this object *not* in", in the form a world point can be
+/// tested against exactly.
+///
+/// Points are only ever *added* to an object's accumulator, so a frame on which the mask jumped to the
+/// wrong segment leaves foreign points behind permanently, and the box — which is the literal extent of
+/// the points — grows to contain them. Removing them again is the classic silhouette/space-carving
+/// argument (Laurentini's visual hull; Kutulakos & Seitz, *A Theory of Shape by Space Carving*): a point
+/// that is inside the camera frustum, is not occluded by anything nearer, and still falls *outside* the
+/// object's silhouette cannot belong to the object, and can be carved away.
+///
+/// Everything needed for that test is bundled here from a single frame — the silhouette itself, the pose
+/// it was observed from, the intrinsics to project with, and the depth map to settle occlusion — so the
+/// test is an exact projection. It deliberately replaces warping screen coordinates by an approximate
+/// scale-and-offset to compensate for a mask that has gone stale, which is only ever an estimate of
+/// where a point would have landed.
+nonisolated struct ObjectMaskSilhouette: @unchecked Sendable {
+    let width: Int
+    let height: Int
+    /// Mask membership per depth pixel, independent of the admission filters used to build the point
+    /// cloud: a retained point has to be testable even where no new point would have been accepted.
+    let isObject: [Bool]
+    /// Measured depth per depth pixel, 0 where the sensor gave nothing usable. Used only to tell
+    /// "outside the silhouette" apart from "hidden behind something nearer".
+    let depths: [Float]
+    let cameraTransform: simd_float4x4
+    let focalX: Float
+    let focalY: Float
+    let principalX: Float
+    let principalY: Float
+
+    /// True only if this pixel *and* its four neighbours are all outside the object.
+    ///
+    /// That is the silhouette dilated by one pixel, and it is what makes carving safe at a mask's own
+    /// boundary. A segmentation edge wobbles by a pixel between frames — especially on a translucent
+    /// or specular surface — and a point sitting exactly on the true edge would otherwise be carved by
+    /// the wobble alone. Requiring the neighbourhood to agree costs no threshold: one pixel is the
+    /// finest distinction the mask is capable of making.
+    func isClearlyOutside(column: Int, row: Int) -> Bool {
+        for (dx, dy) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let x = column + dx
+            let y = row + dy
+            guard x >= 0, x < width, y >= 0, y < height else {
+                continue
+            }
+            if isObject[y * width + x] {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Where a world point lands on this frame's depth grid, or nil if it is behind the camera or
+    /// outside the frame.
+    func pixel(for worldPoint: SIMD3<Float>) -> (column: Int, row: Int, depth: Float)? {
+        let camera = cameraTransform.inverse * SIMD4<Float>(worldPoint, 1)
+        let depth = -camera.z
+        guard depth > 0.01, focalX > 0, focalY > 0 else {
+            return nil
+        }
+        let column = Int((camera.x / depth) * focalX + principalX)
+        let row = Int((-camera.y / depth) * focalY + principalY)
+        guard column >= 0, column < width, row >= 0, row < height else {
+            return nil
+        }
+        return (column, row, depth)
+    }
 }
 
 nonisolated struct ObjectMaskDisplaySeed: @unchecked Sendable {
@@ -935,7 +1005,11 @@ actor ObjectMaskProcessor {
                             y: boundingBox.midY
                         ),
                         preferredInstances: liveSelection.instances,
-                        in: observation
+                        in: observation,
+                        // Warmup only: the result is discarded, and there is no mask held on screen to
+                        // continue from during recognition warmup. Explicitly nil so this path keeps
+                        // behaving exactly as it did before `continuing:` existed.
+                        continuing: nil
                     )
                     hasWarmedLockCandidate = true
                 }
@@ -1437,7 +1511,14 @@ actor ObjectMaskProcessor {
               let candidate = try lockCandidate(
                   near: point,
                   preferredInstances: tappedInstances,
-                  in: observation
+                  in: observation,
+                  // The mask on screen at the moment of the tap, for the same reason the preview uses
+                  // it: without it the lock re-decides which instance the crosshair is on from scratch,
+                  // so a frame whose segmentation momentarily differs from the one the user is looking
+                  // at either locks a different object or finds none and silently does nothing —
+                  // pressing the button and having no measurement start. The preview is sticky and the
+                  // selection was not, which is precisely how they came to disagree.
+                  continuing: livePreviewBoundingBox(at: frame.timestamp)
               ) else {
             return .unchanged
         }
@@ -1486,7 +1567,8 @@ actor ObjectMaskProcessor {
     private func lockCandidate(
         near point: NormalizedPoint,
         preferredInstances: IndexSet,
-        in observation: InstanceMaskObservation
+        in observation: InstanceMaskObservation,
+        continuing previous: CGRect?
     ) throws -> (instance: Int, geometry: MaskGeometry)? {
         try aimedCandidate(
             at: point,
@@ -1496,7 +1578,8 @@ actor ObjectMaskProcessor {
                 excluding: []
             ),
             preferred: preferredInstances,
-            in: observation
+            in: observation,
+            continuing: previous
         )
     }
 
@@ -2209,19 +2292,22 @@ actor ObjectMaskProcessor {
                   let hint = hintsByID[lockID] else {
                 return nil
             }
-            let points = maskedWorldSurface(
+            let surface = maskedWorldSurface(
                 mask: renderedMask.pixelBuffer,
                 anchor: hint,
                 frame: frame,
                 depth: depth
             )
-            guard !points.isEmpty else {
+            // The silhouette is returned even when this frame contributed no new points: a frame that
+            // adds nothing can still be the frame that proves an earlier point does not belong.
+            guard !surface.points.isEmpty || surface.silhouette != nil else {
                 return nil
             }
             return ObjectMaskDepthPointCloud(
                 id: lockID,
-                points: points,
-                timestamp: frame.timestamp
+                points: surface.points,
+                timestamp: frame.timestamp,
+                silhouette: surface.silhouette
             )
         }
     }
@@ -2231,8 +2317,8 @@ actor ObjectMaskProcessor {
         anchor: ObjectMaskAnchorHint,
         frame: ObjectMaskFrame,
         depth: ObjectMaskDepthSnapshot
-    ) -> [SIMD3<Float>] {
-        let empty: [SIMD3<Float>] = []
+    ) -> (points: [SIMD3<Float>], silhouette: ObjectMaskSilhouette?) {
+        let empty: (points: [SIMD3<Float>], silhouette: ObjectMaskSilhouette?) = ([], nil)
         guard CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent32Float else {
             return empty
         }
@@ -2288,6 +2374,11 @@ actor ObjectMaskProcessor {
             count: depthWidth * depthHeight
         )
         var sampleDepths = [Float](repeating: 0, count: depthWidth * depthHeight)
+        // The silhouette records mask membership and raw depth for *every* pixel, not only the ones a
+        // new point may be taken from: an already-retained point has to be testable at a pixel where
+        // nothing new would be accepted, which is precisely where a foreign point tends to sit.
+        var isObject = [Bool](repeating: false, count: depthWidth * depthHeight)
+        var silhouetteDepths = [Float](repeating: 0, count: depthWidth * depthHeight)
         var admittedCount = 0
 
         for row in 0 ..< depthHeight {
@@ -2300,12 +2391,7 @@ actor ObjectMaskProcessor {
 
             for column in 0 ..< depthWidth {
                 let measuredDepth = depthRow[column]
-                guard measuredDepth > 0.15,
-                      measuredDepth < 3.5,
-                      abs(measuredDepth - anchorDepth) <= maximumDepthDifference,
-                      (confidenceRow?[column] ?? 2) >= 1 else {
-                    continue
-                }
+                let index = row * depthWidth + column
 
                 let nativeImagePoint = CGPoint(
                     x: (CGFloat(column) + 0.5) / CGFloat(depthWidth),
@@ -2317,7 +2403,19 @@ actor ObjectMaskProcessor {
                 )
                 let maskX = min(max(Int(uprightPoint.x * CGFloat(maskWidth)), 0), maskWidth - 1)
                 let maskY = min(max(Int(uprightPoint.y * CGFloat(maskHeight)), 0), maskHeight - 1)
-                guard maskBase[maskY * maskStride + maskX] > 0.5 else {
+                let isInsideMask = maskBase[maskY * maskStride + maskX] > 0.5
+                isObject[index] = isInsideMask
+                if measuredDepth > 0.15,
+                   measuredDepth < 3.5,
+                   (confidenceRow?[column] ?? 2) >= 1 {
+                    silhouetteDepths[index] = measuredDepth
+                }
+
+                guard measuredDepth > 0.15,
+                      measuredDepth < 3.5,
+                      abs(measuredDepth - anchorDepth) <= maximumDepthDifference,
+                      (confidenceRow?[column] ?? 2) >= 1,
+                      isInsideMask else {
                     continue
                 }
 
@@ -2332,7 +2430,6 @@ actor ObjectMaskProcessor {
                       worldPoint.z.isFinite else {
                     continue
                 }
-                let index = row * depthWidth + column
                 admitted[index] = true
                 worldPoints[index] = worldPoint
                 sampleDepths[index] = measuredDepth
@@ -2340,8 +2437,20 @@ actor ObjectMaskProcessor {
             }
         }
 
+        let silhouette = ObjectMaskSilhouette(
+            width: depthWidth,
+            height: depthHeight,
+            isObject: isObject,
+            depths: silhouetteDepths,
+            cameraTransform: cameraToWorld,
+            focalX: fx,
+            focalY: fy,
+            principalX: cx,
+            principalY: cy
+        )
+
         guard admittedCount > 0 else {
-            return empty
+            return ([], silhouette)
         }
 
         var points: [SIMD3<Float>] = []
@@ -2370,6 +2479,6 @@ actor ObjectMaskProcessor {
                 points.append(worldPoints[index])
             }
         }
-        return points
+        return (points, silhouette)
     }
 }

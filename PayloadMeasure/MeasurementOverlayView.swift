@@ -2072,7 +2072,7 @@ struct MesOverlayView: View {
                 : "Does not fit available boxes"
         }
         let boxName = packingStore.selectedBoxPreset(for: id)?.name
-            ?? "Choose outer box"
+            ?? "Choose a box"
         let weight = captureEngine.weightInGrams(for: id)
             .flatMap { PositiveDecimalText.format($0, maximumFractionDigits: 3) }
             .map { "\($0) g" }

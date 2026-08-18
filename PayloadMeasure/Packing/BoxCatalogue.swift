@@ -74,17 +74,56 @@ final class BoxCatalogue {
     // MARK: - Persistence
 
     /// The generation moves whenever the stocked sizes change, because a saved list would otherwise
-    /// restore the old ones on upgrade. v5: the 130 × 100 × 105 box is stocked for the small payload too.
+    /// restore the old ones on upgrade. v6: updated stocked dimensions and interior-first naming.
     private static func key(for payload: StudyBox) -> String {
+        "packing.boxes.v6.\(payload.rawValue)"
+    }
+
+    private static func legacyKeyV5(for payload: StudyBox) -> String {
         "packing.boxes.v5.\(payload.rawValue)"
     }
 
     private static func load(for payload: StudyBox) -> [PackingBoxPreset] {
-        guard let data = UserDefaults.standard.data(forKey: key(for: payload)),
-              let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) else {
-            return PackingBoxPreset.defaultCatalog(for: payload)
+        if let data = UserDefaults.standard.data(forKey: key(for: payload)),
+           let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) {
+            return migrated(stored, for: payload)
         }
-        return stored
+        if let data = UserDefaults.standard.data(forKey: legacyKeyV5(for: payload)),
+           let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) {
+            return migrated(stored, for: payload)
+        }
+        return PackingBoxPreset.defaultCatalog(for: payload)
+    }
+
+    private static func migrated(
+        _ presets: [PackingBoxPreset],
+        for payload: StudyBox
+    ) -> [PackingBoxPreset] {
+        var result: [PackingBoxPreset] = []
+        var seenIDs: Set<String> = []
+        for preset in presets {
+            var outer = preset.outerSizeMillimetres
+            var inner = preset.usableInnerSizeMillimetres
+
+            if payload == .big, outer == SIMD3(35, 22, 115) {
+                outer = SIMD3(35, 22, 120)
+                inner = SIMD3(35, 22, 120)
+            }
+            if payload == .big, outer == SIMD3(95, 95, 160) {
+                inner = SIMD3(100, 100, 160)
+            }
+
+            let id = PackingBoxPreset.identifier(for: outer)
+            guard !seenIDs.contains(id),
+                  let rebuilt = PackingBoxPreset.sized(
+                      id: id,
+                      outerSizeMillimetres: outer,
+                      usableInnerSizeMillimetres: inner
+                  ) else { continue }
+            result.append(rebuilt)
+            seenIDs.insert(id)
+        }
+        return result
     }
 
     private func save() {

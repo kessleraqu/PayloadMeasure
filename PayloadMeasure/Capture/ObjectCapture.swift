@@ -982,10 +982,45 @@ nonisolated struct PointAccumulator: Sendable {
         return removedCount
     }
 
+    /// Removes a batch of voxels without disturbing the relative order of the stable points that
+    /// survive.
+    ///
+    /// `OrientedBoundingBox.uniformDownsample` reservoir-samples `stablePointsSnapshot()` with a fixed
+    /// seed specifically so that the same accumulated cloud reproduces the same orientation search —
+    /// reservoir sampling's initial fill is a literal prefix of the array, so which points end up in
+    /// that sample is a function of array *order*, not just array *content*. An order that reshuffles
+    /// on every removal — as a swap-remove necessarily does, since it plugs the gap with whatever
+    /// element currently sits last — hands the orientation search an effectively different, arbitrary
+    /// subsample on any frame that removes anything, even when the underlying cloud has barely changed.
+    /// That is indistinguishable from the fit itself being unstable, and removal is no longer a rare
+    /// event now that `ARCameraView.carvePointsOutside` can call it every frame: this is what "the
+    /// bounding box rotates wildly" actually was.
+    ///
+    /// Kept as one O(n) compaction per call rather than a swap-remove per key: removal already happens
+    /// at most once per frame with a batch of keys, so one pass over the array is cheaper than as many
+    /// order-preserving single-element removes as there are keys, and it is the only way to guarantee
+    /// the survivors' relative order is untouched.
     private mutating func remove(_ keys: [Key]) {
         for key in keys {
-            removeStablePoint(for: key)
             samples[key] = nil
+        }
+        let victims = Set(keys)
+        guard victims.contains(where: { stablePointIndices[$0] != nil }) else {
+            return
+        }
+        var newStableKeys: [Key] = []
+        var newStablePoints: [AccumulatedDepthPoint] = []
+        newStableKeys.reserveCapacity(stableKeys.count)
+        newStablePoints.reserveCapacity(stablePoints.count)
+        for index in stableKeys.indices where !victims.contains(stableKeys[index]) {
+            newStableKeys.append(stableKeys[index])
+            newStablePoints.append(stablePoints[index])
+        }
+        stableKeys = newStableKeys
+        stablePoints = newStablePoints
+        stablePointIndices.removeAll(keepingCapacity: true)
+        for (index, key) in stableKeys.enumerated() {
+            stablePointIndices[key] = index
         }
     }
 
@@ -1006,21 +1041,6 @@ nonisolated struct PointAccumulator: Sendable {
                     ?? sample.observedPoint
             )
         )
-    }
-
-    private mutating func removeStablePoint(for key: Key) {
-        guard let index = stablePointIndices.removeValue(forKey: key) else {
-            return
-        }
-        let lastIndex = stablePoints.count - 1
-        if index != lastIndex {
-            stablePoints[index] = stablePoints[lastIndex]
-            let movedKey = stableKeys[lastIndex]
-            stableKeys[index] = movedKey
-            stablePointIndices[movedKey] = index
-        }
-        stablePoints.removeLast()
-        stableKeys.removeLast()
     }
 }
 
@@ -1405,17 +1425,16 @@ nonisolated enum ObjectBoundingBox {
         around centroid: SIMD3<Float>,
         along axis: SIMD3<Float>
     ) -> (span: Float, mid: Float) {
-        var lowest = Float.greatestFiniteMagnitude
-        var highest = -Float.greatestFiniteMagnitude
+        var projections = [Float]()
+        projections.reserveCapacity(points.count + enclosurePoints.count)
         for point in points {
-            let projection = simd_dot(point - centroid, axis)
-            lowest = min(lowest, projection)
-            highest = max(highest, projection)
+            projections.append(simd_dot(point - centroid, axis))
         }
         for point in enclosurePoints {
-            let projection = simd_dot(point - centroid, axis)
-            lowest = min(lowest, projection)
-            highest = max(highest, projection)
+            projections.append(simd_dot(point - centroid, axis))
+        }
+        guard let lowest = projections.min(), let highest = projections.max() else {
+            return (0, 0)
         }
         return (highest - lowest, (lowest + highest) / 2)
     }
@@ -1500,6 +1519,9 @@ nonisolated enum OrientedBoundingBox {
 
         let width = fit.widthMaximum - fit.widthMinimum
         let depth = fit.depthMaximum - fit.depthMinimum
+        // The top is the highest point measured, literally — same reasoning as `rectangleFit`: a thin
+        // upright feature is not separable from an artifact by height alone, and the image-space edge
+        // test upstream has already had the only look at that question worth taking.
         var highestProjection = groundHeight
         for point in points {
             highestProjection = max(highestProjection, simd_dot(point, upAxis))
@@ -1696,10 +1718,20 @@ nonisolated enum OrientedBoundingBox {
         return bestAxis
     }
 
-    /// Zhang, Xu, Dong and Dolan's closeness criterion, reference [15] of Liu. β = Σ 1/max(min(d₁,
-    /// d₂), d₀), taken over the side of each axis with the smaller squared residual.
+    /// Zhang, Xu, Dong and Dolan's closeness criterion, reference [15] of Liu. β = Σᵢ 1/max(min(D₁ᵢ,
+    /// D₂ᵢ), d₀), where D₁ᵢ = min(c1_max − c1ᵢ, c1ᵢ − c1_min) is point i's own distance to whichever
+    /// side of axis 1 it is nearer to, and D₂ᵢ the same for axis 2 — a per-point nearest-edge distance,
+    /// not a single edge chosen for the whole axis. Matches both Zhang's own definition and the
+    /// reference open-source transcriptions of it (e.g. Autoware's and PythonRobotics' L-shape fitters).
+    /// An earlier version of this function chose one edge per axis for every point at once, by an
+    /// aggregate sum-of-squares vote across the whole cloud — plausible from a casual reading of the
+    /// vectorised "argmin(‖max C1 − C1‖, ‖C1 − min C1‖)" notation some summaries use, but it discards
+    /// half of a full-perimeter cloud's evidence: any point nearer the edge the vote didn't pick gets
+    /// scored against the far edge instead of its own near one. That single-axis vote is a materially
+    /// different computation from Zhang's, verified by direct comparison against the per-point formula
+    /// on synthetic asymmetric box clouds, and has been corrected to the per-point form below.
     ///
-    /// Note the comparison direction. Liu's Algorithm 2 initialises `S = INT_MAX` and keeps
+    /// Note the comparison direction separately. Liu's Algorithm 2 initialises `S = INT_MAX` and keeps
     /// `Scur < S`, i.e. minimises. This implementation maximises, because the criterion it cites is
     /// defined and used by Zhang as a maximisation objective — β grows as the points hug the
     /// rectangle. The two papers disagree; this follows the one that defines the criterion.
@@ -1726,31 +1758,12 @@ nonisolated enum OrientedBoundingBox {
             secondMaximum = max(secondMaximum, second)
         }
 
-        var firstMinimumNorm: Float = 0
-        var firstMaximumNorm: Float = 0
-        var secondMinimumNorm: Float = 0
-        var secondMaximumNorm: Float = 0
-        for point in points {
-            let first = simd_dot(point, axis)
-            let second = simd_dot(point, perpendicular)
-            firstMinimumNorm += (first - firstMinimum) * (first - firstMinimum)
-            firstMaximumNorm += (firstMaximum - first) * (firstMaximum - first)
-            secondMinimumNorm += (second - secondMinimum) * (second - secondMinimum)
-            secondMaximumNorm += (secondMaximum - second) * (secondMaximum - second)
-        }
-        let useFirstMaximum = firstMaximumNorm <= firstMinimumNorm
-        let useSecondMaximum = secondMaximumNorm <= secondMinimumNorm
-
         var score: Float = 0
         for point in points {
             let first = simd_dot(point, axis)
             let second = simd_dot(point, perpendicular)
-            let firstDistance = useFirstMaximum
-                ? firstMaximum - first
-                : first - firstMinimum
-            let secondDistance = useSecondMaximum
-                ? secondMaximum - second
-                : second - secondMinimum
+            let firstDistance = min(first - firstMinimum, firstMaximum - first)
+            let secondDistance = min(second - secondMinimum, secondMaximum - second)
             score += 1 / max(
                 min(firstDistance, secondDistance),
                 minimumEdgeDistance
@@ -1759,6 +1772,16 @@ nonisolated enum OrientedBoundingBox {
         return score
     }
 
+    /// The literal extremes of the projected cloud, as §3.4 describes: the box is exactly the
+    /// smallest rectangle containing every point it was given, and nothing is discarded here.
+    ///
+    /// Outlier rejection deliberately does **not** live at this stage. A depth artifact and a thin
+    /// real feature — a prong, a handle, a tab — look identical once projected onto an axis: both are
+    /// a few points set apart from the bulk. They are only distinguishable in image space, by whether
+    /// the sample sits across a depth discontinuity from its neighbours, and that test is already
+    /// applied there (`ObjectMaskProcessor.maskedWorldSurface`) before a point ever reaches this
+    /// function. Re-testing here on projection distance alone cannot recover that information, and in
+    /// practice removes thin parts of real objects.
     private static func rectangleFit(
         points: [SIMD2<Float>],
         axis: SIMD2<Float>
@@ -1766,19 +1789,19 @@ nonisolated enum OrientedBoundingBox {
         let perpendicular = SIMD2<Float>(-axis.y, axis.x)
         let first = points.map { simd_dot($0, axis) }
         let second = points.map { simd_dot($0, perpendicular) }
-        guard let firstMinimum = first.min(),
-              let firstMaximum = first.max(),
-              let secondMinimum = second.min(),
-              let secondMaximum = second.max() else {
+        guard let widthMinimum = first.min(),
+              let widthMaximum = first.max(),
+              let depthMinimum = second.min(),
+              let depthMaximum = second.max() else {
             return nil
         }
         return RectangleFit(
             widthAxis: axis,
             depthAxis: perpendicular,
-            widthMinimum: firstMinimum,
-            widthMaximum: firstMaximum,
-            depthMinimum: secondMinimum,
-            depthMaximum: secondMaximum
+            widthMinimum: widthMinimum,
+            widthMaximum: widthMaximum,
+            depthMinimum: depthMinimum,
+            depthMaximum: depthMaximum
         )
     }
 

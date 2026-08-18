@@ -36,11 +36,9 @@ nonisolated enum PackagePreparationState: Sendable, Equatable {
 nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
     let id: String
     let name: String
-    /// The box's size, full stop, as far as anything the operator sees is concerned: it is the name, and
-    /// it is the space the box takes up in the payload.
+    /// The box's outside size, used for payload placement.
     let outerSizeMillimetres: SIMD3<Double>
-    /// What actually fits in it. Normally the same figure; a couple of the stocked boxes were measured
-    /// and turned out not to be, and only the fits-or-not test ever reads this.
+    /// What actually fits in it, and what the operator sees as the box name.
     let usableInnerSizeMillimetres: SIMD3<Double>
 
     /// Box sizes are taken as given: what is written on the box is its size. No wall allowance is
@@ -71,7 +69,7 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         }
         return PackingBoxPreset(
             id: id,
-            name: sizeName(outerSizeMillimetres),
+            name: sizeName(inner),
             outerSizeMillimetres: outerSizeMillimetres,
             usableInnerSizeMillimetres: inner
         )
@@ -98,9 +96,9 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
         switch payload {
         case .big:
             stock = [
-                (SIMD3(35, 22, 115), nil),
+                (SIMD3(35, 22, 120), nil),
                 (SIMD3(75, 75, 230), SIMD3(75, 75, 235)),
-                (SIMD3(95, 95, 160), nil),
+                (SIMD3(95, 95, 160), SIMD3(100, 100, 160)),
                 (SIMD3(100, 95, 85), nil),
                 (SIMD3(130, 100, 105), nil),
             ]

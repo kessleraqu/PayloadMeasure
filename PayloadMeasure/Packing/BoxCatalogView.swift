@@ -10,12 +10,12 @@ import simd
 // Every box carries two sizes, and this is the one screen that shows both, because it is the one screen
 // where they can be edited:
 //
-//   • the size it takes up  — what the loading plan places in the payload, and the box's name
-//   • the size it holds     — what an object has to fit inside to be assigned this box
+//   • the interior size     — what an object has to fit inside, and the box's displayed name
+//   • the outer footprint   — what the loading plan places in the payload
 //
 // They are the same figure for almost every box. Two of the stocked ones were measured and are not what
-// their size suggests, which is the whole reason the two are kept apart. Nowhere else in the app mentions
-// the distinction: the packing instruction says one size, the one written on the box.
+// their size suggests, which is the whole reason the two are kept apart. Everywhere in the app, boxes are
+// referred to by their interior size.
 //
 // Reached both from the setup screen, before a run starts, and from the measuring screens. Both edit the
 // same saved list for that payload; `onChange` is how the measuring side learns to re-solve.
@@ -66,7 +66,7 @@ struct BoxCatalogView: View {
                 } header: {
                     Text("Boxes")
                 } footer: {
-                    Text("Takes up is what the loading plan places in the payload. Holds is what an object has to fit inside to be given this box. Tap the bin, or swipe, to delete a box. An object fits when it fits in any of the six orientations, and the system always assigns the smallest box that fits.")
+                    Text("The displayed size is the interior. Outer footprint is still tracked for payload placement. Tap the bin, or swipe, to delete a box. An object fits when it fits in any of the six orientations, and the system always assigns the smallest box that fits.")
                 }
 
                 Section {
@@ -74,24 +74,24 @@ struct BoxCatalogView: View {
                     millimetres("Width", value: $width)
                     millimetres("Height", value: $height)
                 } header: {
-                    Text("New box · size it takes up")
+                    Text("New box · outer footprint")
                 } footer: {
-                    Text("This is the box's name, and the space it occupies in the payload.")
+                    Text("Used for payload placement only.")
                 }
 
                 Section {
-                    Toggle("It holds less than its size suggests", isOn: $holdsADifferentSize)
+                    Toggle("Interior differs from outer footprint", isOn: $holdsADifferentSize)
                     if holdsADifferentSize {
                         millimetres("Length inside", value: $innerLength)
                         millimetres("Width inside", value: $innerWidth)
                         millimetres("Height inside", value: $innerHeight)
                     }
                 } header: {
-                    Text("New box · size it holds")
+                    Text("New box · interior size (displayed name)")
                 } footer: {
                     Text(holdsADifferentSize
-                        ? "Measured, rather than read off the box. Only the fit test uses it; the box is still named and packed at the size above."
-                        : "Off for almost every box: what it holds is its size.")
+                        ? "This is the size shown everywhere in the app when naming this box."
+                        : "Off for almost every box: interior and outer are the same.")
                 }
 
                 Section {
@@ -128,11 +128,11 @@ struct BoxCatalogView: View {
             Text(preset.name)
                 .monospacedDigit()
             if preset.usableInnerSizeMillimetres == preset.outerSizeMillimetres {
-                Text("Takes up and holds the same")
+                Text("Interior and outer are the same")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
-                Text("Holds \(PackingBoxPreset.sizeName(preset.usableInnerSizeMillimetres))")
+                Text("Outer footprint \(PackingBoxPreset.sizeName(preset.outerSizeMillimetres))")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.orange)
             }
@@ -140,8 +140,8 @@ struct BoxCatalogView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
             preset.usableInnerSizeMillimetres == preset.outerSizeMillimetres
-                ? "\(preset.name), takes up and holds the same"
-                : "Takes up \(preset.name), holds \(PackingBoxPreset.sizeName(preset.usableInnerSizeMillimetres))"
+                ? "\(preset.name), interior and outer are the same"
+                : "\(preset.name), outer footprint \(PackingBoxPreset.sizeName(preset.outerSizeMillimetres))"
         )
     }
 

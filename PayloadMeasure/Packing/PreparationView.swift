@@ -86,6 +86,13 @@ private struct PackingPreparationView: View {
     private struct Draft {
         var nameText: String
         var packedWeightText: String
+        /// Whether this object had no saved name when its draft was first created. Decided once and
+        /// never recomputed from the live text: the name field's own visibility used to be driven by
+        /// whether `nameText` was empty, so typing the very first letter made the field non-empty and
+        /// therefore made SwiftUI remove it from the view tree mid-keystroke — which is what "only
+        /// allows one letter, then locks" actually was. The field stays up for as long as this object
+        /// has gone without a saved name, however much has been typed into it.
+        let arrivedWithoutName: Bool
     }
 
     let captureEngine: ObjectCaptureEngine
@@ -381,10 +388,12 @@ private struct PackingPreparationView: View {
 
     /// True only when something has gone wrong upstream: both measuring paths name an object as it is
     /// entered. Kept as a way out rather than a dead end.
+    ///
+    /// Reads the flag captured once in the draft, not the live `nameText` — the field this decides the
+    /// visibility of is the very field that edits `nameText`, so testing the live value hid the field
+    /// after its first keystroke.
     private func needsName(for objectID: UUID) -> Bool {
-        (drafts[objectID]?.nameText ?? captureEngine.name(for: objectID) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty
+        drafts[objectID]?.arrivedWithoutName ?? isUnnamed(captureEngine.name(for: objectID))
     }
 
     /// An object the operator set aside while measuring. It needs no box, no name and no weight; it is
@@ -678,7 +687,8 @@ private struct PackingPreparationView: View {
                 ?? ""
             drafts[objectID] = Draft(
                 nameText: captureEngine.name(for: objectID) ?? "",
-                packedWeightText: weightText
+                packedWeightText: weightText,
+                arrivedWithoutName: isUnnamed(captureEngine.name(for: objectID))
             )
         }
 
@@ -713,12 +723,17 @@ private struct PackingPreparationView: View {
     private func updateDraft(for objectID: UUID, change: (inout Draft) -> Void) {
         var draft = drafts[objectID] ?? Draft(
             nameText: captureEngine.name(for: objectID) ?? "",
-            packedWeightText: ""
+            packedWeightText: "",
+            arrivedWithoutName: isUnnamed(captureEngine.name(for: objectID))
         )
         change(&draft)
         drafts[objectID] = draft
         validationMessage = nil
         invalidFields = []
+    }
+
+    private func isUnnamed(_ name: String?) -> Bool {
+        (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Leaves an object out for good: it is marked as fitting no box, so it is neither boxed nor placed

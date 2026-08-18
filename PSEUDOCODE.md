@@ -440,22 +440,41 @@ return bestAxis
 
 ```
 C₁ ← X cos θ + Y sin θ ;  C₂ ← −X sin θ + Y cos θ
-D₁ ← argmin( ‖max C₁ − C₁‖ , ‖C₁ − min C₁‖ )
-D₂ ← argmin( ‖max C₂ − C₂‖ , ‖C₂ − min C₂‖ )
+D₁ ← argmin( ‖max C₁ − C₁‖ , ‖C₁ − min C₁‖ )      // per point: pick the nearer of the two sides
+D₂ ← argmin( ‖max C₂ − C₂‖ , ‖C₂ − min C₂‖ )      // per point: pick the nearer of the two sides
 β ← 0
-for each pair (d₁, d₂):  β ← β + 1 / max( min(d₁, d₂), d₀ )
+for each pair (d₁, d₂):  β ← β + 1 / max( min(d₁, d₂), d₀ )    // one (d₁, d₂) per point
 return β                                        // the search takes the argmax
 ```
 
+`D₁` and `D₂` are per-point: for point *i*, `D₁ᵢ` is that point's own distance to whichever of the two
+sides of axis 1 it happens to be nearer, independent of what every other point picks — which is what
+makes `D₁` a vector long enough for "for each pair (d₁, d₂)" to range over one pair per point. This
+matches Zhang's own definition and the reference open-source transcriptions of it (e.g. Autoware's and
+PythonRobotics' L-shape fitters).
+
 ### Implementation — `OrientedBoundingBox.closenessScore`
 
-Term for term: the same squared-norm side selection, the same `1/max(min(d₁,d₂), d₀)` accumulation,
-`d₀` supplied as `minimumEdgeDistance`.
+The same per-point `D₁ᵢ = min(c1_max − c1ᵢ, c1ᵢ − c1_min)`, `D₂ᵢ` likewise, and the same
+`1/max(min(D₁ᵢ, D₂ᵢ), d₀)` accumulation, `d₀` supplied as `minimumEdgeDistance`.
 
 ### Differences
 
-None identified against [Z]. Where [L] and [Z] disagree on the direction of optimisation, see §3.2,
-difference 1.
+**Found and fixed, not merely checked.** An earlier version of this function read the vectorised
+`argmin(‖max C1 − C1‖, ‖C1 − min C1‖)` notation as a single *scalar* choice per axis — comparing
+`Σᵢ(c1_max − c1ᵢ)²` against `Σᵢ(c1ᵢ − c1_min)²` once for the whole cloud, then using that one verdict
+for every point. That is a real, verified deviation from [Z]: it is exact on point clouds symmetric
+enough for the vote to agree with the per-point answer for (nearly) every point — which is what every
+prior unit test's fixtures happened to be — but on an asymmetric or partially-occluded cloud it forces
+roughly half the points to be scored against the *far* edge instead of their own near one, discarding
+real evidence and biasing the axis search. Confirmed by comparing both formulas directly against
+synthetic asymmetric box clouds before changing the code. Fixed to the per-point form above; see
+`BaldiPaperFidelityTests.testClosenessIsMaximisedSoTheChosenAxisHugsTheRectangle`, which still passes
+under either formula and therefore could not have caught this on its own — it was not extended, because
+the discriminating case is a full-perimeter, deliberately asymmetric cloud, which belongs with the other
+orientation-search behaviour rather than duplicated as a unit fixture here.
+
+Where [L] and [Z] disagree on the direction of optimisation, see §3.2, difference 1.
 
 ## 3.4 Final extents and height — application only
 
@@ -477,6 +496,140 @@ height ← max projection of every point onto the up axis − support-plane heig
 | 2 | Height from the support plane to the highest point. | Application; [L] is purely 2D. |
 | 3 | Longer horizontal side named "width". | Application naming convention. |
 | 4 | Full 3D and Top modes share this fitter. | Application. The world is gravity-aligned and the object rests on a horizontal plane, so the box has a vertical axis by construction and the 3D fit reduces to the same 2D problem. A PCA fit remains as a fallback for a cloud too degenerate to hull. |
+| 5 | The extreme projection is **literal**. Depth artifacts are rejected upstream, in image space, never here — see below. | Application; the rejection itself is a standard depth-discontinuity test, not a new method. |
+
+### Where depth-artifact rejection lives, and why it is not here
+
+The extents above are literal: the box is exactly the smallest box containing every point handed to
+the fitter. Nothing is trimmed at this stage, deliberately.
+
+LiDAR/ToF sensors do produce "flying pixels" — readings displaced past the true surface, generated at
+sharp depth discontinuities, which is why a box-shaped object generates far more of them than a
+smoothly curved one. They are rejected, but **in image space, before a point is ever unprojected**, in
+`ObjectMaskProcessor.maskedWorldSurface`: a depth sample is admitted only if at least three of its four
+pixel neighbours are also admitted and none of them differs from it in depth by more than a proportional
+threshold. That is the standard depth-discontinuity / neighbourhood-consistency test for flying pixels,
+and image space is the only place it can be applied, because it is the only place where "neighbour" is
+still defined.
+
+An earlier attempt in this project put a second, statistical filter in the fitter instead
+(`RobustExtent`): sort each axis's projections, split them into runs at large gaps, and keep the
+largest run. **It has been removed.** Once a point is projected onto an axis, a thin real feature — a
+prong, a handle, a tab — and a small multipath cluster are the same thing: a few points set apart from
+the bulk. The rule cannot separate them even in principle, and in practice it deleted thin parts of real
+objects, which is exactly what it was observed doing. It also introduced four thresholds with no source.
+`ThinFeatureExtentTests` pins the restored behaviour: every point drawn is inside the box drawn.
+
+### The cross-frame merge: `ObjectBoundingBox.enclosing`
+
+Purely application behaviour; no paper claims anything about it. While the object fits in the point
+accumulator the displayed box is the current `OrientedBoundingBox.make` fit. Once `PointAccumulator`
+reaches capacity, later frames instead rebuild the box with `ObjectBoundingBox.enclosing`, which takes
+the literal min/max of the retained surface points unioned with the box's existing extent, on the rule
+that a box already confirmed must never be shown smaller later. It is the same literal-extent rule as
+the fitter, applied to the accumulated point set.
+
+### Keeping the points inside the mask: silhouette carving
+
+The box is the literal extent of the retained points, so the box is only correct if the points are.
+Points were only ever *added*: `PointAccumulator` never drops a voxel once it has been observed
+`minObservations` times. A single frame on which the segmentation jumped to the wrong object —
+which happens, because the locked instance is re-matched per frame from 2D geometry and appearance
+alone, and admitted points are only required to lie within 42 cm of the anchor — therefore left
+foreign points in the cloud for the rest of the scan, and the box grew to contain them. Observed
+directly as dots that sit inside the mask from the viewpoint they were captured from and outside it
+from any other.
+
+Removing them again is the standard **silhouette / space-carving** argument — Laurentini's visual hull
+(1994), and Kutulakos & Seitz, *A Theory of Shape by Space Carving* (2000): a point that lies inside
+the camera frustum, is not occluded by anything nearer, and still falls outside the object's silhouette
+cannot belong to the object.
+
+```
+for each retained point p:
+    (col, row, d) ← project p into this frame          // exact: world → camera → intrinsics
+    if p is behind the camera or outside the frame:  this frame says nothing
+    if not ClearlyOutside(col, row):                 this frame says nothing
+    if depth(col,row) > 0 and depth(col,row) < d − voxelSize:   hidden ⇒ says nothing
+    disagreements[p] += 1
+    if disagreements[p] ≥ minObservations:  remove p
+
+for each retained point this frame vouched for:  disagreements[p] ← 0
+
+ClearlyOutside(col,row) = the pixel and its four neighbours are all outside the mask
+```
+
+Three things keep this from eating real surface, and none of them is a new tuned constant:
+
+- **`ClearlyOutside` is the silhouette dilated by one pixel.** A segmentation boundary wobbles by a
+  pixel between frames, most of all on a translucent or specular surface; a point sitting on the true
+  edge must not be carved by that wobble. One pixel is the finest distinction the mask can make.
+- **The occlusion test.** Depth is measured to the nearest surface along the ray, so a point on the
+  object's own far side reads as "something nearer" and is correctly judged unobservable rather than
+  empty. Carving only ever acts on space it can actually see. One voxel of slack absorbs sensor noise.
+- **Repeated, uninterrupted disagreement.** Removal needs `minObservations` frames — the same constant
+  a point needs to be trusted in the first place, so evidence to drop a point is held to exactly the
+  standard as evidence to keep one — and any frame that vouches for the point clears its doubt.
+
+Everything the test uses comes from **one frame**: the silhouette, the pose it was seen from, the
+intrinsics, and the depth map, bundled together in `ObjectMaskSilhouette` by the same pass that
+extracts the points. So the projection is exact. This replaces an earlier attempt
+(`removeVisiblePointsOutsideCurrentMask`) which had the right idea but tested against a mask up to
+0.2 s stale, warping viewport coordinates by an approximate scale-and-offset to guess where a point
+would have landed, and which only ran while the mask overlay happened to be visible on screen.
+
+Pinned by `ObjectMaskSilhouetteTests`, including the projection's sign conventions — which must mirror
+the unprojection in `maskedWorldSurface` exactly, or every carve decision is wrong.
+
+### A removed point could not be allowed to reshuffle the rest
+
+`OrientedBoundingBox.bestOrientation` reservoir-samples `PointAccumulator.stablePointsSnapshot()` with a
+fixed seed. Reservoir sampling's initial fill is a literal prefix of the array being sampled, so which
+points end up in the sample is a function of the array's **order**, not only its content — the seed is
+fixed specifically so that the same accumulated cloud reproduces the same orientation search, as §3.2's
+implementation notes already state.
+
+Removing a point used to plug the gap with whichever point currently sat last in the array — an
+ordinary swap-remove, correct for an unordered set. It is not correct here: it reshuffles the relative
+order of every point that survives, and after that reshuffling the "same" cloud, sampled again, hands
+the orientation search an effectively different, arbitrary ~100-point subsample. That is indistinguishable
+downstream from the fit itself being unstable, and it used to be rare enough not to matter — the only
+removal paths were capacity eviction and a manual, gated cleanup — but it stopped being rare the moment
+silhouette carving started calling it every frame. This is what "the bounding box rotates wildly between
+frames that added nothing" actually was: not the orientation search failing, but the search being fed a
+freshly-shuffled hand of the same cards each time.
+
+Fixed by making removal a single order-preserving compaction pass — every point that survives keeps its
+position relative to every other survivor — rather than a swap-remove per key. `PointAccumulatorOrderingTests`
+pins this directly; two of its five tests were confirmed to fail against the previous swap-remove
+implementation before this fix was written, and continue to pass against it now.
+
+### The lock follows the mask on screen
+
+`aimedCandidate` chooses which segmented instance the crosshair is on, and takes a `continuing:` hint —
+the mask already on screen, which "wins any argument it is still eligible for", judged on a looser
+threshold so that sitting on a boundary does not flick the mask on and off. The preview passed that
+hint. The lock did not: `lockCandidate` omitted it and let it default to `nil`.
+
+So pressing *measure* re-decided from scratch which object the crosshair was on. On a frame whose
+segmentation momentarily differed from the one the user was looking at, that either locked a different
+instance or found none at all and returned `.unchanged` — the button pressed and no measurement
+starting. Both paths now pass the hint, which is what the function's own contract already claimed:
+the object that lights up is the object that gets measured.
+
+### The drawn footprint follows the current fit
+
+`ARCameraView.viewGatedBox` classifies the view (`.topDown`, `.side`, `.other`) to decide when width
+and depth have been observed well enough to call the scan settled. That classification once also decided
+*what geometry was drawn*: the footprint was published only on `.topDown` frames, so approaching an
+object from any other angle drew whatever rectangle the first frame had guessed, over a point cloud that
+had since filled in and settled underneath it — the box standing off the dots on every side. The height
+had already been fixed for precisely this reason; the footprint had not. Both now publish the current
+fit on every frame.
+
+This cannot shrink the box as the phone moves, because the fit is taken over the *accumulated* cloud,
+not the current frame's: the masked accumulator retains points from every earlier view and is only ever
+`pruneTransient`-ed, so a face that has been seen stays seen.
 
 ---
 
@@ -632,3 +785,31 @@ to them.
 | `testOneUnsettledDimensionBlocksTheWholeMeasurement` | all three dimensions must clear it |
 | `testWithoutASupportPlaneNothingFinishes` | the physical precondition |
 | `testStaleEvidenceFinishesTheScanWithoutThePrecisionTest` | the second exit, and that it is a safeguard |
+
+`ThinFeatureExtentTests` pins the literal-extent rule:
+
+| Test | Protects |
+| --- | --- |
+| `testAThinProtrusionIsInsideTheMeasuredBox` | a thin real feature is inside the box, not trimmed off it |
+| `testTheBoxIsExactlyTheExtremesOfTheCloudItWasGiven` | the box is the literal min/max of its input |
+| `testEnclosingContainsEveryRetainedPointAndNeverShrinks` | the cross-frame merge contains every retained point and never shrinks |
+
+`ObjectMaskSilhouetteTests` pins silhouette carving:
+
+| Test | Protects |
+| --- | --- |
+| `testAPointStraightAheadProjectsToThePrincipalPoint` | the projection, and its sign conventions against `maskedWorldSurface` |
+| `testOffAxisPointsProjectToTheExpectedSideOfTheImage` | that +x is right and +y is a smaller row, as the unprojection assumes |
+| `testAPointBehindTheCameraOrOutsideTheFrameHasNoPixel` | a point the frame cannot see is never judged |
+| `testProjectionRespectsTheCameraPose` | the silhouette is only valid with the pose it was captured at |
+| `testAPixelOnTheBoundaryIsNotClearlyOutside` | a one-pixel mask wobble cannot carve real surface |
+| `testAPixelWellAwayFromTheObjectIsClearlyOutside` | a genuinely foreign point is still carveable |
+
+`PointAccumulatorOrderingTests` pins order-preserving removal:
+
+| Test | Protects |
+| --- | --- |
+| `testRemovingOnePointPreservesTheRelativeOrderOfEveryOtherPoint` | a single removal cannot reshuffle survivors — fails against the old swap-remove |
+| `testRemovingSeveralPointsAtOncePreservesRelativeOrder` | a batch removal, as silhouette carving performs, cannot reshuffle survivors — fails against the old swap-remove |
+| `testANewlyAddedPointAppendsAfterExistingOnesEvenFollowingARemoval` | a new point fills the end of the array, not the gap left by a removal |
+| `testTwoIdenticallyOrderedSnapshotsSampleIdentically` | the property that actually matters: the same sequence of operations reproduces the same snapshot order, which is what makes the orientation search's fixed seed meaningful |
