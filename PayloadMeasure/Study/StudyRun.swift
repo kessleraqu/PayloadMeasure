@@ -127,6 +127,9 @@ struct StudyObjectRecord: Codable, Identifiable, Sendable {
     var assignedBoxName: String?
     var isOwnBox: Bool
     var hasEnforcedSize: Bool
+    /// Left out of this payload on the operator's say-so. Optional so study files written before skipping
+    /// existed still decode; those read as not skipped.
+    var wasSkipped: Bool?
     var massKilograms: Double?
     /// File name inside the run's photos folder, if a snapshot was captured.
     var photoFileName: String?
@@ -198,6 +201,8 @@ struct StudyRun: Codable, Identifiable, Sendable {
     /// *told* to stop from one it simply vanished in the middle of, and only the latter is offered for
     /// resuming. Everything recorded is kept either way.
     var abandonedAt: Date?
+    /// Seconds spent connecting the small and big payload boxes at the end of the run.
+    var finalConnectionSeconds: Double?
 
     var isComplete: Bool {
         boxOrder.allSatisfy { box in
@@ -399,7 +404,9 @@ extension StudyRun {
                 lines.append("  \(offset + 1). \(object.name)  [\(loaded)]")
                 lines.append("     measured  : \(object.measuredSizeText)")
                 lines.append("     packed as : \(object.packagedSizeText)")
-                if object.isOwnBox {
+                if object.wasSkipped == true {
+                    lines.append("     package   : skipped by the operator, not loaded")
+                } else if object.isOwnBox {
                     lines.append("     package   : the object itself (already a box)")
                 } else if object.hasEnforcedSize {
                     lines.append("     package   : size entered by hand")
@@ -425,6 +432,10 @@ extension StudyRun {
         }
 
         lines.append("-------------------------------------------------------------")
+        if let finalConnectionSeconds {
+            lines.append("Final connection : \(Self.durationText(finalConnectionSeconds))")
+            lines.append("-------------------------------------------------------------")
+        }
         lines.append("End of report")
         return lines.joined(separator: "\n")
     }

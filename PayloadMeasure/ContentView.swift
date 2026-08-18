@@ -23,10 +23,16 @@ struct ContentView: View {
     /// rebuilt and can be left and returned to.
     @State private var accuracy = AccuracyStore()
     @State private var framingAccuracy = FramingAccuracyStore()
+    @State private var isShowingFinalConnectStep = false
 
     var body: some View {
         Group {
-            if study.isAwaitingParticipantStart {
+            if isShowingFinalConnectStep {
+                StudyConnectView(
+                    onConnectStarted: { study.endCurrentPhase() },
+                    onConnectFinished: completeFinalConnectStep
+                )
+            } else if study.isAwaitingParticipantStart {
                 StudyParticipantStartView(store: study) {
                     study.beginParticipantSession()
                 }
@@ -92,6 +98,7 @@ struct ContentView: View {
     /// move on, so a participant cannot reach the next box — or leave the practice payload — without
     /// the operator entering the password.
     private func restartCurrentPayload() {
+        isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
         sessionManager.setPackingArrangementPresented(false)
         captureEngine.reset()
@@ -111,16 +118,24 @@ struct ContentView: View {
         if study.isPractice {
             study.startRealStudy()
         } else if study.isOnLastBox {
-            study.finishRun()
-            study.returnToSetupAfterCompletion()
+            study.endCurrentPhase()
+            isShowingFinalConnectStep = true
         } else {
             study.advanceToNextBox()
         }
     }
 
+    private func completeFinalConnectStep(elapsed: TimeInterval) {
+        study.recordFinalConnection(seconds: elapsed)
+        study.finishRun()
+        study.returnToSetupAfterCompletion()
+        isShowingFinalConnectStep = false
+    }
+
     /// Abandons the run from the info panel, behind the study password. Whatever was already recorded
     /// for finished payloads stays on disk; the payload in progress simply never completes.
     private func cancelRun() {
+        isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
         sessionManager.setPackingArrangementPresented(false)
         captureEngine.reset()
@@ -130,6 +145,7 @@ struct ContentView: View {
 
     /// From the results screen. Keeps every saved run; only clears the screen.
     private func restartForNextParticipant() {
+        isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
         sessionManager.setPackingArrangementPresented(false)
         captureEngine.reset()

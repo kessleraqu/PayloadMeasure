@@ -12,6 +12,9 @@ nonisolated enum PackagePreparationState: Sendable, Equatable {
     case unavailable
     case noStockedBoxFits
     case excludedBecauseNoStockedBoxFits
+    /// Left out on the operator's say-so rather than because nothing fits it. Needs no box, name or
+    /// weight, and is recorded as skipped.
+    case skipped
     case needsFittingBox
     case needsName
     case needsPackedWeight
@@ -20,7 +23,9 @@ nonisolated enum PackagePreparationState: Sendable, Equatable {
     case readyAsItsOwnBox
 
     var isComplete: Bool {
-        isSubmittedToOptimizer || self == .excludedBecauseNoStockedBoxFits
+        isSubmittedToOptimizer
+            || self == .excludedBecauseNoStockedBoxFits
+            || self == .skipped
     }
 
     var isSubmittedToOptimizer: Bool {

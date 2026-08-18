@@ -125,7 +125,6 @@ struct BaldiPlanView: View {
     let solution: BaldiSolution
     let colours: [UUID: Color]
     @Binding var highlightedPackageID: UUID?
-    var selectedLayerIndex: Int?
 
     @State private var cameraResetToken = 0
 
@@ -135,7 +134,6 @@ struct BaldiPlanView: View {
                 solution: solution,
                 colours: colours,
                 highlightedPackageID: $highlightedPackageID,
-                selectedLayerIndex: selectedLayerIndex,
                 cameraResetToken: cameraResetToken
             )
             .frame(height: 380)
@@ -388,7 +386,6 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
     let solution: BaldiSolution
     let colours: [UUID: Color]
     @Binding var highlightedPackageID: UUID?
-    let selectedLayerIndex: Int?
     let cameraResetToken: Int
 
     final class Coordinator: NSObject {
@@ -493,7 +490,6 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         let state = SceneState(
             solution: solution,
             highlightedPackageID: highlightedPackageID,
-            selectedLayerIndex: selectedLayerIndex,
             colours: colours,
             interfaceStyle: view.traitCollection.userInterfaceStyle.rawValue
         )
@@ -506,32 +502,13 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         SceneBuilder.addContainer(to: content, metrics: metrics)
         SceneBuilder.addBalanceMarkers(solution: solution, to: content, metrics: metrics)
 
-        let layers = BaldiLoadingGuide.layers(for: solution)
         let numbering = BaldiLoadingGuide.numbering(for: solution)
-        let layerByPackage = Dictionary(
-            uniqueKeysWithValues: layers.flatMap { layer in
-                layer.placements.map { ($0.id, layer.index) }
-            }
-        )
-        let selectedLayer = selectedLayerIndex.flatMap { selected in
-            layers.first { $0.index == selected }
-        }
-        let selectedSupporters = Set(
-            selectedLayer?.placements.flatMap {
-                BaldiVerticalSupport.report(for: $0, among: solution.placements).supporterIDs
-            } ?? []
-        )
 
         for placement in BaldiLoadingGuide.orderedPlacements(in: solution) {
-            let packageLayer = layerByPackage[placement.id]
             let presentation = PackagePresentation(
-                isInSelectedLayer: selectedLayer.map { packageLayer == $0.index } ?? true,
-                isDirectSupporter: selectedSupporters.contains(placement.id),
                 isHighlighted: highlightedPackageID == placement.id,
-                hasLayerSelection: selectedLayer != nil,
                 hasPackageHighlight: highlightedPackageID != nil
             )
-            guard presentation.isVisible else { continue }
             SceneBuilder.addPackage(
                 placement,
                 among: solution.placements,
@@ -596,12 +573,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
     }
 
     private var accessibilityLabel: String {
-        let layerDescription: String
-        if let selectedLayerIndex {
-            layerDescription = "Layer \(selectedLayerIndex + 1) is highlighted and its direct supporters remain visible."
-        } else {
-            layerDescription = "All loading layers are shown."
-        }
+        let layerDescription = "All loading layers are shown together."
         let selectedName = highlightedPackageID.flatMap { id in
             solution.placements.first { $0.id == id }.map {
                 "Selected package \($0.name). \(BaldiOpeningMarker.description(for: $0))."
@@ -630,13 +602,11 @@ private struct SceneState: Equatable {
     let placements: [Placement]
     let colourDescriptions: [String]
     let highlightedPackageID: UUID?
-    let selectedLayerIndex: Int?
     let interfaceStyle: Int
 
     init(
         solution: BaldiSolution,
         highlightedPackageID: UUID?,
-        selectedLayerIndex: Int?,
         colours: [UUID: Color],
         interfaceStyle: Int
     ) {
@@ -657,7 +627,6 @@ private struct SceneState: Equatable {
             String(reflecting: colours[$0.id] ?? Color.accentColor)
         }
         self.highlightedPackageID = highlightedPackageID
-        self.selectedLayerIndex = selectedLayerIndex
         self.interfaceStyle = interfaceStyle
     }
 }
@@ -692,31 +661,17 @@ private struct SceneMetrics {
 }
 
 private struct PackagePresentation {
-    let isInSelectedLayer: Bool
-    let isDirectSupporter: Bool
     let isHighlighted: Bool
-    let hasLayerSelection: Bool
     let hasPackageHighlight: Bool
-
-    /// Future layers are omitted while following one loading step. Drawing them at 9% alpha used
-    /// translucent, intersecting boxes and made it harder—not easier—to see the active layer.
-    var isVisible: Bool {
-        !hasLayerSelection || isInSelectedLayer || isDirectSupporter || isHighlighted
-    }
 
     /// Visible boxes stay opaque. Muting by colour rather than alpha avoids SceneKit having to sort
     /// six transparent faces for every touching package on every camera frame.
     var softening: CGFloat {
         if isHighlighted { return 0 }
-        if hasLayerSelection {
-            return isInSelectedLayer ? 0.08 : 0.58
-        }
         return hasPackageHighlight ? 0.52 : 0.06
     }
 
-    var showsLabel: Bool {
-        !hasLayerSelection || isInSelectedLayer || isHighlighted
-    }
+    var showsLabel: Bool { true }
 }
 
 private enum SceneBuilder {
@@ -728,8 +683,8 @@ private enum SceneBuilder {
             chamferRadius: 0
         )
         floor.firstMaterial = material(
-            colour: UIColor.systemGray5,
-            opacity: 1,
+            colour: UIColor(white: 0.22, alpha: 1),
+            opacity: 0.45,
             lightingModel: .constant
         )
         let floorNode = SCNNode(geometry: floor)

@@ -155,18 +155,27 @@ final class ManualStudyWorkflowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(packages.first?.massKilograms), 0.25, accuracy: 1e-12)
     }
 
-    func testManualMeasurementCanRemainUnnamedUntilPacking() throws {
+    /// The manual screen names an object as it is entered, with the object in hand — the same moment the
+    /// AR screen asks. The size-only entry point is still there for the sizes-first path, and a name given
+    /// later survives a size correction.
+    func testAManualObjectKeepsItsNameThroughASizeCorrection() throws {
         let engine = ObjectCaptureEngine()
         let id = try XCTUnwrap(
-            engine.addManualMeasurement(sizeMillimetres: SIMD3(123, 70, 37))
+            engine.addManualMeasurement(name: "Mouse", sizeMillimetres: SIMD3(123, 70, 37))
         )
-        XCTAssertNil(engine.name(for: id))
-        engine.updateName(id: id, name: "Mouse")
         XCTAssertEqual(engine.name(for: id), "Mouse")
         XCTAssertTrue(
-            engine.updateManualMeasurement(id: id, sizeMillimetres: SIMD3(124, 71, 38))
+            engine.updateManualMeasurement(
+                id: id,
+                name: "Mouse",
+                sizeMillimetres: SIMD3(124, 71, 38)
+            )
         )
         XCTAssertEqual(engine.name(for: id), "Mouse")
+        XCTAssertEqual(
+            engine.capturedObjectsByID[id]?.sizeMillimetres,
+            SIMD3(124, 71, 38)
+        )
     }
 
     func testManualMeasurementValidationAndUniqueNames() {

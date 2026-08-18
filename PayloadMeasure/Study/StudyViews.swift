@@ -291,13 +291,6 @@ struct StudyParticipantStartView: View {
         ZStack {
             Color.white.ignoresSafeArea()
 
-            VStack {
-                StudyTimerStrip(study: store)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 10)
-                Spacer()
-            }
-
             Button(buttonTitle, action: onStart)
                 .font(.title2.weight(.semibold))
                 .buttonStyle(.borderedProminent)
@@ -314,6 +307,58 @@ struct StudyParticipantStartView: View {
         }
         guard let box = store.scheduledBox else { return "Start" }
         return "Start \(box.shortTitle.lowercased())"
+    }
+}
+
+struct StudyConnectView: View {
+    let onConnectStarted: () -> Void
+    let onConnectFinished: (TimeInterval) -> Void
+
+    @State private var startedAt: Date?
+
+    var body: some View {
+        ZStack {
+            Color.white.ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                Text("Connect")
+                    .font(.system(size: 40, weight: .semibold, design: .rounded))
+
+                Text("Connect the small and big boxes, then finish the study.")
+                    .font(.subheadline)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 26)
+
+                if let startedAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        let elapsed = max(0, timeline.date.timeIntervalSince(startedAt))
+                        Text(StudyRun.durationText(elapsed))
+                            .font(.title.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.primary)
+                    }
+                    .accessibilityLabel("Connect timer")
+                }
+
+                Button(actionTitle) {
+                    if let startedAt {
+                        onConnectFinished(max(0, Date().timeIntervalSince(startedAt)))
+                    } else {
+                        self.startedAt = Date()
+                        onConnectStarted()
+                    }
+                }
+                .font(.title3.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.horizontal, 48)
+            }
+        }
+        .preferredColorScheme(.light)
+    }
+
+    private var actionTitle: String {
+        startedAt == nil ? "Connect" : "Finish study"
     }
 }
 
@@ -444,6 +489,12 @@ struct StudyResultsView: View {
             Text("\(methodTitle) · \(run.inputModeOrder.map(\.shortTitle).joined(separator: " then ")) · \(run.boxOrder.map(\.shortTitle).joined(separator: " then "))")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let finalConnectionSeconds = run.finalConnectionSeconds {
+                Text("Final connection: \(StudyRun.durationText(finalConnectionSeconds))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

@@ -617,6 +617,75 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(Set(store.baldiItems(from: engine).map(\.id)), [boxed, ownBox])
     }
 
+    // MARK: - Skipping an object
+
+    /// Skipping is the operator's decision to leave an object out of this payload. It is a different thing
+    /// from an object nothing fits: a box does fit this one, and it is being left out anyway.
+    func testSkippingCompletesPreparationWithoutBoxNameOrWeight() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+        XCTAssertNotNil(
+            store.selectedBoxPreset(for: objectID),
+            "A box fits it, so this is a skip by choice rather than for want of a box."
+        )
+
+        store.setSkipped(true, for: objectID, in: engine)
+
+        XCTAssertTrue(store.isSkipped(objectID, in: engine))
+        XCTAssertEqual(store.preparationState(for: objectID, in: engine), .skipped)
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
+        XCTAssertTrue(store.packagesMissingWeight(from: engine).isEmpty)
+        XCTAssertEqual(store.objectIDsSkipped(in: engine), [objectID])
+        // And it reaches neither optimiser.
+        XCTAssertTrue(store.packages(from: engine).isEmpty)
+        XCTAssertTrue(store.baldiItems(from: engine).isEmpty)
+        // The box choice goes with it: the object is not being packed.
+        XCTAssertNil(store.selectedBoxPreset(for: objectID))
+    }
+
+    func testPuttingASkippedObjectBackRestoresItsAssignment() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let store = PackingStore()
+        store.setSkipped(true, for: objectID, in: engine)
+        store.setSkipped(false, for: objectID, in: engine)
+        store.assignBoxesAutomatically(in: engine)
+
+        XCTAssertFalse(store.isSkipped(objectID, in: engine))
+        XCTAssertNotNil(store.selectedBoxPreset(for: objectID))
+        XCTAssertTrue(store.objectIDsSkipped(in: engine).isEmpty)
+        // It is wanted again, so it is incomplete until it has a name and a weight.
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).contains(objectID))
+    }
+
+    /// One skipped object must not stop the rest of the payload being planned.
+    func testASkippedObjectDoesNotBlockTheOthers() {
+        let engine = ObjectCaptureEngine()
+        let keptID = lockObject(in: engine, sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let skippedID = lockObject(in: engine, sizeMetres: SIMD3(0.06, 0.05, 0.04))
+        let store = PackingStore()
+        store.assignBoxesAutomatically(in: engine)
+        engine.updateName(id: keptID, name: "Kept")
+        engine.updatePackedWeight(id: keptID, weightInGrams: 120)
+
+        store.setSkipped(true, for: skippedID, in: engine)
+
+        XCTAssertTrue(store.packagesMissingPreparation(from: engine).isEmpty)
+        XCTAssertEqual(store.packages(from: engine).map(\.id), [keptID])
+        XCTAssertEqual(store.baldiItems(from: engine).map(\.id), [keptID])
+    }
+
+    /// Removing an object forgets that it was skipped, so a later object cannot inherit the flag.
+    func testASkipIsForgottenWithTheObject() {
+        let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let store = PackingStore()
+        store.setSkipped(true, for: objectID, in: engine)
+        engine.removeFinalizedObject(id: objectID)
+        store.reconcilePreparationState(with: engine)
+
+        XCTAssertTrue(store.skippedObjectIDs.isEmpty)
+    }
+
     private func makeLockedObject(
         sizeMetres: SIMD3<Float>
     ) -> (ObjectCaptureEngine, UUID) {

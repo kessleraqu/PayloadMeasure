@@ -30,8 +30,7 @@ struct PreparationView: View {
             StudyPhaseHandoffView(
                 title: "Packing",
                 detail: "The measuring timer is stopped. Start when you are ready to prepare and weigh every package.",
-                buttonTitle: "Start packing",
-                study: study
+                buttonTitle: "Start packing"
             ) {
                 study.beginPhase(.pack)
                 withAnimation(.snappy(duration: 0.25)) {
@@ -41,13 +40,9 @@ struct PreparationView: View {
             .onAppear { study.endCurrentPhase() }
 
         case .preparation:
-            // The timer strip is inset inside the screen's own navigation stack rather than around it.
-            // Wrapped around, it was laid over the navigation bar, and the bar's Previous button ended
-            // up underneath the timers where it could be neither read nor pressed.
             PackingPreparationView(
                 captureEngine: captureEngine,
-                store: store,
-                study: study
+                store: store
             ) {
                 study.endCurrentPhase()
                 withAnimation(.snappy(duration: 0.25)) {
@@ -60,8 +55,7 @@ struct PreparationView: View {
             StudyPhaseHandoffView(
                 title: "Loading",
                 detail: "The packing timer is stopped. Start when you are ready to optimise and load the payload.",
-                buttonTitle: "Start loading",
-                study: study
+                buttonTitle: "Start loading"
             ) {
                 study.beginPhase(.payload)
                 withAnimation(.snappy(duration: 0.25)) {
@@ -96,7 +90,6 @@ private struct PackingPreparationView: View {
 
     let captureEngine: ObjectCaptureEngine
     @Bindable var store: PackingStore
-    let study: StudyStore
     let onComplete: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -129,11 +122,6 @@ private struct PackingPreparationView: View {
                 }
             }
             .background(Color(.systemGroupedBackground))
-            .safeAreaInset(edge: .top) {
-                StudyTimerStrip(study: study)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 4)
-            }
             .navigationTitle("Prepare packages")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -172,11 +160,12 @@ private struct PackingPreparationView: View {
                 progressHeader
                 objectCard(for: objectID)
 
-                if canPrepare {
+                if store.isSkipped(objectID, in: captureEngine) {
+                    skippedCard(for: objectID)
+                } else if canPrepare {
                     boxCard(for: objectID)
-                    // Name and weight are the only two things to type, so they are one card, one after
-                    // the other. They used to sit on either side of the box instructions, which read as
-                    // two unrelated jobs and left the second one easy to walk past.
+                    // The weight is the only thing to type here now — the name is given while measuring,
+                    // where the object is in the operator's hands.
                     detailsCard(for: objectID)
                     ownBoxCard(for: objectID)
                 } else {
@@ -323,32 +312,34 @@ private struct PackingPreparationView: View {
         }
     }
 
-    /// The two things the operator has to type, side by side and labelled, with whichever one Next
-    /// refused marked in place.
+    /// The weight, and — only if the object somehow arrived without one — its name. Naming happens while
+    /// measuring, with the object in hand; asking again here would be asking twice.
     private func detailsCard(for objectID: UUID) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Fill in both", systemImage: "square.and.pencil")
+            Label("Weigh the finished package", systemImage: "scalemass")
                 .font(.headline)
 
-            VStack(alignment: .leading, spacing: 5) {
-                fieldLabel("Name of this object", field: .name)
-                TextField("For example: red cable drum", text: nameBinding(for: objectID))
-                    .textInputAutocapitalization(.words)
-                    .font(.title3)
-                    .focused($focusedField, equals: .name)
-                    .submitLabel(.next)
-                    .onSubmit { focusedField = .weight }
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: 50)
-                    .background(fieldFill(.name), in: RoundedRectangle(cornerRadius: 12))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(fieldStroke(.name), lineWidth: 2)
+            if needsName(for: objectID) {
+                VStack(alignment: .leading, spacing: 5) {
+                    fieldLabel("Name of this object", field: .name)
+                    TextField("For example: red cable drum", text: nameBinding(for: objectID))
+                        .textInputAutocapitalization(.words)
+                        .font(.title3)
+                        .focused($focusedField, equals: .name)
+                        .submitLabel(.next)
+                        .onSubmit { focusedField = .weight }
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 50)
+                        .background(fieldFill(.name), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(fieldStroke(.name), lineWidth: 2)
+                        }
+                        .accessibilityLabel("Name of this object")
+                        .accessibilityHint("This name appears in the loading plan.")
+                    if invalidFields.contains(.name) {
+                        fieldWarning("A name is needed before you can continue.")
                     }
-                    .accessibilityLabel("Name of this object")
-                    .accessibilityHint("This name appears in the loading plan.")
-                if invalidFields.contains(.name) {
-                    fieldWarning("A name is needed before you can continue.")
                 }
             }
 
@@ -386,6 +377,50 @@ private struct PackingPreparationView: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// True only when something has gone wrong upstream: both measuring paths name an object as it is
+    /// entered. Kept as a way out rather than a dead end.
+    private func needsName(for objectID: UUID) -> Bool {
+        (drafts[objectID]?.nameText ?? captureEngine.name(for: objectID) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+
+    /// An object the operator set aside while measuring. It needs no box, no name and no weight; it is
+    /// recorded as skipped and left out of the loading plan.
+    private func skippedCard(for objectID: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Skipped", systemImage: "arrow.uturn.forward")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.orange)
+
+            Text("This object was skipped while measuring. It is not boxed, not weighed and not loaded, and it is recorded as skipped.")
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                store.setSkipped(false, for: objectID, in: captureEngine)
+                store.assignBoxesAutomatically(in: captureEngine)
+                validationMessage = nil
+            } label: {
+                Label("Put it back in the payload", systemImage: "arrow.uturn.backward")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .strokeBorder(
+                    Color.orange.opacity(0.7),
+                    style: StrokeStyle(lineWidth: 2, dash: [5, 4])
+                )
+        }
+        .accessibilityElement(children: .contain)
     }
 
     private func fieldLabel(_ title: String, field: FocusedField) -> some View {
@@ -568,6 +603,11 @@ private struct PackingPreparationView: View {
     }
 
     private func nextActionTitle(for objectID: UUID) -> String {
+        if store.isSkipped(objectID, in: captureEngine) {
+            return currentIndex == objectIDs.count - 1
+                ? "Create loading plan"
+                : "Next object"
+        }
         if store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty,
            !store.isItsOwnBox(objectID, in: captureEngine) {
             return currentIndex == objectIDs.count - 1
@@ -702,6 +742,12 @@ private struct PackingPreparationView: View {
         focusedField = nil
         validationMessage = nil
         invalidFields = []
+
+        // A skipped object has already been dealt with: nothing is asked of it.
+        if store.isSkipped(objectID, in: captureEngine) {
+            advanceAfterCurrentObject()
+            return
+        }
 
         // Only exclude an object that actually needs a box and has none. An object marked "already
         // a box" needs no outer box, so excluding it here would throw away the name and weight just

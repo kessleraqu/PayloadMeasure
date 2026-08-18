@@ -164,6 +164,7 @@ struct MesOverlayView: View {
                 assignedBoxName: nil,
                 isOwnBox: false,
                 hasEnforcedSize: packingStore.forcedSize(for: id, in: captureEngine) != nil,
+                wasSkipped: packingStore.isSkipped(id, in: captureEngine),
                 massKilograms: captureEngine.weightInKilograms(for: id),
                 photoFileName: captureEngine.snapshotJPEGData(for: id).flatMap {
                     study.storePhoto(
@@ -422,10 +423,6 @@ struct MesOverlayView: View {
         guard showsLiveOverlay else { return AnyView(EmptyView()) }
         return AnyView(
             VStack(spacing: 10) {
-                StudyTimerStrip(study: study)
-                    .padding(.top, 8)
-                    .padding(.horizontal, 16)
-
                 GlassEffectContainer(spacing: 14) {
                     topHUD
                 }

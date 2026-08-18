@@ -16,7 +16,6 @@ struct ArrangementView: View {
     let onBoxFinished: () -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var showsNextBoxPassword = false
     @State private var showsFinishedPackingConfirmation = false
     @State private var highlightedPackageID: UUID?
     @State private var showsSettings = false
@@ -33,9 +32,9 @@ struct ArrangementView: View {
     }
 
     /// The only way out of a participant's payload, and the last thing on the screen: everything above
-    /// it is the plan being followed, and this ends it. Pressing it asks for confirmation first and the
-    /// study password after, so neither a stray tap nor a participant can close a payload. The box is
-    /// recorded once the confirmation is given — except after the practice payload, which is never
+    /// it is the plan being followed, and this ends it. Pressing it asks for confirmation first, so
+    /// neither a stray tap nor a participant can close a payload by accident. The box is recorded once
+    /// the confirmation is given - except after the practice payload, which is never
     /// recorded.
     @ViewBuilder
     private var nextBoxButton: some View {
@@ -48,7 +47,7 @@ struct ArrangementView: View {
                     .frame(maxWidth: .infinity, minHeight: 50)
             }
             .buttonStyle(.borderedProminent)
-            .accessibilityHint("Asks whether the payload is really loaded, then for the study password.")
+            .accessibilityHint("Asks whether the payload is really loaded before moving on.")
         }
     }
 
@@ -82,7 +81,7 @@ struct ArrangementView: View {
         } else {
             consequence = "the next payload starts"
         }
-        return "Everything measured, weighed and loaded for this payload is recorded, and \(consequence). It cannot be reopened. The study password is asked for next."
+        return "Everything measured, weighed and loaded for this payload is recorded, and \(consequence). It cannot be reopened."
     }
 
     /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
@@ -110,6 +109,7 @@ struct ArrangementView: View {
                     assignedBoxName: store.selectedBoxPreset(for: id)?.name,
                     isOwnBox: store.isItsOwnBox(id, in: captureEngine),
                     hasEnforcedSize: store.forcedSize(for: id, in: captureEngine) != nil,
+                    wasSkipped: store.isSkipped(id, in: captureEngine),
                     massKilograms: captureEngine.weightInKilograms(for: id),
                     photoFileName: photoName,
                     placementOriginMillimetres: placement.map {
@@ -172,13 +172,6 @@ struct ArrangementView: View {
                 .padding(20)
             }
             .background(Color(.systemGroupedBackground))
-            // Inside the navigation stack: inset around it, the strip was drawn over the navigation
-            // bar's own buttons.
-            .safeAreaInset(edge: .top) {
-                StudyTimerStrip(study: study)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 4)
-            }
             .navigationTitle(
                 study.isPractice
                     ? "Practice arrangement"
@@ -233,12 +226,11 @@ struct ArrangementView: View {
                 if !study.isPractice {
                     recordCurrentBox()
                 }
-                showsNextBoxPassword = true
+                onBoxFinished()
             }
         } message: {
             Text(finishedPackingDetail)
         }
-        .sheet(isPresented: $showsNextBoxPassword) { studyPasswordSheet }
     }
 
     private var solveTrigger: String {
@@ -254,40 +246,6 @@ struct ArrangementView: View {
         case .knapsack3D:
             return "knapsack|" + store.baldiSignature(for: baldiProblem)
         }
-    }
-
-    private var studyPasswordSheet: some View {
-        StudyPasswordSheet(
-            title: passwordSheetTitle,
-            message: passwordSheetMessage,
-            password: StudyStore.nextBoxPassword,
-            confirmTitle: study.isPractice
-                ? "Start"
-                : study.isOnLastBox
-                    ? "Finish"
-                    : study.switchesInputModeAfterCurrentBox ? "Next condition" : "Next box"
-        ) {
-            onBoxFinished()
-        }
-    }
-
-    private var passwordSheetTitle: String {
-        if study.isPractice { return "Start the real measurement" }
-        if study.isOnLastBox { return "Finish the study" }
-        return study.switchesInputModeAfterCurrentBox ? "Start the next condition" : "Next payload box"
-    }
-
-    private var passwordSheetMessage: String {
-        if study.isPractice {
-            return "Clears the unrecorded practice payload and opens a white Start screen for the \(study.activeRun?.firstBox.shortTitle ?? "first box")."
-        }
-        if study.isOnLastBox {
-            return "Saves this condition and returns to the main setup screen. The other condition can then be configured separately."
-        }
-        if let nextMode = study.nextInputMode, study.switchesInputModeAfterCurrentBox {
-            return "Closes this payload and starts \(nextMode.title.lowercased()) on the \(study.currentBox?.other.shortTitle ?? "next box"), without returning to setup."
-        }
-        return "Closes this box, stops its timers, and opens a white Start screen for the \(study.currentBox?.other.shortTitle ?? "next box")."
     }
 
     // The method picker has deliberately been removed from this screen. Balance is still implemented

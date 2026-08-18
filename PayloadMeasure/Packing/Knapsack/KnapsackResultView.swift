@@ -26,7 +26,6 @@ struct BaldiResultView: View {
     @Binding var highlightedPackageID: UUID?
 
     @State private var selectedMode: BaldiPackingMode = .paper
-    @State private var selectedLayerIndex: Int?
     /// Every opening gets a fresh model and coordinator lease. The single ARView/CAMetalLayer is
     /// reused intentionally, because creating a later RealityKit renderer is what can strand its
     /// camera background on an old texture on iOS 26.
@@ -63,7 +62,6 @@ struct BaldiResultView: View {
         }
         .onChange(of: selectedMode) { _, _ in
             highlightedPackageID = nil
-            selectedLayerIndex = nil
             // Picking the other algorithm is a decision, so get out of the way and show its result.
             showsDetails = false
         }
@@ -233,8 +231,7 @@ struct BaldiResultView: View {
                 BaldiPlanView(
                     solution: solution,
                     colours: colours,
-                    highlightedPackageID: packageSelection(in: solution),
-                    selectedLayerIndex: selectedLayerIndex
+                    highlightedPackageID: packageSelection
                 )
                 .id(selectedMode)
 
@@ -323,12 +320,11 @@ struct BaldiResultView: View {
                     layer: layer,
                     colours: colours,
                     numbering: numbering,
-                    highlightedPackageID: packageSelection(in: solution)
+                    highlightedPackageID: packageSelection
                 )
 
                 packageLegend(
                     layer.placements,
-                    layerIndex: layer.index,
                     numbering: numbering
                 )
             }
@@ -337,7 +333,6 @@ struct BaldiResultView: View {
 
     private func packageLegend(
         _ placements: [BaldiPlacement],
-        layerIndex: Int,
         numbering: [UUID: Int]
     ) -> some View {
         ScrollViewReader { reader in
@@ -348,10 +343,8 @@ struct BaldiResultView: View {
                         Button {
                             if selected {
                                 highlightedPackageID = nil
-                                selectedLayerIndex = nil
                             } else {
                                 highlightedPackageID = placement.id
-                                selectedLayerIndex = layerIndex
                             }
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
@@ -455,18 +448,11 @@ struct BaldiResultView: View {
         return result.solution
     }
 
-    private func packageSelection(in solution: BaldiSolution) -> Binding<UUID?> {
+    private var packageSelection: Binding<UUID?> {
         Binding(
             get: { highlightedPackageID },
             set: { id in
                 highlightedPackageID = id
-                guard let id else {
-                    selectedLayerIndex = nil
-                    return
-                }
-                selectedLayerIndex = BaldiLoadingGuide.layers(for: solution).first {
-                    $0.placements.contains { $0.id == id }
-                }?.index
             }
         )
     }

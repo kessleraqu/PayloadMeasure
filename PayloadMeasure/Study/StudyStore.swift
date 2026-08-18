@@ -293,6 +293,13 @@ final class StudyStore {
         exportReport(for: run)
     }
 
+    func recordFinalConnection(seconds: Double) {
+        guard var run = activeRun else { return }
+        run.finalConnectionSeconds = max(0, seconds)
+        activeRun = run
+        persistActiveRun()
+    }
+
     /// Dismisses a completed condition back to administrator setup while preserving the saved run
     /// and its exported report. The other condition is deliberately not started automatically.
     func returnToSetupAfterCompletion() {

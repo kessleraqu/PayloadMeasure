@@ -6,6 +6,7 @@ import simd
 
 struct ManualMeasurementView: View {
     private enum FocusedField: Hashable {
+        case name
         case length
         case width
         case height
@@ -18,6 +19,7 @@ struct ManualMeasurementView: View {
     let onRunCancelled: () -> Void
 
     @State private var packingStore = PackingStore()
+    @State private var nameText = ""
     @State private var lengthText = ""
     @State private var widthText = ""
     @State private var heightText = ""
@@ -47,11 +49,6 @@ struct ManualMeasurementView: View {
             .navigationTitle("Enter measurements")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
-            .safeAreaInset(edge: .top) {
-                StudyTimerStrip(study: study)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 4)
-            }
             .safeAreaInset(edge: .bottom) { preparationButton }
         }
         .onAppear(perform: configurePackingStore)
@@ -89,7 +86,7 @@ struct ManualMeasurementView: View {
             }
             Button("Keep measuring", role: .cancel) {}
         } message: {
-            Text("Check that every object has all three dimensions before continuing. Names are entered while packing and weighing.")
+            Text("Check that every object has a name and all three dimensions before continuing. Weights are entered while packing.")
         }
         .confirmationDialog(
             "Reset all manual measurements?",
@@ -172,20 +169,35 @@ struct ManualMeasurementView: View {
             )
             .font(.headline)
 
-            Text("Use a ruler or calliper and enter the three outside dimensions in millimetres. You will name the object while packing and weighing it.")
+            Text("Name it, then measure it with a ruler or calliper. All three dimensions are in millimetres.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                dimensionField("Length", text: $lengthText, field: .length)
-                Text("×").foregroundStyle(.secondary)
-                dimensionField("Width", text: $widthText, field: .width)
-                Text("×").foregroundStyle(.secondary)
-                dimensionField("Height", text: $heightText, field: .height)
-                Text("mm")
-                    .font(.caption.weight(.semibold))
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Name")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
+                TextField("For example: red cable drum", text: $nameText)
+                    .textInputAutocapitalization(.words)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .name)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .length }
+                    .accessibilityLabel("Object name")
+                    .accessibilityHint("This name appears in the loading plan.")
+            }
+
+            HStack(alignment: .bottom, spacing: 8) {
+                dimensionField("Length", text: $lengthText, field: .length)
+                Text("×")
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 8)
+                dimensionField("Width", text: $widthText, field: .width)
+                Text("×")
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 8)
+                dimensionField("Height", text: $heightText, field: .height)
             }
 
             if let validationMessage {
@@ -222,10 +234,10 @@ struct ManualMeasurementView: View {
         field: FocusedField
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title)
+            Text("\(title) (mm)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            TextField("0", text: text)
+            TextField("mm", text: text)
                 .keyboardType(.decimalPad)
                 .multilineTextAlignment(.center)
                 .textFieldStyle(.roundedBorder)
@@ -247,13 +259,19 @@ struct ManualMeasurementView: View {
             .padding(.vertical, 24)
         } else {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Measured objects")
+                Text(measuredObjectsTitle)
                     .font(.headline)
                 ForEach(objectIDs, id: \.self) { id in
                     objectRow(id)
                 }
             }
         }
+    }
+
+    private var measuredObjectsTitle: String {
+        let skipped = packingStore.objectIDsSkipped(in: captureEngine).count
+        guard skipped > 0 else { return "Measured objects" }
+        return "Measured objects · \(skipped) skipped"
     }
 
     private func objectRow(_ id: UUID) -> some View {
@@ -273,9 +291,15 @@ struct ManualMeasurementView: View {
                 Text(sizeText(for: id))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                Text("Entered manually · no photo")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if isSkipped(id) {
+                    Label("Skipped · left out of this payload", systemImage: "arrow.uturn.forward")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("Entered manually · no photo")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 4)
             Menu {
@@ -283,6 +307,14 @@ struct ManualMeasurementView: View {
                     beginEditing(id)
                 } label: {
                     Label("Edit", systemImage: "pencil")
+                }
+                Button {
+                    packingStore.setSkipped(!isSkipped(id), for: id, in: captureEngine)
+                    if editingObjectID == id { clearDraft() }
+                } label: {
+                    isSkipped(id)
+                        ? Label("Put back in the payload", systemImage: "arrow.uturn.backward")
+                        : Label("Skip this object", systemImage: "arrow.uturn.forward")
                 }
                 Button(role: .destructive) {
                     pendingRemovalID = id
@@ -300,8 +332,16 @@ struct ManualMeasurementView: View {
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 16))
         .overlay {
             RoundedRectangle(cornerRadius: 16)
-                .stroke(objectColour(id).opacity(0.8), lineWidth: 2)
+                .stroke(
+                    isSkipped(id) ? Color.orange.opacity(0.8) : objectColour(id).opacity(0.8),
+                    style: StrokeStyle(lineWidth: 2, dash: isSkipped(id) ? [5, 4] : [])
+                )
         }
+        .opacity(isSkipped(id) ? 0.75 : 1)
+    }
+
+    private func isSkipped(_ id: UUID) -> Bool {
+        packingStore.isSkipped(id, in: captureEngine)
     }
 
     private var preparationButton: some View {
@@ -323,7 +363,7 @@ struct ManualMeasurementView: View {
             .disabled(objectIDs.isEmpty)
             .accessibilityHint("Confirms every object was measured, then opens the untimed packing start screen.")
 
-            Text("Add every object first. Weights are entered on the next screen.")
+            Text("Add every object with its name and size. Weights are entered on the next screen.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -352,9 +392,20 @@ struct ManualMeasurementView: View {
     private func saveDraft() {
         focusedField = nil
         validationMessage = nil
+        let name = nameText.trimmingCharacters(in: .whitespacesAndNewlines)
         let values = [lengthText, widthText, heightText].compactMap(PositiveDecimalText.parse)
+        guard !name.isEmpty else {
+            validationMessage = "Give this object a name. It is what the loading plan calls it."
+            focusedField = .name
+            return
+        }
+        guard captureEngine.isNameAvailable(name, excluding: editingObjectID) else {
+            validationMessage = "Another object is already called “\(name)”. Give this one a different name."
+            focusedField = .name
+            return
+        }
         guard values.count == 3 else {
-            validationMessage = "Enter all three dimensions as numbers greater than zero."
+            validationMessage = "Enter all three dimensions in millimetres, as numbers greater than zero."
             return
         }
         let size = SIMD3(values[0], values[1], values[2])
@@ -363,13 +414,17 @@ struct ManualMeasurementView: View {
             packingStore.clearPreparation(for: editingObjectID)
             guard captureEngine.updateManualMeasurement(
                 id: editingObjectID,
+                name: name,
                 sizeMillimetres: size
             ) else {
                 validationMessage = "These dimensions could not be saved."
                 return
             }
         } else {
-            guard captureEngine.addManualMeasurement(sizeMillimetres: size) != nil else {
+            guard captureEngine.addManualMeasurement(
+                name: name,
+                sizeMillimetres: size
+            ) != nil else {
                 validationMessage = "These dimensions could not be added."
                 return
             }
@@ -382,15 +437,17 @@ struct ManualMeasurementView: View {
             return
         }
         editingObjectID = id
+        nameText = captureEngine.name(for: id) ?? ""
         lengthText = PositiveDecimalText.format(size.x, maximumFractionDigits: 2) ?? ""
         widthText = PositiveDecimalText.format(size.y, maximumFractionDigits: 2) ?? ""
         heightText = PositiveDecimalText.format(size.z, maximumFractionDigits: 2) ?? ""
         validationMessage = nil
-        focusedField = .length
+        focusedField = .name
     }
 
     private func clearDraft() {
         editingObjectID = nil
+        nameText = ""
         lengthText = ""
         widthText = ""
         heightText = ""

@@ -37,6 +37,11 @@ final class PackingStore {
     private var noStockedBoxFitExclusionSizesByObjectID: [UUID: SIMD3<Double>] = [:]
     /// Objects that are already boxed, so their measured size is the package size.
     private(set) var objectsThatAreTheirOwnBox: Set<UUID> = []
+    /// Objects the operator has left out of this payload on purpose. Unlike the no-fit exclusion, this is
+    /// a decision rather than a measurement: a box does fit, or could, and it is being skipped anyway.
+    /// A skipped object needs no box, name or weight, is never given to the optimiser, and is recorded as
+    /// skipped so the study can tell it apart from one that was never measured.
+    private(set) var skippedObjectIDs: Set<UUID> = []
     /// Sizes typed in by hand, overriding both the measurement and the assigned box.
     private(set) var forcedSizesByObjectID: [UUID: SIMD3<Double>] = [:]
     /// The boxes for the payload being planned. Held by BoxCatalogue so that the setup screen and the
@@ -264,7 +269,8 @@ final class PackingStore {
 
     func packagesMissingWeight(from engine: ObjectCaptureEngine) -> [UUID] {
         engine.measuredObjectIDs.filter { id in
-            guard !isExcludedBecauseNoStockedBoxFits(id, in: engine) else {
+            guard !isExcludedBecauseNoStockedBoxFits(id, in: engine),
+                  !skippedObjectIDs.contains(id) else {
                 return false
             }
             return validPackedMass(for: id, in: engine) == nil
@@ -284,6 +290,9 @@ final class PackingStore {
         guard engine.measuredObjectIDs.contains(objectID),
               engine.capturedObjectsByID[objectID] != nil else {
             return .unavailable
+        }
+        if skippedObjectIDs.contains(objectID) {
+            return .skipped
         }
 
         let needsNoBox = isItsOwnBox(objectID, in: engine)
@@ -373,6 +382,31 @@ final class PackingStore {
         }
     }
 
+    // MARK: - Skipping an object
+
+    func isSkipped(_ objectID: UUID, in engine: ObjectCaptureEngine) -> Bool {
+        skippedObjectIDs.contains(objectID)
+            && engine.measuredObjectIDs.contains(objectID)
+    }
+
+    /// Leaves an object out of this payload, or puts it back. Skipping drops the box choice with it: the
+    /// object is not being packed, so a box assigned to it is not a fact about anything.
+    func setSkipped(_ isSkipped: Bool, for objectID: UUID, in engine: ObjectCaptureEngine) {
+        guard engine.measuredObjectIDs.contains(objectID) else { return }
+        let changed = isSkipped
+            ? skippedObjectIDs.insert(objectID).inserted
+            : skippedObjectIDs.remove(objectID) != nil
+        guard changed else { return }
+        if isSkipped {
+            selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID)
+        }
+        invalidateResults()
+    }
+
+    func objectIDsSkipped(in engine: ObjectCaptureEngine) -> [UUID] {
+        engine.measuredObjectIDs.filter { skippedObjectIDs.contains($0) }
+    }
+
     func selectedBoxPreset(for objectID: UUID) -> PackingBoxPreset? {
         guard let presetID = selectedBoxPresetIDsByObjectID[objectID] else {
             return nil
@@ -440,8 +474,9 @@ final class PackingStore {
         let removedUprightPreference = uprightPackageIDs.remove(objectID) != nil
         let removedOwnBox = objectsThatAreTheirOwnBox.remove(objectID) != nil
         let removedForcedSize = forcedSizesByObjectID.removeValue(forKey: objectID) != nil
+        let removedSkip = skippedObjectIDs.remove(objectID) != nil
         guard removedPreset || removedExclusion || removedUprightPreference || removedOwnBox
-            || removedForcedSize else {
+            || removedForcedSize || removedSkip else {
             return
         }
         invalidateResults()
@@ -484,6 +519,12 @@ final class PackingStore {
         let staleOwnBoxIDs = objectsThatAreTheirOwnBox.subtracting(measuredIDs)
         if !staleOwnBoxIDs.isEmpty {
             objectsThatAreTheirOwnBox.subtract(staleOwnBoxIDs)
+            changed = true
+        }
+
+        let staleSkipIDs = skippedObjectIDs.subtracting(measuredIDs)
+        if !staleSkipIDs.isEmpty {
+            skippedObjectIDs.subtract(staleSkipIDs)
             changed = true
         }
 
