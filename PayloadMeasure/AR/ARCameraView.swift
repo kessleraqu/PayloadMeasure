@@ -307,10 +307,14 @@ struct ARCameraView: UIViewRepresentable {
         private var objectMaskDisplayTask: Task<Void, Never>?
         private var objectMaskDisplayTaskGeneration = 0
         private var objectMaskDisplaySeedsByID: [UUID: ObjectMaskDisplaySeed] = [:]
-        /// The point in the room that the live mask on screen was sampled at, kept so it can be
-        /// reprojected every frame. Cleared with the live mask itself.
-        private var liveMaskWorldPoint: SIMD3<Float>?
-        /// The point sampled by the newest segmentation, which becomes the one above only if that
+        /// The anchor the live mask on screen is positioned by, added to the AR session so ARKit keeps
+        /// reprojecting it every frame — the same mechanism a locked object's anchor uses — instead of a
+        /// raw point this code would have to reproject by hand. Cleared with the live mask itself. A
+        /// sampling miss on some later frame leaves it exactly as it is: an anchor already being tracked
+        /// is not evidence the object moved, so it is only ever replaced by a genuine new sample, never by
+        /// the absence of one.
+        private var liveMaskAnchor: ARAnchor?
+        /// The point sampled by the newest segmentation, which becomes the anchor above only if that
         /// segmentation's mask is actually put on screen. Holding the picture while moving the point it is
         /// positioned by is what made a held mask twitch.
         private var pendingLiveMaskWorldPoint: SIMD3<Float>?
@@ -1762,7 +1766,8 @@ struct ARCameraView: UIViewRepresentable {
                             preview,
                             frame: currentFrame,
                             in: arView
-                        )
+                        ),
+                        in: arView
                     )
                     self.consecutiveMaskMisses = 0
                     let includesLiveMask = preview.layers.contains {
@@ -1885,7 +1890,8 @@ struct ARCameraView: UIViewRepresentable {
         /// between segmentations. Only a genuinely different view is worth swapping in, and a hold is
         /// capped in time so a mask cannot go stale.
         private func previewByHoldingUnchangedLiveMask(
-            _ preview: ObjectMaskPreview
+            _ preview: ObjectMaskPreview,
+            in arView: ARView
         ) -> ObjectMaskPreview {
             guard let incoming = preview.layers.first(where: { $0.trackedObjectID == nil }) else {
                 isHoldingLiveMask = false
@@ -1901,7 +1907,19 @@ struct ARCameraView: UIViewRepresentable {
             ) else {
                 isHoldingLiveMask = false
                 liveMaskAcceptedTimestamp = preview.timestamp
-                liveMaskWorldPoint = pendingLiveMaskWorldPoint
+                // A miss this cycle (no depth inside the new silhouette) is left alone: the anchor
+                // already on the session keeps being reprojected exactly as it was. An ARAnchor's
+                // transform cannot itself be moved, so a genuine new sample replaces it outright.
+                if let worldPoint = pendingLiveMaskWorldPoint {
+                    if let previousAnchor = liveMaskAnchor {
+                        arView.session.remove(anchor: previousAnchor)
+                    }
+                    var transform = matrix_identity_float4x4
+                    transform.columns.3 = SIMD4<Float>(worldPoint, 1)
+                    let anchor = ARAnchor(name: "payload-live-mask", transform: transform)
+                    arView.session.add(anchor: anchor)
+                    liveMaskAnchor = anchor
+                }
                 return preview
             }
             isHoldingLiveMask = true
@@ -2031,7 +2049,10 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func removeLiveObjectMaskDisplaySeed() {
-            liveMaskWorldPoint = nil
+            if let liveMaskAnchor {
+                arView?.session.remove(anchor: liveMaskAnchor)
+            }
+            liveMaskAnchor = nil
             pendingLiveMaskWorldPoint = nil
             isHoldingLiveMask = false
             liveMaskAcceptedTimestamp = -.greatestFiniteMagnitude
@@ -2061,13 +2082,19 @@ struct ARCameraView: UIViewRepresentable {
         /// object's mask on the object at the distance the accuracy rule asks for: ARKit can place a
         /// world point on screen however few pixels the object covers.
         private func updateLiveMaskTracking(frame: ARFrame, in arView: ARView) {
-            guard let worldPoint = liveMaskWorldPoint,
+            guard let liveMaskAnchor,
                   captureEngine.objectMaskPreview?.layers.contains(where: {
                       $0.trackedObjectID == nil
                   }) == true else {
                 captureEngine.updateLiveMaskTracking(nil)
                 return
             }
+            // ARKit keeps refining this anchor's pose every frame on its own, the same as a locked
+            // object's — read the live tracked copy, not the one from the moment it was added.
+            let trackedAnchor = frame.anchors.first {
+                $0.identifier == liveMaskAnchor.identifier
+            } ?? liveMaskAnchor
+            let worldPoint = trackedAnchor.transform.translation
             let viewportSize = arView.bounds.size
             guard viewportSize.width > 0, viewportSize.height > 0 else { return }
             // A point behind the camera still projects, to nonsense. Turning away from the object would
@@ -3500,12 +3527,17 @@ struct ARCameraView: UIViewRepresentable {
         private func removeAllObjectMaskAnchors() {
             guard let arView else {
                 objectMaskAnchors.removeAll()
+                liveMaskAnchor = nil
                 return
             }
             for anchor in objectMaskAnchors.values {
                 arView.session.remove(anchor: anchor)
             }
+            if let liveMaskAnchor {
+                arView.session.remove(anchor: liveMaskAnchor)
+            }
             objectMaskAnchors.removeAll()
+            liveMaskAnchor = nil
             objectMaskMarkerStates.removeAll()
             objectMaskColorsByID.removeAll()
             maskedAccumulators.removeAll()

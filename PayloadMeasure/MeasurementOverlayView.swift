@@ -141,7 +141,13 @@ struct MesOverlayView: View {
                 lockFeedback.prepare()
             }
         }
-        .onChange(of: captureEngine.measuredObjectIDs.count) { _, _ in
+        // Watches the array of IDs, not its count: a count can mask a real change (one object
+        // finalized while another is dropped in the same update leaves the count unchanged, and
+        // SwiftUI's onChange only fires when the watched value itself differs). This is the only
+        // thing standing between a mid-box crash and losing every object measured on this box so
+        // far — study.recordMeasurementProgress is the per-object safety net; the authoritative,
+        // complete record is written once by ArrangementView.recordCurrentBox when the box closes.
+        .onChange(of: captureEngine.measuredObjectIDs) { _, _ in
             recordMeasurementProgress()
         }
         )

@@ -1449,8 +1449,7 @@ nonisolated enum ObjectBoundingBox {
 //                      from it — extents from the full cloud, height from the support plane, longer
 //                      horizontal side named width. None of that is from the paper.
 nonisolated enum OrientedBoundingBox {
-    /// N_max in Algorithm 2. Liu's largest tested value, where the reported average error is
-    /// under 1°.
+    /// N_max in Algorithm 2. See PSEUDOCODE.md §3.2, "Why 100, precisely."
     static let maximumOrientationPointCount = 100
     /// τ. Liu's own recommendation: "produces almost the same results as using accurate
     /// convex-hull points".

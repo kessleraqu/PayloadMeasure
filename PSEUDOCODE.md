@@ -431,8 +431,21 @@ return bestAxis
 | 1 | **The criterion is maximised, not minimised.** | [L]'s printed optimisation direction (`S = INT_MAX`, keep `Scur < S`, "a smaller closeness means a better orientation") conflicts with the definition and original use of the referenced closeness criterion of [Z], which increases as the points lie closer to the rectangle edges and which [Z] explicitly treats as a maximisation objective. The implementation follows [Z]'s maximisation convention. |
 | 2 | **Reservoir sampling**, seeded. | [L] says "uniformly downsampled" without specifying a method. Reservoir sampling gives a uniformly random subset; seeding makes a scan reproducible. Implementation choice. |
 | 3 | Direction vectors instead of `atan2`. | Implementation detail; algebraically the same, and it avoids a wrap at ±π. |
-| 4 | N_max = 100. | [L]'s largest tested value, where the reported average error is under 1°. |
+| 4 | N_max = 100. | [L]'s largest tested value, where the reported average error is under 1°. See below. |
 | 5 | Only θ is returned; `lcur`, `wcur` are not. | See §3.4 — the size is computed differently by the application. |
+
+**Why 100, precisely.** [L] §IV.E ("Efficiency and Impact of Downsampling") states the experiment directly:
+on the 3,095 test cases with 1000 or more points, "we uniformly downsampled its points to a smaller size
+ranging from **20 to 100**, with a step size of 10" — so 100 is not a round number picked for convenience,
+it is the literal upper end of the only range [L] tested. Within that range: "By downsampling the raw
+points to a size of **80 or 100**, it works well with an average error lower than 1°." 100 is one of the
+two sizes [L] explicitly reports meeting that bar, and it is the larger of the two — the code comment's
+"largest tested value, where the reported average error is under 1°" is that sentence, not a paraphrase
+that drifted from it. (§IV.F additionally reports the pair (100 points, τ = 0.01) together delivering a
+0.04° average difference from the exhaustive-search baseline and an 8× speed-up, but that is a
+consequence of the choice already justified above, not a separate justification for it.) Nothing above
+N_max = 100 was tested by [L], so nothing above it could be cited; the implementation does not extrapolate
+past the paper's own experiment.
 
 ## 3.3 Zhang's closeness
 
@@ -813,3 +826,12 @@ to them.
 | `testRemovingSeveralPointsAtOncePreservesRelativeOrder` | a batch removal, as silhouette carving performs, cannot reshuffle survivors — fails against the old swap-remove |
 | `testANewlyAddedPointAppendsAfterExistingOnesEvenFollowingARemoval` | a new point fills the end of the array, not the gap left by a removal |
 | `testTwoIdenticallyOrderedSnapshotsSampleIdentically` | the property that actually matters: the same sequence of operations reproduces the same snapshot order, which is what makes the orientation search's fixed seed meaningful |
+
+`StudySecondBoxRecordingTests` pins that a box's measurements and photos, not only its timing, reach the
+box actually in progress after `advanceToNextBox`:
+
+| Test | Protects |
+| --- | --- |
+| `testMeasurementProgressReachesTheSecondBoxAfterAdvancing` | per-object progress lands on the second box, not the first or nowhere |
+| `testRecordCurrentBoxReachesTheSecondBoxAfterAdvancing` | the final snapshot — objects, loaded IDs, packing mode, balance — lands on the second box |
+| `testAPhotoStoredForTheSecondBoxIsNamedForTheSecondBox` | a photo captured after advancing is filed under the box now in progress |
