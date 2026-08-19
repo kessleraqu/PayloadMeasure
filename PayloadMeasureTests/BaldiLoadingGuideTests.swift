@@ -34,6 +34,28 @@ final class BaldiLoadingGuideTests: XCTestCase {
         }
     }
 
+    /// An object that already arrived as its own box was never given an opening to match: the length
+    /// axis is still meaningful for placement, but nothing chose it to line up with a real opening,
+    /// so the description must not claim one.
+    func testDescriptionOmitsTheOpeningForAnObjectThatIsItsOwnBox() {
+        let placement = BaldiTestFixtures.placement(origin: .zero, isOwnBox: true)
+        XCTAssertEqual(
+            BaldiOpeningMarker.description(for: placement),
+            "Already its own box — no catalogue opening to line up"
+        )
+    }
+
+    /// The flag on the item the solver was given must survive into the placement it produces, since
+    /// that is the only copy the loading guide ever sees.
+    func testIsOwnBoxSurvivesFromItemIntoItsPlacement() {
+        let item = BaldiTestFixtures.item(isOwnBox: true)
+        let solution = BaldiConstruction.pack(
+            order: [item],
+            knapsack: BaldiTestFixtures.knapsack()
+        )
+        XCTAssertEqual(solution.placements.first?.isOwnBox, true)
+    }
+
     func testOpeningLineIsMarkedCoveredOnlyOnTheTouchingLWFace() {
         let package = BaldiTestFixtures.placement(
             name: "Lower",

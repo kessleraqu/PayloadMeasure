@@ -1187,7 +1187,10 @@ private struct PackingARContainer: UIViewRepresentable {
             colour: UIColor,
             id: UUID
         ) {
-            guard let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return }
+            // The length/opening convention only describes one of our own catalogue presets: an
+            // object that already arrived as its own box was never given an opening to match.
+            guard !placement.isOwnBox,
+                  let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return }
             let normal = axes.normal
             let length = axes.length
             let width = axes.width

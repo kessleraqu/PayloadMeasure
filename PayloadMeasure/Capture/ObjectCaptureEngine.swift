@@ -113,6 +113,9 @@ final class ObjectCaptureEngine {
     /// out of the stored boxes; no tracking is involved.
     private(set) var isPointingAtFinishedObject = false
     private(set) var framingGuidance: ObjectFramingGuidance?
+    /// Whether the object being framed fills more of the screen than the framing study found accurate.
+    /// Advice only — nothing checks it before starting, continuing or finishing a measurement.
+    private(set) var isFramedTooClose = false
     private var candidateFramingGuidance: ObjectFramingGuidance?
     private var candidateFramingGuidanceCount = 0
     private var lastPublishedDetailStatus: MeasurementDetailStatus = .unknown
@@ -537,7 +540,12 @@ final class ObjectCaptureEngine {
                < Self.liveMaskTrackingEpsilon,
            abs(existing.normalizedViewportPoint.y - tracking.normalizedViewportPoint.y)
                < Self.liveMaskTrackingEpsilon,
-           abs(existing.cameraDistance - tracking.cameraDistance) < 0.002 {
+           abs(existing.cameraDistance - tracking.cameraDistance) < 0.002,
+           // The anchor sitting still does not mean the picture should. Rolling the phone about the
+           // point it is anchored to moves neither the point nor the distance, and only the gauge
+           // records it — testing the anchor alone would hold the mask at its old angle through exactly
+           // the motion the gauge was added to draw.
+           gaugesAreWithinEpsilon(existing.gauge, tracking.gauge) {
             return
         }
         liveMaskTracking = tracking
@@ -546,6 +554,25 @@ final class ObjectCaptureEngine {
     /// A fifth of a percent of the screen. Below that, moving the mask is invisible and republishing it
     /// only costs a redraw.
     private static let liveMaskTrackingEpsilon: CGFloat = 0.002
+
+    /// Whether two gauge frames are close enough that redrawing between them would show nothing. One
+    /// having a gauge and the other not is a change, because it decides which display model applies.
+    private func gaugesAreWithinEpsilon(
+        _ existing: MaskGaugeFrame?,
+        _ incoming: MaskGaugeFrame?
+    ) -> Bool {
+        switch (existing, incoming) {
+        case (nil, nil):
+            return true
+        case let (existing?, incoming?):
+            return zip(existing.points, incoming.points).allSatisfy { first, second in
+                abs(first.x - second.x) < Self.liveMaskTrackingEpsilon
+                    && abs(first.y - second.y) < Self.liveMaskTrackingEpsilon
+            }
+        default:
+            return false
+        }
+    }
 
     func updateObjectMaskDisplayBoundingBoxes(
         _ boundingBoxes: [UUID: CGRect],
@@ -1158,6 +1185,7 @@ final class ObjectCaptureEngine {
         heightSatisfied = false
         topMeasurementStable = false
         framingGuidance = nil
+        isFramedTooClose = false
         measurementDetailStatus = .unknown
         didEncounterInsufficientFit = false
         resetConvergence()
@@ -1172,6 +1200,7 @@ final class ObjectCaptureEngine {
         objectMaskDisplayBoundingBoxes.removeAll()
         objectMaskViewportSize = .zero
         framingGuidance = nil
+        isFramedTooClose = false
         latestObjectMaskPreviewTimestamp = -.greatestFiniteMagnitude
     }
 
@@ -1276,7 +1305,31 @@ final class ObjectCaptureEngine {
     /// because stale advice is worse than none.
     private static let framingGuidanceHoldCount = 4
 
+    /// The mask being framed right now: the object under measurement, or the one the crosshair is on
+    /// before anything has been selected. The advice is about the object, so it is read from the
+    /// object's own mask rather than from anything under the crosshair or on the surface beneath it.
+    private var framedObjectViewportBoundingBox: CGRect? {
+        if let activeObjectID {
+            return objectMaskDisplayBoundingBoxes[activeObjectID]
+                ?? lockedMaskLayersByID[activeObjectID]?.referenceViewportBoundingBox
+        }
+        guard let liveMaskLayer else { return nil }
+        return objectMaskDisplayBoundingBoxes[liveMaskLayer.id]
+            ?? liveMaskLayer.referenceViewportBoundingBox
+    }
+
+    private func refreshTooCloseAdvice() {
+        isFramedTooClose = MeasurementFramingRule.isTooClose(
+            fillPercent: MeasurementFramingRule.fillPercent(
+                objectBoundingBox: framedObjectViewportBoundingBox,
+                viewportSize: objectMaskViewportSize
+            ),
+            wasTooClose: isFramedTooClose
+        )
+    }
+
     private func refreshFramingGuidance() {
+        refreshTooCloseAdvice()
         let updatedGuidance = activeObjectID
             .flatMap { objectMaskDisplayBoundingBoxes[$0] }
             .flatMap {
@@ -1294,6 +1347,7 @@ final class ObjectCaptureEngine {
             candidateFramingGuidance = nil
             candidateFramingGuidanceCount = 0
             framingGuidance = nil
+        isFramedTooClose = false
             return
         }
 

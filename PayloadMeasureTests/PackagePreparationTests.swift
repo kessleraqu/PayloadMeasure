@@ -294,6 +294,34 @@ final class PackagePreparationTests: XCTestCase {
         XCTAssertEqual(store.preparationState(for: objectID, in: engine), .needsName)
     }
 
+    /// A preset stands for one physical box. Two objects that would both pick the same smallest size
+    /// must not both be told to use it.
+    func testEachBoxPresetIsAssignedToAtMostOneObject() {
+        let engine = ObjectCaptureEngine()
+        let first = lockObject(in: engine, sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let second = lockObject(in: engine, sizeMetres: SIMD3(0.05, 0.04, 0.03))
+        let store = PackingStore()
+
+        store.assignBoxesAutomatically(in: engine)
+
+        let firstPreset = try! XCTUnwrap(store.selectedBoxPreset(for: first)?.id)
+        let secondPreset = try! XCTUnwrap(store.selectedBoxPreset(for: second)?.id)
+        XCTAssertEqual(firstPreset, "120x90x40", "The smallest fitting box, same as the single-object case.")
+        XCTAssertNotEqual(
+            secondPreset, firstPreset,
+            "The second object of the same size must be given a different box, not share the first's."
+        )
+
+        // Manually choosing the one already taken must also fail, not just the automatic assignment.
+        XCTAssertFalse(store.selectBoxPreset(id: firstPreset, for: second, in: engine))
+        XCTAssertEqual(store.selectedBoxPreset(for: second)?.id, secondPreset, "Left unchanged by the refusal.")
+
+        // Freeing the first object's box makes it available again.
+        store.setSkipped(true, for: first, in: engine)
+        XCTAssertTrue(store.selectBoxPreset(id: firstPreset, for: second, in: engine))
+        XCTAssertEqual(store.selectedBoxPreset(for: second)?.id, firstPreset)
+    }
+
     func testObjectMarkedAsItsOwnBoxPacksAtItsMeasuredSize() {
         let (engine, objectID) = makeLockedObject(sizeMetres: SIMD3(0.40, 0.30, 0.20))
         let store = PackingStore()

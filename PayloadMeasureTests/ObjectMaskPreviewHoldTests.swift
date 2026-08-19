@@ -101,6 +101,76 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
+    // MARK: - What actually ends a hold
+
+    /// Elapsed time is a poor proxy for staleness, and it was the only test there used to be. The picture
+    /// is drawn by the best similarity through three of the object's points; the residual of that fit is
+    /// how much of the motion it is failing to draw, and it is measured, not guessed. Past the limit the
+    /// silhouette is no longer a fair drawing of the object whatever else argues for keeping it.
+    func testAPictureThatCanNoLongerBeDrawnFairlyIsReplaced() {
+        XCTAssertFalse(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: 0.05,
+                displayResidual: ObjectMaskPreviewHold.maximumDisplayResidual + 0.001
+            ),
+            "A fifth of the time budget is no defence once the drawing has gone wrong."
+        )
+        XCTAssertTrue(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: 0.05,
+                displayResidual: ObjectMaskPreviewHold.maximumDisplayResidual - 0.001
+            )
+        )
+    }
+
+    /// The other half of the same argument: a phone that has barely moved keeps its picture for the full
+    /// budget, which is what stops the shimmer the hold exists for.
+    func testAStillPhoneKeepsItsPictureForTheWholeBudget() {
+        XCTAssertTrue(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: ObjectMaskPreviewHold.maximumHoldSeconds - 0.01,
+                displayResidual: 0
+            )
+        )
+    }
+
+    /// No gauge, no measurement: the time backstop is then the only rule there is, and it still applies.
+    func testWithoutAResidualTheTimeBackstopStillEndsTheHold() {
+        XCTAssertTrue(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: 0.3,
+                displayResidual: nil
+            )
+        )
+        XCTAssertFalse(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: ObjectMaskPreviewHold.maximumHoldSeconds,
+                displayResidual: nil
+            )
+        )
+    }
+
+    func testANonsenseResidualIsNotEvidenceTheDrawingIsFine() {
+        XCTAssertFalse(
+            ObjectMaskPreviewHold.holdsExistingLayer(
+                existing: onScreen,
+                incoming: onScreen,
+                secondsHeld: 0.1,
+                displayResidual: .nan
+            )
+        )
+    }
+
     /// A hold age computed against the sentinel start value is enormous; it must read as "no hold".
     func testAnAbsurdHoldAgeIsNotAHold() {
         XCTAssertFalse(

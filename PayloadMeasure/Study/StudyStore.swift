@@ -177,10 +177,27 @@ final class StudyStore {
     @discardableResult
     func resumeRun(_ run: StudyRun) -> Bool {
         guard activeRun == nil, !run.isComplete else { return false }
+        var run = run
         let firstUnfinished = run.boxOrder.firstIndex {
             run.result(for: $0)?.completedAt == nil
         }
         guard let firstUnfinished else { return false }
+        let resumedBox = run.boxOrder[firstUnfinished]
+        // Whatever objects were recorded for this box belong to the coordinate system the relaunch
+        // just threw away, so they are about to be measured again from nothing, not resumed one by
+        // one. Left in place, that stale, otherwise-valid-looking count is what the progress safety
+        // net in `recordMeasurementProgress` compares fresh measurements against — a participant who
+        // ends up re-measuring fewer objects than were staged before the crash would have every one
+        // of them silently refused until the count caught back up. Clearing it here is what makes
+        // "measured again from the start" true for the record as well as for the AR session.
+        if let index = run.boxes.firstIndex(where: { $0.box == resumedBox }) {
+            run.boxes[index].objects = []
+            run.boxes[index].loadedObjectIDs = []
+            run.boxes[index].unloadedObjectNames = []
+            run.boxes[index].packingMode = nil
+            run.boxes[index].centreOfMassMillimetres = nil
+            run.boxes[index].unbalancingIndexMillimetres = nil
+        }
         endCurrentPhase()
         activeRun = run
         currentBoxIndex = firstUnfinished
@@ -200,10 +217,20 @@ final class StudyStore {
     /// Snapshots the objects measured so far for the payload in progress, without touching anything the
     /// loading plan owns. Called as each object is finished, so a crash costs at most the object being
     /// measured at the time rather than the whole payload's dimensions.
+    ///
+    /// Finishing the run's *last* box does not invalidate `currentBox` the way advancing to a middle box
+    /// does — `startNextBox()` resets the capture engine (collapsing its object list to empty) before
+    /// deciding whether there even is a next box to advance to, and on the last box nothing afterwards
+    /// moves `currentBoxIndex` or sets `isAwaitingParticipantStart`. A stray call carrying that
+    /// now-empty list can therefore still land on the box that `recordCurrentBox` just correctly saved a
+    /// moment before, on every run's actual last box — which in a two-box study is always whichever box
+    /// was measured second. A progress snapshot exists to grow the record as objects are found, never to
+    /// erase ones already there, so it is never allowed to shrink what is already recorded.
     func recordMeasurementProgress(objects: [StudyObjectRecord]) {
         guard let box = currentBox,
               var run = activeRun,
               let index = run.boxes.firstIndex(where: { $0.box == box }) else { return }
+        guard objects.count >= run.boxes[index].objects.count else { return }
         guard run.boxes[index].objects.map(\.id) != objects.map(\.id)
                 || run.boxes[index].objects.count != objects.count else {
             return

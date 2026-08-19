@@ -113,7 +113,10 @@ nonisolated enum BaldiOpeningMarker {
     }
 
     static func description(for placement: BaldiPlacement) -> String {
-        switch containerAxis(for: placement) {
+        guard !placement.isOwnBox else {
+            return "Already its own box — no catalogue opening to line up"
+        }
+        return switch containerAxis(for: placement) {
         case 0: "Opening and length along the container"
         case 1: "Opening and length across the container"
         default: "Opening and length vertical"
@@ -296,11 +299,16 @@ struct BaldiLayerFootprintView: View {
 
     /// Shades the opening side of the footprint and rules a darker line straight across the package
     /// along its length, which is the direction the operator has to line the box up with.
+    ///
+    /// Drawn only for a package boxed from the catalogue: the line marks the length/opening
+    /// convention of one of *our* presets, which is not a fact about an object that already arrived
+    /// as its own box — nothing chose an opening for it to match.
     private func drawOpeningMarker(
         for placement: BaldiPlacement,
         in rect: CGRect,
         context: GraphicsContext
     ) {
+        guard !placement.isOwnBox else { return }
         let axis = BaldiOpeningMarker.containerAxis(for: placement)
         guard rect.width >= 11, rect.height >= 11 else { return }
 
@@ -917,7 +925,10 @@ private enum SceneBuilder {
 
         // SCNBox material order is front(+z), right(+x), back(-z), left(-x), top(+y), bottom(-y).
         var result = Array(repeating: base, count: 6)
-        guard let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return result }
+        // The length/opening convention only describes one of our own catalogue presets: an object
+        // that already arrived as its own box was never given an opening to match.
+        guard !placement.isOwnBox,
+              let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return result }
         let markedFaces: [(index: Int, sign: Int)]
         let lineIsHorizontal: Bool
         switch axes.normal {
@@ -940,18 +951,20 @@ private enum SceneBuilder {
             result[face.index] = markedFaceMaterial(
                 colour: baseColour,
                 lineIsHorizontal: lineIsHorizontal,
-                isDotted: covered.contains(face.sign),
-                highlighted: highlighted ? colour : nil
+                isDotted: covered.contains(face.sign)
             )
         }
         return result
     }
 
+    /// No highlight wash here, unlike the package's other faces: an emission tint over this baked
+    /// texture is what used to fade the line out right when selecting a package was supposed to make
+    /// it easier to read. Selection is already shown unambiguously by the highlighted edges
+    /// `addBoxEdges` draws around the whole package, so the opening line stays at full contrast.
     private static func markedFaceMaterial(
         colour: UIColor,
         lineIsHorizontal: Bool,
-        isDotted: Bool,
-        highlighted: UIColor?
+        isDotted: Bool
     ) -> SCNMaterial {
         let faceColour = darkened(colour, by: 0.4)
         let lineColour = darkened(colour, by: 0.75)
@@ -991,9 +1004,6 @@ private enum SceneBuilder {
         marked.diffuse.mipFilter = .linear
         marked.diffuse.wrapS = .clamp
         marked.diffuse.wrapT = .clamp
-        if let highlighted {
-            marked.emission.contents = highlighted.withAlphaComponent(0.22)
-        }
         return marked
     }
 

@@ -185,7 +185,8 @@ nonisolated struct BaldiPacking: Sendable {
             origin: point.position,
             rotation: rotation,
             size: rotation.size(of: item.size),
-            mass: item.mass
+            mass: item.mass,
+            isOwnBox: item.isOwnBox
         )
     }
 

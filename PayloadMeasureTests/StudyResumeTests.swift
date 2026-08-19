@@ -157,6 +157,45 @@ final class StudyResumeTests: XCTestCase {
         )
     }
 
+    /// The box being resumed is measured again from nothing — its old objects belong to an AR
+    /// coordinate system the relaunch already threw away. Leaving them in place would let their stale
+    /// count block the progress safety net (`recordMeasurementProgress`) from persisting genuine
+    /// re-measurement until it happened to catch back up, on top of misrepresenting what the payload
+    /// currently holds.
+    func testResumingClearsStaleObjectsOnTheBoxBeingResumed() {
+        let name = "resume-\(UUID().uuidString.prefix(8))"
+        let started = makeStartedRun(named: name)
+        let box = try! XCTUnwrap(started.store.currentBox)
+        started.store.recordMeasurementProgress(
+            objects: [
+                StudyObjectRecord(
+                    id: UUID(),
+                    name: "Drum",
+                    measuredSizeMillimetres: [120, 80, 60],
+                    packagedSizeMillimetres: [],
+                    assignedBoxName: nil,
+                    isOwnBox: false,
+                    hasEnforcedSize: false,
+                    massKilograms: nil,
+                    photoFileName: nil,
+                    placementOriginMillimetres: nil
+                )
+            ]
+        )
+
+        let afterRelaunch = StudyStore()
+        let resumable = try! XCTUnwrap(
+            afterRelaunch.saved.first { $0.id == started.run.id }
+        )
+        XCTAssertTrue(afterRelaunch.resumeRun(resumable))
+
+        XCTAssertEqual(
+            afterRelaunch.activeRun?.result(for: box)?.objects.count,
+            0,
+            "The stale object from before the crash must not linger into the resumed run."
+        )
+    }
+
     func testAFinishedRunIsNeverOfferedForResuming() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)

@@ -23,6 +23,11 @@ checked against the PDF. Where a claim could not be checked, it says so.
 - **[Z]** X. Zhang, W. Xu, C. Dong, J. M. Dolan, "Efficient L-shape fitting for vehicle detection
   using laser scanners", *IEEE Intelligent Vehicles Symposium*, 2017. Reference [15] of [L], and the
   source of the `closeness` criterion.
+- **[HZ]** R. Hartley, A. Zisserman, *Multiple View Geometry in Computer Vision*, 2nd ed., Cambridge,
+  2004. §13.1, the plane-induced homography. Part 6 only.
+- **[U]** S. Umeyama, "Least-Squares Estimation of Transformation Parameters Between Two Point
+  Patterns", *IEEE Transactions on Pattern Analysis and Machine Intelligence* 13(4), 1991, 376–380.
+  Eqs. (34)–(42), the closed-form least-squares similarity. Part 6 only.
 
 **Equation numbers.** All [B] numbers below were re-checked against the PDF: (1) total profit,
 (2) centre of mass, (3) standard deviation, (4) unbalancing index, (5)–(20) the MIP model,
@@ -770,6 +775,136 @@ to them.
 
 ---
 
+# Part 6 — Placing a mask picture between segmentations
+
+Segmentation runs at best six times a second, and a silhouette that has just been computed is usually
+held rather than redrawn, because Vision does not segment a complex object the same way twice and
+redrawing every result is a visible shimmer. So the picture on screen is routinely a fifth of a second
+old and sometimes a whole second. Something has to say where it goes in the meantime.
+
+This is display only. It cannot move a measured dimension: the point cloud is sampled from a freshly
+generated mask aligned to the frame it came from (`generateScaledMask`), never from the picture drawn
+here. It is documented to the same standard anyway, because it decides what the operator aims with,
+and therefore which object gets measured.
+
+## Paper — Hartley & Zisserman §13.1, and Umeyama (1991)
+
+For a rigid scene under camera motion, the exact image-to-image map of a **plane** is a homography:
+
+```
+H = K (R − t nᵀ / d) K⁻¹                                    // [HZ] §13.1
+```
+
+Given point correspondences and a chosen transformation class, the least-squares member of that class
+has a closed form. For a similarity — rotation, isotropic scale, translation — Umeyama gives it as
+eqs. (34)–(42): centre both sets, take the SVD of the cross-covariance, and read off `R`, `c` and `t`.
+
+## Implementation — `MaskDisplayTransform.following`
+
+```
+at segmentation:                                             // the reference frame
+    p₀ ← the object's anchor in the room
+    L  ← 0.15 · distance(camera, p₀)                         // gauge baseline
+    p₁ ← p₀ + right(camera) · L
+    p₂ ← p₀ + up(camera)    · L
+    reference ← project(p₀, p₁, p₂) with this frame's camera
+
+every frame after:
+    basis   ← rebase (p₀, p₁, p₂) onto the anchor's current pose
+    current ← project(basis) with this frame's camera
+    fit     ← argmin over similarities S of Σᵢ ‖S(referenceᵢ) − currentᵢ‖²
+    residual ← √( Σᵢ ‖fit(referenceᵢ) − currentᵢ‖² / 3 )
+    draw the picture rotated by fit.θ and scaled by fit.c about reference₀,
+        then translated by fit(reference₀) − reference₀
+```
+
+with the fit specialised to two dimensions, where the 2 × 2 SVD collapses to one `atan2`:
+
+```
+θ = atan2( Σ(α × β), Σ⟨α, β⟩ )          c = ‖(Σ⟨α,β⟩, Σ(α×β))‖ / Σ‖α‖²
+```
+
+## Differences
+
+| # | Difference | Category |
+| --- | --- | --- |
+| 1 | **The homography is sampled, not composed.** Three points are placed on the fronto-parallel plane through the object and reprojected by ARKit's own calibrated camera each frame, rather than forming `H` from `R`, `t`, `n` and `d`. | Adaptation. It needs no plane normal and no inter-frame pose estimate, and it inherits ARKit's camera model rather than restating it. The object is not a plane; the plane through it at its measured depth is the first-order surrogate, and the error of that surrogate is bounded by the object's depth range over its distance. |
+| 2 | **A similarity is fitted where the true map is a homography.** Four of the eight degrees of freedom are dropped. | Deliberate, and the reason is the raster: the picture is a fixed image and can only be moved, turned and scaled. Exact for translation parallel to the image plane, dolly along the optical axis and roll about it. Not exact for out-of-plane rotation, which is difference 3. |
+| 3 | **The residual of the fit is kept and used.** It bounds how long a silhouette may be held (`ObjectMaskPreviewHold.maximumDisplayResidual`). | Application extension; no paper says to do this. It is the RMS reprojection error Umeyama's objective already minimises, which makes it exactly the part of the motion the drawn transform is failing to represent. It replaced a wall-clock hold, which cannot distinguish a still phone from one swung through 40° in a fifth of a second. |
+| 4 | **Three points, not more.** | Application. Two determine a similarity exactly and leave no residual to measure; three overdetermine it by one point pair, which is the minimum that yields an error. More would cost reprojections per frame for a better-conditioned estimate of a quantity already limited by the plane approximation, not by noise. |
+| 5 | **Gauge baseline is 0.15 × distance, legs perpendicular and equal.** | Application. A constant angular baseline keeps the rotation estimate's conditioning independent of range; perpendicular equal legs make it isotropic, so no direction of motion is estimated better than another. The variance of an angle from a baseline `L` goes as `1/L²`, which is also why a gauge below `minimumGaugeLeg` is refused outright rather than fitted badly. |
+| 6 | **The fit runs in height-normalised coordinates.** | Implementation detail, but a necessary one: unit viewport coordinates are anisotropic, and a rotation is not defined in a metric where a unit of x and a unit of y are different distances. |
+| 7 | **The gauge is rebased onto the anchor's current pose before projecting.** | Application. Apple documents that ARKit "might move that anchor when it optimizes its internal map". That correction moves the object, so it applies to all three points; applying it to the anchor alone would read a map optimisation as the object rotating. |
+
+## What this replaced, and why it was wrong
+
+The previous model was translation plus isotropic scale, with the scale taken from the ratio of
+distances on the argument that apparent size goes as `1/d`. Two faults, both now removed:
+
+- **No rotation term at all.** Roll the phone, or orbit the object, and the image rotates while the
+  picture does not. Observed directly as a silhouette sitting at a visibly different angle from the
+  object under it, and worst exactly where the app asks the operator to move — around the object.
+- **`1/d` is not general.** It is exact for translation along the optical axis with a fronto-parallel
+  target, and was stated as though it held for any motion. The fitted scale now comes from the same
+  reprojections as everything else, so it is right whenever the similarity is.
+
+A third fault was in the *selection* path rather than the display. `livePreviewBoundingBox` was
+documented as "the mask on screen" and was in fact the most recently segmented one — which, under a
+hold, is a different picture. The continuation hint that is supposed to make the lock agree with what
+the operator aimed at therefore agreed with the new segmentation trivially and with the operator never.
+The view now supplies what is actually drawn (`ObjectMaskFrame.displayedLiveMaskBoundingBox`).
+
+---
+
+# Part 7 — Telling the operator they are too close
+
+From this project's own framing study, not from any paper. Included because the number on screen is
+derived from data, and a reader should be able to see which variable that data was collected in.
+
+## The study
+
+Each object was measured once at five **screen fill** levels — the object's longest projected side over
+the shorter viewport dimension:
+
+```
+fill %   25    30    38    53    65
+→ mm    650   550   450   350   300        // observed, for the objects tested
+         └──── stable ────┘ └── loss ──┘
+```
+
+Fill is the independent variable the protocol controlled
+(`FramingCalibrationProtocol.targetFillPercentages`). The millimetre row is an **observed result** of
+following those five guides with those objects, not a second protocol.
+
+## The rule — `MeasurementFramingRule`
+
+```
+fill      ← longest projected side of the object's mask ÷ shorter viewport side
+too close ⇔ fill ≥ 53%,  releasing below 45.5%
+too far   ⇔ never reported
+```
+
+## Differences from the obvious reading of the same data
+
+| # | Choice | Why |
+| --- | --- | --- |
+| 1 | **Stated in fill, not in millimetres.** The rule this replaced was "closer than 350 mm". | 350 mm *is* 53% fill — for a study object. Under a pinhole camera the projected size goes as size ÷ distance, so the same fill arrives at a different distance for a different object, and a fixed millimetre threshold silently carries the study's object sizes into every later measurement. Pinned by `aLargeObjectIsWarnedAtADistanceTheOldRuleCalledSafe` and `aSmallObjectIsNotWarnedWhereTheOldRuleWouldHaveBeen`, which are the two cases it got backwards. |
+| 2 | **53%, not a rounder number.** | It is the first tested level at which the loss appears, so it is the first level that can honestly be called too close. The cliff itself lies somewhere in the untested 38–53% interval; the study does not resolve where, and nothing here pretends otherwise. |
+| 3 | **Release at 45.5%.** | Midpoint of that untested interval — the centre of the region the cliff is known to be in, and the least committal point that still gives the hysteresis real width. Without a band the message flickers while fill sits at the threshold, which is the same failure `ObjectCaptureEngine.refreshFramingGuidance` already documents for its own advice. |
+| 4 | **The on-screen measure is the study's own function**, `FramingCalibrationProtocol.fillPercent`, called rather than reimplemented. | A threshold read off one measure and applied to a lookalike is not supported by the data. Pinned by `theOnScreenMeasureIsTheStudysOwnMeasure`. |
+| 5 | **Too far is not reported at all.** | The study found accuracy broadly stable across its three wider framings, so there is nothing to say. Advice that can be ignored without cost teaches the operator to ignore the line the rest of the time. |
+| 6 | **Nothing is gated.** | Unchanged from the previous rule and for the same reason: the band cannot be met for every object, so enforcing it produced an object that was masked, obviously ready, and refused, with an instruction the operator could not act on. |
+| 7 | **The recommendation is still phrased in centimetres** ("tap Measure at 40–50 cm") while the *warning* is phrased in fill. | The recommendation is a starting hint for an operator who has nothing on screen yet and no fill to compute; the warning is a judgement about an object that is on screen. `observedPreferredDistanceMetres` is retained for the first and takes no decision. |
+
+## What the fill is read from
+
+The object's own mask bounding box — the active object's while measuring, the crosshair candidate's
+before selection — never the crosshair, and never the surface beneath the object. That is the same
+quantity `FramingAccuracyReading.viewportBoundingBox` recorded, so the operator is scored on screen by
+what the study scored on paper.
+
+---
+
 # What is tested
 
 `BaldiPaperFidelityTests` pins the claims above that could otherwise drift:
@@ -835,3 +970,41 @@ box actually in progress after `advanceToNextBox`:
 | `testMeasurementProgressReachesTheSecondBoxAfterAdvancing` | per-object progress lands on the second box, not the first or nowhere |
 | `testRecordCurrentBoxReachesTheSecondBoxAfterAdvancing` | the final snapshot — objects, loaded IDs, packing mode, balance — lands on the second box |
 | `testAPhotoStoredForTheSecondBoxIsNamedForTheSecondBox` | a photo captured after advancing is filed under the box now in progress |
+
+`MaskDisplayTransformTests` pins Part 6:
+
+| Test | Protects |
+| --- | --- |
+| `testAMaskOnAStillObjectIsDrawnUntouched` | a still scene produces the identity, not drift |
+| `testSlidingTheObjectMovesThePictureAndNothingElse` | translation is recovered without inventing scale or angle |
+| `testBackingAwayHalvesTheMaskAboutTheObjectsOwnPoint` | scale is recovered from the reprojected gauge, and pivots on the object |
+| `testRollingThePhoneTurnsTheMaskWithTheObject` | the rotation term exists and has the sign SwiftUI draws — fails against the old model |
+| `testRollScaleAndSlideAreRecoveredTogether` | all four degrees of freedom are recovered simultaneously, not one at a time |
+| `testARotationIsTheSameAngleOnANonSquareScreen` | difference 6: the fit is done in an isotropic metric |
+| `testOutOfPlaneTiltLeavesAResidualLargeEnoughToEndAHold` | difference 3: the motion a similarity cannot draw is reported, not hidden |
+| `testLargeButSimilarMotionLeavesNoResidual` | the converse — a steady sweep does not cost a needless refresh |
+| `testOneBadReadingCannotDistortTheMaskWithoutLimit` | the scale clamp survives the change of model |
+| `testAGaugeTooSmallToCarryAnAngleIsRefused` | difference 5: a baseline too short to resolve an angle is refused, not fitted |
+| `testTheGaugeBaselineGrowsWithDistance` | difference 5: constant angular baseline, perpendicular legs |
+| `testRebasingMovesTheWholeGaugeRigidly` | difference 7: an anchor refinement is not read as rotation |
+
+`ObjectMaskPreviewHoldTests` pins what ends a hold:
+
+| Test | Protects |
+| --- | --- |
+| `testAPictureThatCanNoLongerBeDrawnFairlyIsReplaced` | the residual overrides the time budget |
+| `testAStillPhoneKeepsItsPictureForTheWholeBudget` | and does not fire on a phone that has not moved |
+| `testWithoutAResidualTheTimeBackstopStillEndsTheHold` | the backstop still applies when there is no gauge to measure with |
+| `testANonsenseResidualIsNotEvidenceTheDrawingIsFine` | a NaN residual reads as "unknown and unsafe", not "fine" |
+
+`MeasurementFramingRuleTests` pins Part 7:
+
+| Test | Protects |
+| --- | --- |
+| `theWarningStartsAtTheFirstTestedLevelShowingTheLoss` | difference 2: the threshold is a tested level, not a rounded guess |
+| `theWarningHasToBeClearedNotJustGrazed` | difference 3: the release band, and that clearing it re-arms the full threshold |
+| `beingTooFarAwayIsNeverReported` | difference 5: there is no far-side warning, in either hysteresis state |
+| `nothingIsSaidWithoutAMaskToMeasure` | no mask, no viewport or no reading says nothing rather than guessing |
+| `theOnScreenMeasureIsTheStudysOwnMeasure` | difference 4: the rule and the study score framing with one function |
+| `aLargeObjectIsWarnedAtADistanceTheOldRuleCalledSafe` | difference 1: the case the millimetre rule missed |
+| `aSmallObjectIsNotWarnedWhereTheOldRuleWouldHaveBeen` | difference 1: the case the millimetre rule warned about wrongly |

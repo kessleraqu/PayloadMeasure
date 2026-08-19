@@ -254,7 +254,8 @@ nonisolated enum BaldiReferenceModelBuilder {
                     origin: origin,
                     rotation: rotation,
                     size: size,
-                    mass: item.mass
+                    mass: item.mass,
+                    isOwnBox: item.isOwnBox
                 )
             )
         }

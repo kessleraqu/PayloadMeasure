@@ -32,6 +32,10 @@ nonisolated struct BaldiItem: Sendable, Identifiable {
     var name: String
     var size: SIMD3<Int>
     var mass: Double
+    /// The object itself, not a box chosen for it. Carried through to the placement only so the
+    /// loading guide knows not to draw an opening line nobody chose an orientation for; the solver
+    /// itself treats every item identically regardless of this flag.
+    var isOwnBox: Bool = false
 
     /// Every package counts the same, so the objective is simply how many get loaded.
     var profit: Double { 1 }
@@ -143,6 +147,10 @@ nonisolated struct BaldiPlacement: Sendable, Identifiable {
     var rotation: BaldiRotation
     var size: SIMD3<Int>
     var mass: Double
+    /// The object itself, not a box chosen for it — see `BaldiItem.isOwnBox`. The length/opening
+    /// convention `BaldiOpeningMarker` draws is a fact about the app's own box presets, and does not
+    /// hold for whatever the object already arrived packaged in.
+    var isOwnBox: Bool = false
 
     var extent: SIMD3<Double> { SIMD3(Double(size.x), Double(size.y), Double(size.z)) }
     var maximum: SIMD3<Double> { origin + extent }

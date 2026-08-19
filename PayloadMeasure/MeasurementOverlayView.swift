@@ -570,38 +570,11 @@ struct MesOverlayView: View {
             }
     }
 
-    /// Uses the fitted box centre once measuring has begun. Before selection, ARCameraView attaches
-    /// the median LiDAR distance sampled inside the live mask so differently sized objects are all
-    /// guided to the same physical range.
-    private var estimatedCameraToObjectCentreDistanceMetres: Double? {
-        if let activeID = captureEngine.activeObjectID {
-            if let captured = captureEngine.capturedObjectsByID[activeID],
-               let distance = sessionManager.cameraDistanceMetres(to: captured.center) {
-                return distance
-            }
-            if let marker = captureEngine.objectMaskMarkers.first(where: { $0.id == activeID }) {
-                return Double(marker.cameraDistance)
-            }
-            if let layer = captureEngine.objectMaskPreview?.layers.first(where: {
-                $0.trackedObjectID == activeID
-            }), let distance = layer.referenceCameraDistance {
-                return Double(distance)
-            }
-        }
 
-        return liveMeasurementCandidateLayer?.referenceCameraDistance.map(Double.init)
-    }
-
-    private var measurementDistanceGuidance: MeasurementFramingRule.Guidance {
-        MeasurementFramingRule.guidance(
-            distanceMetres: estimatedCameraToObjectCentreDistanceMetres
-        )
-    }
-
-    /// Anything masked can be measured. Distance is advice, not a gate: the 40–50 cm band is where the
-    /// framing study found the best accuracy, and it is said plainly on screen — but an object whose mask
-    /// is on screen can be measured from wherever the operator is standing. Enforcing the band meant a
-    /// small object, which has to be closer before there is anything to work with, could be masked and
+    /// Anything masked can be measured. Framing is advice, not a gate: an object filling more of the
+    /// screen than the study found accurate gets told so — see `MeasurementFramingRule` — but an object
+    /// whose mask is on screen can be measured from wherever the operator is standing. Enforcing it meant
+    /// a small object, which has to be closer before there is anything to work with, could be masked and
     /// still refuse to be measured, which is not a rule the operator can do anything about.
     private var automaticMeasurementCandidate: AutomaticMeasurementCandidate? {
         guard isAutomaticCaptureSupported,
@@ -655,21 +628,17 @@ struct MesOverlayView: View {
         return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
     }
 
-    /// The recommended distance, as a sentence to add to whatever the banner is already saying. Nil when
-    /// the phone is in the band, or when there is no depth reading to talk about.
+    /// A sentence to add to whatever the banner is already saying, when the object fills more of the
+    /// screen than the framing study found accurate. Nil otherwise.
+    ///
+    /// Only ever about being *too close*. The study found accuracy broadly stable across its three
+    /// wider framings, so there is nothing to say to an operator standing further back, and saying it
+    /// anyway was advice they could ignore without cost — which teaches them to ignore the line the
+    /// rest of the time too. Nothing here gates anything: the measurement carries on either way.
     private var distanceAdvice: String? {
-        guard let distance = estimatedCameraToObjectCentreDistanceMetres else { return nil }
-        let centimetres = Int((distance * 100).rounded())
-        switch measurementDistanceGuidance {
-        case .moveFarther:
-            return MeasurementFramingRule.isBelowAccuracyThreshold(distanceMetres: distance)
-                ? "You are at \(centimetres) cm. Readings are least accurate this close — 40–50 cm is best."
-                : "You are at \(centimetres) cm. 40–50 cm is best."
-        case .moveCloser:
-            return "You are at \(centimetres) cm. 40–50 cm is best."
-        case .ready, .unavailable:
-            return nil
-        }
+        captureEngine.isFramedTooClose
+            ? "Back off a little — you are nearer than the recommended range."
+            : nil
     }
 
     private var measurementInstructionTitle: String {
@@ -1270,36 +1239,45 @@ struct MesOverlayView: View {
 
     /// How to place this mask picture on the camera image in this frame.
     ///
-    /// World tracking first, always: the mask's own point in the room, reprojected by ARKit, with the
-    /// apparent size following the change in how far away it is. Vision's object tracker is the fallback
-    /// and contributes position only. It has a minimum target size in frame, and a small object at the
-    /// 40–50 cm the accuracy rule asks for is under it — so its box stops following and decays, which is
-    /// what made the mask lag on small objects and pulse between two sizes when its size was believed.
+    /// World tracking first, always: three of the object's own points in the room, reprojected by ARKit,
+    /// and the best similarity — rotation, isotropic scale, translation — fitted to where they were when
+    /// the picture was taken and where they are now. See `MaskDisplayTransform` for why three points and
+    /// why a similarity.
+    ///
+    /// Vision's object tracker is the fallback and contributes position only. It has a minimum target
+    /// size in frame, and a small object at the 40–50 cm the accuracy rule asks for is under it — so its
+    /// box stops following and decays, which is what made the mask lag on small objects and pulse
+    /// between two sizes when its size was believed. Its box is axis-aligned besides, so there is no
+    /// angle in it to take.
     private func maskTransform(
         for layer: ObjectMaskPreviewLayer,
         marker: ObjectMaskMarker?,
-        currentBoundingBox: CGRect?
+        currentBoundingBox: CGRect?,
+        viewportSize: CGSize
     ) -> MaskDisplayTransform? {
-        let world: ObjectMaskWorldTracking? = layer.trackedObjectID == nil
-            ? captureEngine.liveMaskTracking
-            : marker.map {
-                ObjectMaskWorldTracking(
-                    normalizedViewportPoint: $0.normalizedViewportPoint,
-                    cameraDistance: $0.cameraDistance
-                )
-            }
-        if let transform = MaskDisplayTransform.following(
-            referencePoint: layer.referenceAnchorPoint,
-            referenceDistanceMetres: layer.referenceCameraDistance,
-            currentPoint: world?.normalizedViewportPoint,
-            currentDistanceMetres: world?.cameraDistance
-        ) {
+        if viewportSize.height > 0,
+           let transform = MaskDisplayTransform.following(
+               reference: layer.referenceGauge,
+               current: currentGauge(for: layer, marker: marker),
+               viewportAspect: viewportSize.width / viewportSize.height
+           ) {
             return transform
         }
         return MaskDisplayTransform.sliding(
             reference: layer.referenceViewportBoundingBox,
             current: currentBoundingBox
         )
+    }
+
+    /// Where this layer's gauge points are right now: the live mask's come from its own anchor, a locked
+    /// object's from its marker.
+    private func currentGauge(
+        for layer: ObjectMaskPreviewLayer,
+        marker: ObjectMaskMarker?
+    ) -> MaskGaugeFrame? {
+        layer.trackedObjectID == nil
+            ? captureEngine.liveMaskTracking?.gauge
+            : marker?.gauge
     }
 
     private func trackedObjectMaskPreview(
@@ -1313,7 +1291,8 @@ struct MesOverlayView: View {
             let tracked = maskTransform(
                 for: layer,
                 marker: marker,
-                currentBoundingBox: currentBoundingBox
+                currentBoundingBox: currentBoundingBox,
+                viewportSize: proxy.size
             )
             let xOffset = tracked?.translation.x.scaled(by: proxy.size.width)
                 ?? (currentPoint.x - referencePoint.x) * proxy.size.width
@@ -1325,11 +1304,16 @@ struct MesOverlayView: View {
                 Image(decorative: layer.image, scale: 1, orientation: .up)
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
+                    // Scale and rotation share an anchor, so they commute and the order they are written
+                    // in does not change the result. The offset has to come after both: it is the
+                    // translation left over once the picture has been turned and resized about that
+                    // anchor, and applying it first would move the pivot with it.
                     .scaleEffect(
                         x: tracked?.scale.width ?? 1,
                         y: tracked?.scale.height ?? 1,
                         anchor: anchor
                     )
+                    .rotationEffect(tracked?.rotation ?? .zero, anchor: anchor)
                     .offset(
                         x: xOffset,
                         y: yOffset
@@ -1968,9 +1952,12 @@ struct MesOverlayView: View {
         let canSelect = captureEngine.activeObjectID == nil
             && !captureEngine.isObjectSelectionPending
         let objectName = captureEngine.name(for: id) ?? "Unnamed object"
-        let doesNotFitAvailableBoxes = packingStore
-            .fittingBoxPresets(for: id, in: captureEngine)
-            .isEmpty
+        let isSkipped = packingStore.isSkipped(id, in: captureEngine)
+        let doesNotFitAvailableBoxes = !isSkipped
+            && packingStore.fittingBoxPresets(for: id, in: captureEngine).isEmpty
+        let rowSummary = isSkipped
+            ? "Skipped · left out of this payload"
+            : objectPreparationSummary(for: id)
 
         return HStack(spacing: 4) {
             Button {
@@ -1988,10 +1975,12 @@ struct MesOverlayView: View {
                             .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                             .truncationMode(.tail)
 
-                        Text(objectPreparationSummary(for: id))
+                        Text(rowSummary)
                             .font(.caption)
                             .foregroundStyle(
-                                doesNotFitAvailableBoxes ? Color.orange : Color.secondary
+                                isSkipped
+                                    ? Color.orange
+                                    : doesNotFitAvailableBoxes ? Color.orange : Color.secondary
                             )
                             .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
                     }
@@ -2011,14 +2000,32 @@ struct MesOverlayView: View {
             .buttonStyle(.plain)
             .disabled(!canSelect)
             .opacity(canSelect ? 1 : 0.55)
-            .accessibilityLabel(
-                "\(objectName), \(objectPreparationSummary(for: id))"
-            )
+            .accessibilityLabel("\(objectName), \(rowSummary)")
             .accessibilityValue(isFocused ? "Selected" : "Not selected")
             .accessibilityHint(
                 canSelect
                     ? "Selects this object for viewing or editing."
                     : "Wait for the active object to finish before selecting this one."
+            )
+
+            Button {
+                packingStore.setSkipped(!isSkipped, for: id, in: captureEngine)
+            } label: {
+                Image(systemName: isSkipped ? "arrow.uturn.backward" : "arrow.uturn.forward")
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isSkipped ? .orange : .primary)
+            .accessibilityLabel(
+                isSkipped
+                    ? "Put \(objectName) back in the payload"
+                    : "Skip \(objectName)"
+            )
+            .accessibilityHint(
+                isSkipped
+                    ? "Restores this object to the payload it was left out of."
+                    : "Leaves this object out of the payload, for one that does not fit any box."
             )
 
             Button {

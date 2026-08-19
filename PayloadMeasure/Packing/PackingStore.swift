@@ -258,7 +258,8 @@ final class PackingStore {
                 id: id,
                 name: name,
                 size: size,
-                mass: mass
+                mass: mass,
+                isOwnBox: isItsOwnBox(id, in: engine)
             )
         }
     }
@@ -414,6 +415,10 @@ final class PackingStore {
         return boxPresets.first(where: { $0.id == presetID })
     }
 
+    /// Every catalogue size that fits this object and is not already carrying a different one. A
+    /// preset stands for one physical box, not an unlimited supply of its size, so once it is assigned
+    /// it drops out of every other object's choices until it is freed again — by that object being
+    /// skipped, marked as its own box, given a forced size, or removed outright.
     func fittingBoxPresets(
         for objectID: UUID,
         in engine: ObjectCaptureEngine
@@ -421,10 +426,15 @@ final class PackingStore {
         guard let captured = engine.capturedObjectsByID[objectID] else {
             return []
         }
+        let usedByOtherObjects = Set(
+            selectedBoxPresetIDsByObjectID.compactMap { key, presetID in
+                key == objectID ? nil : presetID
+            }
+        )
         return PackingBoxCatalog.fittingPresets(
             for: measuredSizeMillimetres(captured),
             in: boxPresets
-        )
+        ).filter { !usedByOtherObjects.contains($0.id) }
     }
 
     func recommendedBoxPreset(

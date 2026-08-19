@@ -163,13 +163,26 @@ nonisolated enum ObjectMaskCandidatePolicy {
 /// on screen is already the right answer and is left alone — the display tracker keeps it aligned in
 /// the meantime. A hold is capped in time so a mask can never go stale.
 nonisolated enum ObjectMaskPreviewHold {
-    /// However steady the scene, the picture is refreshed at least this often.
+    /// However steady the scene, the picture is refreshed at least this often. This is a backstop and
+    /// not the working limit: `maximumDisplayResidual` is what normally ends a hold, because elapsed
+    /// time is a poor proxy for staleness. A phone resting on a table drifts by nothing in a second; a
+    /// phone rolled through 40° goes stale in a fifth of one, and only the residual can tell them apart.
     static let maximumHoldSeconds: TimeInterval = 1.2
     /// How far outside the mask on screen the new mask's centre may fall and still be the same object.
     static let sameObjectCentreSlack: CGFloat = 0.05
     /// A new mask bigger than this multiple of the one on screen is a better look at the object, and worth
     /// showing even mid-hold.
     static let materiallyLargerRatio: CGFloat = 1.15
+    /// How far the drawn transform may be from the true image motion before the held picture is replaced,
+    /// as the RMS reprojection residual of `MaskDisplayTransform.following` in units of viewport height.
+    ///
+    /// 0.006 is a little over half a percent of the screen's height — on a 2556-px display, about 15 px of
+    /// silhouette misplacement at the gauge points. That is around the width of the mask's own drawn edge,
+    /// so it is the point at which the error stops being a soft edge and starts being a visibly wrong
+    /// outline. Anything the similarity cannot represent — out-of-plane rotation, perspective — shows up
+    /// here and nowhere else, which is exactly the motion that used to leave a mask sitting at its old
+    /// angle over a turned object.
+    static let maximumDisplayResidual: CGFloat = 0.006
 
     /// Whether the mask on screen should stay, rather than be replaced by the one just segmented.
     ///
@@ -180,14 +193,18 @@ nonisolated enum ObjectMaskPreviewHold {
     /// that is smaller or the same is held; a mask that is materially bigger is taken, because more of the
     /// object has been found; a mask centred somewhere else is taken, because the aim has moved.
     ///
-    /// Nothing is lost by holding: position and size are followed through the world every frame, so a
-    /// silhouette up to `maximumHoldSeconds` old is still drawn in the right place at the right size. This
-    /// is deliberately close to what a *selected* object does — one tracked instance, held while the phone
-    /// moves — which is the case that is already rock steady on screen.
+    /// What holding costs is stated exactly rather than assumed away. The picture is placed by the best
+    /// similarity fitted to three of the object's points reprojected through the world, so a held
+    /// silhouette is drawn in the right place, at the right size *and* at the right angle for as long as
+    /// the motion since it was taken is a similarity. `displayResidual` is how far it is not, measured;
+    /// once it passes `maximumDisplayResidual` the picture is no longer a fair drawing of the object and
+    /// is replaced whatever else argues for keeping it. A nil residual means the caller had no gauge to
+    /// measure with, and only the time backstop applies.
     static func holdsExistingLayer(
         existing: CGRect?,
         incoming: CGRect?,
-        secondsHeld: TimeInterval
+        secondsHeld: TimeInterval,
+        displayResidual: CGFloat? = nil
     ) -> Bool {
         guard let existing,
               let incoming,
@@ -195,6 +212,12 @@ nonisolated enum ObjectMaskPreviewHold {
               secondsHeld >= 0,
               secondsHeld < maximumHoldSeconds else {
             return false
+        }
+        if let displayResidual {
+            guard displayResidual.isFinite,
+                  displayResidual <= maximumDisplayResidual else {
+                return false
+            }
         }
         let existingArea = existing.width * existing.height
         let incomingArea = incoming.width * incoming.height
@@ -216,19 +239,61 @@ nonisolated struct ObjectMaskPreviewLayer: @unchecked Sendable {
     let trackedObjectID: UUID?
     let referenceAnchorPoint: CGPoint?
     let referenceCameraDistance: Float?
+    /// Where the object's three gauge points were on screen when this picture was rendered. Paired with
+    /// the same three points reprojected into the current frame, they give the transform the picture is
+    /// drawn with — see `MaskDisplayTransform`.
+    let referenceGauge: MaskGaugeFrame?
     let referenceViewportBoundingBox: CGRect?
     let trackingBoundingBox: NormalizedRect?
     let trackingOrientation: CGImagePropertyOrientation
+
+    init(
+        id: UUID,
+        image: CGImage,
+        trackedObjectID: UUID?,
+        referenceAnchorPoint: CGPoint?,
+        referenceCameraDistance: Float?,
+        referenceGauge: MaskGaugeFrame? = nil,
+        referenceViewportBoundingBox: CGRect?,
+        trackingBoundingBox: NormalizedRect?,
+        trackingOrientation: CGImagePropertyOrientation
+    ) {
+        self.id = id
+        self.image = image
+        self.trackedObjectID = trackedObjectID
+        self.referenceAnchorPoint = referenceAnchorPoint
+        self.referenceCameraDistance = referenceCameraDistance
+        self.referenceGauge = referenceGauge
+        self.referenceViewportBoundingBox = referenceViewportBoundingBox
+        self.trackingBoundingBox = trackingBoundingBox
+        self.trackingOrientation = trackingOrientation
+    }
 }
 
-/// Where a mask's own point in the room is on screen right now, and how far away it is.
+/// Where a mask's own points in the room are on screen right now, and how far away it is.
 ///
-/// The pair is everything needed to keep a mask picture on its object between segmentations: the point
-/// gives the position, and the change in distance gives the apparent size. It comes from ARKit's world
-/// tracking, so it holds at any distance and at any apparent size — which is the whole reason it exists.
+/// This is everything needed to keep a mask picture on its object between segmentations. It comes from
+/// ARKit's world tracking, so it holds at any distance and at any apparent size — which is the whole
+/// reason it exists, Vision's object tracker having a minimum target size that a small object at
+/// measuring range is under.
+///
+/// `gauge` carries three of the object's points rather than one. One point can only say where the
+/// object went; three say how it turned and how much bigger it got as well, and leave a residual over
+/// to say how much of the motion is not being drawn at all.
 nonisolated struct ObjectMaskWorldTracking: Equatable, Sendable {
     let normalizedViewportPoint: CGPoint
     let cameraDistance: Float
+    let gauge: MaskGaugeFrame?
+
+    init(
+        normalizedViewportPoint: CGPoint,
+        cameraDistance: Float,
+        gauge: MaskGaugeFrame? = nil
+    ) {
+        self.normalizedViewportPoint = normalizedViewportPoint
+        self.cameraDistance = cameraDistance
+        self.gauge = gauge
+    }
 }
 
 nonisolated struct ObjectMaskPreview: @unchecked Sendable {
@@ -279,6 +344,25 @@ nonisolated struct ObjectMaskMarker: Identifiable, Equatable, @unchecked Sendabl
     let cameraDistance: Float
     let color: ObjectMaskDisplayColor
     let isMaskVisible: Bool
+    /// This object's three gauge points as they stand in the current frame, for the transform its mask
+    /// picture is drawn with. See `MaskDisplayTransform`.
+    let gauge: MaskGaugeFrame?
+
+    init(
+        id: UUID,
+        normalizedViewportPoint: CGPoint,
+        cameraDistance: Float,
+        color: ObjectMaskDisplayColor,
+        isMaskVisible: Bool,
+        gauge: MaskGaugeFrame? = nil
+    ) {
+        self.id = id
+        self.normalizedViewportPoint = normalizedViewportPoint
+        self.cameraDistance = cameraDistance
+        self.color = color
+        self.isMaskVisible = isMaskVisible
+        self.gauge = gauge
+    }
 }
 
 nonisolated enum ObjectMaskLockChangeKind: Sendable {
@@ -305,6 +389,14 @@ nonisolated struct ObjectMaskFrame: @unchecked Sendable {
     let trackingGeneration: Int
     let requiresDepthWarmup: Bool
     let depthSnapshot: ObjectMaskDepthSnapshot?
+    /// The silhouette the operator is actually looking at, in Vision's coordinates.
+    ///
+    /// Not the same thing as the last one this processor segmented. Whether a freshly segmented mask is
+    /// shown or held back is decided on the AR side (`ObjectMaskPreviewHold`), so the processor cannot
+    /// know from its own state what is on screen — and when it guessed, it guessed the fresh one, which
+    /// is exactly the mask the operator was *not* looking at. Supplied by the view for the one job that
+    /// needs it: deciding which instance a tap meant.
+    let displayedLiveMaskBoundingBox: NormalizedRect?
 }
 
 nonisolated struct ObjectMaskDepthSnapshot: @unchecked Sendable {
@@ -1518,7 +1610,7 @@ actor ObjectMaskProcessor {
                   // at either locks a different object or finds none and silently does nothing —
                   // pressing the button and having no measurement start. The preview is sticky and the
                   // selection was not, which is precisely how they came to disagree.
-                  continuing: livePreviewBoundingBox(at: frame.timestamp)
+                  continuing: livePreviewBoundingBox(for: frame)
               ) else {
             return .unchanged
         }
@@ -1570,17 +1662,40 @@ actor ObjectMaskProcessor {
         in observation: InstanceMaskObservation,
         continuing previous: CGRect?
     ) throws -> (instance: Int, geometry: MaskGeometry)? {
-        try aimedCandidate(
+        let candidateInstances = ObjectMaskCandidatePolicy.previewInstances(
+            nearby: preferredInstances,
+            withinAim: instances(inAimWindowAround: point, in: observation),
+            excluding: []
+        )
+        let continued = try aimedCandidate(
             at: point,
-            candidates: ObjectMaskCandidatePolicy.previewInstances(
-                nearby: preferredInstances,
-                withinAim: instances(inAimWindowAround: point, in: observation),
-                excluding: []
-            ),
+            candidates: candidateInstances,
             preferred: preferredInstances,
             in: observation,
             continuing: previous
         )
+        guard previous != nil, let continued else {
+            return continued
+        }
+        // A lock is a one-time, deliberate act, not a per-frame display refresh — it deserves the most
+        // complete view of the object available this instant, not whatever fragment happened to still be
+        // on screen just because the crosshair was technically inside it. `aimedCandidate`'s continuation
+        // bias exists to stop the *live preview* from flickering between near-identical candidates
+        // several times a second; that reasoning does not extend to deciding what gets measured. Where a
+        // materially larger, still-aimed-at instance exists this same frame, the tracker seeds from that
+        // one instead — the same "big enough to be a better look" bar the display already uses to accept
+        // an unheld mask.
+        guard let fresh = try aimedCandidate(
+            at: point,
+            candidates: candidateInstances,
+            preferred: preferredInstances,
+            in: observation
+        ), fresh.instance != continued.instance,
+        fresh.geometry.area >= continued.geometry.area * ObjectMaskPreviewHold.materiallyLargerRatio
+        else {
+            return continued
+        }
+        return fresh
     }
 
     /// The one instance the crosshair is on, or nothing. Distance from the aim to the mask's own
@@ -2091,7 +2206,7 @@ actor ObjectMaskProcessor {
                 candidates: candidateInstances,
                 preferred: nearbyInstances,
                 in: observation,
-                continuing: livePreviewBoundingBox(at: frame.timestamp)
+                continuing: livePreviewBoundingBox(for: frame)
             )
 
             if let bestPreview {
@@ -2114,11 +2229,26 @@ actor ObjectMaskProcessor {
         return selections
     }
 
-    /// The mask on screen, as long as it is recent enough to still be on screen. A stale one would pull
-    /// the preview back onto an object the phone is no longer pointed at.
-    private func livePreviewBoundingBox(at timestamp: TimeInterval) -> CGRect? {
+    /// The mask on screen, which is what the operator is choosing from.
+    ///
+    /// The view is asked first and believed, because only the view knows whether the last silhouette
+    /// this processor segmented was shown or held back. This function used to answer from
+    /// `lastLivePreview` alone — the most recent *segmentation* — and document it as "the mask on
+    /// screen"; under a hold those are different pictures, and the continuation hint then agreed with
+    /// the new segmentation trivially and with what the operator saw not at all. That is the safeguard
+    /// being a no-op in precisely the case it was written for: aim at an object, press Measure, and the
+    /// lock re-decides from a frame the operator never saw.
+    ///
+    /// `lastLivePreview` remains the fallback for the frames before the view has reported anything —
+    /// startup, and the first cycle after a reset — where a recent segmentation is the best available
+    /// account of what is up. Its age limit stays, because a stale one would pull the preview back onto
+    /// an object the phone is no longer pointed at.
+    private func livePreviewBoundingBox(for frame: ObjectMaskFrame) -> CGRect? {
+        if let displayed = frame.displayedLiveMaskBoundingBox {
+            return displayed.cgRect
+        }
         guard let lastLivePreview,
-              timestamp - lastLivePreview.timestamp
+              frame.timestamp - lastLivePreview.timestamp
                   <= ObjectMaskCandidatePolicy.continuationTimeout else {
             return nil
         }

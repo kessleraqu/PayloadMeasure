@@ -9,9 +9,10 @@ enum BaldiTestFixtures {
         id: UUID = UUID(),
         name: String = "Package",
         size: SIMD3<Int> = SIMD3(10, 10, 10),
-        mass: Double = 1
+        mass: Double = 1,
+        isOwnBox: Bool = false
     ) -> BaldiItem {
-        BaldiItem(id: id, name: name, size: size, mass: mass)
+        BaldiItem(id: id, name: name, size: size, mass: mass, isOwnBox: isOwnBox)
     }
 
     static func placement(
@@ -20,7 +21,8 @@ enum BaldiTestFixtures {
         origin: SIMD3<Double>,
         size: SIMD3<Int> = SIMD3(10, 10, 10),
         mass: Double = 1,
-        rotation: BaldiRotation = upright
+        rotation: BaldiRotation = upright,
+        isOwnBox: Bool = false
     ) -> BaldiPlacement {
         BaldiPlacement(
             id: id,
@@ -28,7 +30,8 @@ enum BaldiTestFixtures {
             origin: origin,
             rotation: rotation,
             size: size,
-            mass: mass
+            mass: mass,
+            isOwnBox: isOwnBox
         )
     }
 

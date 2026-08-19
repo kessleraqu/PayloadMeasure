@@ -156,4 +156,38 @@ final class StudySecondBoxRecordingTests: XCTestCase {
             "The second box's photo must actually be written to disk."
         )
     }
+
+    /// The mechanism behind the reported bug: `ContentView.startNextBox()` resets the capture engine —
+    /// collapsing its object list to empty — before deciding whether there even is a next box to advance
+    /// to. On the run's last box nothing afterwards moves `currentBoxIndex` or sets
+    /// `isAwaitingParticipantStart`, so `currentBox` keeps resolving to that box straight through the
+    /// reset. A stray SwiftUI `onChange` carrying that now-empty list, arriving after
+    /// `ArrangementView.recordCurrentBox` already saved the real objects, must not be able to erase them.
+    func testAnEmptyProgressSnapshotCannotErodeTheLastBoxAfterItIsRecorded() throws {
+        let store = try makeSmallBoxStore("second-box-race")
+        store.advanceToNextBox()
+        store.beginParticipantSession()
+        XCTAssertEqual(store.currentBox, .big, "Fixture check.")
+
+        let bigObject = object("Big-box item", size: [300, 200, 150])
+        store.recordCurrentBox(
+            objects: [bigObject],
+            loadedObjectIDs: [bigObject.id],
+            unloadedObjectNames: [],
+            packingMode: "paper",
+            centreOfMass: SIMD3(150, 100, 75),
+            unbalancingIndex: 4.5
+        )
+
+        // The stray call `captureEngine.reset()` would trigger: the capture engine's object list is
+        // empty again, but `currentBox` still validly points at the box just recorded.
+        store.recordMeasurementProgress(objects: [])
+
+        let run = try XCTUnwrap(store.activeRun)
+        let bigResult = try XCTUnwrap(run.result(for: .big))
+        XCTAssertEqual(
+            bigResult.objects.map(\.name), ["Big-box item"],
+            "A stray empty progress snapshot must never erase what recordCurrentBox already saved."
+        )
+    }
 }

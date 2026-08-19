@@ -1,51 +1,74 @@
+import CoreGraphics
 import Foundation
 
-/// Where measurements are most accurate, reported to the operator and enforced nowhere.
+/// Whether the operator is too close for an accurate reading, reported and enforced nowhere.
 ///
-/// The framing study found a clear loss of accuracy below 350 mm, while readings above that point
-/// remained broadly stable, and 400–500 mm is the band the study recommends. That is now advice on the
-/// screen and nothing more: measuring starts whenever an object is masked, and finishes wherever the
-/// operator happens to be standing.
+/// THE RULE, exactly. The framing study measured each object once at five *screen fill* levels —
+/// 25, 30, 38, 53 and 65% of the shorter viewport dimension — and found accuracy broadly stable across
+/// the first three and clearly worse at the last two. Fill is the independent variable the protocol
+/// controlled (`FramingCalibrationProtocol.targetFillPercentages`); the distances usually quoted
+/// alongside it — about 650, 550, 450, 350 and 300 mm — are an *observed result* of following those
+/// five guides, and hold only for the objects that were tested.
 ///
-/// It used to gate both. The band cannot be met for every object — a small object has to be held closer
-/// before there is enough of it on screen to work with at all — so the gate produced an object that was
-/// masked, obviously ready, and refused, with an instruction the operator could not act on. A reading
-/// taken slightly too close is worth more than a reading that was never allowed to happen, and the
-/// distance every measurement was taken at is in the study data either way.
+/// So the criterion is stated in fill, not in millimetres:
+///
+///     too close  ⇔  fill ≥ 53%,  releasing below 45.5%
+///
+/// Why this is not the same rule as "closer than 350 mm", which is what this file used to say. That
+/// number is 53% fill *for a study object*. Applied to a different object it silently rescales: a
+/// 400 mm crate overflows the frame at 600 mm and would have been told it was fine, while a 40 mm part
+/// held at 300 mm to get any pixels on it at all would have been told it was too close when it occupies
+/// a fifth of the screen. Reading the study in the variable it controlled removes that dependence — the
+/// same rule now applies to any object, because the object's own image is what it is measured against.
+///
+/// **The threshold and the release are both from the study's levels, and neither is rounder than the
+/// data.** 53% is the first tested level at which the loss appears, so it is the first level that can
+/// honestly be called too close. The cliff itself is somewhere in the untested interval between 38% and
+/// 53%; the study does not resolve where. The release is the midpoint of that interval, which is the
+/// centre of the region the cliff is known to lie in and the least committal point that still gives the
+/// hysteresis a real width. Without a band the message flickers on and off while fill hovers at the
+/// threshold, which is the same lesson `ObjectCaptureEngine.refreshFramingGuidance` already records.
+///
+/// **Nothing is gated.** Measuring starts whenever an object is masked and finishes wherever the
+/// operator is standing. A gate used to exist and was removed: the band cannot be met for every object,
+/// so it produced an object that was masked, obviously ready, and refused, with an instruction the
+/// operator could not act on. A reading taken slightly too close is worth more than a reading that was
+/// never allowed to happen, and the framing every measurement was taken at is in the study data either
+/// way. Being too far is not reported at all — the study found no loss there.
 nonisolated enum MeasurementFramingRule {
-    enum Guidance: Equatable, Sendable {
-        case unavailable
-        case moveFarther
-        case ready
-        case moveCloser
+    /// The first tested fill level showing the accuracy loss.
+    static let tooCloseFillPercent: Double = 53
+    /// Midpoint of the untested interval the cliff lies in, 38–53%.
+    static let releaseFillPercent: Double = 45.5
+
+    /// Distances the study's fill levels were observed at, for the objects it used. Retained because the
+    /// reports quote them and the operator-facing recommendation is still phrased in centimetres — but
+    /// they describe those objects, and no decision is taken on them.
+    static let observedPreferredDistanceMetres = 0.40 ... 0.50
+
+    /// How much of the frame this object occupies, by the study's own definition — its longest projected
+    /// side over the shorter viewport dimension. Deliberately the *same function* the protocol scored its
+    /// readings with, not a reimplementation of it: a threshold read off one measure and applied to
+    /// another is not supported by the data, however close the two look.
+    static func fillPercent(
+        objectBoundingBox: CGRect?,
+        viewportSize: CGSize
+    ) -> Double? {
+        guard let objectBoundingBox else { return nil }
+        return FramingCalibrationProtocol.fillPercent(
+            boundingBox: objectBoundingBox,
+            viewportSize: viewportSize
+        )
     }
 
-    static let minimumDistanceMetres = 0.35
-    static let preferredDistanceMetres = 0.40 ... 0.50
-
-    static func guidance(distanceMetres: Double?) -> Guidance {
-        guard let distanceMetres,
-              distanceMetres.isFinite,
-              distanceMetres > 0 else {
-            return .unavailable
-        }
-        if distanceMetres < preferredDistanceMetres.lowerBound {
-            return .moveFarther
-        }
-        if distanceMetres > preferredDistanceMetres.upperBound {
-            return .moveCloser
-        }
-        return .ready
-    }
-
-    /// Inside the range where the study measured accuracy falling off. Used to word the recommendation
-    /// more firmly; it stops nothing.
-    static func isBelowAccuracyThreshold(distanceMetres: Double?) -> Bool {
-        guard let distanceMetres,
-              distanceMetres.isFinite,
-              distanceMetres > 0 else {
+    /// Whether to warn, given what is being shown now. `wasTooClose` carries the hysteresis: the answer
+    /// depends on whether the warning is already up, which is what stops it flickering at the boundary.
+    static func isTooClose(fillPercent: Double?, wasTooClose: Bool) -> Bool {
+        guard let fillPercent, fillPercent.isFinite, fillPercent > 0 else {
             return false
         }
-        return distanceMetres < minimumDistanceMetres
+        return wasTooClose
+            ? fillPercent > releaseFillPercent
+            : fillPercent >= tooCloseFillPercent
     }
 }
