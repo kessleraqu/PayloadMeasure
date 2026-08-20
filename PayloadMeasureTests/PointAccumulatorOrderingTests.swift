@@ -100,3 +100,144 @@ final class PointAccumulatorOrderingTests: XCTestCase {
         )
     }
 }
+
+// Carrying the evidence into a corrected world frame.
+//
+// ARKit refines an anchor for as long as it exists, and Apple's note on `ARAnchor` is that it "might
+// move that anchor when it optimizes its internal map". That correction says the estimate of the room
+// moved, not the object — so the accumulated points are still evidence, expressed in a frame that has
+// just been superseded. `transformed(by:)` expresses them in the current one. The alternative, which is
+// what the app used to do, is to delete them; a brand-new anchor is corrected most in its first seconds,
+// which is exactly the window in which deleting everything means no box is ever fitted and
+// `MeasurementStartRule` abandons the measurement for never having started.
+final class PointAccumulatorRebasingTests: XCTestCase {
+    private func point(_ index: Int) -> SIMD3<Float> {
+        SIMD3<Float>(Float(index) * 0.05, 0, 0)
+    }
+
+    private func makeAccumulator(
+        count: Int,
+        observations: Int = 1
+    ) -> PointAccumulator {
+        var accumulator = PointAccumulator(voxelSize: 0.005, maxVoxels: 10_000)
+        for _ in 0 ..< max(observations, 1) {
+            for index in 0 ..< count {
+                accumulator.add([point(index)], stabilizationObservations: 1)
+            }
+        }
+        return accumulator
+    }
+
+    private func translation(_ offset: SIMD3<Float>) -> simd_float4x4 {
+        var matrix = matrix_identity_float4x4
+        matrix.columns.3 = SIMD4<Float>(offset, 1)
+        return matrix
+    }
+
+    func testEveryPointMovesByTheCorrectionAndNoneIsLost() {
+        let accumulator = makeAccumulator(count: 40)
+        let offset = SIMD3<Float>(0.013, -0.004, 0.007)
+        let rebased = accumulator.transformed(by: translation(offset))
+
+        let before = accumulator.stablePointsSnapshot()
+        let after = rebased.stablePointsSnapshot()
+        XCTAssertEqual(after.count, before.count, "A rebase is not a filter.")
+        for (original, moved) in zip(before, after) {
+            XCTAssertEqual(
+                simd_distance(moved.position, original.position + offset),
+                0,
+                accuracy: 1e-5
+            )
+        }
+    }
+
+    /// The property `PointAccumulatorOrderingTests` protects, across a rebase: the orientation search
+    /// reservoir-samples this array with a fixed seed, so its order is part of the fit's reproducibility.
+    func testRebasingPreservesTheOrderOfTheStablePoints() {
+        let accumulator = makeAccumulator(count: 60)
+        let rebased = accumulator.transformed(
+            by: translation(SIMD3<Float>(0.02, 0.01, -0.01))
+        )
+        let before = accumulator.stablePointsSnapshot().map(\.position.x)
+        let after = rebased.stablePointsSnapshot().map(\.position.x)
+        XCTAssertEqual(
+            after.map { ($0 - 0.02).rounded(toPlaces: 4) },
+            before.map { $0.rounded(toPlaces: 4) }
+        )
+    }
+
+    /// A rebase must not cost a point the trust it has already earned, or the next fit would wait for
+    /// `minObservations` all over again — which is the delay this whole change exists to avoid.
+    func testObservationCountsAndStableStatusSurvive() {
+        let accumulator = makeAccumulator(count: 20, observations: 4)
+        XCTAssertEqual(accumulator.stablePointCount, 20, "Fixture check.")
+        let rebased = accumulator.transformed(
+            by: translation(SIMD3<Float>(0.006, 0, 0))
+        )
+        XCTAssertEqual(rebased.stablePointCount, 20)
+        XCTAssertEqual(
+            rebased.points(minObservations: 4).count,
+            accumulator.points(minObservations: 4).count,
+            "Four observations before the correction are still four after it."
+        )
+    }
+
+    func testARotationCarriesThePointsRoundWithIt() {
+        var accumulator = PointAccumulator(voxelSize: 0.005, maxVoxels: 10_000)
+        accumulator.add([SIMD3<Float>(0.1, 0, 0)], stabilizationObservations: 1)
+        var rotation = matrix_identity_float4x4
+        // A quarter turn about +y takes +x to -z.
+        rotation.columns.0 = SIMD4<Float>(0, 0, -1, 0)
+        rotation.columns.2 = SIMD4<Float>(1, 0, 0, 0)
+
+        let moved = accumulator.transformed(by: rotation).stablePointsSnapshot()
+        XCTAssertEqual(moved.count, 1)
+        XCTAssertEqual(
+            simd_distance(moved[0].position, SIMD3<Float>(0, 0, -0.1)),
+            0,
+            accuracy: 1e-5
+        )
+    }
+
+    /// Two source voxels can quantise into one after the transform. They must merge, not vanish: the
+    /// observations that earned them are the evidence the measurement is made of.
+    func testVoxelsThatCollideAfterTheCorrectionAreMergedNotDropped() {
+        var accumulator = PointAccumulator(voxelSize: 0.01, maxVoxels: 10_000)
+        // Two points in adjacent voxels, each seen twice.
+        for _ in 0 ..< 2 {
+            accumulator.add(
+                [SIMD3<Float>(0.001, 0, 0), SIMD3<Float>(0.011, 0, 0)],
+                stabilizationObservations: 1
+            )
+        }
+        XCTAssertEqual(accumulator.stablePointCount, 2, "Fixture check: two distinct voxels.")
+
+        // Squash the axis so both land in the same voxel.
+        var squash = matrix_identity_float4x4
+        squash.columns.0 = SIMD4<Float>(0.01, 0, 0, 0)
+        let rebased = accumulator.transformed(by: squash)
+
+        XCTAssertEqual(rebased.stablePointCount, 1, "They occupy one voxel now.")
+        XCTAssertEqual(
+            rebased.points(minObservations: 4).count,
+            1,
+            "Both voxels' observations are carried into the survivor, not discarded with it."
+        )
+    }
+
+    func testAnIdentityCorrectionChangesNothing() {
+        let accumulator = makeAccumulator(count: 25, observations: 3)
+        let rebased = accumulator.transformed(by: matrix_identity_float4x4)
+        XCTAssertEqual(
+            rebased.stablePointsSnapshot().map(\.position),
+            accumulator.stablePointsSnapshot().map(\.position)
+        )
+    }
+}
+
+private extension Float {
+    func rounded(toPlaces places: Int) -> Float {
+        let scale = powf(10, Float(places))
+        return (self * scale).rounded() / scale
+    }
+}

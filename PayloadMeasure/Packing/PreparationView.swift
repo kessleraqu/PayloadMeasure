@@ -131,27 +131,49 @@ private struct PackingPreparationView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Prepare packages")
             .navigationBarTitleDisplayMode(.inline)
+            // Both are in the navigation bar rather than at the foot of the screen, because the
+            // foot of the screen is where the keyboard is: with a weight being typed on every
+            // object, a bottom bar spends most of this screen either covered or squeezed against
+            // the keyboard's own row. Up here they are in the same place whatever the keyboard is
+            // doing, and neither can be reached by a stray thumb near the keys.
             .toolbar {
-                if focusedField != nil,
-                   let currentObjectID {
-                    ToolbarItemGroup(placement: .keyboard) {
-                        // The weight field is a decimal pad with no return key, so closing the
-                        // keyboard needs a button of its own rather than the bottom bar underneath.
-                        Button("Done") { focusedField = nil }
-                            .accessibilityHint("Closes the keyboard and brings back the back and next buttons.")
-                        Spacer()
+                if isReady, let currentObjectID {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(action: goBack) {
+                            Image(systemName: "chevron.left")
+                        }
+                        .accessibilityLabel(currentIndex == 0 ? "Back" : "Previous object")
+                        .accessibilityHint(
+                            currentIndex == 0
+                                ? "Leaves the packing screen."
+                                : "Goes back to the previous object."
+                        )
+                    }
+
+                    ToolbarItem(placement: .topBarTrailing) {
                         Button {
                             saveAndAdvance(objectID: currentObjectID)
                         } label: {
                             Label(
-                                nextActionTitle(for: currentObjectID),
+                                compactNextActionTitle(for: currentObjectID),
                                 systemImage: currentIndex == objectIDs.count - 1
                                     ? "square.grid.3x3.square"
                                     : "arrow.right"
                             )
                         }
                         .buttonStyle(.borderedProminent)
-                        .accessibilityHint("Saves the weight and continues without first closing the keyboard.")
+                        .accessibilityLabel(nextActionTitle(for: currentObjectID))
+                        .accessibilityHint(nextActionHint(for: currentObjectID))
+                    }
+                }
+
+                if focusedField != nil {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        // The weight field is a decimal pad with no return key, so closing the
+                        // keyboard needs a button of its own.
+                        Spacer()
+                        Button("Done") { focusedField = nil }
+                            .accessibilityHint("Closes the keyboard.")
                     }
                 }
             }
@@ -195,14 +217,6 @@ private struct PackingPreparationView: View {
         }
         .scrollDismissesKeyboard(.interactively)
         .id(objectID)
-        // The bottom bar steps aside while the keyboard is up: it used to be pushed up against the
-        // keyboard's own button, putting "Back" and the next action a few points apart from it.
-        // Everything the bar offers while typing is on the keyboard bar instead.
-        .safeAreaInset(edge: .bottom) {
-            if focusedField == nil {
-                bottomBar(for: objectID)
-            }
-        }
     }
 
     private var progressHeader: some View {
@@ -516,24 +530,29 @@ private struct PackingPreparationView: View {
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // The skip is spelled out and given its own button rather than left to a "Continue" that
-            // says nothing about what it does. Skipping is the honest outcome for an over-measured
-            // object: it is not boxed, and it is not loaded.
-            Button {
-                skip(objectID: objectID)
-            } label: {
-                Label("Skip this object", systemImage: "arrow.uturn.forward")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 48)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .accessibilityHint("Leaves this object out: no box, no weight, and no place in the loading plan.")
-
             Text("Skipped objects are recorded as not boxable and are left out of the loading plan. No name or packed weight is needed.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            // The skip is spelled out and given its own button rather than left to a "Continue" that
+            // says nothing about what it does. Skipping is the honest outcome for an over-measured
+            // object: it is not boxed, and it is not loaded — which is exactly why this button is
+            // small, quiet and last. It used to be the big orange one at the top of the card, and a
+            // card about a problem with a prominent button on it reads as "press this to fix it".
+            // The one thing it must not become is an easy accident.
+            Button {
+                skip(objectID: objectID)
+            } label: {
+                Label("Skip this object", systemImage: "arrow.uturn.forward")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 4)
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .controlSize(.small)
+            .tint(.secondary)
+            .accessibilityHint("Leaves this object out: no box, no weight, and no place in the loading plan.")
 
             Divider()
 
@@ -564,60 +583,29 @@ private struct PackingPreparationView: View {
         )
     }
 
-    /// Previous and Next together at the bottom. Previous used to be the navigation bar's leading item,
-    /// where the study timers were laid over it.
-    private func bottomBar(for objectID: UUID) -> some View {
-        let hasNoFittingBox = store.fittingBoxPresets(
-            for: objectID,
-            in: captureEngine
-        ).isEmpty
+    /// What the navigation bar's button can fit next to a title. The spelled-out version is still
+    /// what VoiceOver reads.
+    private func compactNextActionTitle(for objectID: UUID) -> String {
         let isLastObject = currentIndex == objectIDs.count - 1
-
-        return HStack(spacing: 10) {
-            Button {
-                goBack()
-            } label: {
-                Label(
-                    currentIndex == 0 ? "Back" : "Previous",
-                    systemImage: "chevron.left"
-                )
-                .font(.headline)
-                .padding(.horizontal, 14)
-                .frame(minHeight: 52)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityHint(
-                currentIndex == 0
-                    ? "Leaves the packing screen."
-                    : "Goes back to the previous object."
-            )
-
-            Button {
-                saveAndAdvance(objectID: objectID)
-            } label: {
-                HStack {
-                    Text(nextActionTitle(for: objectID))
-                    Spacer(minLength: 6)
-                    Image(systemName: isLastObject ? "square.grid.3x3.square" : "arrow.right")
-                }
-                .font(.headline)
-                .padding(.horizontal, 18)
-                .frame(maxWidth: .infinity, minHeight: 52)
-            }
-            .buttonStyle(.borderedProminent)
-            .accessibilityHint(
-                hasNoFittingBox
-                    ? isLastObject
-                        ? "Skips this object and creates a loading plan from the objects that fit available boxes."
-                        : "Skips this object and shows the next one."
-                    : isLastObject
-                        ? "Checks every prepared package, then opens the loading plan."
-                        : "Saves this box and packed weight, then shows the next object."
-            )
+        if !store.isSkipped(objectID, in: captureEngine),
+           store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty,
+           !store.isItsOwnBox(objectID, in: captureEngine) {
+            return isLastObject ? "Skip & plan" : "Skip"
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .background(.bar)
+        return isLastObject ? "Loading plan" : "Next"
+    }
+
+    private func nextActionHint(for objectID: UUID) -> String {
+        let isLastObject = currentIndex == objectIDs.count - 1
+        let hasNoFittingBox = store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
+        if hasNoFittingBox {
+            return isLastObject
+                ? "Skips this object and creates a loading plan from the objects that fit available boxes."
+                : "Skips this object and shows the next one."
+        }
+        return isLastObject
+            ? "Checks every prepared package, then opens the loading plan."
+            : "Saves this box and packed weight, then shows the next object."
     }
 
     private func nextActionTitle(for objectID: UUID) -> String {

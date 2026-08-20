@@ -5,13 +5,6 @@ import simd
 // shared capture engine, then hands the same engine to package preparation and both optimizers.
 
 struct ManualMeasurementView: View {
-    private enum FocusedField: Hashable {
-        case name
-        case length
-        case width
-        case height
-    }
-
     let captureEngine: ObjectCaptureEngine
     let study: StudyStore
     let onFullReset: () -> Void
@@ -30,7 +23,7 @@ struct ManualMeasurementView: View {
     @State private var showsPackingConfirmation = false
     @State private var showsCancelPassword = false
     @State private var showsResetConfirmation = false
-    @FocusState private var focusedField: FocusedField?
+    @State private var showsObjectEntry = false
 
     private var objectIDs: [UUID] { captureEngine.measuredObjectIDs }
 
@@ -39,24 +32,39 @@ struct ManualMeasurementView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     conditionHeader
-                    measurementEntryCard
+                    addObjectButton
                     savedObjectsSection
                 }
                 .padding(16)
             }
-            .scrollDismissesKeyboard(.interactively)
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Enter measurements")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
-            // "Start packing" is hidden while the keyboard is up. It used to sit directly on top of
-            // the keyboard's "Add object" button — two prominent buttons a few points apart — so a
-            // slightly low tap left the measuring screen in the middle of entering an object.
-            .safeAreaInset(edge: .bottom) {
-                if focusedField == nil { preparationButton }
-            }
+            .safeAreaInset(edge: .bottom) { preparationButton }
         }
         .onAppear(perform: configurePackingStore)
+        // The form is a sheet rather than a card on the page. As a card it sat between the header
+        // and the list looking like part of the page, and operators asked where they were supposed
+        // to put the object's details while looking straight at it. A "+" that opens a form on top
+        // of everything else cannot be mistaken for anything other than what it is.
+        .sheet(isPresented: $showsObjectEntry) {
+            ManualObjectEntrySheet(
+                nameText: $nameText,
+                lengthText: $lengthText,
+                widthText: $widthText,
+                heightText: $heightText,
+                isEditing: editingObjectID != nil,
+                validationMessage: validationMessage,
+                onSave: {
+                    if saveDraft() { showsObjectEntry = false }
+                },
+                onCancel: {
+                    clearDraft()
+                    showsObjectEntry = false
+                }
+            )
+        }
         .fullScreenCover(
             isPresented: $showsPackingWorkflow,
             onDismiss: { study.beginPhase(.measure) }
@@ -84,7 +92,6 @@ struct ManualMeasurementView: View {
             titleVisibility: .visible
         ) {
             Button("Continue to packing") {
-                focusedField = nil
                 clearDraft()
                 study.endCurrentPhase()
                 showsPackingWorkflow = true
@@ -143,19 +150,14 @@ struct ManualMeasurementView: View {
             .accessibilityLabel("Manual measurement options")
         }
 
-        if focusedField != nil {
-            ToolbarItemGroup(placement: .keyboard) {
-                // The dimension fields use a decimal pad, which has no return key: without this the
-                // only way to close the keyboard was the "Start packing" bar underneath it.
-                Button("Done") { focusedField = nil }
-                    .accessibilityHint("Closes the keyboard and brings back the start packing button.")
-                Spacer()
-                Button(editingObjectID == nil ? "Add object" : "Save changes") {
-                    saveDraft()
-                }
-                .buttonStyle(.borderedProminent)
-                .accessibilityHint("Saves this object and clears the fields for the next one.")
+        // The same action as the card below, kept where it is reachable once the list is long
+        // enough to have scrolled the card away.
+        ToolbarItem(placement: .topBarTrailing) {
+            Button(action: beginAddingObject) {
+                Image(systemName: "plus")
             }
+            .accessibilityLabel("Add object")
+            .accessibilityHint("Opens the form for a new object's name and size.")
         }
     }
 
@@ -179,90 +181,33 @@ struct ManualMeasurementView: View {
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 
-    private var measurementEntryCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(
-                editingObjectID == nil ? "Measure the next object" : "Edit this object",
-                systemImage: "ruler"
-            )
-            .font(.headline)
-
-            Text("Name it, then measure it with a ruler or calliper. All three dimensions are in millimetres.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Name")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                TextField("For example: red cable drum", text: $nameText)
-                    .textInputAutocapitalization(.words)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focusedField, equals: .name)
-                    .submitLabel(.next)
-                    .onSubmit { focusedField = .length }
-                    .accessibilityLabel("Object name")
-                    .accessibilityHint("This name appears in the loading plan.")
-            }
-
-            HStack(alignment: .bottom, spacing: 8) {
-                dimensionField("Length", text: $lengthText, field: .length)
-                Text("×")
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 8)
-                dimensionField("Width", text: $widthText, field: .width)
-                Text("×")
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 8)
-                dimensionField("Height", text: $heightText, field: .height)
-            }
-
-            if let validationMessage {
-                Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            HStack(spacing: 10) {
-                Button(action: saveDraft) {
-                    Label(
-                        editingObjectID == nil ? "Add object" : "Save changes",
-                        systemImage: editingObjectID == nil ? "plus" : "checkmark"
-                    )
-                    .frame(maxWidth: .infinity, minHeight: 44)
+    /// The one obvious thing to press. Deliberately large, deliberately alone, and deliberately not
+    /// styled like the "Start packing" bar at the foot of the screen.
+    private var addObjectButton: some View {
+        Button(action: beginAddingObject) {
+            HStack(spacing: 12) {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Add object")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text("Name it, then enter its length, width and height.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
                 }
-                .buttonStyle(.borderedProminent)
-
-                if editingObjectID != nil {
-                    Button("Cancel edit", action: clearDraft)
-                        .buttonStyle(.bordered)
-                        .frame(minHeight: 44)
-                }
+                Spacer(minLength: 0)
             }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
+            .contentShape(.rect(cornerRadius: 18))
         }
-        .padding(16)
-        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
-    }
-
-    private func dimensionField(
-        _ title: String,
-        text: Binding<String>,
-        field: FocusedField
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("\(title) (mm)")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            TextField("mm", text: text)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.center)
-                .textFieldStyle(.roundedBorder)
-                .focused($focusedField, equals: field)
-                .accessibilityLabel("\(title) in millimetres")
-        }
-        .frame(maxWidth: .infinity)
+        .buttonStyle(.plain)
+        .accessibilityLabel("Add object")
+        .accessibilityHint("Opens the form for a new object's name and size.")
     }
 
     @ViewBuilder
@@ -272,6 +217,9 @@ struct ManualMeasurementView: View {
                 Label("No objects entered", systemImage: "shippingbox")
             } description: {
                 Text("Enter every object before continuing to package weights.")
+            } actions: {
+                Button("Add the first object", action: beginAddingObject)
+                    .buttonStyle(.borderedProminent)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 24)
@@ -365,7 +313,6 @@ struct ManualMeasurementView: View {
     private var preparationButton: some View {
         VStack(spacing: 5) {
             Button {
-                focusedField = nil
                 showsPackingConfirmation = true
             } label: {
                 HStack {
@@ -407,24 +354,31 @@ struct ManualMeasurementView: View {
         study.beginPhase(.measure)
     }
 
-    private func saveDraft() {
-        focusedField = nil
+    /// Opens the entry form for a new object. Any half-typed draft from a cancelled edit is cleared
+    /// first, so the form is never opened showing someone else's object.
+    private func beginAddingObject() {
+        clearDraft()
+        showsObjectEntry = true
+    }
+
+    /// True when the object was saved and the form can close. False leaves the form up with
+    /// `validationMessage` explaining why — closing on a refusal would throw away what was typed.
+    @discardableResult
+    private func saveDraft() -> Bool {
         validationMessage = nil
         let name = nameText.trimmingCharacters(in: .whitespacesAndNewlines)
         let values = [lengthText, widthText, heightText].compactMap(PositiveDecimalText.parse)
         guard !name.isEmpty else {
             validationMessage = "Give this object a name. It is what the loading plan calls it."
-            focusedField = .name
-            return
+            return false
         }
         guard captureEngine.isNameAvailable(name, excluding: editingObjectID) else {
             validationMessage = "Another object is already called “\(name)”. Give this one a different name."
-            focusedField = .name
-            return
+            return false
         }
         guard values.count == 3 else {
             validationMessage = "Enter all three dimensions in millimetres, as numbers greater than zero."
-            return
+            return false
         }
         let size = SIMD3(values[0], values[1], values[2])
 
@@ -436,7 +390,7 @@ struct ManualMeasurementView: View {
                 sizeMillimetres: size
             ) else {
                 validationMessage = "These dimensions could not be saved."
-                return
+                return false
             }
         } else {
             guard captureEngine.addManualMeasurement(
@@ -444,10 +398,11 @@ struct ManualMeasurementView: View {
                 sizeMillimetres: size
             ) != nil else {
                 validationMessage = "These dimensions could not be added."
-                return
+                return false
             }
         }
         clearDraft()
+        return true
     }
 
     private func beginEditing(_ id: UUID) {
@@ -460,7 +415,7 @@ struct ManualMeasurementView: View {
         widthText = PositiveDecimalText.format(size.y, maximumFractionDigits: 2) ?? ""
         heightText = PositiveDecimalText.format(size.z, maximumFractionDigits: 2) ?? ""
         validationMessage = nil
-        focusedField = .name
+        showsObjectEntry = true
     }
 
     private func clearDraft() {
@@ -495,5 +450,117 @@ struct ManualMeasurementView: View {
             return "—"
         }
         return "\(PositiveDecimalText.format(size.x, maximumFractionDigits: 2) ?? "—") × \(PositiveDecimalText.format(size.y, maximumFractionDigits: 2) ?? "—") × \(PositiveDecimalText.format(size.z, maximumFractionDigits: 2) ?? "—") mm"
+    }
+}
+
+/// The name and size of one object, asked for on top of everything else.
+///
+/// It owns its own focus rather than borrowing the presenting screen's: focus does not reliably
+/// cross a sheet boundary, and a field that cannot be focused is a field that cannot be typed into.
+private struct ManualObjectEntrySheet: View {
+    private enum Field: Hashable {
+        case name
+        case length
+        case width
+        case height
+    }
+
+    @Binding var nameText: String
+    @Binding var lengthText: String
+    @Binding var widthText: String
+    @Binding var heightText: String
+    let isEditing: Bool
+    let validationMessage: String?
+    let onSave: () -> Void
+    let onCancel: () -> Void
+
+    @FocusState private var focusedField: Field?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("For example: red cable drum", text: $nameText)
+                        .textInputAutocapitalization(.words)
+                        .focused($focusedField, equals: .name)
+                        .submitLabel(.next)
+                        .onSubmit { focusedField = .length }
+                        .accessibilityLabel("Object name")
+                } header: {
+                    Text("Name")
+                } footer: {
+                    Text("This name appears in the loading plan.")
+                }
+
+                Section {
+                    HStack(alignment: .bottom, spacing: 8) {
+                        dimensionField("Length", text: $lengthText, field: .length)
+                        separator
+                        dimensionField("Width", text: $widthText, field: .width)
+                        separator
+                        dimensionField("Height", text: $heightText, field: .height)
+                    }
+                } header: {
+                    Text("Size in millimetres")
+                } footer: {
+                    Text("Measure the object itself with a ruler or calliper. The packed weight is asked for later, while packing.")
+                }
+
+                if let validationMessage {
+                    Section {
+                        Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .navigationTitle(isEditing ? "Edit object" : "New object")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(isEditing ? "Save" : "Add", action: onSave)
+                        .buttonStyle(.borderedProminent)
+                }
+                if focusedField != nil {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        // The dimensions use a decimal pad, which has no return key of its own.
+                        Spacer()
+                        Button("Done") { focusedField = nil }
+                    }
+                }
+            }
+            .onAppear { focusedField = .name }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var separator: some View {
+        Text("×")
+            .foregroundStyle(.secondary)
+            .padding(.bottom, 8)
+            .accessibilityHidden(true)
+    }
+
+    private func dimensionField(
+        _ title: String,
+        text: Binding<String>,
+        field: Field
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField("mm", text: text)
+                .keyboardType(.decimalPad)
+                .multilineTextAlignment(.center)
+                .textFieldStyle(.roundedBorder)
+                .focused($focusedField, equals: field)
+                .accessibilityLabel("\(title) in millimetres")
+        }
+        .frame(maxWidth: .infinity)
     }
 }

@@ -31,27 +31,34 @@ struct ArrangementView: View {
         store.packagesMissingPreparation(from: captureEngine)
     }
 
-    /// The only way out of a participant's payload, and the last thing on the screen: everything above
-    /// it is the plan being followed, and this ends it. Pressing it asks for confirmation first, so
-    /// neither a stray tap nor a participant can close a payload by accident. The box is recorded once
-    /// the confirmation is given — except in test mode, which records nothing.
+    /// The only way out of a participant's payload, in the navigation bar rather than at the end of
+    /// the plan: the plan is a scrolling list whose length depends on how many packages there are, so
+    /// at the foot of it this button was somewhere different on every payload — and behind a scroll
+    /// on the long ones. Pressing it asks for confirmation first, so neither a stray tap nor a
+    /// participant can close a payload by accident. The box is recorded once the confirmation is
+    /// given — except in test mode, which records nothing.
     @ViewBuilder
     private var nextBoxButton: some View {
         if store.baldiComparison != nil || store.result != nil {
             Button {
                 showsFinishedPackingConfirmation = true
             } label: {
-                Label(nextStepTitle, systemImage: nextStepIcon)
+                Label(compactNextStepTitle, systemImage: nextStepIcon)
                     .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 50)
             }
             .buttonStyle(.borderedProminent)
+            .accessibilityLabel(nextStepTitle)
             .accessibilityHint("Asks whether the payload is really loaded before moving on.")
         }
     }
 
     private var nextStepTitle: String {
         study.isTestMode ? "Finish the test" : "Finished packing"
+    }
+
+    /// What fits beside a title and the settings button. VoiceOver still reads the whole thing.
+    private var compactNextStepTitle: String {
+        study.isTestMode ? "Finish" : "Done packing"
     }
 
     private var nextStepIcon: String {
@@ -165,8 +172,6 @@ struct ArrangementView: View {
                             }
                         }
                     }
-
-                    nextBoxButton
                 }
                 .padding(20)
             }
@@ -181,13 +186,15 @@ struct ArrangementView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         showsSettings = true
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                     }
                     .accessibilityLabel("Arrangement settings")
+
+                    nextBoxButton
                 }
             }
             .sheet(isPresented: $showsSettings) {

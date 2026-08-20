@@ -953,6 +953,79 @@ nonisolated struct PointAccumulator: Sendable {
         stablePoints
     }
 
+    /// The same evidence, expressed in a corrected world frame.
+    ///
+    /// ARKit refines an anchor's pose for as long as it exists, and Apple's own note on `ARAnchor` is
+    /// that it "might move that anchor when it optimizes its internal map". What that correction says is
+    /// that the *estimate of the room* has changed, not that the object moved in it — so every point
+    /// recorded against the old estimate is still evidence, just expressed in the wrong frame. The
+    /// answer to a change of frame is to transform the data into the new one, which is what this does.
+    ///
+    /// It is exact for the rigid correction ARKit hands over: a rigid map is affine, so the mean of the
+    /// transformed observations is the transform of their mean, and the running means are carried across
+    /// without touching the observation counts that earned them.
+    ///
+    /// Two source voxels can quantise into one after the transform. They are merged rather than dropped —
+    /// sums and counts add, and the first of them to arrive keeps the stable identity — so no observation
+    /// is lost. `stableKeys` is walked in its existing order because `stablePoints` is reservoir-sampled
+    /// with a fixed seed, and that sample is a function of array order; see `remove(_:)`.
+    func transformed(by matrix: simd_float4x4) -> PointAccumulator {
+        var result = PointAccumulator(voxelSize: voxelSize, maxVoxels: maxVoxels)
+        result.generation = generation
+        result.lastAddedTimestamp = lastAddedTimestamp
+
+        func moved(_ point: SIMD3<Float>) -> SIMD3<Float> {
+            let value = matrix * SIMD4<Float>(point, 1)
+            return SIMD3<Float>(value.x, value.y, value.z)
+        }
+
+        func carry(_ key: Key, _ sample: Sample) {
+            let count = Float(max(sample.observationCount, 1))
+            let movedMean = moved(sample.sum / count)
+            let newKey = result.key(for: movedMean)
+            let movedObserved = moved(sample.observedPoint)
+            let movedStable = sample.stablePoint.map(moved)
+            let movedStableObserved = sample.stableObservedPoint.map(moved)
+
+            if var existing = result.samples[newKey] {
+                existing.sum += movedMean * count
+                existing.observationCount += sample.observationCount
+                existing.lastSeenGeneration = max(
+                    existing.lastSeenGeneration,
+                    sample.lastSeenGeneration
+                )
+                if existing.stablePoint == nil, let movedStable {
+                    existing.stablePoint = movedStable
+                    existing.stableObservedPoint = movedStableObserved ?? movedObserved
+                }
+                result.samples[newKey] = existing
+            } else {
+                result.samples[newKey] = Sample(
+                    sum: movedMean * count,
+                    observationCount: sample.observationCount,
+                    lastSeenGeneration: sample.lastSeenGeneration,
+                    stablePoint: movedStable,
+                    observedPoint: movedObserved,
+                    stableObservedPoint: movedStableObserved
+                )
+            }
+            if let sample = result.samples[newKey], sample.stablePoint != nil {
+                result.recordStablePointIfNeeded(for: newKey, sample: sample)
+            }
+        }
+
+        var carried = Set<Key>()
+        for key in stableKeys {
+            guard let sample = samples[key] else { continue }
+            carry(key, sample)
+            carried.insert(key)
+        }
+        for (key, sample) in samples where !carried.contains(key) {
+            carry(key, sample)
+        }
+        return result
+    }
+
     mutating func pruneTransient(below minCount: Int, olderThan minimumAge: Int = 0) {
         let oldestRecentGeneration = generation - Int32(max(minimumAge, 0))
         let stale: [Key] = samples.compactMap { entry in

@@ -41,12 +41,18 @@ struct BaldiResultView: View {
             if let solution = verifiedSolution,
                let verification = result.verification {
                 headline(solution)
-                // Above the drawing, because putting the plan on the real table is what the operator
-                // does next; the drawing is for checking it afterwards.
+                // Where the plan is put on the real table, that is the only place it is shown. The
+                // on-screen drawing was a second, smaller, hand-rotated copy of the thing already
+                // standing on the table at full size, and having both invites loading from the one
+                // that is easier to look at rather than the one that is where the boxes go.
+                //
+                // The no-AR condition has no table view, so there the drawing is all there is and it
+                // stays. That asymmetry is the condition being compared, not an oversight.
                 if allowsRoomScaleAR {
                     placeOnTableButton
+                } else {
+                    interactivePacking(solution)
                 }
-                interactivePacking(solution)
                 openingInstruction
                 loadingGuide(solution, verification: verification)
                 if !solution.unloaded.isEmpty {
@@ -378,7 +384,11 @@ struct BaldiResultView: View {
                         .buttonStyle(.plain)
                         .accessibilityLabel("Package \(numbering[placement.id] ?? 0), \(placement.name)")
                         .accessibilityValue(BaldiOpeningMarker.description(for: placement))
-                        .accessibilityHint("Reveals or hides this package name and highlights it in the 3D view.")
+                        .accessibilityHint(
+                            allowsRoomScaleAR
+                                ? "Reveals or hides this package name."
+                                : "Reveals or hides this package name and highlights it in the drawing."
+                        )
                     }
                 }
             }

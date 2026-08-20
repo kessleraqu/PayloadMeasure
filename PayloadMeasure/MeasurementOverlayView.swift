@@ -17,9 +17,11 @@ struct MesOverlayView: View {
         case edit(UUID)
     }
 
-    /// What the banner is telling the operator to do. There is deliberately no "move closer" or "move
-    /// farther" state: distance is a recommendation carried in the detail line, not an instruction that
-    /// has to be obeyed before anything can happen.
+    /// What the banner is telling the operator to do. There is deliberately no distance state at
+    /// all: framing is recorded with every measurement and reported by the study's own tools, and an
+    /// instruction to step back — which cannot be met for every object — is one more thing to read
+    /// while holding a phone over something. Nothing about distance is gated, so nothing about it is
+    /// said here.
     private enum MeasurementInstruction: Equatable {
         case preparing
         case findObject
@@ -628,36 +630,24 @@ struct MesOverlayView: View {
         return finalizedMeasuredObjectIDs.isEmpty ? .findObject : .findNextObject
     }
 
-    /// A sentence to add to whatever the banner is already saying, when the object fills more of the
-    /// screen than the framing study found accurate. Nil otherwise.
-    ///
-    /// Only ever about being *too close*. The study found accuracy broadly stable across its three
-    /// wider framings, so there is nothing to say to an operator standing further back, and saying it
-    /// anyway was advice they could ignore without cost — which teaches them to ignore the line the
-    /// rest of the time too. Nothing here gates anything: the measurement carries on either way.
-    private var distanceAdvice: String? {
-        captureEngine.isFramedTooClose
-            ? "Back off a little — you are nearer than the recommended range."
-            : nil
-    }
-
     private var measurementInstructionTitle: String {
         switch measurementInstruction {
         case .preparing: "Getting ready"
         case .findObject: "Look for an object"
         case .findNextObject: "Look for the next object"
         case .readyToMeasure: "Ready to measure"
-        case .holdStill: "DON’T MOVE"
+        case .holdStill: "Stay still and measure"
         case .pointDown: "Point straight down"
         case .useSideView: "Use a side view"
         case .findSurface: "Find the surface"
         }
     }
 
-    private var measurementInstructionDetail: String {
-        [instructionDetailText, distanceAdvice]
-            .compactMap { $0 }
-            .joined(separator: " ")
+    /// The line under the title, or nothing. The state that fills the banner with colour carries no
+    /// detail at all: it is read at a glance, from arm's length, while the phone is being held over
+    /// an object, and a paragraph underneath is what the instruction competes with.
+    private var measurementInstructionDetail: String? {
+        measurementInstruction == .holdStill ? nil : instructionDetailText
     }
 
     private var instructionDetailText: String {
@@ -690,7 +680,9 @@ struct MesOverlayView: View {
 
     private var measurementInstructionColor: Color {
         switch measurementInstruction {
-        case .holdStill: .red
+        // Holding still used to be red, which put the alarm colour on the state the operator reaches
+        // when everything is going right.
+        case .holdStill: .green
         case .pointDown, .useSideView, .findSurface: .yellow
         case .readyToMeasure: .green
         case .findObject, .findNextObject: .blue
@@ -710,35 +702,38 @@ struct MesOverlayView: View {
         }
     }
 
+    /// The one state that is the whole banner rather than a line in it.
+    private var isSolidInstructionBanner: Bool {
+        measurementInstruction == .holdStill
+    }
+
     private var measurementInstructionBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: measurementInstructionIcon)
-                .font(.headline.weight(.semibold))
+                .font(isSolidInstructionBanner ? .title3.weight(.bold) : .headline.weight(.semibold))
                 .foregroundStyle(
-                    measurementInstruction == .holdStill
+                    isSolidInstructionBanner
                         ? Color.white
                         : measurementInstructionColor
                 )
             VStack(alignment: .leading, spacing: 2) {
                 Text(measurementInstructionTitle)
-                    .font(.headline)
-                    .foregroundStyle(measurementInstruction == .holdStill ? .white : .primary)
-                Text(measurementInstructionDetail)
-                    .font(.caption)
-                    .foregroundStyle(
-                        measurementInstruction == .holdStill
-                            ? Color.white.opacity(0.9)
-                            : Color.secondary
-                    )
-                    .fixedSize(horizontal: false, vertical: true)
+                    .font(isSolidInstructionBanner ? .title3.weight(.bold) : .headline)
+                    .foregroundStyle(isSolidInstructionBanner ? .white : .primary)
+                if let measurementInstructionDetail {
+                    Text(measurementInstructionDetail)
+                        .font(.caption)
+                        .foregroundStyle(Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 13)
-        .padding(.vertical, 10)
+        .padding(.vertical, isSolidInstructionBanner ? 14 : 10)
         .background(
-            measurementInstruction == .holdStill
-                ? Color.red.opacity(0.92)
+            isSolidInstructionBanner
+                ? measurementInstructionColor.opacity(0.92)
                 : measurementInstructionColor.opacity(0.12),
             in: RoundedRectangle(cornerRadius: 16)
         )
@@ -993,10 +988,10 @@ struct MesOverlayView: View {
         }
     }
 
+    /// No distance sentence here any more: being too close is said once, by the red banner at the
+    /// top of the screen, rather than a second time in small type down here.
     private var measuringAdvice: String {
-        [measuringAdviceText, distanceAdvice]
-            .compactMap { $0 }
-            .joined(separator: " ")
+        measuringAdviceText
     }
 
     private var measuringAdviceText: String {

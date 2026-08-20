@@ -1366,10 +1366,14 @@ struct ARCameraView: UIViewRepresentable {
                 frame: frame,
                 fallback: objectMaskAnchors[id]
             )
-            if let object = captureEngine.capturedObjectsByID[id],
-               let currentAnchor {
-                let worldRebase: simd_float4x4
-                let usesCurrentPlanePresentation: Bool
+            // The correction, as a world transform, worked out whether or not a box has been fitted yet.
+            // It used to be computed only inside the `capturedObjectsByID` branch below, so during the
+            // first seconds of a measurement — before any box exists, and exactly when ARKit corrects a
+            // brand-new anchor most — there was nothing to rebase anything *with*, and the evidence was
+            // simply deleted instead. See `restartActiveMeasurementAfterAnchorCorrectionIfNeeded`.
+            var worldRebase: simd_float4x4?
+            var usesCurrentPlanePresentation = false
+            if let currentAnchor {
                 if let planeID = capturePresentationPlaneIDsByObject[id],
                    let currentPlane = frame?.anchors.first(where: {
                        $0.identifier == planeID
@@ -1383,8 +1387,11 @@ struct ARCameraView: UIViewRepresentable {
                         ?? objectMaskAnchors[id]?.transform
                         ?? currentAnchor.transform
                     worldRebase = currentAnchor.transform * publishedTransform.inverse
-                    usesCurrentPlanePresentation = false
                 }
+            }
+            if let object = captureEngine.capturedObjectsByID[id],
+               let currentAnchor,
+               let worldRebase {
                 let rebasedObject = transformedCapturedObject(
                     object,
                     by: worldRebase
@@ -1406,8 +1413,22 @@ struct ARCameraView: UIViewRepresentable {
                 evidenceAnchorTransformByObject[id] = currentAnchor.transform
             }
 
-            supportAccumulators.removeValue(forKey: id)
-            maskedAccumulators.removeValue(forKey: id)
+            // Carry the cloud into the corrected frame rather than throwing it away. An anchor
+            // correction says the estimate of the room moved, not the object, so every accumulated point
+            // is still evidence — it is simply expressed in the frame ARKit has just superseded, and a
+            // rigid transform puts it back in the current one exactly. Deleting it instead is what made
+            // a measurement restart from nothing several times in its first three seconds and then be
+            // abandoned by `MeasurementStartRule` for never having produced a box.
+            //
+            // Without a usable correction there is nothing to express the points *in*, and only then is
+            // starting again the honest answer.
+            if let worldRebase {
+                maskedAccumulators[id] = maskedAccumulators[id]?.transformed(by: worldRebase)
+                supportAccumulators[id] = supportAccumulators[id]?.transformed(by: worldRebase)
+            } else {
+                supportAccumulators.removeValue(forKey: id)
+                maskedAccumulators.removeValue(forKey: id)
+            }
             newestMaskedPointTimestamp.removeValue(forKey: id)
             fittedMaskedPointTimestamp.removeValue(forKey: id)
             liveResultsByObject.removeValue(forKey: id)
@@ -1418,7 +1439,29 @@ struct ARCameraView: UIViewRepresentable {
             selectionPointsByObject.removeValue(forKey: id)
             capturedFootprintByObject.removeValue(forKey: id)
             capturedHeightByObject.removeValue(forKey: id)
-            supportHeightStateByObject.removeValue(forKey: id)
+            // The support height moves with the correction like everything else. Clearing it instead
+            // costs `minimumSupportSamples` more ticks before a depth- or raycast-backed height can be
+            // returned at all, and no fit publishes without one — so on the path this function is on,
+            // clearing it delays the very box whose absence gets the measurement abandoned.
+            if let worldRebase,
+               let held = supportHeightStateByObject[id],
+               let height = held.value,
+               let reference = currentAnchor?.transform.translation {
+                let moved = worldRebase * SIMD4<Float>(
+                    reference.x,
+                    height,
+                    reference.z,
+                    1
+                )
+                let shift = moved.y.isFinite ? moved.y - height : 0
+                supportHeightStateByObject[id] = SupportHeightState(
+                    recentCandidates: held.recentCandidates.map { $0 + shift },
+                    value: height + shift,
+                    source: held.source
+                )
+            } else {
+                supportHeightStateByObject.removeValue(forKey: id)
+            }
             fittedSupportHeightByObject.removeValue(forKey: id)
             bootstrapSupportFootprintByObject.removeValue(forKey: id)
             supportRaycastMissTicks.removeValue(forKey: id)
@@ -1460,8 +1503,20 @@ struct ARCameraView: UIViewRepresentable {
                 1
             )
             let rotationShift = 2 * acos(quaternionDot)
-            guard horizontalTranslationShift > 0.008
-                    || verticalTranslationShift > 0.0015
+            // Below half a voxel, acting is provably pointless: no accumulated point can quantise into a
+            // different voxel than the one it is already in, so the evidence after a rebase is identical
+            // to the evidence before it. The vertical threshold used to be 1.5 mm, under that floor and
+            // under the depth sensor's own noise besides — it was not detecting a change of frame, it was
+            // detecting ARKit's ordinary jitter around a newly added anchor, and every sighting cost the
+            // in-flight segmentation and, until `rebaseAndRestartMeasurement` learned to carry the cloud
+            // across, the whole accumulation with it.
+            //
+            // Only the floor is raised. Every threshold here is at least as loose as it was, so this can
+            // only fire less often than before — which matters because firing still cancels the mask task
+            // in flight, and a rule that fired every tick would starve the segmentation it depends on.
+            let quantisationFloor = ObjectCapturePipeline.voxelSize / 2
+            guard horizontalTranslationShift > max(0.008, quantisationFloor)
+                    || verticalTranslationShift > quantisationFloor
                     || rotationShift > (Float.pi / 180) else {
                 return false
             }
@@ -1631,6 +1686,27 @@ struct ARCameraView: UIViewRepresentable {
                       let currentFrame = arView.session.currentFrame,
                       case .normal = currentFrame.camera.trackingState,
                       currentFrame.timestamp >= input.timestamp else {
+                    // A discarded pass can still have locked an object: `toggleLock` runs inside the
+                    // processor and has already appended its tracker by the time any of these
+                    // conditions is tested. Dropping the result silently left the selection pending
+                    // with nothing in flight to answer it — "Selecting object…" on screen, the Measure
+                    // button disabled, and no retry coming. Put the request back so the next pass can
+                    // act on it, and give up out loud rather than quietly once the attempts are spent.
+                    // The processor's own bookkeeping releases the orphaned tracker and its colour on
+                    // its next pass, since neither the active object nor the new request names it.
+                    if let submittedToggleRequest,
+                       self.captureEngine.isObjectSelectionPending,
+                       self.pendingObjectMaskToggleRequest == nil {
+                        self.objectMaskToggleAttemptsRemaining = max(
+                            self.objectMaskToggleAttemptsRemaining - 1,
+                            0
+                        )
+                        if self.objectMaskToggleAttemptsRemaining > 0 {
+                            self.pendingObjectMaskToggleRequest = submittedToggleRequest
+                        } else {
+                            self.captureEngine.cancelObjectSelection()
+                        }
+                    }
                     return
                 }
 
@@ -1670,6 +1746,19 @@ struct ARCameraView: UIViewRepresentable {
                     switch lockChange.kind {
                     case .added:
                         self.captureEngine.beginObjectMeasurement(id: lockChange.id)
+                        // `beginObjectMeasurement` has preconditions of its own, so asking is not the
+                        // same as it having happened. If it declined, the anchor and scene entity just
+                        // added belong to a measurement that does not exist: nothing will ever fit
+                        // against them, nothing will ever finish them, and the next lock would be the
+                        // second object anchored for the first one measured. Take them back out.
+                        if self.captureEngine.activeObjectID != lockChange.id {
+                            self.clearCaptureContent(for: lockChange.id)
+                            if let anchor = self.objectMaskAnchors
+                                .removeValue(forKey: lockChange.id) {
+                                arView.session.remove(anchor: anchor)
+                            }
+                            self.releaseMeasurementScratch(for: lockChange.id)
+                        }
                     case .focused:
                         self.captureEngine.focusFinalizedObject(id: lockChange.id)
                     }
