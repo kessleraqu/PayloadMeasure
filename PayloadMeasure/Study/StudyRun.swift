@@ -190,9 +190,6 @@ struct StudyRun: Codable, Identifiable, Sendable {
     /// New study runs complete both payload sizes. Nil preserves the one-payload interpretation of
     /// AR-only/no-AR-only files recorded by the immediately preceding app version.
     var includesBothPayloads: Bool? = nil
-    /// Whether the participant had a practice payload first. Optional so runs recorded before the
-    /// practice run existed still decode; those read as unknown rather than as "no".
-    var includedPracticeRun: Bool?
     /// The run's own folder under StudyRuns, named after the run and made unique when the name is
     /// already taken on disk. Nil for runs written before this existed: those still live in a folder
     /// named after their id, and are still read from it.
@@ -274,15 +271,6 @@ extension StudyRun {
         return formatter
     }()
 
-    /// Nothing from the practice payload is recorded, so this line is the only trace of it.
-    var practiceText: String {
-        switch includedPracticeRun {
-        case true: "yes, on a \(StudyBox.small.title.replacingOccurrences(of: "Small — ", with: "")) payload (not recorded)"
-        case false: "no"
-        case nil: "not recorded for this run"
-        }
-    }
-
     /// The run's name, as a name a file system will accept. Everything a path cannot carry becomes a
     /// hyphen; brackets go too, because brackets are what makes a duplicate name unique.
     static func safeName(_ name: String) -> String {
@@ -348,7 +336,6 @@ extension StudyRun {
         lines.append("Method      : \(flow)")
         lines.append("Input tools : \(inputModeOrder.map(\.title).joined(separator: " then "))")
         lines.append("Box order   : \(boxOrder.map(\.shortTitle).joined(separator: " then "))")
-        lines.append("Practice    : \(practiceText)")
         lines.append("Run id      : \(id.uuidString)")
         lines.append("")
 

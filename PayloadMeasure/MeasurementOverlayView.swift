@@ -158,7 +158,7 @@ struct MesOverlayView: View {
     /// payload is closed; this is so that a crash in the middle of a payload costs the object being
     /// measured at the time rather than all of them.
     private func recordMeasurementProgress() {
-        guard !study.isPractice, study.currentBox != nil else { return }
+        guard !study.isTestMode, study.currentBox != nil else { return }
         let records = captureEngine.measuredObjectIDs.map { id in
             StudyObjectRecord(
                 id: id,
@@ -484,10 +484,10 @@ struct MesOverlayView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
         } else {
             HStack(alignment: .top, spacing: 10) {
-                if study.isPractice {
-                    // Nothing here is recorded, and it should be impossible to be confused about
-                    // which payload the participant is on.
-                    Label("Practice", systemImage: "graduationcap.fill")
+                if study.isTestMode {
+                    // Nothing here is recorded, and it should be impossible to mistake a test for a
+                    // run that is being kept.
+                    Label("Test mode", systemImage: "testtube.2")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 11)
                         .frame(height: 28)
@@ -1339,16 +1339,28 @@ struct MesOverlayView: View {
             // rather than alongside the participant's measuring controls.
             testingControls
 
-            // Abandoning the run is the operator's decision, never the participant's, so it is behind
-            // the study password like every other way out of a payload.
+            // Abandoning a real run is the operator's decision, never the participant's, so it is
+            // behind the study password like every other way out of a payload. A test run has no
+            // participant to keep out and nothing to protect, so it is simply left.
             Button {
-                showsCancelRunPassword = true
+                if study.isTestMode {
+                    onRunCancelled()
+                } else {
+                    showsCancelRunPassword = true
+                }
             } label: {
-                Label("Cancel the run", systemImage: "xmark.circle")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.red)
+                Label(
+                    study.isTestMode ? "Leave the test" : "Cancel the run",
+                    systemImage: "xmark.circle"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.red)
             }
-            .accessibilityHint("Asks for the study password, then returns to the start screen.")
+            .accessibilityHint(
+                study.isTestMode
+                    ? "Returns to the start screen. Nothing from a test is saved."
+                    : "Asks for the study password, then returns to the start screen."
+            )
 
             HStack(spacing: 10) {
                 Circle()

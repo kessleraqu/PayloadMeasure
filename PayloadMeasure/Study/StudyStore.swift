@@ -29,20 +29,15 @@ final class StudyStore {
 
     /// Index into `activeRun.boxOrder`.
     private(set) var currentBoxIndex = 0
-    /// True while the participant is on the practice payload, before the study proper.
-    private(set) var isPractice = false
+    /// True while a throwaway test run is in progress. A test run has no participant, is never
+    /// written to disk, and can be left at any time without the study password. It replaced the
+    /// practice payload, which was a step inside a real run rather than a run of its own.
+    private(set) var isTestMode = false
     /// True after the administrator has configured the run but before the participant taps the
     /// neutral Start screen. No study timer or measuring workflow is active in this state.
     private(set) var isAwaitingParticipantStart = false
     private var phaseStartedAt: Date?
     private(set) var currentPhase: StudyPhase?
-
-    /// The practice payload is the same size as the small module, so the participant has met the
-    /// screens and the AR view before anything is measured for real. Deliberately derived rather than
-    /// written out again, so the two cannot drift apart.
-    static var practiceModuleSizeMillimetres: SIMD3<Double> {
-        StudyBox.small.sizeMillimetres
-    }
 
     init() {
         saved = Self.loadAll()
@@ -50,11 +45,10 @@ final class StudyStore {
 
     // MARK: - Current position
 
-    /// Nil during the practice run and before the participant's Start tap. Nothing measured in
-    /// practice is recorded, and the configured payload cannot leak into a pre-start timer.
+    /// Nil before the participant's Start tap, so the configured payload cannot leak into a
+    /// pre-start timer.
     var currentBox: StudyBox? {
-        guard !isPractice,
-              !isAwaitingParticipantStart,
+        guard !isAwaitingParticipantStart,
               let activeRun,
               activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
@@ -63,20 +57,19 @@ final class StudyStore {
     /// The payload shown on a neutral handoff screen. Unlike `currentBox`, this remains available
     /// while timing is deliberately stopped.
     var scheduledBox: StudyBox? {
-        guard !isPractice,
-              let activeRun,
+        guard let activeRun,
               activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
     }
 
-    /// Whether the measuring screens should be up at all: a box, or the practice payload.
+    /// Whether the measuring screens should be up at all.
     var hasActiveSession: Bool {
-        activeRun != nil && !isAwaitingParticipantStart && (isPractice || currentBox != nil)
+        activeRun != nil && !isAwaitingParticipantStart && currentBox != nil
     }
 
     /// The module the plan is built for.
     var activeModuleSizeMillimetres: SIMD3<Double>? {
-        isPractice ? Self.practiceModuleSizeMillimetres : currentBox?.sizeMillimetres
+        currentBox?.sizeMillimetres
     }
 
     var isOnLastBox: Bool {
@@ -84,11 +77,9 @@ final class StudyStore {
         return currentBoxIndex >= activeRun.boxOrder.count - 1
     }
 
-    /// Practice uses the first condition so the participant learns the interface they will see
-    /// first. Recorded boxes resolve their condition from the two-box schedule.
+    /// Boxes resolve their condition from the schedule the run was started with.
     var currentInputMode: StudyInputMode {
         guard let activeRun else { return .augmentedReality }
-        if isPractice { return activeRun.resolvedFirstInputMode }
         guard activeRun.inputModeOrder.indices.contains(currentBoxIndex) else {
             return .augmentedReality
         }
@@ -97,7 +88,6 @@ final class StudyStore {
 
     var nextInputMode: StudyInputMode? {
         guard let activeRun,
-              !isPractice,
               activeRun.inputModeOrder.indices.contains(currentBoxIndex + 1) else {
             return nil
         }
@@ -123,7 +113,6 @@ final class StudyStore {
         studyDate: Date,
         flow: MeasurementFlow,
         firstBox: StudyBox,
-        includesPractice: Bool,
         inputPlan: StudyInputPlan? = nil,
         firstInputMode: StudyInputMode = .augmentedReality
     ) {
@@ -135,7 +124,6 @@ final class StudyStore {
             flow: flow.rawValue,
             firstBox: firstBox
         )
-        run.includedPracticeRun = includesPractice
         run.includesBothPayloads = true
         run.inputPlan = inputPlan
         run.firstInputMode = inputPlan == .arOnly
@@ -147,9 +135,38 @@ final class StudyStore {
         run.folderName = Self.availableFolderName(base: run.exportBaseName)
         activeRun = run
         currentBoxIndex = 0
-        isPractice = includesPractice
+        isTestMode = false
         isAwaitingParticipantStart = true
         persistActiveRun()
+    }
+
+    /// A run that exists only while it is being used: no participant name, one payload, nothing
+    /// written to disk and no neutral handoff screen in front of it. It is the way to try the app —
+    /// or to show someone how it works — without a real run appearing in the archive.
+    ///
+    /// It takes the condition and the payload size chosen on the setup screen, so what it exercises
+    /// is exactly what a participant would get.
+    func startTestRun(box: StudyBox, inputMode: StudyInputMode) {
+        var run = StudyRun(
+            id: UUID(),
+            participantName: "",
+            studyDate: Date(),
+            createdAt: Date(),
+            flow: MeasurementFlow.batch.rawValue,
+            firstBox: box
+        )
+        // One payload rather than both: a test is left whenever the operator has seen enough, so a
+        // second payload would only ever be a screen nobody reaches.
+        run.includesBothPayloads = false
+        run.inputPlan = inputMode == .augmentedReality ? .arOnly : .manualOnly
+        run.firstInputMode = inputMode
+        activeRun = run
+        currentBoxIndex = 0
+        isTestMode = true
+        isAwaitingParticipantStart = false
+        // Straight into the workflow, and straight past `persistActiveRun`: a test run never has a
+        // folder, so there is nothing for it to leave behind.
+        openCurrentBox()
     }
 
     // MARK: - Picking a run back up
@@ -201,7 +218,7 @@ final class StudyStore {
         endCurrentPhase()
         activeRun = run
         currentBoxIndex = firstUnfinished
-        isPractice = false
+        isTestMode = false
         isAwaitingParticipantStart = true
         currentPhase = nil
         phaseStartedAt = nil
@@ -250,28 +267,11 @@ final class StudyStore {
         }
         activeRun = run
         persistActiveRun()
-        if isPractice {
-            isAwaitingParticipantStart = false
-            // No box result yet. The first one is opened when the practice ends, so its start time is
-            // when the study actually began rather than when the participant started playing.
-            beginPhase(.measure)
-        } else {
-            openCurrentBox()
-        }
-    }
-
-    /// The practice payload is done. Everything measured on it is dropped and the study begins.
-    func startRealStudy() {
-        guard isPractice else { return }
-        endCurrentPhase()
-        isPractice = false
-        currentBoxIndex = 0
-        isAwaitingParticipantStart = true
+        openCurrentBox()
     }
 
     private func openCurrentBox() {
         guard var run = activeRun else { return }
-        isPractice = false
         guard run.boxOrder.indices.contains(currentBoxIndex) else { return }
         let box = run.boxOrder[currentBoxIndex]
         if run.result(for: box) == nil {
@@ -306,7 +306,8 @@ final class StudyStore {
 
     /// Closes the last box and finalises the run: it joins `saved` and its report is written.
     func finishRun() {
-        guard activeRun != nil else { return }
+        // A test run has nothing to finish: it is never saved, and its exit is `clearActiveRun`.
+        guard activeRun != nil, !isTestMode else { return }
         endCurrentPhase()
         guard var run = activeRun else { return }
         closeCurrentBox(in: &run)
@@ -333,7 +334,7 @@ final class StudyStore {
         guard activeRun?.isComplete == true else { return }
         activeRun = nil
         currentBoxIndex = 0
-        isPractice = false
+        isTestMode = false
         isAwaitingParticipantStart = false
         currentPhase = nil
         phaseStartedAt = nil
@@ -368,7 +369,7 @@ final class StudyStore {
         if activeRun?.id == runID {
             activeRun = nil
             currentBoxIndex = 0
-            isPractice = false
+            isTestMode = false
             isAwaitingParticipantStart = false
             currentPhase = nil
             phaseStartedAt = nil
@@ -391,14 +392,14 @@ final class StudyStore {
     /// which is a different thing from the app disappearing mid-measurement.
     func clearActiveRun() {
         endCurrentPhase()
-        if var run = activeRun, !run.isComplete {
+        if var run = activeRun, !run.isComplete, !isTestMode {
             run.abandonedAt = Date()
             activeRun = run
             persistActiveRun()
         }
         activeRun = nil
         currentBoxIndex = 0
-        isPractice = false
+        isTestMode = false
         isAwaitingParticipantStart = false
         lastExportURL = nil
         exportMessage = nil
@@ -483,7 +484,7 @@ final class StudyStore {
     /// photos, so the name identifies the file for the whole run.
     @discardableResult
     func storePhoto(_ data: Data, objectID: UUID, objectName: String? = nil) -> String? {
-        guard !isPractice, let run = activeRun else { return nil }
+        guard !isTestMode, let run = activeRun else { return nil }
         let name = Self.photoFileName(
             objectID: objectID,
             objectName: objectName,
@@ -543,7 +544,9 @@ final class StudyStore {
     // MARK: - Persistence
 
     private func persistActiveRun() {
-        guard let activeRun else { return }
+        // The single point where a test run is kept off the disk: it has state like any other run
+        // while it is in progress, and no file, folder or archive entry once it is over.
+        guard !isTestMode, let activeRun else { return }
         write(activeRun)
         if let index = saved.firstIndex(where: { $0.id == activeRun.id }) {
             saved[index] = activeRun

@@ -61,8 +61,7 @@ final class StudyTransitionTests: XCTestCase {
             participantName: "P01",
             studyDate: Date(),
             flow: .sequential,
-            firstBox: .small,
-            includesPractice: false
+            firstBox: .small
         )
         XCTAssertTrue(store.isAwaitingParticipantStart)
         XCTAssertNil(store.currentBox)
@@ -107,85 +106,79 @@ final class StudyTransitionTests: XCTestCase {
         XCTAssertEqual(previousRun.inputModeOrder, [.manual, .manual])
     }
 
-    /// The practice payload exists so a participant can learn the app on something that does not
-    /// count. Nothing measured on it may reach the run, and the first box must not start until the
-    /// operator has cleared the password.
-    func testPracticePayloadIsNotRecordedAndPrecedesTheFirstBox() throws {
-        let store = StudyStore()
-        store.startRun(
-            participantName: "P03",
-            studyDate: Date(),
-            flow: .batch,
-            firstBox: .big,
-            includesPractice: true
-        )
-
-        XCTAssertTrue(store.isPractice)
-        XCTAssertTrue(store.isAwaitingParticipantStart)
-        XCTAssertFalse(store.hasActiveSession, "The admin handoff must not start the workflow or timer.")
-        store.beginParticipantSession()
-        XCTAssertTrue(store.hasActiveSession, "The measuring screens have to be up during practice.")
-        XCTAssertNil(store.currentBox, "There is no study box yet.")
-        XCTAssertEqual(
-            store.activeModuleSizeMillimetres,
-            StudyBox.small.sizeMillimetres,
-            "The practice payload is the same size as the small module."
-        )
-        XCTAssertEqual(store.activeRun?.boxes.count, 0, "No box may be opened during practice.")
-
-        // Anything the participant does with it goes nowhere.
-        store.beginPhase(.pack)
-        store.beginPhase(.payload)
-        store.recordCurrentBox(
-            objects: [],
-            loadedObjectIDs: [],
-            unloadedObjectNames: ["practice object"],
-            packingMode: "practice",
-            centreOfMass: nil,
-            unbalancingIndex: nil
-        )
-        XCTAssertNil(store.storePhoto(Data([0x01]), objectID: UUID()))
-        XCTAssertEqual(store.activeRun?.boxes.count, 0)
-
-        store.startRealStudy()
-
-        XCTAssertFalse(store.isPractice)
-        XCTAssertTrue(store.isAwaitingParticipantStart)
-        XCTAssertNil(store.currentBox)
-        XCTAssertNil(store.currentPhase)
-        store.beginParticipantSession()
-        XCTAssertEqual(store.currentBox, .big, "The study starts on the chosen first box.")
-        XCTAssertEqual(store.activeRun?.boxes.count, 1)
-        let first = try XCTUnwrap(store.activeRun?.boxes.first)
-        XCTAssertTrue(
-            first.phaseSeconds.isEmpty,
-            "The first box must start with a clean clock, not with the practice time."
-        )
-        XCTAssertTrue(first.unloadedObjectNames.isEmpty)
-        XCTAssertEqual(store.activeRun?.includedPracticeRun, true)
-        XCTAssertTrue(
-            try XCTUnwrap(store.activeRun).reportText().contains("Practice"),
-            "The report has to say a practice run happened, since nothing else records it."
-        )
-    }
-
-    func testPracticeCanBeTurnedOffAndTheFirstBoxOpensImmediately() {
+    /// A run always waits on the neutral Start screen: there is no practice payload in front of it
+    /// any more, and the payload must not open — or start timing — before the participant taps.
+    func testTheFirstBoxOpensOnlyWhenTheParticipantStarts() {
         let store = StudyStore()
         store.startRun(
             participantName: "P04",
             studyDate: Date(),
             flow: .sequential,
-            firstBox: .small,
-            includesPractice: false
+            firstBox: .small
         )
 
-        XCTAssertFalse(store.isPractice)
+        XCTAssertFalse(store.isTestMode)
         XCTAssertTrue(store.isAwaitingParticipantStart)
+        XCTAssertFalse(store.hasActiveSession, "The admin handoff must not start the workflow or timer.")
         XCTAssertNil(store.currentBox, "The payload must stay closed until the participant taps Start.")
         store.beginParticipantSession()
         XCTAssertEqual(store.currentBox, .small)
         XCTAssertEqual(store.activeRun?.boxes.count, 1)
-        XCTAssertEqual(store.activeRun?.includedPracticeRun, false)
+    }
+
+    /// Test mode is a run nobody is being measured by: it starts on the condition and payload chosen
+    /// on the setup screen, skips the participant handoff, and leaves nothing behind. The last part
+    /// is the one that matters — a test that reached the archive would be indistinguishable from a
+    /// participant's run in the data.
+    func testTestModeRunsTheChosenPayloadAndIsNeverWrittenToDisk() throws {
+        let store = StudyStore()
+        let savedBefore = store.saved.map(\.id)
+
+        store.startTestRun(box: .big, inputMode: .manual)
+
+        XCTAssertTrue(store.isTestMode)
+        XCTAssertFalse(
+            store.isAwaitingParticipantStart,
+            "Test mode goes straight into the workflow: there is no participant to hand over to."
+        )
+        XCTAssertTrue(store.hasActiveSession)
+        XCTAssertEqual(store.currentBox, .big, "It takes the payload size chosen on the setup screen.")
+        XCTAssertEqual(store.currentInputMode, .manual, "It takes the condition chosen on the setup screen.")
+        XCTAssertEqual(store.activeModuleSizeMillimetres, StudyBox.big.sizeMillimetres)
+        XCTAssertEqual(store.activeRun?.boxOrder, [.big], "A test is one payload, not the pair.")
+        XCTAssertTrue(store.isOnLastBox)
+        XCTAssertEqual(store.activeRun?.participantName, "")
+
+        // Everything a real run would record is refused.
+        let testRunID = try XCTUnwrap(store.activeRun?.id)
+        store.beginPhase(.pack)
+        store.recordCurrentBox(
+            objects: [],
+            loadedObjectIDs: [],
+            unloadedObjectNames: ["test object"],
+            packingMode: "test",
+            centreOfMass: nil,
+            unbalancingIndex: nil
+        )
+        XCTAssertNil(store.storePhoto(Data([0x01]), objectID: UUID()))
+        XCTAssertEqual(store.saved.map(\.id), savedBefore, "A test run must not join the archive.")
+
+        store.clearActiveRun()
+
+        XCTAssertNil(store.activeRun)
+        XCTAssertFalse(store.isTestMode)
+        XCTAssertNotEqual(
+            store.resumableRun?.id,
+            testRunID,
+            "A test run is not something to be offered back."
+        )
+
+        // Read from disk rather than from this store: persistence is the thing being checked.
+        let reloaded = StudyStore()
+        XCTAssertFalse(
+            reloaded.saved.contains { $0.id == testRunID },
+            "Nothing from a test run may survive on disk."
+        )
     }
 
     /// Boxing and loading the payload were showing as "—" on the results screen and in the report.
@@ -197,8 +190,7 @@ final class StudyTransitionTests: XCTestCase {
             participantName: "P02",
             studyDate: Date(),
             flow: .batch,
-            firstBox: .big,
-            includesPractice: false
+            firstBox: .big
         )
         store.beginParticipantSession()
 
@@ -251,7 +243,6 @@ final class StudyTransitionTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .big,
-            includesPractice: false,
             inputPlan: .arOnly,
             firstInputMode: .augmentedReality
         )
@@ -299,7 +290,6 @@ final class StudyTransitionTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .small,
-            includesPractice: false,
             inputPlan: .arOnly
         )
         store.beginParticipantSession()

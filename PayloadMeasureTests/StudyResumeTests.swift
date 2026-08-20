@@ -27,7 +27,6 @@ final class StudyResumeTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .big,
-            includesPractice: false,
             inputPlan: .arOnly,
             firstInputMode: .augmentedReality
         )
@@ -78,7 +77,7 @@ final class StudyResumeTests: XCTestCase {
             afterRelaunch.isAwaitingParticipantStart,
             "The participant taps Start again rather than landing straight in the camera."
         )
-        XCTAssertFalse(afterRelaunch.isPractice)
+        XCTAssertFalse(afterRelaunch.isTestMode)
         XCTAssertNil(afterRelaunch.currentPhase, "No timer runs until Start is tapped.")
     }
 

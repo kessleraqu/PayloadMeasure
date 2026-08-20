@@ -43,7 +43,6 @@ final class StudySecondBoxRecordingTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .small,
-            includesPractice: false,
             inputPlan: .arOnly
         )
         startedRunIDs.append(try XCTUnwrap(store.activeRun?.id))

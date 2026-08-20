@@ -132,9 +132,13 @@ private struct PackingPreparationView: View {
             .navigationTitle("Prepare packages")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if focusedField == .weight,
+                if focusedField != nil,
                    let currentObjectID {
                     ToolbarItemGroup(placement: .keyboard) {
+                        // The weight field is a decimal pad with no return key, so closing the
+                        // keyboard needs a button of its own rather than the bottom bar underneath.
+                        Button("Done") { focusedField = nil }
+                            .accessibilityHint("Closes the keyboard and brings back the back and next buttons.")
                         Spacer()
                         Button {
                             saveAndAdvance(objectID: currentObjectID)
@@ -191,8 +195,13 @@ private struct PackingPreparationView: View {
         }
         .scrollDismissesKeyboard(.interactively)
         .id(objectID)
+        // The bottom bar steps aside while the keyboard is up: it used to be pushed up against the
+        // keyboard's own button, putting "Back" and the next action a few points apart from it.
+        // Everything the bar offers while typing is on the keyboard bar instead.
         .safeAreaInset(edge: .bottom) {
-            bottomBar(for: objectID)
+            if focusedField == nil {
+                bottomBar(for: objectID)
+            }
         }
     }
 

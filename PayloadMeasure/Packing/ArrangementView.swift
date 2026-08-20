@@ -34,8 +34,7 @@ struct ArrangementView: View {
     /// The only way out of a participant's payload, and the last thing on the screen: everything above
     /// it is the plan being followed, and this ends it. Pressing it asks for confirmation first, so
     /// neither a stray tap nor a participant can close a payload by accident. The box is recorded once
-    /// the confirmation is given - except after the practice payload, which is never
-    /// recorded.
+    /// the confirmation is given — except in test mode, which records nothing.
     @ViewBuilder
     private var nextBoxButton: some View {
         if store.baldiComparison != nil || store.result != nil {
@@ -52,17 +51,17 @@ struct ArrangementView: View {
     }
 
     private var nextStepTitle: String {
-        study.isPractice ? "Start real measurement" : "Finished packing"
+        study.isTestMode ? "Finish the test" : "Finished packing"
     }
 
     private var nextStepIcon: String {
-        study.isPractice ? "play.circle" : "checkmark.circle"
+        study.isTestMode ? "xmark.circle" : "checkmark.circle"
     }
 
     /// Spells out what happens next, because the button no longer does: "Finished packing" is the same
     /// label whether the next thing is another payload, the other condition, or the end of the study.
     private var finishedPackingQuestion: String {
-        if study.isPractice { return "Finished with the practice payload?" }
+        if study.isTestMode { return "Finish the test?" }
         if study.isOnLastBox { return "Finished packing this payload?" }
         return study.switchesInputModeAfterCurrentBox
             ? "Finished packing this payload and this condition?"
@@ -70,8 +69,8 @@ struct ArrangementView: View {
     }
 
     private var finishedPackingDetail: String {
-        if study.isPractice {
-            return "Nothing from the practice payload is kept. The real study starts next."
+        if study.isTestMode {
+            return "Nothing from a test is kept. This returns to the start screen."
         }
         let consequence: String
         if study.isOnLastBox {
@@ -173,8 +172,8 @@ struct ArrangementView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle(
-                study.isPractice
-                    ? "Practice arrangement"
+                study.isTestMode
+                    ? "Test arrangement"
                     : "\(study.currentInputMode.shortTitle) arrangement"
             )
             .navigationBarTitleDisplayMode(.inline)
@@ -222,8 +221,8 @@ struct ArrangementView: View {
             isPresented: $showsFinishedPackingConfirmation
         ) {
             Button("Not yet", role: .cancel) {}
-            Button("Yes, finished") {
-                if !study.isPractice {
+            Button(study.isTestMode ? "Yes, finish" : "Yes, finished") {
+                if !study.isTestMode {
                     recordCurrentBox()
                 }
                 onBoxFinished()

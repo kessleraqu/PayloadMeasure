@@ -506,24 +506,24 @@ final class PackagePreparationTests: XCTestCase {
         }
     }
 
-    /// The practice payload is the small module's stand-in, so it must offer the same boxes.
-    func testThePracticePayloadUsesTheSmallModulesBoxes() {
+    /// Each payload has its own boxes, and the run follows whichever payload is open — including a
+    /// test run, which is a payload like any other while it lasts.
+    func testTheBoxCatalogueFollowsThePayloadInProgress() {
         let store = StudyStore()
         store.startRun(
             participantName: "boxes",
             studyDate: Date(),
             flow: .batch,
-            firstBox: .big,
-            includesPractice: true
+            firstBox: .big
         )
-        XCTAssertTrue(store.isPractice)
-        XCTAssertEqual(store.catalogueOwner, .small)
-
         store.beginParticipantSession()
-        store.startRealStudy()
-        XCTAssertEqual(store.catalogueOwner, .big, "Once the study starts it follows the actual box.")
+        XCTAssertEqual(store.catalogueOwner, .big)
         store.advanceToNextBox()
         XCTAssertEqual(store.catalogueOwner, .small)
+
+        let test = StudyStore()
+        test.startTestRun(box: .small, inputMode: .augmentedReality)
+        XCTAssertEqual(test.catalogueOwner, .small, "A test run uses the boxes of the payload it picked.")
     }
 
     func testStandardCentreOfMassDomainMatchesThePaper() {

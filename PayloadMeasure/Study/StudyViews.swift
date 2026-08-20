@@ -20,7 +20,6 @@ struct StudySetupView: View {
     @State private var date = Date()
     @State private var firstBox: StudyBox = .big
     @State private var inputMode: StudyInputMode = .augmentedReality
-    @State private var includesPractice = true
     @State private var showsArchive = false
     @State private var showsAccuracy = false
     @State private var showsFramingAccuracy = false
@@ -78,12 +77,6 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    Toggle("Practice run first", isOn: $includesPractice)
-                } footer: {
-                    Text(practiceFooter)
-                }
-
-                Section {
                     // Stages the run, then replaces this administrator form with the neutral
                     // participant handoff. Timing and the workflow start only after that Start tap.
                     Button {
@@ -107,6 +100,20 @@ struct StudySetupView: View {
                 }
 
                 Section {
+                    // No name, no record, no password on the way out. Everything above it still
+                    // applies: a test run is the selected condition on the selected payload size, so
+                    // what it shows is what a participant would get.
+                    Button {
+                        store.startTestRun(box: firstBox, inputMode: inputMode)
+                    } label: {
+                        Label("Test mode", systemImage: "testtube.2")
+                            .font(.headline)
+                    }
+                } footer: {
+                    Text(testModeFooter)
+                }
+
+                Section {
                     Button {
                         editedCatalogue = StudyBox.big
                     } label: {
@@ -120,7 +127,7 @@ struct StudySetupView: View {
                 } header: {
                     Text("Package boxes")
                 } footer: {
-                    Text("Each payload has its own boxes. The practice payload uses the small one's, being the same size.")
+                    Text("Each payload has its own boxes.")
                 }
 
                 Section {
@@ -254,16 +261,8 @@ struct StudySetupView: View {
         }
     }
 
-    private var practiceFooter: String {
-        guard includesPractice else {
-            return "The participant goes straight into the first payload box."
-        }
-        let size = StudyStore.practiceModuleSizeMillimetres
-        let centimetres = String(
-            format: "%.0f × %.0f × %.0f cm",
-            size.x / 10, size.y / 10, size.z / 10
-        )
-        return "The participant uses \(inputMode.title.lowercased()) for a practice payload of \(centimetres) first. Nothing from it is recorded. The same selected condition is then used for both study payloads."
+    private var testModeFooter: String {
+        "Goes straight into \(inputMode.title) on the \(firstBox.shortTitle.lowercased()): no participant name, and no Start screen in front of it. Nothing is saved, and it can be left at any time without the password."
     }
 
     private func start() {
@@ -272,7 +271,6 @@ struct StudySetupView: View {
             studyDate: date,
             flow: .batch,
             firstBox: firstBox,
-            includesPractice: includesPractice,
             inputPlan: inputMode == .augmentedReality ? .arOnly : .manualOnly,
             firstInputMode: inputMode
         )
@@ -302,9 +300,6 @@ struct StudyParticipantStartView: View {
     }
 
     private var buttonTitle: String {
-        if store.isPractice {
-            return "Start practice"
-        }
         guard let box = store.scheduledBox else { return "Start" }
         return "Start \(box.shortTitle.lowercased())"
     }

@@ -49,7 +49,12 @@ struct ManualMeasurementView: View {
             .navigationTitle("Enter measurements")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
-            .safeAreaInset(edge: .bottom) { preparationButton }
+            // "Start packing" is hidden while the keyboard is up. It used to sit directly on top of
+            // the keyboard's "Add object" button — two prominent buttons a few points apart — so a
+            // slightly low tap left the measuring screen in the middle of entering an object.
+            .safeAreaInset(edge: .bottom) {
+                if focusedField == nil { preparationButton }
+            }
         }
         .onAppear(perform: configurePackingStore)
         .fullScreenCover(
@@ -120,9 +125,17 @@ struct ManualMeasurementView: View {
                     Label("Reset this payload", systemImage: "arrow.counterclockwise")
                 }
                 Button(role: .destructive) {
-                    showsCancelPassword = true
+                    // Nothing to protect in a test run: no participant, no record, no password.
+                    if study.isTestMode {
+                        onRunCancelled()
+                    } else {
+                        showsCancelPassword = true
+                    }
                 } label: {
-                    Label("Cancel study run", systemImage: "xmark.circle")
+                    Label(
+                        study.isTestMode ? "Leave the test" : "Cancel study run",
+                        systemImage: "xmark.circle"
+                    )
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -132,11 +145,16 @@ struct ManualMeasurementView: View {
 
         if focusedField != nil {
             ToolbarItemGroup(placement: .keyboard) {
+                // The dimension fields use a decimal pad, which has no return key: without this the
+                // only way to close the keyboard was the "Start packing" bar underneath it.
+                Button("Done") { focusedField = nil }
+                    .accessibilityHint("Closes the keyboard and brings back the start packing button.")
                 Spacer()
                 Button(editingObjectID == nil ? "Add object" : "Save changes") {
                     saveDraft()
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityHint("Saves this object and clears the fields for the next one.")
             }
         }
     }
@@ -151,7 +169,7 @@ struct ManualMeasurementView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("No-AR condition")
                     .font(.headline)
-                Text("\(study.isPractice ? "Practice payload" : study.currentBox?.shortTitle ?? "Payload") · \(objectIDs.count) object\(objectIDs.count == 1 ? "" : "s") entered")
+                Text("\(study.isTestMode ? "Test payload" : study.currentBox?.shortTitle ?? "Payload") · \(objectIDs.count) object\(objectIDs.count == 1 ? "" : "s") entered")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

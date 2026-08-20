@@ -12,7 +12,6 @@ final class ManualStudyWorkflowTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .big,
-            includesPractice: false,
             inputPlan: .manualOnly,
             firstInputMode: .manual
         )
@@ -43,7 +42,6 @@ final class ManualStudyWorkflowTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .small,
-            includesPractice: false,
             inputPlan: .arOnly,
             firstInputMode: .augmentedReality
         )
@@ -72,7 +70,6 @@ final class ManualStudyWorkflowTests: XCTestCase {
                 studyDate: Date(),
                 flow: .batch,
                 firstBox: .big,
-                includesPractice: false,
                 inputPlan: plan,
                 firstInputMode: expected.other
             )
@@ -95,27 +92,17 @@ final class ManualStudyWorkflowTests: XCTestCase {
         }
     }
 
-    func testPracticeUsesTheFirstInputConditionWithoutOpeningAResult() {
+    func testTestModeOpensItsPayloadInTheChosenConditionImmediately() {
         let store = StudyStore()
-        store.startRun(
-            participantName: "practice-manual",
-            studyDate: Date(),
-            flow: .batch,
-            firstBox: .small,
-            includesPractice: true,
-            inputPlan: .manualOnly,
-            firstInputMode: .manual
-        )
-        XCTAssertTrue(store.isPractice)
-        XCTAssertEqual(store.currentInputMode, .manual)
-        XCTAssertTrue(store.activeRun?.boxes.isEmpty == true)
+        store.startTestRun(box: .small, inputMode: .manual)
 
-        store.beginParticipantSession()
-        store.startRealStudy()
-        XCTAssertTrue(store.isAwaitingParticipantStart)
-        store.beginParticipantSession()
+        XCTAssertTrue(store.isTestMode)
+        XCTAssertFalse(store.isAwaitingParticipantStart)
         XCTAssertEqual(store.currentInputMode, .manual)
+        XCTAssertEqual(store.currentBox, .small)
         XCTAssertEqual(store.activeRun?.boxes.first?.inputMode, .manual)
+
+        store.clearActiveRun()
     }
 
     func testManualMeasurementsUseTheSharedPackingPipelineWithoutPhotos() throws {
@@ -201,7 +188,6 @@ final class ManualStudyWorkflowTests: XCTestCase {
             studyDate: Date(),
             flow: .batch,
             firstBox: .big,
-            includesPractice: false,
             inputPlan: .manualOnly,
             firstInputMode: .manual
         )

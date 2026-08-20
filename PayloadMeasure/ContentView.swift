@@ -95,8 +95,8 @@ struct ContentView: View {
     }
 
     /// Reset: throw away everything measured and start this same payload over. The study does not
-    /// move on, so a participant cannot reach the next box — or leave the practice payload — without
-    /// the operator entering the password.
+    /// move on, so a participant cannot reach the next box without the operator entering the
+    /// password.
     private func restartCurrentPayload() {
         isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
@@ -106,8 +106,8 @@ struct ContentView: View {
     }
 
     /// At a payload boundary the measurements belong to the one just finished, so the capture
-    /// session is cleared and the view hierarchy rebuilt. Practice and both real payloads are
-    /// separated by neutral participant-controlled start screens.
+    /// session is cleared and the view hierarchy rebuilt. Real payloads are separated by neutral
+    /// participant-controlled start screens.
     private func startNextBox() {
         // The presenting overlay is replaced as part of this transition, so do not wait for its
         // onDismiss callback to return camera ownership. Clear it before constructing the next box.
@@ -115,8 +115,10 @@ struct ContentView: View {
         sessionManager.setPackingArrangementPresented(false)
         captureEngine.reset()
         sessionToken &+= 1
-        if study.isPractice {
-            study.startRealStudy()
+        if study.isTestMode {
+            // A test run has one payload and nothing to record, so finishing it is the same thing as
+            // leaving it: straight back to setup, with no connect step and no saved run.
+            study.clearActiveRun()
         } else if study.isOnLastBox {
             study.endCurrentPhase()
             isShowingFinalConnectStep = true
