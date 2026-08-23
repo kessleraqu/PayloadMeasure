@@ -130,4 +130,55 @@ struct MeasurementFramingRuleTests {
         #expect(percent < MeasurementFramingRule.releaseFillPercent)
         #expect(!MeasurementFramingRule.isTooClose(fillPercent: percent, wasTooClose: true))
     }
+
+    // MARK: - The distance the operator is told to stand at
+
+    /// The one number in the app that is stated in millimetres rather than in fill, because it is said
+    /// to an operator who has nothing on screen yet and therefore no fill to be judged on. These tests
+    /// pin it to the study's own observed distances so it cannot drift into a number nobody measured.
+    private var accurateDistances: [Double] {
+        zip(
+            FramingCalibrationProtocol.targetFillPercentages,
+            FramingCalibrationProtocol.observedDistanceMillimetres
+        )
+        .filter { $0.0 < MeasurementFramingRule.tooCloseFillPercent }
+        .map(\.1)
+    }
+
+    private var degradedDistances: [Double] {
+        zip(
+            FramingCalibrationProtocol.targetFillPercentages,
+            FramingCalibrationProtocol.observedDistanceMillimetres
+        )
+        .filter { $0.0 >= MeasurementFramingRule.tooCloseFillPercent }
+        .map(\.1)
+    }
+
+    /// The recommendation is exactly the span of the framings the study found accurate — 38% at about
+    /// 450 mm to 25% at about 650 mm — and nothing wider or rounder. Fails against the "40–50 cm" this
+    /// replaced, at both ends.
+    @Test func theRecommendedDistanceIsTheSpanTheStudyFoundAccurate() {
+        let band = MeasurementFramingRule.observedAccurateDistanceMetres
+        #expect(abs(band.lowerBound * 1000 - (accurateDistances.min() ?? .nan)) < 1e-9)
+        #expect(abs(band.upperBound * 1000 - (accurateDistances.max() ?? .nan)) < 1e-9)
+    }
+
+    /// The point of changing it. Every framing the study found worse was observed at 350 mm or nearer,
+    /// so a recommendation reaching below 450 mm is telling the operator to stand somewhere the data
+    /// says is worse. "40 cm" did exactly that.
+    @Test func theRecommendationNeverReachesIntoAFramingTheStudyFoundWorse() {
+        #expect(!degradedDistances.isEmpty)
+        for distance in degradedDistances {
+            #expect(MeasurementFramingRule.observedAccurateDistanceMetres.lowerBound * 1000 > distance)
+        }
+    }
+
+    /// The words on screen and the band they came from are one thing, so the copy cannot be edited into
+    /// disagreeing with the data.
+    @Test func theOperatorReadsTheBandTheDataGives() {
+        let band = MeasurementFramingRule.observedAccurateDistanceMetres
+        let near = Int((band.lowerBound * 100).rounded())
+        let far = Int((band.upperBound * 100).rounded())
+        #expect(MeasurementFramingRule.recommendedDistanceText == "\(near)–\(far) cm")
+    }
 }

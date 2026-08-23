@@ -15,6 +15,15 @@ enum FramingCalibrationProtocol {
     static let targetFillPercentages: [Double] = [25, 30, 38, 53, 65]
     static let legacyTargetFillPercentages: [Double] = [20, 35, 50, 65, 80]
 
+    /// Where following those five guides actually put the phone, for the objects the study used, in the
+    /// same order as the levels above. An *observed result* and not a controlled variable — which is why
+    /// every threshold in `MeasurementFramingRule` is stated in fill and none of them in millimetres.
+    ///
+    /// It is written down rather than left in prose because one thing genuinely is decided on it: the
+    /// distance an operator is told to stand at before there is any mask on screen to compute a fill
+    /// from. `MeasurementFramingRuleTests` checks that recommendation against these numbers.
+    static let observedDistanceMillimetres: [Double] = [650, 550, 450, 350, 300]
+
     /// The on-screen guide is a physical square even when the renderer is rectangular. Returning it
     /// in renderer-normalized coordinates lets the live mask and the visible guide use one test.
     static func guideRect(

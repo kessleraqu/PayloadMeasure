@@ -399,7 +399,15 @@ private struct FramingAccuracyMeasureView: View {
                     ?? layer.referenceViewportBoundingBox else {
                 return nil
             }
-            let point = layer.referenceAnchorPoint
+            // Where the mask is *now*, not where it was when its silhouette was cut. A held mask is
+            // drawn through the world for up to `ObjectMaskPreviewHold.maximumHoldSeconds` while
+            // `referenceAnchorPoint` stays at the frame it was sampled in, so by the time Start is
+            // pressed that point can be well off the object — and a selection resolved there either
+            // finds nothing or finds the surface behind it. `liveMaskTracking` is the same anchor
+            // reprojected into the current frame, published every frame. Same reasoning as the Measure
+            // button in `MesOverlayView.onScreenMask`.
+            let point = captureEngine.liveMaskTracking?.normalizedViewportPoint
+                ?? layer.referenceAnchorPoint
                 ?? CGPoint(x: box.midX, y: box.midY)
             let distance = hypot(point.x - viewportCentre.x, point.y - viewportCentre.y)
             return (MaskCandidate(boundingBox: box, selectionPoint: point), distance)

@@ -338,6 +338,19 @@ struct ARCameraView: UIViewRepresentable {
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskProcessingFailuresRemaining = 0
+        /// How long a press has to be answered before it is given up on, on the monotonic clock.
+        ///
+        /// The retry budget alone could not express this. A pass discarded because tracking dropped for
+        /// a frame is not the segmenter saying "no object here", so it must not spend an attempt — but
+        /// something has to stop the press being requeued for ever, and the only thing the operator
+        /// actually experiences is the wait. `Self.objectMaskToggleTimeout` is what they are made to
+        /// wait; the attempt count remains, and now means only "how many times the segmenter may look
+        /// and find nothing".
+        private var objectMaskToggleDeadline: CFTimeInterval = 0
+        /// Long enough to cover a hand still settling from the tap and a segmentation pass or two of
+        /// tracking recovery, short enough that a press that is not going to land is handed back while
+        /// the operator is still holding the same view of the same object.
+        private static let objectMaskToggleTimeout: CFTimeInterval = 2
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
         private var objectMaskMarkerStates: [UUID: ObjectMaskMarkerState] = [:]
         private var objectMaskColorsByID: [UUID: ObjectMaskDisplayColor] = [:]
@@ -633,6 +646,7 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
+            objectMaskToggleDeadline = 0
             removeAllObjectMaskAnchors()
             clearAllCaptureContent(publishesScanReset: false)
 
@@ -768,6 +782,7 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
+            objectMaskToggleDeadline = 0
             captureEngine.cancelObjectSelection()
             objectMaskDisplayTask?.cancel()
             objectMaskDisplayTaskGeneration &+= 1
@@ -861,8 +876,10 @@ struct ARCameraView: UIViewRepresentable {
             if captureEngine.objectMaskToggleRequestRevision != observedObjectMaskToggleRequestRevision {
                 observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
                 pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
-                objectMaskToggleAttemptsRemaining = 4
+                objectMaskToggleAttemptsRemaining = 6
                 objectMaskProcessingFailuresRemaining = 8
+                objectMaskToggleDeadline = CACurrentMediaTime()
+                    + Self.objectMaskToggleTimeout
             }
 
             if captureEngine.isMeshVisible != observedMeshVisible {
@@ -897,6 +914,7 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
+            objectMaskToggleDeadline = 0
             if publishesCancellation {
                 captureEngine.cancelObjectSelection()
             }
@@ -919,6 +937,7 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
+            objectMaskToggleDeadline = 0
 
             switch request.kind {
             case .finalize:
@@ -1691,17 +1710,22 @@ struct ARCameraView: UIViewRepresentable {
                     // conditions is tested. Dropping the result silently left the selection pending
                     // with nothing in flight to answer it — "Selecting object…" on screen, the Measure
                     // button disabled, and no retry coming. Put the request back so the next pass can
-                    // act on it, and give up out loud rather than quietly once the attempts are spent.
+                    // act on it, and give up out loud rather than quietly once its time is up.
                     // The processor's own bookkeeping releases the orphaned tracker and its colour on
                     // its next pass, since neither the active object nor the new request names it.
+                    //
+                    // No attempt is spent here. None of these conditions is an answer to the question
+                    // the press asked — tracking dropped for a frame, the session was re-based, the
+                    // pass was cancelled — and charging them against the retry budget is why a press
+                    // made while the phone was still settling from the tap itself could exhaust its
+                    // attempts without the segmenter ever once being asked about the object. The press
+                    // is bounded by `objectMaskToggleDeadline` instead, which is the honest limit: how
+                    // long the operator is made to wait, rather than how many passes happened to fail
+                    // for unrelated reasons.
                     if let submittedToggleRequest,
                        self.captureEngine.isObjectSelectionPending,
                        self.pendingObjectMaskToggleRequest == nil {
-                        self.objectMaskToggleAttemptsRemaining = max(
-                            self.objectMaskToggleAttemptsRemaining - 1,
-                            0
-                        )
-                        if self.objectMaskToggleAttemptsRemaining > 0 {
+                        if CACurrentMediaTime() < self.objectMaskToggleDeadline {
                             self.pendingObjectMaskToggleRequest = submittedToggleRequest
                         } else {
                             self.captureEngine.cancelObjectSelection()
@@ -1732,6 +1756,8 @@ struct ARCameraView: UIViewRepresentable {
                     if result.isSelectionPipelineWarmed {
                         self.captureEngine.markObjectRecognitionWarmupCompleted()
                     }
+                    // Only a pass that actually looked at the scene and did not find the object counts
+                    // against the budget.
                     if submittedToggleRequest != nil {
                         self.objectMaskToggleAttemptsRemaining = max(
                             self.objectMaskToggleAttemptsRemaining - 1,
@@ -1845,11 +1871,13 @@ struct ARCameraView: UIViewRepresentable {
                     self.pendingObjectMaskToggleRequest = nil
                     self.objectMaskToggleAttemptsRemaining = 0
                     self.objectMaskProcessingFailuresRemaining = 0
+                    self.objectMaskToggleDeadline = 0
                     self.captureEngine.reportObjectLockNeedsSurface()
                 } else if submittedToggleRequest != nil,
                    !result.didToggleLock,
                    self.pendingObjectMaskToggleRequest == nil,
-                   self.objectMaskToggleAttemptsRemaining > 0 {
+                   self.objectMaskToggleAttemptsRemaining > 0,
+                   CACurrentMediaTime() < self.objectMaskToggleDeadline {
                     self.pendingObjectMaskToggleRequest = submittedToggleRequest
                 } else if submittedToggleRequest != nil,
                           !result.didToggleLock,
@@ -3043,6 +3071,35 @@ struct ARCameraView: UIViewRepresentable {
             )
         }
 
+        /// The live mask's own point in the room and on screen, in this frame.
+        ///
+        /// This is the anchor the mask picture is placed by, so it is the object the operator is looking
+        /// at, expressed in the frame the segmentation is about to run on rather than in the frame the
+        /// silhouette was cut in.
+        private func currentLiveMaskReference(
+            frame: ARFrame,
+            in arView: ARView
+        ) -> (point: CGPoint, worldPosition: SIMD3<Float>)? {
+            guard let liveMaskAnchor,
+                  captureEngine.objectMaskPreview?.layers.contains(where: {
+                      $0.trackedObjectID == nil
+                  }) == true else {
+                return nil
+            }
+            let tracked = frame.anchors.first {
+                $0.identifier == liveMaskAnchor.identifier
+            } ?? liveMaskAnchor
+            let worldPosition = tracked.transform.translation
+            guard let point = normalizedViewportPoint(
+                of: worldPosition,
+                frame: frame,
+                in: arView
+            ) else {
+                return nil
+            }
+            return (point, worldPosition)
+        }
+
         private func preparedObjectMaskToggleRequest(
             _ request: ObjectMaskToggleRequest?,
             frame: ARFrame,
@@ -3052,14 +3109,49 @@ struct ARCameraView: UIViewRepresentable {
                 return nil
             }
 
+            // A press is answered on a later frame than the one it was aimed on: the first attempt is a
+            // frame or two after the tap, a retry can be four segmentations later, and the point itself
+            // was fixed against a picture that may already have been a hold when it was pressed. Left
+            // where it was, it drifts by however far the hand has moved — a few percent of the screen is
+            // enough to put it on the table behind the object, and `previewInstances` stops at whatever a
+            // probe on the point hits, so the table becomes the only candidate offered. That is both
+            // halves of the reported failure: a press that locks nothing and quietly hands the button
+            // back, and a press that locks something that is not the object.
+            //
+            // So the point is re-read from the mask's own anchor every attempt, which is the same anchor
+            // the picture on screen is being drawn by — the point and the picture cannot disagree. Only a
+            // request already aimed at that mask is moved: the RGB fallback lets the operator tap
+            // anywhere, and a tap that plainly means another part of the scene has to keep meaning it.
+            // `heldAimBoundsSlack` is this codebase's own "still the same mask" distance.
+            let liveMask = currentLiveMaskReference(frame: frame, in: arView)
+            let aimsAtLiveMask = liveMask.map {
+                hypot(
+                    $0.point.x - request.normalizedViewportPoint.x,
+                    $0.point.y - request.normalizedViewportPoint.y
+                ) <= ObjectMaskCandidatePolicy.heldAimBoundsSlack
+            } ?? false
+            let normalizedPoint = aimsAtLiveMask
+                ? liveMask?.point ?? request.normalizedViewportPoint
+                : request.normalizedViewportPoint
+
             let viewportPoint = CGPoint(
-                x: request.normalizedViewportPoint.x * arView.bounds.width,
-                y: request.normalizedViewportPoint.y * arView.bounds.height
+                x: normalizedPoint.x * arView.bounds.width,
+                y: normalizedPoint.y * arView.bounds.height
             )
             let worldTransform: simd_float4x4
-            if let depthPoint = DepthPointCloud.worldPoint(
+            // The mask's anchor, when the press was aimed at the mask. ARKit has been refining it under
+            // the object since the preview first found depth inside the silhouette, and it was sampled
+            // from a point the mask was known to cover — where a fresh raycast at a screen point can
+            // just as easily return the surface behind a thin or open object. Apple's guidance on
+            // ARAnchor is that ARKit optimises world tracking around an anchor it has been given, so
+            // adopting the one already there keeps that refinement instead of discarding it.
+            if aimsAtLiveMask, let liveMask {
+                var anchorTransform = matrix_identity_float4x4
+                anchorTransform.columns.3 = SIMD4<Float>(liveMask.worldPosition, 1)
+                worldTransform = anchorTransform
+            } else if let depthPoint = DepthPointCloud.worldPoint(
                 from: frame,
-                normalizedViewportPoint: request.normalizedViewportPoint,
+                normalizedViewportPoint: normalizedPoint,
                 interfaceOrientation: interfaceOrientation(in: arView),
                 viewportSize: arView.bounds.size
             ) {
@@ -3082,7 +3174,7 @@ struct ARCameraView: UIViewRepresentable {
                 )
                 worldTransform = provisionalTransform
             } else {
-                return request
+                return ObjectMaskToggleRequest(normalizedViewportPoint: normalizedPoint)
             }
 
             let distance = simd_distance(
@@ -3090,7 +3182,7 @@ struct ARCameraView: UIViewRepresentable {
                 worldTransform.translation
             )
             return ObjectMaskToggleRequest(
-                normalizedViewportPoint: request.normalizedViewportPoint,
+                normalizedViewportPoint: normalizedPoint,
                 proposedLockID: UUID(),
                 worldTransform: worldTransform,
                 cameraDistance: distance
@@ -3852,6 +3944,7 @@ struct ARCameraView: UIViewRepresentable {
             pendingObjectMaskToggleRequest = nil
             objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
+            objectMaskToggleDeadline = 0
             consecutiveMaskMisses = 0
             consecutiveLiveMaskMisses = 0
             maskedAccumulators.removeAll()

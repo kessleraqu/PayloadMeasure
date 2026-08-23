@@ -68,6 +68,18 @@ final class ObjectCaptureEngine {
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var objectWorkflowRequest: ObjectWorkflowRequest?
     private(set) var isObjectSelectionPending = false
+    /// Why the last press did not become a measurement, or nil when nothing has failed since.
+    ///
+    /// The reasons were already being written down, into `objectMaskFeedbackText` — but that is read
+    /// only from the information panel, which is closed while measuring. So a press that failed showed
+    /// the operator nothing whatsoever: the Measure button disappeared, nothing happened, and the button
+    /// came back. That is indistinguishable from a fault even on the occasions when the app is behaving
+    /// exactly as designed, and it is the experience this exists to end. The instruction banner reads it.
+    private(set) var lastSelectionFailure: String?
+    /// When to stop saying it, on the monotonic clock. A failed press is news for as long as the
+    /// operator is still standing where they pressed; a minute later it is a stale complaint about
+    /// something they have long since moved on from.
+    private var selectionFailureExpiry: TimeInterval = 0
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
     private(set) var showsSelectedPoints = true
@@ -231,7 +243,9 @@ final class ObjectCaptureEngine {
         }
         cancelActiveMeasurement()
         statusText = "That did not start measuring. Aim at the object again and tap Measure."
-        objectMaskFeedbackText = statusText
+        // Same reasoning as every other way a press can come to nothing: the operator watched the
+        // button disappear, and has to be told why it came back.
+        failObjectSelection(statusText)
         return true
     }
 
@@ -640,6 +654,13 @@ final class ObjectCaptureEngine {
     }
 
     func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
+        // Once per segmentation rather than once per frame: the notice needs to go away on its own, and
+        // this is the slowest regular beat that still does it promptly. Publishing it from the frame
+        // callback would redraw the whole overlay, mask included, to retire one line of text.
+        if lastSelectionFailure != nil,
+           ProcessInfo.processInfo.systemUptime >= selectionFailureExpiry {
+            clearSelectionFailure()
+        }
         visibleObjectMaskCount = min(max(visibleCount, 0), lockedObjectMaskCount)
         let retainedMarkers = retainedObjectMaskMarkers(markers)
         cacheObjectMaskColors(from: retainedMarkers)
@@ -671,24 +692,43 @@ final class ObjectCaptureEngine {
         }
     }
 
-    func reportObjectLockNeedsSurface() {
+    /// Ends a selection that did not become a measurement, and leaves the reason somewhere the operator
+    /// will actually see it. Every path that hands the Measure button back goes through here, so none of
+    /// them can do it silently.
+    private func failObjectSelection(_ reason: String) {
         isObjectSelectionPending = false
-        objectMaskFeedbackText = "No stable surface was found. Move slowly around the object and hold it in view."
+        objectMaskFeedbackText = reason
+        lastSelectionFailure = reason
+        selectionFailureExpiry = ProcessInfo.processInfo.systemUptime
+            + Self.selectionFailureNoticeSeconds
+    }
+
+    /// Drops the notice once it has been answered — by a fresh press, by a measurement starting, or by
+    /// simply having been on screen long enough.
+    private func clearSelectionFailure() {
+        selectionFailureExpiry = 0
+        if lastSelectionFailure != nil {
+            lastSelectionFailure = nil
+        }
+    }
+
+    /// How long the banner keeps explaining a failed press.
+    private static let selectionFailureNoticeSeconds: TimeInterval = 8
+
+    func reportObjectLockNeedsSurface() {
+        failObjectSelection("No stable surface was found. Move slowly around the object and hold it in view.")
     }
 
     func reportObjectSelectionNotReady() {
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "Wait for Environment ready before selecting an object."
+        failObjectSelection("Wait for Environment ready before selecting an object.")
     }
 
     func reportObjectRecognitionPreparing() {
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "Object recognition is preparing. Keep an object near the center for a moment."
+        failObjectSelection("Object recognition is preparing. Keep an object near the center for a moment.")
     }
 
     func reportObjectRecognitionFailure() {
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "Object recognition had a temporary problem. Keep the object visible and hold steady."
+        failObjectSelection("Object recognition had a temporary problem. Keep the object visible and hold steady.")
     }
 
     func markObjectRecognitionWarmupCompleted() {
@@ -696,13 +736,11 @@ final class ObjectCaptureEngine {
     }
 
     func reportObjectLockNotFound() {
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "No separate object mask was found. Keep one object fully visible near the centre."
+        failObjectSelection("No separate object mask was found. Keep one object fully visible near the centre.")
     }
 
     func reportObjectLimitReached() {
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "Maximum 15 objects reached."
+        failObjectSelection("Maximum 15 objects reached.")
     }
 
     func requestObjectMaskToggle(at normalizedViewportPoint: CGPoint) {
@@ -715,6 +753,7 @@ final class ObjectCaptureEngine {
             return
         }
         isObjectSelectionPending = true
+        clearSelectionFailure()
         objectMaskToggleRequest = ObjectMaskToggleRequest(
             normalizedViewportPoint: normalizedViewportPoint
         )
@@ -726,8 +765,7 @@ final class ObjectCaptureEngine {
         guard isObjectSelectionPending else {
             return
         }
-        isObjectSelectionPending = false
-        objectMaskFeedbackText = "Object selection was interrupted. Keep the object visible to try again."
+        failObjectSelection("Object selection was interrupted. Keep the object visible to try again.")
     }
 
     func beginObjectMeasurement(id: UUID) {
@@ -742,6 +780,7 @@ final class ObjectCaptureEngine {
         measurementDetailStatus = .unknown
         didEncounterInsufficientFit = false
         activeObjectID = id
+        clearSelectionFailure()
         startMeasurementClock()
         refreshFramingGuidance()
         focusedCaptureID = id
@@ -1347,7 +1386,12 @@ final class ObjectCaptureEngine {
             candidateFramingGuidance = nil
             candidateFramingGuidanceCount = 0
             framingGuidance = nil
-        isFramedTooClose = false
+            // The too-close state is deliberately not cleared here. It is recomputed in full by
+            // `refreshTooCloseAdvice` at the top of every call, and already reads false whenever there
+            // is no mask to measure — whereas clearing it here tied it to the *centring* advice, which
+            // is a different question and is only ever published for an object under measurement. That
+            // coupling was invisible while nothing read the flag; now that the banner does, it would
+            // blink the warning off every time the centring advice lapsed.
             return
         }
 
@@ -1461,6 +1505,7 @@ final class ObjectCaptureEngine {
         clearAllSnapshotJPEGData()
         focusedCaptureID = nil
         isObjectSelectionPending = false
+        clearSelectionFailure()
         objectWorkflowRequest = nil
         objectMaskPreview = nil
         lockedMaskLayersByID.removeAll()

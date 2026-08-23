@@ -622,6 +622,21 @@ position relative to every other survivor — rather than a swap-remove per key.
 pins this directly; two of its five tests were confirmed to fail against the previous swap-remove
 implementation before this fix was written, and continue to pass against it now.
 
+### The mask is not drawn until a measurement is running
+
+Application behaviour, no paper involved, and recorded here because it changes what the operator aims
+with. Nothing is drawn until `ObjectCaptureEngine.activeObjectID` is set — that is,
+`MeasurementOverlayView.showsMaskPictures`. Before that the operator is choosing an object, and the
+live silhouette was the loudest thing on screen while being the least trustworthy thing on it: it is
+re-segmented several times a second, Vision does not segment a complex object the same way twice, it
+jumps between neighbouring objects, and under a hold it is a picture of a frame up to a second old
+drawn through the world by Part 6's similarity fit. Aiming is what the crosshair, the "Ready to
+measure" banner and the Measure button appearing are for.
+
+Selection is untouched. `automaticMeasurementCandidate` and `lockCandidate` read the mask *layers*,
+which are still computed every frame; only the drawing is withheld. The object that gets measured is
+the same object it was before, and the framing warning above still reads the same mask geometry.
+
 ### The lock follows the mask on screen
 
 `aimedCandidate` chooses which segmented instance the crosshair is on, and takes a `continuing:` hint —
@@ -894,7 +909,9 @@ too far   ⇔ never reported
 | 4 | **The on-screen measure is the study's own function**, `FramingCalibrationProtocol.fillPercent`, called rather than reimplemented. | A threshold read off one measure and applied to a lookalike is not supported by the data. Pinned by `theOnScreenMeasureIsTheStudysOwnMeasure`. |
 | 5 | **Too far is not reported at all.** | The study found accuracy broadly stable across its three wider framings, so there is nothing to say. Advice that can be ignored without cost teaches the operator to ignore the line the rest of the time. |
 | 6 | **Nothing is gated.** | Unchanged from the previous rule and for the same reason: the band cannot be met for every object, so enforcing it produced an object that was masked, obviously ready, and refused, with an instruction the operator could not act on. |
-| 7 | **The recommendation is still phrased in centimetres** ("tap Measure at 40–50 cm") while the *warning* is phrased in fill. | The recommendation is a starting hint for an operator who has nothing on screen yet and no fill to compute; the warning is a judgement about an object that is on screen. `observedPreferredDistanceMetres` is retained for the first and takes no decision. |
+| 7 | **The recommendation is still phrased in centimetres** while the *warning* is phrased in fill. | The recommendation is a starting hint for an operator who has nothing on screen yet and no fill to compute; the warning is a judgement about an object that is on screen. `observedAccurateDistanceMetres` is retained for the first and takes no decision. |
+| 8 | **The recommendation is 45–65 cm, not the 40–50 cm every screen used to quote.** | 45–65 cm is exactly the span of the framings the study found accurate: 38% fill was observed at about 450 mm and 25% at about 650 mm. 40 cm is nearer than any framing that was tested and found accurate — it sits inside the untested 38–53% interval where the cliff is known to lie — so the old copy was recommending a distance the data cannot speak for. Pinned by `theRecommendedDistanceIsTheSpanTheStudyFoundAccurate` and `theRecommendationNeverReachesIntoAFramingTheStudyFoundWorse`. The observed distances themselves now live in `FramingCalibrationProtocol.observedDistanceMillimetres` rather than in prose, so the recommendation can be checked against them. |
+| 9 | **The warning is now on screen.** `MeasurementFramingRule` was computed every frame and read by nothing; `ObjectCaptureEngine.isFramedTooClose` had no consumer at all, so the one thing the study established about how to hold the phone was the one thing the operator was never told. It is now a state of the instruction banner (`.tooClose`), and it takes the place of "Ready to measure" and of "Stay still and measure" — never of `pointDown`, `useSideView` or `findSurface`, which are what the stopping rule is actually waiting for. | Still not a gate, per difference 6: the Measure button is unmoved and unchanged. |
 
 ## What the fill is read from
 
@@ -1008,3 +1025,6 @@ box actually in progress after `advanceToNextBox`:
 | `theOnScreenMeasureIsTheStudysOwnMeasure` | difference 4: the rule and the study score framing with one function |
 | `aLargeObjectIsWarnedAtADistanceTheOldRuleCalledSafe` | difference 1: the case the millimetre rule missed |
 | `aSmallObjectIsNotWarnedWhereTheOldRuleWouldHaveBeen` | difference 1: the case the millimetre rule warned about wrongly |
+| `theRecommendedDistanceIsTheSpanTheStudyFoundAccurate` | difference 8: the recommendation is the tested-accurate span and nothing rounder |
+| `theRecommendationNeverReachesIntoAFramingTheStudyFoundWorse` | difference 8: it never reaches below 450 mm, which "40 cm" did |
+| `theOperatorReadsTheBandTheDataGives` | difference 8: the words on screen and the band they came from are one thing |

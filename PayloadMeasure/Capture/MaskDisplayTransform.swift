@@ -92,7 +92,7 @@ nonisolated struct MaskDisplayTransform: Equatable {
 
     /// The least-squares similarity taking the object's three reference points to where they are now.
     ///
-    /// This is the path that matters, and it is what keeps a mask on a small object at the 40–50 cm the
+    /// This is the path that matters, and it is what keeps a mask on a small object at the 45–65 cm the
     /// accuracy rule asks for. Vision's object tracker has a minimum target size in frame and is under
     /// it at that range — its box decays or stops following, which is a mask that lags, sticks or
     /// pulses. Points in the room have no such limit: ARKit reprojects them at any distance and any
@@ -304,7 +304,7 @@ extension CGFloat {
 
 /// Whether Vision's object tracker is worth running on a mask at all.
 ///
-/// It needs a target of some minimum size in the frame, and a small object at the 40–50 cm the accuracy
+/// It needs a target of some minimum size in the frame, and a small object at the 45–65 cm the accuracy
 /// rule asks for is under it: the tracker either stops following or lets its box decay, and both look
 /// like a broken mask. Below the threshold the mask is followed through the world instead, which has no
 /// such limit, and the tracker is not asked to do a job it cannot do — which also saves its cost in

@@ -1662,11 +1662,32 @@ actor ObjectMaskProcessor {
         in observation: InstanceMaskObservation,
         continuing previous: CGRect?
     ) throws -> (instance: Int, geometry: MaskGeometry)? {
-        let candidateInstances = ObjectMaskCandidatePolicy.previewInstances(
+        // `previewInstances` stops at whatever a probe on the point hits and only widens to the aim
+        // window when nothing is under the point at all. For a *preview* that is right: the probe found
+        // the object, and generating a mask for every instance in the window costs a full-resolution
+        // buffer each.
+        //
+        // For a *lock* it is not enough, and it is why pressing Measure on a plainly masked object could
+        // do nothing. The point is answered a frame or more after it was chosen, and against a fresh
+        // segmentation of the scene; when it has drifted a few percent onto the table behind the object,
+        // the table is the one instance the probe reports and therefore the only candidate — so the mask
+        // being continued is never even offered, and `aimedCandidate` has nothing to hold on to. It then
+        // either locks the table or, once the table fails the aim test, returns nothing and the press is
+        // silently lost.
+        //
+        // Whenever there is a mask on screen to continue, the aim window goes in as well, so the
+        // silhouette the operator was looking at is always among the candidates and the continuation rule
+        // can do the job it was written for. Sorted rather than set-ordered because `aimedCandidate`
+        // breaks exact ties on first-seen, and a mask that depends on hash order is not reproducible.
+        let aimWindowInstances = instances(inAimWindowAround: point, in: observation)
+        let probedInstances = ObjectMaskCandidatePolicy.previewInstances(
             nearby: preferredInstances,
-            withinAim: instances(inAimWindowAround: point, in: observation),
+            withinAim: aimWindowInstances,
             excluding: []
         )
+        let candidateInstances = previous == nil
+            ? probedInstances
+            : Set(probedInstances).union(aimWindowInstances).sorted()
         let continued = try aimedCandidate(
             at: point,
             candidates: candidateInstances,

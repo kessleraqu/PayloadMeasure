@@ -1,7 +1,8 @@
 import CoreGraphics
 import Foundation
 
-/// Whether the operator is too close for an accurate reading, reported and enforced nowhere.
+/// Whether the operator is too close for an accurate reading. Reported on the measuring screen,
+/// enforced nowhere.
 ///
 /// THE RULE, exactly. The framing study measured each object once at five *screen fill* levels —
 /// 25, 30, 38, 53 and 65% of the shorter viewport dimension — and found accuracy broadly stable across
@@ -29,10 +30,10 @@ import Foundation
 /// hysteresis a real width. Without a band the message flickers on and off while fill hovers at the
 /// threshold, which is the same lesson `ObjectCaptureEngine.refreshFramingGuidance` already records.
 ///
-/// **Nothing is gated.** Measuring starts whenever an object is masked and finishes wherever the
-/// operator is standing. A gate used to exist and was removed: the band cannot be met for every object,
-/// so it produced an object that was masked, obviously ready, and refused, with an instruction the
-/// operator could not act on. A reading taken slightly too close is worth more than a reading that was
+/// **Nothing is gated**, and the warning now being visible does not change that. Measuring starts
+/// whenever an object is masked and finishes wherever the operator is standing. A gate used to exist
+/// and was removed: the band cannot be met for every object, so it produced an object that was masked,
+/// obviously ready, and refused, with an instruction the operator could not act on. A reading taken slightly too close is worth more than a reading that was
 /// never allowed to happen, and the framing every measurement was taken at is in the study data either
 /// way. Being too far is not reported at all — the study found no loss there.
 nonisolated enum MeasurementFramingRule {
@@ -41,10 +42,23 @@ nonisolated enum MeasurementFramingRule {
     /// Midpoint of the untested interval the cliff lies in, 38–53%.
     static let releaseFillPercent: Double = 45.5
 
-    /// Distances the study's fill levels were observed at, for the objects it used. Retained because the
-    /// reports quote them and the operator-facing recommendation is still phrased in centimetres — but
-    /// they describe those objects, and no decision is taken on them.
-    static let observedPreferredDistanceMetres = 0.40 ... 0.50
+    /// The distances the study's *accurate* fill levels were observed at, for the objects it used.
+    ///
+    /// 38% fill came out at about 450 mm and 25% at about 650 mm, and accuracy held across that whole
+    /// span. 53% — about 350 mm — is the first level where the loss appears. So 450 mm is the nearest
+    /// distance any tested framing was observed to be accurate at, and the recommendation does not
+    /// reach below it.
+    ///
+    /// This band replaces "40–50 cm", which was quoted all over the measuring screen and straddles the
+    /// cliff: 40 cm is nearer than any framing the study found accurate, and the study cannot say
+    /// anything in its favour. As before, the distances describe *those objects* — the warning itself
+    /// is decided in fill, which is object-independent. This is retained for the one job fill cannot
+    /// do: telling an operator who has nothing on screen yet where to stand.
+    static let observedAccurateDistanceMetres = 0.45 ... 0.65
+
+    /// The same band, as the operator reads it. One constant so the banner, the guide and the
+    /// accessibility hints cannot drift apart or from the data.
+    static let recommendedDistanceText = "45–65 cm"
 
     /// How much of the frame this object occupies, by the study's own definition — its longest projected
     /// side over the shorter viewport dimension. Deliberately the *same function* the protocol scored its
