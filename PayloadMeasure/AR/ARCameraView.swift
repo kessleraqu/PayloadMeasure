@@ -336,16 +336,15 @@ struct ARCameraView: UIViewRepresentable {
         private var liveObjectMaskDisplayID: UUID?
         private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
-        private var objectMaskToggleAttemptsRemaining = 0
         private var objectMaskProcessingFailuresRemaining = 0
         /// How long a press has to be answered before it is given up on, on the monotonic clock.
         ///
-        /// The retry budget alone could not express this. A pass discarded because tracking dropped for
-        /// a frame is not the segmenter saying "no object here", so it must not spend an attempt — but
-        /// something has to stop the press being requeued for ever, and the only thing the operator
-        /// actually experiences is the wait. `Self.objectMaskToggleTimeout` is what they are made to
-        /// wait; the attempt count remains, and now means only "how many times the segmenter may look
-        /// and find nothing".
+        /// This replaced a retry count, which could not express the thing that actually needed bounding.
+        /// A pass discarded because tracking dropped for a frame is not the segmenter saying "no object
+        /// here", so charging it to a retry budget spent a press's attempts without the object ever once
+        /// being looked at — and a press made while the phone was still settling from the tap is exactly
+        /// when that happens. The wait is the only part of this the operator experiences, so the wait is
+        /// what is limited.
         private var objectMaskToggleDeadline: CFTimeInterval = 0
         /// Long enough to cover a hand still settling from the tap and a segmentation pass or two of
         /// tracking recovery, short enough that a press that is not going to land is handed back while
@@ -644,7 +643,6 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             pendingObjectMaskToggleRequest = nil
-            objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             objectMaskToggleDeadline = 0
             removeAllObjectMaskAnchors()
@@ -780,7 +778,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask = nil
             cancelCaptureFit()
             pendingObjectMaskToggleRequest = nil
-            objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             objectMaskToggleDeadline = 0
             captureEngine.cancelObjectSelection()
@@ -876,7 +873,6 @@ struct ARCameraView: UIViewRepresentable {
             if captureEngine.objectMaskToggleRequestRevision != observedObjectMaskToggleRequestRevision {
                 observedObjectMaskToggleRequestRevision = captureEngine.objectMaskToggleRequestRevision
                 pendingObjectMaskToggleRequest = captureEngine.objectMaskToggleRequest
-                objectMaskToggleAttemptsRemaining = 6
                 objectMaskProcessingFailuresRemaining = 8
                 objectMaskToggleDeadline = CACurrentMediaTime()
                     + Self.objectMaskToggleTimeout
@@ -912,7 +908,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskDisplayTask = nil
             cancelCaptureFit()
             pendingObjectMaskToggleRequest = nil
-            objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             objectMaskToggleDeadline = 0
             if publishesCancellation {
@@ -935,7 +930,6 @@ struct ARCameraView: UIViewRepresentable {
             objectMaskTask = nil
             cancelCaptureFit()
             pendingObjectMaskToggleRequest = nil
-            objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             objectMaskToggleDeadline = 0
 
@@ -1713,15 +1707,8 @@ struct ARCameraView: UIViewRepresentable {
                     // act on it, and give up out loud rather than quietly once its time is up.
                     // The processor's own bookkeeping releases the orphaned tracker and its colour on
                     // its next pass, since neither the active object nor the new request names it.
-                    //
-                    // No attempt is spent here. None of these conditions is an answer to the question
-                    // the press asked — tracking dropped for a frame, the session was re-based, the
-                    // pass was cancelled — and charging them against the retry budget is why a press
-                    // made while the phone was still settling from the tap itself could exhaust its
-                    // attempts without the segmenter ever once being asked about the object. The press
-                    // is bounded by `objectMaskToggleDeadline` instead, which is the honest limit: how
-                    // long the operator is made to wait, rather than how many passes happened to fail
-                    // for unrelated reasons.
+                    // None of these conditions is an answer to the question the press asked, so the
+                    // only thing that ends the retrying here is the deadline.
                     if let submittedToggleRequest,
                        self.captureEngine.isObjectSelectionPending,
                        self.pendingObjectMaskToggleRequest == nil {
@@ -1747,7 +1734,7 @@ struct ARCameraView: UIViewRepresentable {
                         if self.objectMaskProcessingFailuresRemaining > 0 {
                             self.pendingObjectMaskToggleRequest = submittedToggleRequest
                         } else {
-                            self.objectMaskToggleAttemptsRemaining = 0
+                            self.objectMaskToggleDeadline = 0
                             self.captureEngine.reportObjectRecognitionFailure()
                         }
                     }
@@ -1755,14 +1742,6 @@ struct ARCameraView: UIViewRepresentable {
                 case .succeeded:
                     if result.isSelectionPipelineWarmed {
                         self.captureEngine.markObjectRecognitionWarmupCompleted()
-                    }
-                    // Only a pass that actually looked at the scene and did not find the object counts
-                    // against the budget.
-                    if submittedToggleRequest != nil {
-                        self.objectMaskToggleAttemptsRemaining = max(
-                            self.objectMaskToggleAttemptsRemaining - 1,
-                            0
-                        )
                     }
                 }
 
@@ -1869,14 +1848,12 @@ struct ARCameraView: UIViewRepresentable {
                 )
                 if result.needsWorldSurface {
                     self.pendingObjectMaskToggleRequest = nil
-                    self.objectMaskToggleAttemptsRemaining = 0
                     self.objectMaskProcessingFailuresRemaining = 0
                     self.objectMaskToggleDeadline = 0
                     self.captureEngine.reportObjectLockNeedsSurface()
                 } else if submittedToggleRequest != nil,
                    !result.didToggleLock,
                    self.pendingObjectMaskToggleRequest == nil,
-                   self.objectMaskToggleAttemptsRemaining > 0,
                    CACurrentMediaTime() < self.objectMaskToggleDeadline {
                     self.pendingObjectMaskToggleRequest = submittedToggleRequest
                 } else if submittedToggleRequest != nil,
@@ -3942,7 +3919,6 @@ struct ARCameraView: UIViewRepresentable {
                 )
             }
             pendingObjectMaskToggleRequest = nil
-            objectMaskToggleAttemptsRemaining = 0
             objectMaskProcessingFailuresRemaining = 0
             objectMaskToggleDeadline = 0
             consecutiveMaskMisses = 0

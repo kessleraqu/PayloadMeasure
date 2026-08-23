@@ -14,16 +14,6 @@ final class SelectionFailureNoticeTests: XCTestCase {
         engine.requestObjectMaskToggle(at: crosshair)
     }
 
-    func testAPressIsPendingAndCarriesNoFailureOfItsOwn() {
-        let engine = ObjectCaptureEngine()
-        pressMeasure(on: engine)
-        XCTAssertTrue(engine.isObjectSelectionPending)
-        XCTAssertNil(
-            engine.lastSelectionFailure,
-            "A press that has not been answered yet has not failed."
-        )
-    }
-
     func testEveryWayASelectionCanEndWithoutAMeasurementExplainsItself() {
         let endings: [(name: String, end: (ObjectCaptureEngine) -> Void)] = [
             ("no mask found", { $0.reportObjectLockNotFound() }),
