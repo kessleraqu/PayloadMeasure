@@ -282,6 +282,17 @@ a file on the device. `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPl
 app's Documents folder as Files › On My iPhone › PayloadMeasure, so every run can be collected
 without the app's help. Neither the app nor the Files folder has any delete path.
 
+**The LiDAR snapshot screen is an isolated setup utility.** It borrows the same `ARView` under a
+dedicated renderer lease, runs disposable smoothed scene depth without scene reconstruction or
+plane detection, and requests a fresh measurement world when it closes. One `ARFrame` produces
+three identically sized one-page PDFs — RGB, LiDAR points, and their overlay — under
+`Documents/StudyRuns/lidar/`; no study store, measurement, package or packing state is involved.
+The live display draws medium-or-better depth samples through 64 GPU-backed shape layers, samples
+every second depth cell at roughly 8 Hz, and avoids all triangle construction. Saved PDFs use every
+valid depth sample. A stable deterministic offset scatters each dot by at most 32% of its sampled
+cell, preserving its real depth source without a flickering perfect grid. Colour stays violet through
+15 cm, traverses the full spectrum from 15–60 cm, and stays red at 60 cm and greater.
+
 **`UIFileSharingEnabled` needs the partial `Info.plist` at the project root**, not a build setting.
 Xcode honours only a fixed list of `INFOPLIST_KEY_*` settings and silently drops the rest, so
 `INFOPLIST_KEY_UIFileSharingEnabled = YES` built without complaint and produced an app with the key

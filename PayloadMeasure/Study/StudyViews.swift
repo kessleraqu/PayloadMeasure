@@ -23,6 +23,7 @@ struct StudySetupView: View {
     @State private var showsArchive = false
     @State private var showsAccuracy = false
     @State private var showsFramingAccuracy = false
+    @State private var showsLiDARCapture = false
     @State private var editedCatalogue: StudyBox?
     @State private var duplicateRun: StudyRun?
     @State private var showsOverwritePassword = false
@@ -132,6 +133,11 @@ struct StudySetupView: View {
 
                 Section {
                     Button {
+                        showsLiDARCapture = true
+                    } label: {
+                        Label("LiDAR snapshot", systemImage: "camera.viewfinder")
+                    }
+                    Button {
                         showsAccuracy = true
                     } label: {
                         Label("Accuracy test", systemImage: "ruler")
@@ -142,7 +148,7 @@ struct StudySetupView: View {
                         Label("Distance and framing test", systemImage: "viewfinder")
                     }
                 } footer: {
-                    Text("Independent tools: compare Top and 3D measurements, or measure one object inside five framing boxes to calibrate distance guidance.")
+                    Text("Independent tools: save aligned RGB and LiDAR views, compare Top and 3D measurements, or calibrate distance guidance.")
                 }
             }
             .navigationTitle("New study run")
@@ -155,6 +161,9 @@ struct StudySetupView: View {
             }
             .fullScreenCover(isPresented: $showsFramingAccuracy) {
                 FramingAccuracySiteView(store: framingAccuracy)
+            }
+            .fullScreenCover(isPresented: $showsLiDARCapture) {
+                LiDARCaptureView()
             }
             .sheet(item: $editedCatalogue) { payload in
                 BoxCatalogView(catalogue: catalogue(for: payload))

@@ -95,6 +95,14 @@ contains the only selector, between the two automatic methods: Full 3D and Top.
 
 ✅ LiDAR depth-based automatic Scan workflow implemented with live multi-frame accumulation.
 
+✅ An independent setup-menu LiDAR snapshot utility displays confidence-filtered points directly
+from smoothed scene depth and saves RGB, point-only and combined PDFs from the same AR frame under
+`StudyRuns/lidar/`. It does not enable scene reconstruction or plane detection. The GPU-backed live
+overlay samples every second depth cell at roughly 8 Hz while PDFs retain every valid sample. Its
+stable sub-cell scatter breaks up the depth sensor's raster without inventing samples. Its absolute
+depth palette holds violet through 15 cm, traverses the full spectrum from 15–60 cm, and clamps
+greater distances to red.
+
 ✅ Scan is the sole operator workflow and reports unsupported hardware explicitly on non-LiDAR
 devices; its Full 3D and Top measurement methods share selection, naming, weight and saved objects.
 

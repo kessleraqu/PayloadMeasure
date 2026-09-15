@@ -14,6 +14,7 @@ import UIKit
 nonisolated enum SharedARRendererRole: Equatable, Sendable {
     case measurement
     case packing
+    case lidarCapture
 }
 
 /// Pure ownership state, separate from UIKit so the important stale-release rule can be tested.
