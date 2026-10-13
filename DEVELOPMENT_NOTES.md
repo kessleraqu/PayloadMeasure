@@ -2,6 +2,8 @@
 
 # PayloadMeasure Development Notes
 
+Historical implementation notes. See the root README for the current repository scope and build instructions.
+
 This file records implementation changes in plain language so the research prototype remains explainable and easy to document later.
 
 ---
@@ -1644,7 +1646,6 @@ backup branch was removed after its commit became part of `main` history.
 - Saved objects and their RealityKit boxes remain while the next object is scanned. Boxes cycle
   through eight high-contrast colors and the engine retains every `CapturedObject` result.
 - Apple's native foreground-instance request is the active A15/A16-compatible segmentation path.
-  The incomplete image-only EdgeTAM export and speculative optical-flow overlay are bypassed.
 - Segmentation is single-flight and always accepts the newest camera frame; stale frames never queue.
   The visual overlay raster is smaller, while metric gating still samples the full-resolution mask.
 - Masked depth accumulation and live 3D box fitting now run at the full 15 Hz acquisition cadence,
@@ -2052,16 +2053,14 @@ The lifecycle cleanup now:
 
 Performance cleanup removed the already-unused world-surfel construction and renderer. The measured
 point admission, depth-neighbour filtering, voxel accumulation, view-gated dimensions, fitting rules,
-thresholds and capture algorithms were not changed. The inactive EdgeTAM adapter and model packages
-remain in the repository for future research but are excluded from target membership, avoiding their
-compile time and app-bundle cost. Development Markdown is likewise no longer bundled into the app.
+thresholds and capture algorithms were not changed. Development Markdown is not bundled into the app.
 
 ### Validation
 
 - Xcode 26.5 generic iOS device Debug build with signing disabled: succeeded.
 - Xcode 26.5 generic iOS device clean Release build with signing disabled: succeeded.
 - Xcode 26.5 static analysis: succeeded with no reported source diagnostics.
-- The Release app contains no EdgeTAM model products or development Markdown files.
+- The Release app contains no development Markdown files.
 - Physical iPhone 13 Pro testing remains required for real LiDAR depth, interruption recovery and
   cold-launch first-measurement behavior.
 

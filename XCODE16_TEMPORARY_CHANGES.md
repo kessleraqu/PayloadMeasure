@@ -1,5 +1,7 @@
 # Xcode 16 Temporary Compatibility Changes
 
+Historical development record. See the root README for the current toolchain and run instructions.
+
 Date: 2026-07-22
 
 Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), the bundled Swift 6.0.3 compiler, and the iOS 18.2 SDK on macOS Sonoma 14.8.7 while preserving runtime behavior.
@@ -7,7 +9,6 @@ Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), th
 ## Files changed
 
 - `objectmaskprocessor.swift`
-- `PayloadMeasure/edgetamsegmenter.swift`
 - `arcameraview.swift`
 - `XCODE16_TEMPORARY_CHANGES.md` (this record; newly created)
 
@@ -15,7 +16,7 @@ Purpose: make this temporary project copy compile with Xcode 16.2 (16C5032a), th
 
 ## Temporary source compatibility adjustments
 
-Only 16 type declaration headers and one RealityKit initializer expression were changed. No segmentation, tracking, ARKit session flow, Vision, Core ML, depth processing, concurrency implementation, rendering behavior, constants, or thresholds were changed.
+Only type declaration headers and one RealityKit initializer expression were changed. No segmentation, tracking, ARKit session flow, Vision, depth processing, concurrency implementation, rendering behavior, constants, or thresholds were changed.
 
 ### objectmaskprocessor.swift
 
@@ -46,17 +47,6 @@ Xcode 16.2's Swift 6.0.3 compiler rejects the Xcode 26 declaration-level `noniso
 - Original: `nonisolated struct ObjectMaskProcessingResult: @unchecked Sendable {`
   Temporary: `struct ObjectMaskProcessingResult: @unchecked Sendable {`
 
-### PayloadMeasure/edgetamsegmenter.swift
-
-- Original: `nonisolated struct EdgeTAMFrameFeatures: @unchecked Sendable {`
-  Temporary: `struct EdgeTAMFrameFeatures: @unchecked Sendable {`
-- Original: `nonisolated struct EdgeTAMMask: @unchecked Sendable {`
-  Temporary: `struct EdgeTAMMask: @unchecked Sendable {`
-- Original: `nonisolated enum EdgeTAMSegmenterError: LocalizedError {`
-  Temporary: `enum EdgeTAMSegmenterError: LocalizedError {`
-- Original: `nonisolated final class EdgeTAMSegmenter: @unchecked Sendable {`
-  Temporary: `final class EdgeTAMSegmenter: @unchecked Sendable {`
-
 ### arcameraview.swift
 
 Xcode 16.2's iPhoneOS RealityKit interface contains `AnchorEntity(anchor: ARAnchor)`, but its iPhoneSimulator RealityKit interface omits that convenience initializer. Both SDK interfaces support an anchor target identified by the same `ARAnchor` UUID. The following one-line spelling compiles for device and simulator and continues to bind the RealityKit entity to the exact `ARAnchor` added to the `ARSession` immediately afterward.
@@ -70,7 +60,7 @@ The supported method-level `nonisolated` modifiers on the seven `ARSessionDelega
 
 Date: 2026-07-23
 
-The uninstantiated optical-flow motion pipeline and unreachable EdgeTAM integration path were later removed from `objectmaskprocessor.swift`. The standalone EdgeTAM adapter, all three Core ML packages, and their target membership were retained. This cleanup was independent of Xcode 16 compatibility and did not change the temporary syntax replacements listed above.
+The uninstantiated optical-flow motion pipeline was later removed from `objectmaskprocessor.swift`. This cleanup was independent of Xcode 16 compatibility and did not change the temporary syntax replacements listed above.
 
 ## Project settings
 
@@ -93,10 +83,6 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 ## Source and model membership verification
 
 - `objectmaskprocessor.swift` exists once, has one `PBXFileReference`, one `PBXBuildFile`, and one entry in the sole target's `PBXSourcesBuildPhase`. It is outside the synchronized `PayloadMeasure/` group, so it is compiled exactly once.
-- These Core ML packages remain under the target's synchronized `PayloadMeasure/` root group with no membership exception and were all compiled into the app during verification:
-  - `PayloadMeasure/Models/EdgeTAM/edgetam_image_encoder.mlpackage`
-  - `PayloadMeasure/Models/EdgeTAM/edgetam_prompt_encoder.mlpackage`
-  - `PayloadMeasure/Models/EdgeTAM/edgetam_mask_decoder.mlpackage`
 
 ## Build verification
 
@@ -108,15 +94,12 @@ The deployment target remains iOS 18.0. No dependency was added, removed, or upg
 
 Date: 2026-08-06
 
-- Restored declaration-level `nonisolated` annotations used by the cross-actor mask value types and
-  the retained experimental EdgeTAM adapter.
+- Restored declaration-level `nonisolated` annotations used by the cross-actor mask value types.
 - Restored `AnchorEntity(anchor:)` for anchors created from exact `ARAnchor` instances.
 - Raised the project deployment setting inherited by the app target to iOS 26.5.
 - Restored Xcode 26 concurrency settings: approachable concurrency, MainActor default isolation and
   member-import visibility. Swift 5 language mode remains intentional.
 - Restored the HUD with native Liquid Glass effects and glass button styles.
-- Kept the EdgeTAM source and three Core ML packages as research material, but excluded them from
-  target membership because no active runtime path references them.
 - Removed development Markdown files from the application bundle while retaining them in the project.
 - Verified the active app with Xcode 26.5 using unsigned generic-device Debug and clean Release builds,
   followed by Xcode static analysis.

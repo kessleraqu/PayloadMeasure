@@ -22,7 +22,6 @@
 		AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arsessionmanager.swift; sourceTree = "<group>"; };
 		AC99C67D2FF2B088006EBB3A /* arcameraview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = arcameraview.swift; sourceTree = "<group>"; };
 		AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesoverlayview.swift; sourceTree = "<group>"; };
-		AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = DEVELOPMENT_NOTES.md; sourceTree = "<group>"; };
 		AC99C6832FF2B226006EBB3A /* mespoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mespoint.swift; sourceTree = "<group>"; };
 		AC99C6852FF2B227006EBB3A /* mesengine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesengine.swift; sourceTree = "<group>"; };
 		AC99C6872FF2BA02006EBB3A /* mesmode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = mesmode.swift; sourceTree = "<group>"; };
@@ -36,13 +35,6 @@
 		AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				EdgeTAMSegmenter.swift,
-				Models/EdgeTAM/edgetam_image_encoder.mlpackage,
-				Models/EdgeTAM/edgetam_mask_decoder.mlpackage,
-				Models/EdgeTAM/edgetam_prompt_encoder.mlpackage,
-				Models/EdgeTAM/LICENSE,
-				Models/EdgeTAM/model_info.json,
-				Models/EdgeTAM/README.md,
 				PROJECT_CONTEXT.md,
 			);
 			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;
@@ -79,7 +71,6 @@
 				AC99C67B2FF2B088006EBB3A /* arsessionmanager.swift */,
 				AC99C67D2FF2B088006EBB3A /* arcameraview.swift */,
 				AC99C67F2FF2B08A006EBB3A /* mesoverlayview.swift */,
-				AC99C6812FF2B0A4006EBB3A /* DEVELOPMENT_NOTES.md */,
 				AC99C6832FF2B226006EBB3A /* mespoint.swift */,
 				AC99C6852FF2B227006EBB3A /* mesengine.swift */,
 				AC99C6872FF2BA02006EBB3A /* mesmode.swift */,
@@ -312,7 +303,6 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = AFT38WQV48;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "PayloadMeasure uses the camera for AR payload measurement and positioning.";
@@ -326,7 +316,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.kessler.PayloadMeasure;
+				PRODUCT_BUNDLE_IDENTIFIER = org.example.PayloadMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -345,7 +335,6 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = AFT38WQV48;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSCameraUsageDescription = "PayloadMeasure uses the camera for AR payload measurement and positioning.";
@@ -359,7 +348,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.kessler.PayloadMeasure;
+				PRODUCT_BUNDLE_IDENTIFIER = org.example.PayloadMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;

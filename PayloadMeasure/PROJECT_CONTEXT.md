@@ -1,5 +1,8 @@
 # PROJECT_CONTEXT.md
 
+Historical research and development context. See the root README for the current repository scope,
+supported build configuration, and feature summary.
+
 # PayloadMeasure – Master's Thesis Context
 
 ## Overview
@@ -105,7 +108,7 @@ both LiDAR and non-LiDAR devices. Up to 15 targets retain distinct colors and id
 
 ✅ The active production path uses Apple's native foreground-instance mask from the exact camera
 frame. Between results, its display overlay follows the current projected AR anchor and camera
-distance; the experimental EdgeTAM and dense optical-flow paths remain bypassed.
+distance.
 
 ✅ On LiDAR hardware, automatic box geometry is fitted only from depth pixels admitted by the
 time-synchronized object mask. Unmasked depth is restricted to support-plane height estimation.
@@ -222,9 +225,6 @@ used by the first selection tap, avoiding first-use Vision/Core Image cache work
 ✅ Selection-point buffers and a pool of shared-mesh box-edge entities are prepared in small idle-time
 batches before the first fit, avoiding a burst of first-box renderer allocation on the main actor.
 
-✅ The retained experimental EdgeTAM adapter and model packages are excluded from the app target so
-they remain available for future research without being compiled or shipped in the production app.
-
 ---
 
 # Long-Term Roadmap
@@ -267,15 +267,6 @@ Evaluate:
 - Platform compatibility
 - Arrangement possibilities
 - Payload constraints
-
-## Deferred Tracking Upgrade
-
-After the presentation-safe native Vision version is validated, evaluate replacing foreground-mask
-selection with pretrained promptable video segmentation. The leading option is EdgeTAM exported to
-Core ML: tap prompts select arbitrary objects, one image encoding is shared across locks, and AR
-anchor reprojection plus temporal mask state supports reacquisition. Keep synchronized mask-gated
-LiDAR points for metric capture. EfficientTAM is a secondary candidate if its iOS deployment path
-matures; fixed-class YOLO segmentation is appropriate only with a payload-specific training set.
 
 ---
 

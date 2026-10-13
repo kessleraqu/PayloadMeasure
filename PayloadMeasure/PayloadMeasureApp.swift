@@ -1,8 +1,5 @@
-, //
 //  PayloadMeasureApp.swift
 //  PayloadMeasure
-//
-//  Created by Alexandre on 29/06/2026.
 //
 
 import SwiftUI
