@@ -1,10 +1,7 @@
 import SwiftUI
 
-// Root view. Runs one selected input condition through both payload sizes, then returns to setup so
-// the administrator can configure the other input condition separately.
-//
-// The study owns the flow now — the method and the box order come from StudySetupView rather than
-// being picked ad hoc, so a session cannot start without being recorded.
+// Root view. Runs one input condition through both payload sizes, then returns to the study setup
+// so the other condition can be configured.
 
 struct ContentView: View {
     @AppStorage("measurementWorkflowMode")
@@ -13,14 +10,12 @@ struct ContentView: View {
     @State private var aimerState = AimerState()
     @State private var captureEngine = ObjectCaptureEngine()
     @State private var sessionToken = 0
-    /// Measurement and room-scale packing take turns using this one RealityKit renderer. Creating a
-    /// second ARView later in a full-screen-cover flow can leave its camera background stuck on an
-    /// old texture even while tracking remains live on iOS 26.
+    /// Measurement and packing share one ARView. Creating a second one inside a full-screen cover
+    /// can leave its camera background frozen on iOS 26.
     @State private var sharedARViewHost = SharedARViewHost()
     @State private var warmup = AppWarmup()
     @State private var study = StudyStore()
-    /// Owned here rather than by the setup screen, so an accuracy test survives that screen being
-    /// rebuilt and can be left and returned to.
+    /// Kept here so a running accuracy test survives the setup screen being rebuilt.
     @State private var accuracy = AccuracyStore()
     @State private var framingAccuracy = FramingAccuracyStore()
     @State private var isShowingFinalConnectStep = false
@@ -52,8 +47,7 @@ struct ContentView: View {
                         )
                     } else {
                         ZStack {
-                            // Pausing is not enough here: a paused ARView keeps its RealityKit
-                            // renderer and last camera texture alive under the packing workflow.
+                            // Pausing isn't enough: a paused ARView keeps its renderer and camera texture alive.
                             if !sessionManager.isPackingArrangementPresented {
                                 ARCameraView(
                                     sessionManager: sessionManager,
@@ -67,7 +61,7 @@ struct ContentView: View {
                                 Color.black.ignoresSafeArea()
                             }
 
-                            MesOverlayView(
+                            MeasurementOverlayView(
                                 sessionManager: sessionManager,
                                 aimerState: aimerState,
                                 captureEngine: captureEngine,
@@ -94,9 +88,7 @@ struct ContentView: View {
         .environment(\.sharedARViewHost, sharedARViewHost)
     }
 
-    /// Reset: throw away everything measured and start this same payload over. The study does not
-    /// move on, so a participant cannot reach the next box without the operator entering the
-    /// password.
+    /// Discards this payload's measurements and starts it again. The study does not advance.
     private func restartCurrentPayload() {
         isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
@@ -105,19 +97,15 @@ struct ContentView: View {
         sessionToken &+= 1
     }
 
-    /// At a payload boundary the measurements belong to the one just finished, so the capture
-    /// session is cleared and the view hierarchy rebuilt. Real payloads are separated by neutral
-    /// participant-controlled start screens.
+    /// Clears the capture session and rebuilds the view hierarchy for the next payload.
     private func startNextBox() {
-        // The presenting overlay is replaced as part of this transition, so do not wait for its
-        // onDismiss callback to return camera ownership. Clear it before constructing the next box.
+        // The overlay is replaced in this transition, so don't wait for its onDismiss.
         sharedARViewHost.requestNewMeasurementWorld()
         sessionManager.setPackingArrangementPresented(false)
         captureEngine.reset()
         sessionToken &+= 1
         if study.isTestMode {
-            // A test run has one payload and nothing to record, so finishing it is the same thing as
-            // leaving it: straight back to setup, with no connect step and no saved run.
+            // A test run has a single payload and nothing to save, so finishing it just returns to setup.
             study.clearActiveRun()
         } else if study.isOnLastBox {
             study.endCurrentPhase()
@@ -134,8 +122,7 @@ struct ContentView: View {
         isShowingFinalConnectStep = false
     }
 
-    /// Abandons the run from the info panel, behind the study password. Whatever was already recorded
-    /// for finished payloads stays on disk; the payload in progress simply never completes.
+    /// Cancels the run (password protected). Payloads already finished stay saved.
     private func cancelRun() {
         isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()
@@ -145,7 +132,7 @@ struct ContentView: View {
         study.clearActiveRun()
     }
 
-    /// From the results screen. Keeps every saved run; only clears the screen.
+    /// Clears the results screen. Saved runs are kept.
     private func restartForNextParticipant() {
         isShowingFinalConnectStep = false
         sharedARViewHost.requestNewMeasurementWorld()

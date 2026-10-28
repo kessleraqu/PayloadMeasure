@@ -92,8 +92,7 @@ final class ObjectCaptureMetadataTests: XCTestCase {
             ),
             .moveCloser
         )
-        // Clipped at an edge but not filling the frame: an aiming problem. Telling the operator to
-        // back away from something that is off to one side is the advice that appeared to do nothing.
+        // Clipped at an edge but not filling the frame: re-centre, don't back away.
         XCTAssertEqual(
             ObjectCaptureEngine.framingGuidance(
                 forNormalizedViewportBoundingBox: CGRect(
@@ -105,7 +104,7 @@ final class ObjectCaptureMetadataTests: XCTestCase {
             ),
             .centre
         )
-        // Genuinely filling the frame: backing away is the only thing that helps.
+        // Filling the frame: back away.
         XCTAssertEqual(
             ObjectCaptureEngine.framingGuidance(
                 forNormalizedViewportBoundingBox: CGRect(
@@ -139,13 +138,8 @@ final class ObjectCaptureMetadataTests: XCTestCase {
         XCTAssertNil(engine.framingGuidance)
     }
 
-    /// Framing advice is about framing, and nothing else.
-    ///
-    /// It used to return "move closer" whenever the fit had too little depth evidence, at any distance.
-    /// A dark or glancing surface therefore asked the operator to close in on something already close
-    /// enough, and the apparent-size rule then asked them to back off — the two chasing each other,
-    /// which is what made the advice feel arbitrary. How much evidence there is belongs to the progress
-    /// ring, which reports it as "keep it in view", not to a distance instruction.
+    /// Framing advice only depends on framing, not on how much depth evidence the fit has. Thin
+    /// evidence is shown on the progress ring instead.
     func testFramingAdviceIgnoresHowMuchEvidenceTheFitHas() {
         let engine = ObjectCaptureEngine()
         let id = UUID()
@@ -170,9 +164,7 @@ final class ObjectCaptureMetadataTests: XCTestCase {
             "Needing more detail is not a reason to send the operator anywhere."
         )
 
-        // Moving the object to the edge is still reported, because that is framing. It has to agree
-        // with itself for several updates first: a mask wobbling at the frame edge would otherwise
-        // flick the advice on and off, which is what the hold count is for.
+        // Edge clipping is still reported, but only after it repeats for several updates.
         for _ in 0..<6 {
             engine.updateObjectMaskDisplayBoundingBoxes([
                 id: CGRect(x: 0.01, y: 0.2, width: 0.4, height: 0.4)
@@ -282,7 +274,7 @@ final class ObjectCaptureMetadataTests: XCTestCase {
         engine.updateActiveSupportPlaneAvailability(id: id, isAvailable: true)
         XCTAssertEqual(engine.lockActiveObject(), id)
 
-        // Finished and focused, but no marker is visible, so nothing is being pointed at.
+        // Finished and focused, but no marker visible, so nothing is being pointed at.
         XCTAssertTrue(engine.canReactivateFocusedObject)
         XCTAssertFalse(engine.canEditFocusedObject)
     }

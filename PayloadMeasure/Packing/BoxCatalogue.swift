@@ -2,18 +2,8 @@ import Foundation
 import Observation
 import simd
 
-// The boxes available for one payload module.
-//
-// In:  the payload being worked on, and whatever the operator adds or deletes.
-// Out: the list the assignment step chooses from, saved per payload.
-//
-// Each module carries its own boxes: the two are stocked differently, so a shared list would offer
-// the small module boxes that cannot go in it. The practice payload has no list of its own — it is the
-// same size as the small module and is meant to stand in for it, so it uses the small module's boxes.
-//
-// The list is saved under a key that names the payload, and under a fresh key generation: the earlier
-// build kept one shared list of fourteen boxes, and reusing its key would have restored those on
-// upgrade instead of the sets the study actually uses.
+// The boxes available for one payload module, saved per payload. Each list starts empty and is
+// filled in by the operator.
 
 @MainActor
 @Observable
@@ -32,7 +22,7 @@ final class BoxCatalogue {
         presets = Self.load(for: payload)
     }
 
-    /// Reloads from disk. Used when returning from a screen that may have edited the same payload.
+    /// Reloads from disk after another screen may have edited the same list.
     func reload() {
         presets = Self.load(for: payload)
     }
@@ -62,68 +52,19 @@ final class BoxCatalogue {
         save()
     }
 
-    func resetToDefaults() {
-        presets = PackingBoxPreset.defaultCatalog(for: payload)
-        save()
-    }
-
-    var isDefault: Bool {
-        presets.map(\.id) == PackingBoxPreset.defaultCatalog(for: payload).map(\.id)
-    }
-
     // MARK: - Persistence
 
-    /// The generation moves whenever the stocked sizes change, because a saved list would otherwise
-    /// restore the old ones on upgrade. v6: updated stocked dimensions and interior-first naming.
+    /// Bump the version to start every payload with an empty list again.
     private static func key(for payload: StudyBox) -> String {
-        "packing.boxes.v6.\(payload.rawValue)"
-    }
-
-    private static func legacyKeyV5(for payload: StudyBox) -> String {
-        "packing.boxes.v5.\(payload.rawValue)"
+        "packing.boxes.v7.\(payload.rawValue)"
     }
 
     private static func load(for payload: StudyBox) -> [PackingBoxPreset] {
-        if let data = UserDefaults.standard.data(forKey: key(for: payload)),
-           let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) {
-            return migrated(stored, for: payload)
+        guard let data = UserDefaults.standard.data(forKey: key(for: payload)),
+              let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) else {
+            return []
         }
-        if let data = UserDefaults.standard.data(forKey: legacyKeyV5(for: payload)),
-           let stored = try? JSONDecoder().decode([PackingBoxPreset].self, from: data) {
-            return migrated(stored, for: payload)
-        }
-        return PackingBoxPreset.defaultCatalog(for: payload)
-    }
-
-    private static func migrated(
-        _ presets: [PackingBoxPreset],
-        for payload: StudyBox
-    ) -> [PackingBoxPreset] {
-        var result: [PackingBoxPreset] = []
-        var seenIDs: Set<String> = []
-        for preset in presets {
-            var outer = preset.outerSizeMillimetres
-            var inner = preset.usableInnerSizeMillimetres
-
-            if payload == .big, outer == SIMD3(35, 22, 115) {
-                outer = SIMD3(35, 22, 120)
-                inner = SIMD3(35, 22, 120)
-            }
-            if payload == .big, outer == SIMD3(95, 95, 160) {
-                inner = SIMD3(100, 100, 160)
-            }
-
-            let id = PackingBoxPreset.identifier(for: outer)
-            guard !seenIDs.contains(id),
-                  let rebuilt = PackingBoxPreset.sized(
-                      id: id,
-                      outerSizeMillimetres: outer,
-                      usableInnerSizeMillimetres: inner
-                  ) else { continue }
-            result.append(rebuilt)
-            seenIDs.insert(id)
-        }
-        return result
+        return stored
     }
 
     private func save() {
@@ -133,7 +74,6 @@ final class BoxCatalogue {
 }
 
 extension StudyStore {
-    /// Which payload's boxes apply right now.
     var catalogueOwner: StudyBox {
         currentBox ?? scheduledBox ?? .small
     }

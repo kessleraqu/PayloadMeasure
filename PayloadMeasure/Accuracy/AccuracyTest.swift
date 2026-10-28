@@ -1,48 +1,38 @@
 import Foundation
 import simd
 
-// An accuracy test: the same objects measured over and over, then compared against sizes you type in.
+// Accuracy test: the same objects measured repeatedly, then compared against reference sizes
+// entered afterwards.
 //
-// In:  how many objects and how many passes; one reading per object per pass; a reference size per
-//      object, entered afterwards.
-// Out: per-object and overall trueness, precision and accuracy figures, and a plain-text report.
+// Readings and references are both sorted largest side first before comparing, since which side
+// the app calls "width" can change between passes. The raw values are stored unchanged.
 //
-// AXIS MATCHING. A reading is compared against its reference by sorting both triples largest first
-// and pairing them off. The app has no way of knowing which of an object's sides the operator called
-// "width", and it can come out differently from one pass to the next depending on how the object was
-// approached, so pairing raw axes would report rotations as errors. Sorted comparison measures what is
-// actually being asked — whether the three side lengths are right — and is the only way the numbers
-// mean the same thing across passes. The raw triple is kept as recorded.
+// Statistics (mm unless noted):
+//   error  = measured - reference
+//   bias   = mean(error)
+//   s_r    = repeatability standard deviation (ISO 5725-2)
+//   CV     = s_r / mean * 100
+//   r      = 2.8 * s_r, repeatability limit (ISO 5725-6)
+//   MAE    = mean(|error|)
+//   RMSE   = sqrt(mean(error^2))
+//   CI95   = t(0.975, n-1) * s_r / sqrt(n)
+//   LoA    = bias +- 1.96 * sd(error), Bland-Altman limits of agreement
 //
-// STATISTICS. Standard measurement-system terms, all in millimetres unless marked otherwise:
-//
-//   errorᵢ  = measuredᵢ − reference                  signed, per reading
-//   bias    = mean(errorᵢ)                           trueness: systematic over- or under-reading
-//   sᵣ      = √( Σ(measuredᵢ − mean)² / (n − 1) )    repeatability standard deviation, ISO 5725-2
-//   CV      = sᵣ / mean × 100                        relative precision, per cent
-//   r       = 2.8 · sᵣ                               repeatability limit, ISO 5725-6 §4.1.4
-//   MAE     = mean(|errorᵢ|)
-//   RMSE    = √( mean(errorᵢ²) )                     accuracy: bias and scatter together
-//   CI₉₅    = t₀.₉₇₅,ₙ₋₁ · sᵣ / √n                   half-width on the mean
-//   LoA     = bias ± 1.96 · s(error)                 Bland–Altman limits of agreement
-//
-// RMSE is the headline: it is the only one of these that answers "how far out is a single reading
-// likely to be", because bias and scatter both feed into it.
+// RMSE is the main figure since it combines bias and scatter.
 
 // MARK: - Recording
 
 struct AccuracyReading: Codable, Identifiable, Sendable {
     var id: UUID
-    /// One-based, as shown to the operator.
+    /// 1-based, as shown in the UI.
     var objectNumber: Int
     var pass: Int
-    /// As measured, in the app's own width/length/height order.
+    /// In the app's width/length/height order.
     var sizeMillimetres: [Double]
     var recordedAt: Date
-    /// Nil is retained for tests recorded by versions that only measured the 3D workflow.
+    /// Nil for older tests that only used the 3D workflow.
     var workflowMode: MeasurementWorkflowMode? = nil
 
-    /// Largest side first. What every comparison uses.
     var sortedSizeMillimetres: [Double] {
         sizeMillimetres.sorted(by: >)
     }
@@ -56,15 +46,12 @@ struct AccuracyTestRun: Codable, Identifiable, Sendable {
     var id: UUID
     var createdAt: Date
     var label: String
-    /// How many different objects are in the test.
     var objectCount: Int
-    /// How many times each object is measured.
     var passes: Int
     var readings: [AccuracyReading] = []
-    /// Keyed by object number as a string, because JSON object keys cannot be integers.
+    /// Keyed by object number as a string because JSON keys can't be integers.
     var referenceSizesMillimetres: [String: [Double]] = [:]
-    /// New tests compare both methods. Nil identifies a legacy, 3D-only test and keeps old files
-    /// decodable without a migration step.
+    /// Nil for older 3D-only tests, so their files still decode.
     var workflowModes: [MeasurementWorkflowMode]? = nil
 
     var measurementModes: [MeasurementWorkflowMode] {
@@ -114,17 +101,16 @@ struct AccuracyTestRun: Codable, Identifiable, Sendable {
         objectNumbers.allSatisfy { reference(forObject: $0) != nil }
     }
 
-    // MARK: Position in the test
+    // MARK: - Position in the test
 
-    /// Where the next reading goes: all passes for one method, then the next method. Inside a method,
-    /// every object is measured once per pass in the same order.
+    /// All passes for one method, then the next method. Within a method, objects are measured in
+    /// the same order every pass.
     var nextSlot: (objectNumber: Int, pass: Int, workflowMode: MeasurementWorkflowMode)? {
         guard objectCount > 0, passes > 0 else { return nil }
         let done = readings.count
         guard done < totalExpectedReadings else { return nil }
         let modes = measurementModes
-        // Keep each method in one block. Changing mode deliberately clears the AR fit, so alternating
-        // Top/3D for every object would repeatedly restart recognition and make a long test painful.
+        // Keep each method together; switching mode resets the AR fit, so alternating would be slow.
         let measurementsPerMode = objectCount * passes
         let positionInMode = done % measurementsPerMode
         return (
@@ -142,7 +128,6 @@ struct AccuracyTestRun: Codable, Identifiable, Sendable {
 
 // MARK: - Statistics
 
-/// One axis of one object: the reference side length, and every measurement of it.
 struct AccuracyAxisStatistics: Sendable {
     /// 0 is the longest side, 2 the shortest.
     var axisIndex: Int
@@ -157,7 +142,7 @@ struct AccuracyAxisStatistics: Sendable {
         return values.reduce(0, +) / Double(count)
     }
 
-    /// Repeatability standard deviation. Needs at least two readings to exist at all.
+    /// Needs at least two readings.
     var standardDeviation: Double {
         guard count > 1 else { return .nan }
         let m = mean
@@ -218,7 +203,6 @@ struct AccuracyObjectStatistics: Sendable {
 
     var readingCount: Int { axes.first?.count ?? 0 }
 
-    /// Over all three axes together.
     var allErrors: [Double] { axes.flatMap(\.errors) }
 
     var rootMeanSquareError: Double {
@@ -239,11 +223,10 @@ struct AccuracySummary: Sendable {
 
     var allErrors: [Double] { objects.flatMap(\.allErrors) }
 
-    /// Whole measurements compared.
     var readingCount: Int { objects.reduce(0) { $0 + $1.readingCount } }
 
-    /// Individual side lengths compared — three per reading. This, not `readingCount`, is the n behind
-    /// the bias, the spread and the limits of agreement, so both are reported.
+    /// Number of side lengths compared (three per reading). This is the n used for bias and the
+    /// limits of agreement.
     var comparisonCount: Int { allErrors.count }
 
     var bias: Double { AccuracyStatistics.mean(allErrors) }
@@ -252,14 +235,12 @@ struct AccuracySummary: Sendable {
     var rootMeanSquareError: Double { AccuracyStatistics.rootMeanSquare(allErrors) }
     var maximumAbsoluteError: Double { allErrors.map(abs).max() ?? .nan }
 
-    /// Bland–Altman limits of agreement against the reference.
     var limitsOfAgreement: (lower: Double, upper: Double) {
         let spread = 1.96 * errorStandardDeviation
         return (bias - spread, bias + spread)
     }
 
-    /// Worst repeatability standard deviation across every object and axis: the honest single number
-    /// for "how much does a repeat measurement move".
+    /// Largest repeatability standard deviation over all objects and axes.
     var worstRepeatabilityStandardDeviation: Double {
         objects
             .flatMap(\.axes)
@@ -269,11 +250,8 @@ struct AccuracySummary: Sendable {
     }
 }
 
-/// Pairs unlabeled side lengths with the reference assignment that produces the least dimensional
-/// error. For values on one number line, pairing both lists in the same sorted order minimizes both
-/// the sum of absolute errors and the sum of squared errors. Consequently a 10 × 5 reference and an
-/// 11 × 4 reading are paired as 10↔11 and 5↔4, not treated as errors of −6 and +6. Raw readings and
-/// references remain untouched.
+/// Pairs side lengths by sorting both lists, which minimises both absolute and squared error.
+/// So a 10 x 5 reference and an 11 x 4 reading pair as 10/11 and 5/4.
 nonisolated enum AccuracySideMatching {
     static func minimumErrorPairs(
         measured: [Double],
@@ -301,8 +279,7 @@ enum AccuracyStatistics {
         return (values.reduce(0) { $0 + $1 * $1 } / Double(values.count)).squareRoot()
     }
 
-    /// Two-sided 95% Student-t quantiles, ν = 1…30, then the normal limit. Same table the measurement
-    /// stopping rule uses.
+    /// Two-sided 95% Student-t quantiles for 1 to 30 degrees of freedom, then the normal value.
     static func tQuantile975(degreesOfFreedom: Int) -> Double {
         let table: [Double] = [
             12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
@@ -313,8 +290,7 @@ enum AccuracyStatistics {
         return degreesOfFreedom <= table.count ? table[degreesOfFreedom - 1] : 1.96
     }
 
-    /// Builds the whole summary. Objects without a reference size, or with no readings, are left out
-    /// rather than reported as zero error.
+    /// Objects without a reference size or without readings are skipped.
     static func summarise(
         _ run: AccuracyTestRun,
         workflowMode: MeasurementWorkflowMode? = nil

@@ -2,17 +2,12 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// OrientedBoundingBox.bestOrientation reservoir-samples PointAccumulator.stablePointsSnapshot() with a
-// fixed seed, precisely so the same accumulated cloud reproduces the same orientation search: reservoir
-// sampling's initial fill is a literal prefix of the array, so which points end up in the sample is a
-// function of array *order*, not only array *content*. These tests exist because removal used to plug
-// the gap left by a removed point with whichever point currently sat last (a classic swap-remove),
-// which reshuffles survivors' relative order on every call — indistinguishable, downstream, from the
-// orientation fit itself being unstable, and observed as the fitted box rotating between frames that
-// removed nothing but a stray point.
+// The orientation search reservoir-samples the stable points with a fixed seed, so the result
+// depends on their order. Removing points must keep the survivors in their original order;
+// a swap-remove made the fitted box rotate between frames.
 final class PointAccumulatorOrderingTests: XCTestCase {
     private func point(_ index: Int) -> SIMD3<Float> {
-        // Spaced well beyond voxelSize so each lands in a distinct voxel.
+        // Spaced well beyond voxelSize so each lands in its own voxel.
         SIMD3<Float>(Float(index) * 0.05, 0, 0)
     }
 
@@ -33,8 +28,7 @@ final class PointAccumulatorOrderingTests: XCTestCase {
         let before = order(of: accumulator.stablePointsSnapshot())
         XCTAssertEqual(before, (0 ..< 10).map { Float($0) * 0.05 }, "Fixture check: insertion order.")
 
-        // Remove a point from the middle, not the end — the case a swap-remove handles by moving the
-        // last element into the gap, silently reordering everything after it.
+        // Remove from the middle, where a swap-remove would move the last element into the gap.
         accumulator.removeVoxels(containing: [point(3)])
 
         let after = order(of: accumulator.stablePointsSnapshot())
@@ -49,10 +43,7 @@ final class PointAccumulatorOrderingTests: XCTestCase {
         var accumulator = makeAccumulator(count: 20)
         let before = order(of: accumulator.stablePointsSnapshot())
 
-        // A batch removal, as silhouette carving performs when several voxels cross the disagreement
-        // threshold in the same frame — the case most likely to compound a swap-remove's damage, since
-        // each individual swap can relocate an element that a later swap in the same batch then moves
-        // again.
+        // Batch removal, as done by silhouette carving.
         accumulator.removeVoxels(containing: [2, 5, 9, 10, 17].map(point))
 
         let after = order(of: accumulator.stablePointsSnapshot())
@@ -62,8 +53,7 @@ final class PointAccumulatorOrderingTests: XCTestCase {
     }
 
     func testRemovingTheLastPointStillPreservesOrderOfTheRest() {
-        // The one case a swap-remove happens to get right by accident (nothing needs to move) — pinned
-        // so a future change can't regress the general case while this one keeps passing.
+        // Removing the last element; included so the general case can't regress unnoticed.
         var accumulator = makeAccumulator(count: 5)
         let before = order(of: accumulator.stablePointsSnapshot())
         accumulator.removeVoxels(containing: [point(4)])
@@ -81,10 +71,7 @@ final class PointAccumulatorOrderingTests: XCTestCase {
         XCTAssertEqual(after.count, 5, "4 survivors plus the 1 new point.")
     }
 
-    /// States the property this whole file protects in the terms that actually matter: the same array
-    /// fed to reservoir sampling twice must reservoir-sample the same way. `OrientedBoundingBox` uses a
-    /// fixed seed for exactly this reason; the fix being tested is what makes that seed meaningful for
-    /// an accumulator that has had points removed from it.
+    /// The same snapshot must reservoir-sample the same way twice.
     func testTwoIdenticallyOrderedSnapshotsSampleIdentically() {
         var first = makeAccumulator(count: 150)
         first.removeVoxels(containing: [point(10), point(50), point(90)])
@@ -101,15 +88,8 @@ final class PointAccumulatorOrderingTests: XCTestCase {
     }
 }
 
-// Carrying the evidence into a corrected world frame.
-//
-// ARKit refines an anchor for as long as it exists, and Apple's note on `ARAnchor` is that it "might
-// move that anchor when it optimizes its internal map". That correction says the estimate of the room
-// moved, not the object — so the accumulated points are still evidence, expressed in a frame that has
-// just been superseded. `transformed(by:)` expresses them in the current one. The alternative, which is
-// what the app used to do, is to delete them; a brand-new anchor is corrected most in its first seconds,
-// which is exactly the window in which deleting everything means no box is ever fitted and
-// `MeasurementStartRule` abandons the measurement for never having started.
+// Rebasing the accumulated points into a corrected world frame after ARKit adjusts an anchor,
+// instead of throwing them away.
 final class PointAccumulatorRebasingTests: XCTestCase {
     private func point(_ index: Int) -> SIMD3<Float> {
         SIMD3<Float>(Float(index) * 0.05, 0, 0)
@@ -151,8 +131,7 @@ final class PointAccumulatorRebasingTests: XCTestCase {
         }
     }
 
-    /// The property `PointAccumulatorOrderingTests` protects, across a rebase: the orientation search
-    /// reservoir-samples this array with a fixed seed, so its order is part of the fit's reproducibility.
+    /// Rebasing keeps the stable point order (see `PointAccumulatorOrderingTests`).
     func testRebasingPreservesTheOrderOfTheStablePoints() {
         let accumulator = makeAccumulator(count: 60)
         let rebased = accumulator.transformed(
@@ -166,8 +145,8 @@ final class PointAccumulatorRebasingTests: XCTestCase {
         )
     }
 
-    /// A rebase must not cost a point the trust it has already earned, or the next fit would wait for
-    /// `minObservations` all over again — which is the delay this whole change exists to avoid.
+    /// Points keep their observation counts, so the next fit doesn't have to wait for
+    /// `minObservations` again.
     func testObservationCountsAndStableStatusSurvive() {
         let accumulator = makeAccumulator(count: 20, observations: 4)
         XCTAssertEqual(accumulator.stablePointCount, 20, "Fixture check.")
@@ -199,8 +178,7 @@ final class PointAccumulatorRebasingTests: XCTestCase {
         )
     }
 
-    /// Two source voxels can quantise into one after the transform. They must merge, not vanish: the
-    /// observations that earned them are the evidence the measurement is made of.
+    /// Voxels that land in the same cell after the transform are merged, not dropped.
     func testVoxelsThatCollideAfterTheCorrectionAreMergedNotDropped() {
         var accumulator = PointAccumulator(voxelSize: 0.01, maxVoxels: 10_000)
         // Two points in adjacent voxels, each seen twice.

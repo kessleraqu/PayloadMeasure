@@ -34,9 +34,7 @@ final class BaldiLoadingGuideTests: XCTestCase {
         }
     }
 
-    /// An object that already arrived as its own box was never given an opening to match: the length
-    /// axis is still meaningful for placement, but nothing chose it to line up with a real opening,
-    /// so the description must not claim one.
+    /// Objects that are their own box have no defined opening, so the description shouldn't mention one.
     func testDescriptionOmitsTheOpeningForAnObjectThatIsItsOwnBox() {
         let placement = BaldiTestFixtures.placement(origin: .zero, isOwnBox: true)
         XCTAssertEqual(
@@ -45,8 +43,7 @@ final class BaldiLoadingGuideTests: XCTestCase {
         )
     }
 
-    /// The flag on the item the solver was given must survive into the placement it produces, since
-    /// that is the only copy the loading guide ever sees.
+    /// The placement is the only thing the loading guide sees, so the flag has to carry over.
     func testIsOwnBoxSurvivesFromItemIntoItsPlacement() {
         let item = BaldiTestFixtures.item(isOwnBox: true)
         let solution = BaldiConstruction.pack(

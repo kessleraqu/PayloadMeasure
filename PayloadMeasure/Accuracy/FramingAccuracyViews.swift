@@ -25,8 +25,7 @@ struct FramingAccuracySiteView: View {
             }
         }
         .onAppear {
-            // Accuracy runs must begin in a fresh AR world, but use the same persistent renderer as
-            // the study so RealityKit cannot leave this full-screen cover with a black/stale feed.
+            // Start in a fresh AR world, but on the shared ARView.
             sharedARViewHost?.requestNewMeasurementWorld()
         }
     }
@@ -296,8 +295,7 @@ private struct FramingAccuracyMeasureView: View {
         }
     }
 
-    /// ARCameraView produces the Vision mask but does not draw it itself. The normal measurement
-    /// screen owns this presentation layer; the framing test needs the same layer explicitly.
+    /// ARCameraView produces the mask but doesn't draw it, so the framing test draws it here.
     @ViewBuilder
     private var objectMaskPreview: some View {
         if let preview = captureEngine.objectMaskPreview {
@@ -399,13 +397,8 @@ private struct FramingAccuracyMeasureView: View {
                     ?? layer.referenceViewportBoundingBox else {
                 return nil
             }
-            // Where the mask is *now*, not where it was when its silhouette was cut. A held mask is
-            // drawn through the world for up to `ObjectMaskPreviewHold.maximumHoldSeconds` while
-            // `referenceAnchorPoint` stays at the frame it was sampled in, so by the time Start is
-            // pressed that point can be well off the object — and a selection resolved there either
-            // finds nothing or finds the surface behind it. `liveMaskTracking` is the same anchor
-            // reprojected into the current frame, published every frame. Same reasoning as the Measure
-            // button in `MesOverlayView.onScreenMask`.
+            // Use the mask's current position, not where it was when the silhouette was taken. A held mask
+            // can be well away from its reference point by now.
             let point = captureEngine.liveMaskTracking?.normalizedViewportPoint
                 ?? layer.referenceAnchorPoint
                 ?? CGPoint(x: box.midX, y: box.midY)

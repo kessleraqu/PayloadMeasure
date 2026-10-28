@@ -248,10 +248,9 @@ final class BaldiCOMQualityTests: XCTestCase {
 
         XCTAssertTrue(BaldiVerifier.verify(offCentre, against: problem).isValid)
         XCTAssertTrue(BaldiVerifier.verify(centred, against: problem).isValid)
-        // Paper mode now ranks by eq. (24), F = P − αU, so at equal package count the better
-        // balanced packing wins there too. What still separates the modes is that centred keeps
-        // relocating after the centre of mass is already inside the admissible region, and ranks by
-        // distance to that region's centre rather than by U.
+        // Paper mode ranks by eq. (24), so the better balanced packing wins at equal count. Centred mode
+        // differs by continuing after the centre of mass is admissible and ranking by distance to the
+        // domain centre.
         XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0.1, mode: .paper))
         XCTAssertFalse(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0, mode: .paper))
         XCTAssertTrue(BaldiSearch.isBetterFeasible(centred, than: offCentre, alpha: 0.1, mode: .centred))

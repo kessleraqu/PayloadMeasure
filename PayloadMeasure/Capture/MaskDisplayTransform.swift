@@ -3,54 +3,21 @@ import Foundation
 import simd
 import SwiftUI
 
-// How a mask picture, taken a moment ago, is placed on the camera image now.
+// Places a mask image rendered a moment ago onto the current camera frame.
 //
-// In:  where three points of the object were on screen when the mask was rendered, and where the same
-//      three points are now.
-// Out: the rotation, scale, anchor and translation to draw the picture with, and the residual of that
-//      fit — how much of the true motion the drawn transform could not represent.
+// Three points on a plane through the object (its anchor and two gauge points) are reprojected
+// by ARKit every frame. We fit a 2D similarity (rotation, uniform scale, translation) to where
+// they were and where they are now, using the closed-form least-squares solution from
+// Umeyama (1991). For a roughly planar object this approximates the plane-induced homography
+// (Hartley & Zisserman, Multiple View Geometry, 13.1).
 //
-// THE MODEL, exactly. The mask is a raster of the object's silhouette captured at a reference frame.
-// Placing it in a later frame means knowing how the object's image moved. For a rigid scene under
-// camera motion the exact image-to-image map of a *plane* is a homography — Hartley and Zisserman,
-// *Multiple View Geometry*, §13.1, the plane-induced homography H = K(R − tnᵀ/d)K⁻¹. A silhouette is
-// not a plane, but an object subtends a depth range small beside its distance, so the fronto-parallel
-// plane through the object at its measured depth is the natural first-order surrogate.
-//
-// The homography is not composed algebraically here — that would need the plane normal and the
-// inter-frame pose. It is *sampled*: three points are placed on that plane in the room — the object's
-// own anchor and two gauge points offset along the reference camera's image-plane axes — and ARKit
-// reprojects all three every frame under its own calibrated camera model. The transform drawn with is
-// then the least-squares similarity (rotation, isotropic scale, translation) fitted to those three
-// correspondences in closed form: Umeyama, "Least-Squares Estimation of Transformation Parameters
-// Between Two Point Patterns", IEEE PAMI 13(4), 1991, eqs. (34)–(42), specialised to two dimensions
-// where the SVD reduces to one `atan2`.
-//
-// Two properties are why it is worth doing this way rather than approximating:
-//
-//   1. It is *exact* whenever the true image motion is a similarity — translation parallel to the image
-//      plane, dolly along the optical axis, roll about it — which is most of hand-held motion. The
-//      previous model was a similarity with the rotation term dropped, so roll and orbit were drawn as
-//      no motion at all: the picture kept its old angle while the object turned underneath it.
-//
-//   2. The *residual* of the fit — RMS reprojection error of the three correspondences after the best
-//      similarity — measures precisely what the picture cannot represent, which is the out-of-plane
-//      rotation and perspective the similarity has no terms for. That is a computed quantity, in units
-//      of viewport height, and it is what decides when a held silhouette has gone stale
-//      (`ObjectMaskPreviewHold`). A wall clock cannot tell a phone held still for a second from a phone
-//      swung through 40° in a fifth of one; this can.
-//
-// What is deliberately *not* claimed: this is not a homography and does not become one. Under genuine
-// out-of-plane rotation the drawn mask is the best similarity approximation to the true motion, and the
-// residual says by how much it is wrong rather than hiding it.
+// The fit is exact for pan, dolly and roll. Out-of-plane rotation can't be represented, and the
+// residual of the fit measures how far off it is. ObjectMaskPreviewHold uses that residual to
+// decide when a held mask is too stale to show.
 
-/// Three points of one object on screen: its anchor, and two gauge points one baseline away along the
-/// reference camera's right and up axes. Coordinates are unit viewport coordinates — x over the
-/// viewport width, y over its height.
-///
-/// Three is the smallest set that pins a similarity in two dimensions with a residual left over to
-/// measure. Two points determine rotation and scale exactly and leave nothing to check; three make the
-/// system overdetermined, which is what turns the fit into an estimate with an error attached.
+/// Screen positions of the anchor and the two gauge points (one baseline along the reference
+/// camera's right and up axes), in unit viewport coordinates. Three points leave a residual to
+/// measure; two would fit exactly.
 nonisolated struct MaskGaugeFrame: Equatable, Sendable {
     let origin: CGPoint
     let right: CGPoint
@@ -66,42 +33,27 @@ nonisolated struct MaskGaugeFrame: Equatable, Sendable {
 }
 
 nonisolated struct MaskDisplayTransform: Equatable {
-    /// Multiplier on the drawn picture, about `anchor`.
     var scale: CGSize
-    /// The point the scale and the rotation both pivot around, in unit coordinates of the viewport.
+    /// Pivot for scale and rotation, in unit viewport coordinates.
     var anchor: UnitPoint
-    /// Where to move the picture afterwards, in unit coordinates of the viewport.
     var translation: CGPoint
-    /// In-plane rotation about `anchor`, positive clockwise on screen to match SwiftUI's convention.
+    /// Positive is clockwise on screen, matching SwiftUI.
     var rotation: Angle = .zero
-    /// RMS reprojection error of the correspondences this transform was fitted to, in units of viewport
-    /// height. Zero when the transform came from a path that fits nothing and so cannot report one.
+    /// RMS error of the fit in viewport heights. Zero for transforms that don't come from a fit.
     var residual: CGFloat = 0
 
-    /// Below this a box is too small to be believed and is treated as no information.
     static let minimumBoxSide: CGFloat = 0.005
-    /// Depth below this is not a reading, it is noise, and dividing by it would resize the mask wildly.
     static let minimumDistanceMetres: Float = 0.05
-    /// However far the reading has moved, the drawn mask may not be resized past this either way, so one
-    /// bad depth sample cannot make it vanish or swallow the screen.
+    /// Clamp so one bad depth sample can't make the mask vanish or fill the screen.
     static let scaleLimit: ClosedRange<CGFloat> = 0.4 ... 2.5
-    /// Shortest gauge leg, in viewport heights, that the fit is trusted on. Below it the two legs are
-    /// too short to resolve an angle: the rotation estimate's variance goes as 1/L², so a leg a few
-    /// pixels long turns reprojection noise into visible spin.
+    /// Shorter gauge legs give a noisy rotation estimate, so the fit isn't trusted below this.
     static let minimumGaugeLeg: CGFloat = 0.01
 
-    /// The least-squares similarity taking the object's three reference points to where they are now.
+    /// Least-squares similarity from the three reference points to their current positions.
     ///
-    /// This is the path that matters, and it is what keeps a mask on a small object at the 45–65 cm the
-    /// accuracy rule asks for. Vision's object tracker has a minimum target size in frame and is under
-    /// it at that range — its box decays or stops following, which is a mask that lags, sticks or
-    /// pulses. Points in the room have no such limit: ARKit reprojects them at any distance and any
-    /// apparent size, and three of them carry the rotation and the scale directly instead of inferring
-    /// scale from distance.
-    ///
-    /// `viewportAspect` is width ÷ height. Unit viewport coordinates are anisotropic — x is divided by a
-    /// different number from y — and a rotation is only meaningful in an isotropic metric, so the fit is
-    /// done in height-normalised units and the translation converted back at the end.
+    /// Used instead of Vision's tracker, which loses small objects at the recommended distance.
+    /// The fit is done in height-normalised units (`viewportAspect` is width / height) because
+    /// rotation only makes sense in an isotropic space.
     static func following(
         reference: MaskGaugeFrame?,
         current: MaskGaugeFrame?,
@@ -119,7 +71,6 @@ nonisolated struct MaskDisplayTransform: Equatable {
         let referencePoints = reference.points.map { isotropic($0, aspect: viewportAspect) }
         let currentPoints = current.points.map { isotropic($0, aspect: viewportAspect) }
 
-        // Both legs of the reference frame have to be long enough to carry an angle.
         let firstLeg = hypot(
             referencePoints[1].x - referencePoints[0].x,
             referencePoints[1].y - referencePoints[0].y
@@ -138,8 +89,7 @@ nonisolated struct MaskDisplayTransform: Equatable {
         let clampedScale = clampedScale(fit.scale)
         let anchorPoint = reference.origin
         let anchorIsotropic = referencePoints[0]
-        // Scale and rotation pivot on the anchor, so the translation left to apply is simply how far the
-        // anchor itself moves under the fitted similarity.
+        // Scale and rotation pivot on the anchor, so the remaining translation is how far it moved.
         let movedAnchor = fit.apply(anchorIsotropic)
         let translation = CGPoint(
             x: (movedAnchor.x - anchorIsotropic.x) / viewportAspect,
@@ -168,10 +118,8 @@ nonisolated struct MaskDisplayTransform: Equatable {
         )
     }
 
-    /// Fallback for a mask with no gauge frame of its own: slide it with the tracked box, and take no
-    /// size and no angle from it. The box's size is the one thing Vision gets badly wrong as a target
-    /// gets small — scaling by it is what produced a mask that appeared, shrank, reappeared and shrank
-    /// again — and an axis-aligned box carries no rotation to take in the first place.
+    /// Fallback when there is no gauge frame: move the mask with the tracked box but ignore its
+    /// size and angle, which Vision gets wrong for small targets.
     static func sliding(
         reference: CGRect?,
         current: CGRect?
@@ -192,12 +140,8 @@ nonisolated struct MaskDisplayTransform: Equatable {
         )
     }
 
-    /// Umeyama (1991) in two dimensions, without reflection.
-    ///
-    /// With centred correspondences α and β, the cross-covariance reduces to the pair
-    /// Σ⟨α,β⟩ and Σ(α × β); the rotation is their `atan2` and the least-squares scale is
-    /// ‖Σ‖ ÷ Σ‖α‖², which is eq. (42) once the SVD of a 2 × 2 matrix is written out. Returning the
-    /// angle rather than a matrix keeps the caller free of a wrap at ±π.
+    /// 2D Umeyama (1991) without reflection. With centred points the rotation is the atan2 of the
+    /// summed cross and dot products, and the scale follows eq. (42).
     struct Similarity {
         var rotation: CGFloat
         var scale: CGFloat
@@ -276,8 +220,7 @@ nonisolated struct MaskDisplayTransform: Equatable {
         return CGPoint(x: sum.x / count, y: sum.y / count)
     }
 
-    /// Unit viewport coordinates to height-normalised ones, where a unit of x and a unit of y are the
-    /// same distance on screen and a rotation therefore means something.
+    /// Converts to height-normalised coordinates so x and y units are the same on screen.
     private static func isotropic(_ point: CGPoint, aspect: CGFloat) -> CGPoint {
         CGPoint(x: point.x * aspect, y: point.y)
     }
@@ -296,21 +239,15 @@ nonisolated struct MaskDisplayTransform: Equatable {
 }
 
 extension CGFloat {
-    /// Unit-space offset to points, kept short so the call site reads as one line.
     func scaled(by extent: CGFloat) -> CGFloat {
         self * extent
     }
 }
 
-/// Whether Vision's object tracker is worth running on a mask at all.
-///
-/// It needs a target of some minimum size in the frame, and a small object at the 45–65 cm the accuracy
-/// rule asks for is under it: the tracker either stops following or lets its box decay, and both look
-/// like a broken mask. Below the threshold the mask is followed through the world instead, which has no
-/// such limit, and the tracker is not asked to do a job it cannot do — which also saves its cost in
-/// exactly the case where the pipeline is already working hardest.
+/// Whether Vision's object tracker can follow the mask. Small targets fall below its minimum
+/// size, in which case the mask follows the world-anchored gauge points instead.
 nonisolated enum MaskTrackerEligibility {
-    /// Fraction of the shorter frame side below which a target is too small for the tracker.
+    /// Fraction of the shorter frame side.
     static let minimumTrackableSide: CGFloat = 0.045
 
     static func isTrackable(boundingBox: CGRect?) -> Bool {
@@ -323,21 +260,15 @@ nonisolated enum MaskTrackerEligibility {
     }
 }
 
-/// Where the gauge points sit in the room, so any later frame can reproject them.
-///
-/// Held as the anchor's world position plus the reference camera's right and up axes rather than as
-/// three world points, because that is what makes them a *frame*: the two legs are perpendicular and
-/// equal in the reference image, so the fit is equally well conditioned in every direction. One
-/// baseline is carried rather than assumed, so the gauge subtends the same angle at any distance.
+/// World-space gauge: anchor position plus the reference camera's right and up axes. The two
+/// legs are perpendicular and equal in the reference image, so the fit is well conditioned.
 nonisolated struct MaskGaugeBasis: Equatable, Sendable {
     let origin: SIMD3<Float>
     let right: SIMD3<Float>
     let up: SIMD3<Float>
 
-    /// Baseline as a fraction of the distance to the object, so the gauge covers a constant angle —
-    /// about 8.5° — whatever the range. A fixed metric baseline would be a large fraction of the frame
-    /// up close and a few pixels far away, and the rotation estimate would degrade with distance for no
-    /// reason other than the choice of constant.
+    /// Baseline relative to object distance, so the gauge covers the same angle (about 8.5 degrees)
+    /// at any range.
     static let baselineFraction: Float = 0.15
     static let minimumBaselineMetres: Float = 0.02
 
@@ -347,13 +278,8 @@ nonisolated struct MaskGaugeBasis: Equatable, Sendable {
         self.up = up
     }
 
-    /// The same three points, moved rigidly to follow their anchor.
-    ///
-    /// ARKit refines an anchor's pose for as long as it exists — Apple's own note on `ARAnchor` is that
-    /// it "might move that anchor when it optimizes its internal map". A refinement is a correction to
-    /// where the *object* is, so it applies to all three points equally; leaving the gauge behind at the
-    /// pose the anchor had when the picture was taken would read that correction as object rotation and
-    /// draw it.
+    /// Moves the gauge with its anchor. ARKit keeps refining anchor poses, and leaving the gauge
+    /// behind would show that correction as object rotation.
     func rebased(to trackedOrigin: SIMD3<Float>) -> MaskGaugeBasis {
         let delta = trackedOrigin - origin
         return MaskGaugeBasis(

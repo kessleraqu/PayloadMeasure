@@ -1,12 +1,8 @@
 import SwiftUI
 import simd
 
-// The arrangement result screen. Shows whichever method is selected and lets the operator switch
-// between them on the same measurements.
-//
-// In:  PackingStore and the capture engine.
-// Out: on screen only — drawings, a loading order and the balance figures. Triggers a re-solve
-//      whenever the packages or settings change.
+// Arrangement result screen: the loading drawing, loading order and balance figures. Re-solves
+// whenever the packages or settings change.
 
 struct ArrangementView: View {
     let captureEngine: ObjectCaptureEngine
@@ -31,12 +27,8 @@ struct ArrangementView: View {
         store.packagesMissingPreparation(from: captureEngine)
     }
 
-    /// The only way out of a participant's payload, in the navigation bar rather than at the end of
-    /// the plan: the plan is a scrolling list whose length depends on how many packages there are, so
-    /// at the foot of it this button was somewhere different on every payload — and behind a scroll
-    /// on the long ones. Pressing it asks for confirmation first, so neither a stray tap nor a
-    /// participant can close a payload by accident. The box is recorded once the confirmation is
-    /// given — except in test mode, which records nothing.
+    /// Finishes the payload. In the navigation bar so it's always in the same place, and asks for
+    /// confirmation before recording the box (nothing is recorded in test mode).
     @ViewBuilder
     private var nextBoxButton: some View {
         if store.baldiComparison != nil || store.result != nil {
@@ -56,7 +48,7 @@ struct ArrangementView: View {
         study.isTestMode ? "Finish the test" : "Finished packing"
     }
 
-    /// What fits beside a title and the settings button. VoiceOver still reads the whole thing.
+    /// Short title for the navigation bar. VoiceOver reads the full one.
     private var compactNextStepTitle: String {
         study.isTestMode ? "Finish" : "Done packing"
     }
@@ -65,8 +57,7 @@ struct ArrangementView: View {
         study.isTestMode ? "xmark.circle" : "checkmark.circle"
     }
 
-    /// Spells out what happens next, because the button no longer does: "Finished packing" is the same
-    /// label whether the next thing is another payload, the other condition, or the end of the study.
+    /// Explains what comes next: another payload, the other condition, or the end of the study.
     private var finishedPackingQuestion: String {
         if study.isTestMode { return "Finish the test?" }
         if study.isOnLastBox { return "Finished packing this payload?" }
@@ -90,8 +81,7 @@ struct ArrangementView: View {
         return "Everything measured, weighed and loaded for this payload is recorded, and \(consequence). It cannot be reopened."
     }
 
-    /// Snapshots everything the study needs about this box: sizes, packages, weights, photos and
-    /// where each package ended up.
+    /// Saves what the study needs about this payload: sizes, packages, weights, photos and placements.
     private func recordCurrentBox() {
         let solution = store.baldiComparison?.paper.solution
         let loadedIDs = solution?.placements.map(\.id) ?? []
@@ -254,13 +244,9 @@ struct ArrangementView: View {
         }
     }
 
-    // The method picker has deliberately been removed from this screen. Balance is still implemented
-    // and still selectable through `PackingStore.approach`, but the study runs the 3D knapsack, and
-    // offering a second arrangement method to a participant only invites a condition nobody planned
-    // for. Everything below the picker — including `resultContent` — is left intact for when the
-    // balance method is wanted again.
-
     // MARK: - States
+    // No method picker here, since the study only uses the 3D knapsack. Balance can still be chosen
+    // through `PackingStore.approach` and `resultContent` still supports it.
 
     private var solvingCard: some View {
         card {

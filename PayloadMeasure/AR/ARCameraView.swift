@@ -6,14 +6,11 @@ import RealityKit
 import SwiftUI
 import UIKit
 
-// The AR view and the coordinator that drives everything happening in it: session lifecycle, the
-// object mask, the scan loop, support-plane tracking and all the RealityKit content.
+// The AR view and its coordinator: session lifecycle, object masks, the scan loop, support plane
+// tracking and all RealityKit content. Results are pushed into ObjectCaptureEngine.
 //
-// In:  the session manager, aimer state, capture engine and the chosen measurement method.
-// Out: an ARView on screen, and measurement results pushed into ObjectCaptureEngine.
-//
-// It is one long type on purpose - the coordinator owns mutable per-frame state that would have to
-// be made internal to spread across files. Use the MARK sections to navigate.
+// The coordinator is kept as one type because it owns a lot of per-frame private state.
+// Use the MARK sections to navigate.
 
 struct ARCameraView: UIViewRepresentable {
     let sessionManager: ARSessionManager
@@ -47,16 +44,13 @@ struct ARCameraView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UIView {
-        // SwiftUI owns this lightweight wrapper, never the persistent ARView itself. Measurement
-        // and packing each get a distinct wrapper, so a late presentation teardown cannot remove or
-        // snapshot the renderer after its next owner has mounted it elsewhere.
+        // SwiftUI owns this wrapper, not the shared ARView, so a late teardown can't remove the renderer
+        // after the next screen has mounted it.
         let container = UIView(frame: .zero)
         container.backgroundColor = .black
         container.isOpaque = true
         let arView = context.coordinator.acquireView(mountingIn: container)
-        // ContentView resets the capture engine and requests a new world only at real payload
-        // boundaries. A remount after closing the packing workflow is the same payload, so erasing
-        // every measured object here would be a destructive lifecycle side effect.
+        // Only start a new world at payload boundaries. Coming back from packing is the same payload.
         let resetsTracking = sharedViewHost?.consumeMeasurementWorldRequest() ?? true
         context.coordinator.attach(to: arView)
         context.coordinator.scheduleSessionStart(resetsTracking: resetsTracking)
@@ -64,9 +58,7 @@ struct ARCameraView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        // UIViewRepresentable updates run inside SwiftUI's view transaction. setWorkflowMode also
-        // publishes through the capture engine, so doing it synchronously here produces Xcode's
-        // "Modifying state during view update" warning and undefined reconciliation behaviour.
+        // Deferred, since setWorkflowMode publishes state and this runs during a SwiftUI update.
         context.coordinator.scheduleWorkflowMode(workflowMode)
     }
 
@@ -270,21 +262,15 @@ struct ARCameraView: UIViewRepresentable {
         private static let bootstrapFootprintRefreshPoints = 64
         private static let supportRaycastMissTolerance = 4
         private static let supportPlaneMissTolerance = 6
-        /// Idle segmentation runs at roughly 6 Hz. Retain a small/far live object through brief
-        /// Vision misses while the participant changes distance, but still clear a stale mask.
-        ///
-        /// Back to twelve, about two seconds. It was cut to six when a stale mask also meant a mask stuck
-        /// at the wrong size and place; now that the mask is followed through the world, a retained one
-        /// stays on its object and only its silhouette is slightly old. Clearing it sooner than Vision
-        /// recovers is what made the mask blink out and come back.
+        /// Segmentation runs at about 6 Hz, so this keeps a live mask for about two seconds through
+        /// brief Vision misses.
         private static let liveMaskMissTolerance = 12
         private static let topAlignmentEnterDegrees: Float = 12
         private static let topAlignmentExitDegrees: Float = 18
         private var topAlignmentAccepted = false
         private var acceptedSurfaceVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
         private var manuallyRejectedVoxelKeysByObject: [UUID: Set<SelectionVoxelKey>] = [:]
-        /// Consecutive frames whose silhouette placed a retained voxel outside the object. Reset the
-        /// moment a frame agrees with the voxel; see `carvePointsOutside`.
+        /// Consecutive frames whose silhouette put a voxel outside the object. See `carvePointsOutside`.
         private var silhouetteDisagreementsByObject: [UUID: [SelectionVoxelKey: Int]] = [:]
         private let objectCaptureFitter = ObjectCaptureFitter()
         private var captureFitTask: Task<Void, Never>?
@@ -307,48 +293,27 @@ struct ARCameraView: UIViewRepresentable {
         private var objectMaskDisplayTask: Task<Void, Never>?
         private var objectMaskDisplayTaskGeneration = 0
         private var objectMaskDisplaySeedsByID: [UUID: ObjectMaskDisplaySeed] = [:]
-        /// The anchor the live mask on screen is positioned by, added to the AR session so ARKit keeps
-        /// reprojecting it every frame — the same mechanism a locked object's anchor uses — instead of a
-        /// raw point this code would have to reproject by hand. Cleared with the live mask itself. A
-        /// sampling miss on some later frame leaves it exactly as it is: an anchor already being tracked
-        /// is not evidence the object moved, so it is only ever replaced by a genuine new sample, never by
-        /// the absence of one.
+        /// Session anchor that positions the live mask, so ARKit reprojects it every frame. Only replaced
+        /// by a new sample, never cleared because a frame had no sample.
         private var liveMaskAnchor: ARAnchor?
-        /// The point sampled by the newest segmentation, which becomes the anchor above only if that
-        /// segmentation's mask is actually put on screen. Holding the picture while moving the point it is
-        /// positioned by is what made a held mask twitch.
+        /// Point from the newest segmentation. Becomes the anchor only if that mask is actually shown.
         private var pendingLiveMaskWorldPoint: SIMD3<Float>?
-        /// When the mask now on screen was accepted, and whether the newest segmentation was held back.
         private var liveMaskAcceptedTimestamp: TimeInterval = -.greatestFiniteMagnitude
         private var isHoldingLiveMask = false
-        /// The three points in the room that the live mask picture *on screen* is drawn by, established
-        /// with that picture and reprojected every frame afterwards. See `MaskDisplayTransform`.
+        /// Gauge for the live mask currently on screen. See `MaskDisplayTransform`.
         private var liveMaskGaugeBasis: MaskGaugeBasis?
-        /// The same three points for each locked object, rebuilt every cycle from the anchor it already
-        /// has. Locked pictures are never held back, so there is no pending/accepted split to make here.
+        /// Gauge for each locked object, rebuilt every cycle from its anchor.
         private var maskGaugeBasisByObjectID: [UUID: MaskGaugeBasis] = [:]
-        /// The basis belonging to the newest segmentation, which replaces the one above only if that
-        /// segmentation's picture is actually put on screen — the same pending/accepted split, and for
-        /// the same reason, as `pendingLiveMaskWorldPoint` and `liveMaskAnchor`. Measuring the held
-        /// picture's residual against the incoming basis would compare it to its own reference frame and
-        /// report zero however far the phone had moved.
+        /// Gauge from the newest segmentation, adopted only if that mask is shown (same as
+        /// `pendingLiveMaskWorldPoint`).
         private var pendingLiveMaskGaugeBasis: MaskGaugeBasis?
         private var liveObjectMaskDisplayID: UUID?
         private var objectMaskDisplayOrientation: CGImagePropertyOrientation?
         private var pendingObjectMaskToggleRequest: ObjectMaskToggleRequest?
         private var objectMaskProcessingFailuresRemaining = 0
-        /// How long a press has to be answered before it is given up on, on the monotonic clock.
-        ///
-        /// This replaced a retry count, which could not express the thing that actually needed bounding.
-        /// A pass discarded because tracking dropped for a frame is not the segmenter saying "no object
-        /// here", so charging it to a retry budget spent a press's attempts without the object ever once
-        /// being looked at — and a press made while the phone was still settling from the tap is exactly
-        /// when that happens. The wait is the only part of this the operator experiences, so the wait is
-        /// what is limited.
+        /// Deadline for answering a Measure press. A time limit rather than a retry count, since passes
+        /// dropped for tracking reasons shouldn't use up attempts.
         private var objectMaskToggleDeadline: CFTimeInterval = 0
-        /// Long enough to cover a hand still settling from the tap and a segmentation pass or two of
-        /// tracking recovery, short enough that a press that is not going to land is handed back while
-        /// the operator is still holding the same view of the same object.
         private static let objectMaskToggleTimeout: CFTimeInterval = 2
         private var objectMaskAnchors: [UUID: ARAnchor] = [:]
         private var objectMaskMarkerStates: [UUID: ObjectMaskMarkerState] = [:]
@@ -365,7 +330,7 @@ struct ARCameraView: UIViewRepresentable {
         private var observedObjectWorkflowRequestRevision = 0
         private var observedMeshVisible = false
         private var observedShowsSelectedPoints = false
-        /// Whether the scene graph is currently being drawn. See handleEngineRevisionChange.
+        /// Whether the scene content is enabled. See handleEngineRevisionChange.
         private var isSceneContentEnabled = true
         private var observedShowsBoundingBoxes = true
         private var observedFrameEpoch = 0
@@ -434,9 +399,7 @@ struct ARCameraView: UIViewRepresentable {
                 captureEngine.objectWorkflowRequestRevision
             observedFrameEpoch = sessionManager.frameEpoch
             createContentAnchorIfNeeded(in: arView)
-            // The shared session keeps the same coordinate frame while the operator briefly visits
-            // packing. Its old RealityKit entities were correctly removed during hand-off, so rebuild
-            // the saved measurement outlines in the new coordinator without altering their data.
+            // Coming back from packing: rebuild the saved outlines in this coordinator.
             for (id, object) in captureEngine.capturedObjectsByID {
                 objectMaskColorsByID[id] = captureEngine.objectColor(for: id)
                 addCapturedBox(object, for: id)
@@ -458,10 +421,8 @@ struct ARCameraView: UIViewRepresentable {
             observeEngineRevisions()
         }
 
-        /// UIViewRepresentable construction happens during SwiftUI reconciliation. Configuring the
-        /// observable session/capture models synchronously there triggers "Modifying state during
-        /// view update". Yield one actor turn, then start only if this coordinator still owns the
-        /// renderer; a cover can be presented or dismissed during that turn.
+        /// Starts the session on the next actor turn (not during the SwiftUI update), and only if this
+        /// coordinator still owns the renderer by then.
         func scheduleSessionStart(resetsTracking: Bool) {
             requestedSessionStartRevision &+= 1
             let revision = requestedSessionStartRevision
@@ -657,9 +618,7 @@ struct ARCameraView: UIViewRepresentable {
 
             if let arView {
                 if let sharedViewHost, let sharedViewLease {
-                    // A SwiftUI dismantle can arrive after the next screen has acquired this same
-                    // ARView. In that case this coordinator is stale and must not clear the new
-                    // owner's delegate or pause its session.
+                    // A late dismantle mustn't touch the session if another screen already owns the ARView.
                     if sharedViewHost.owns(sharedViewLease) {
                         sessionManager.detach(arView.session)
                         sharedViewHost.release(sharedViewLease)
@@ -676,9 +635,7 @@ struct ARCameraView: UIViewRepresentable {
             sharedViewLease = nil
             contentAnchor = nil
 
-            // Observable UI cleanup cannot be published from dismantleUIView's SwiftUI update
-            // transaction. Do it on the next main-actor turn, and never let a stale dismantle clear
-            // state after a new measurement renderer has already acquired the shared view.
+            // Clean up on the next turn, and not at all if a new renderer has taken over.
             let captureEngine = captureEngine
             let sharedViewHost = sharedViewHost
             Task { @MainActor [weak captureEngine, weak sharedViewHost] in
@@ -738,18 +695,9 @@ struct ARCameraView: UIViewRepresentable {
             sessionManager.restartTracking(arView.session)
         }
 
-        /// Frees the point clouds and voxel bookkeeping an object needed *while it was being measured*.
-        ///
-        /// These are the largest things the scan holds — the accumulated depth points, the selected and
-        /// surface point arrays of the last fit, the accepted/rejected voxel keys — and they were being
-        /// kept for every finished object until the payload ended. Ten objects into a payload that is a
-        /// great deal of memory held for nothing, on a screen that is also running ARKit, LiDAR depth,
-        /// Vision segmentation and RealityKit. Nothing reads them once the object is finished: editing it
-        /// again calls `rebaseAndRestartMeasurement`, which clears exactly this set and starts over.
-        ///
-        /// Deliberately *not* freed: the support height and plane bindings, the fitted footprint and
-        /// height, the anchors and the drawn box. A finished object still gets re-snapped when its plane
-        /// is refined, and that needs them.
+        /// Frees the point clouds and voxel data an object only needed while being measured. Keeps the
+        /// support plane, footprint, height, anchors and box, which are needed if the plane is refined
+        /// later. Editing the object again goes through `rebaseAndRestartMeasurement`.
         private func releaseMeasurementScratch(for id: UUID) {
             supportAccumulators.removeValue(forKey: id)
             maskedAccumulators.removeValue(forKey: id)
@@ -767,8 +715,7 @@ struct ARCameraView: UIViewRepresentable {
         }
 
         private func releaseRebuildableScanCaches() {
-            // Under memory pressure, every object that is not being measured right now gives up its
-            // scratch immediately rather than waiting for the payload to end.
+            // Under memory pressure, free scratch data for all finished objects right away.
             for id in captureEngine.finalizedObjectIDs
             where id != captureEngine.activeObjectID {
                 releaseMeasurementScratch(for: id)
@@ -824,17 +771,9 @@ struct ARCameraView: UIViewRepresentable {
         private func handleEngineRevisionChange() {
             synchronizeRealtimeProcessing()
 
-            // Put the scene down while the session is suspended. Pausing the session stops the camera
-            // but leaves this ARView drawing every box, every dashed edge, the point cloud and the
-            // world mesh on each frame against a frozen image — and while the packing screens are up
-            // the room view has a second ARView rendering on top of it. Two RealityKit renderers, the
-            // heavier of them drawing something nobody can see, and by the second payload this scene
-            // is at its largest.
-            //
-            // RealityKit has no equivalent of SceneKit's `isPaused`, so what is switched off is the
-            // content: only the top-level anchors, so each entity keeps its own visibility for when it
-            // comes back. Set before the guard below, which returns as soon as the session is
-            // suspended.
+            // Disable scene content while the session is suspended, otherwise the ARView keeps drawing all
+            // boxes and points over a frozen image underneath the packing screens. RealityKit has no pause,
+            // so the top-level anchors are disabled. Must run before the guard below.
             if let arView, isSceneContentEnabled == sessionManager.isTrackingSuspended {
                 isSceneContentEnabled = !sessionManager.isTrackingSuspended
                 for anchor in arView.scene.anchors {
@@ -947,7 +886,7 @@ struct ARCameraView: UIViewRepresentable {
                     for: request.id,
                     isCommitting: true
                 )
-                // Redraw it solid now that it is finished, releasing its dash entities.
+                // Finished: redraw with solid edges.
                 if let finishedObject = captureEngine.capturedObjectsByID[request.id] {
                     renderCapturedBoxSpans(
                         captureBoxLineSpans(
@@ -1379,11 +1318,8 @@ struct ARCameraView: UIViewRepresentable {
                 frame: frame,
                 fallback: objectMaskAnchors[id]
             )
-            // The correction, as a world transform, worked out whether or not a box has been fitted yet.
-            // It used to be computed only inside the `capturedObjectsByID` branch below, so during the
-            // first seconds of a measurement — before any box exists, and exactly when ARKit corrects a
-            // brand-new anchor most — there was nothing to rebase anything *with*, and the evidence was
-            // simply deleted instead. See `restartActiveMeasurementAfterAnchorCorrectionIfNeeded`.
+            // The anchor correction as a world transform, computed even before a box has been fitted, since
+            // that's when ARKit corrects new anchors the most.
             var worldRebase: simd_float4x4?
             var usesCurrentPlanePresentation = false
             if let currentAnchor {
@@ -1426,15 +1362,8 @@ struct ARCameraView: UIViewRepresentable {
                 evidenceAnchorTransformByObject[id] = currentAnchor.transform
             }
 
-            // Carry the cloud into the corrected frame rather than throwing it away. An anchor
-            // correction says the estimate of the room moved, not the object, so every accumulated point
-            // is still evidence — it is simply expressed in the frame ARKit has just superseded, and a
-            // rigid transform puts it back in the current one exactly. Deleting it instead is what made
-            // a measurement restart from nothing several times in its first three seconds and then be
-            // abandoned by `MeasurementStartRule` for never having produced a box.
-            //
-            // Without a usable correction there is nothing to express the points *in*, and only then is
-            // starting again the honest answer.
+            // Move the accumulated points into the corrected frame instead of deleting them. Without a
+            // correction transform there's nothing to map into, so start over.
             if let worldRebase {
                 maskedAccumulators[id] = maskedAccumulators[id]?.transformed(by: worldRebase)
                 supportAccumulators[id] = supportAccumulators[id]?.transformed(by: worldRebase)
@@ -1452,10 +1381,7 @@ struct ARCameraView: UIViewRepresentable {
             selectionPointsByObject.removeValue(forKey: id)
             capturedFootprintByObject.removeValue(forKey: id)
             capturedHeightByObject.removeValue(forKey: id)
-            // The support height moves with the correction like everything else. Clearing it instead
-            // costs `minimumSupportSamples` more ticks before a depth- or raycast-backed height can be
-            // returned at all, and no fit publishes without one — so on the path this function is on,
-            // clearing it delays the very box whose absence gets the measurement abandoned.
+            // Move the support height with the correction too; clearing it would delay the first box.
             if let worldRebase,
                let held = supportHeightStateByObject[id],
                let height = held.value,
@@ -1516,17 +1442,8 @@ struct ARCameraView: UIViewRepresentable {
                 1
             )
             let rotationShift = 2 * acos(quaternionDot)
-            // Below half a voxel, acting is provably pointless: no accumulated point can quantise into a
-            // different voxel than the one it is already in, so the evidence after a rebase is identical
-            // to the evidence before it. The vertical threshold used to be 1.5 mm, under that floor and
-            // under the depth sensor's own noise besides — it was not detecting a change of frame, it was
-            // detecting ARKit's ordinary jitter around a newly added anchor, and every sighting cost the
-            // in-flight segmentation and, until `rebaseAndRestartMeasurement` learned to carry the cloud
-            // across, the whole accumulation with it.
-            //
-            // Only the floor is raised. Every threshold here is at least as loose as it was, so this can
-            // only fire less often than before — which matters because firing still cancels the mask task
-            // in flight, and a rule that fired every tick would starve the segmentation it depends on.
+            // Corrections under half a voxel can't change which voxel any point is in, so ignore them.
+            // This also stops ordinary anchor jitter from cancelling the segmentation in flight.
             let quantisationFloor = ObjectCapturePipeline.voxelSize / 2
             guard horizontalTranslationShift > max(0.008, quantisationFloor)
                     || verticalTranslationShift > quantisationFloor
@@ -1590,10 +1507,8 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Segmentation is resubmitted the instant the previous pass finishes, which pins the neural
-        /// engine and starves ARKit's own tracking of the CPU. Hold a floor between passes, and back
-        /// off further on a device where a pass is slow, so the pipeline never takes more than about
-        /// half the time. A pending selection is urgent and gets the fastest cadence.
+        /// Minimum time between segmentation passes. Back-to-back passes starve ARKit tracking, so keep
+        /// segmentation under roughly half the time. Pending selections use the fastest rate.
         private var objectMaskInterval: CFTimeInterval {
             let floor: CFTimeInterval = pendingObjectMaskToggleRequest != nil
                 ? 1.0 / 20
@@ -1626,9 +1541,7 @@ struct ARCameraView: UIViewRepresentable {
             let submittedToggleRequest: ObjectMaskToggleRequest?
             if pendingObjectMaskToggleRequest != nil,
                !sessionManager.isObjectTrackingEnvironmentReady {
-                // Keep the user's accepted selection queued while ARKit finishes finding the
-                // supporting surface. Rejecting it here made the framing screen's Start action
-                // appear ineffective even though the user had already accepted the framing.
+                // Keep the selection queued while ARKit is still finding the surface.
                 submittedToggleRequest = nil
             } else {
                 submittedToggleRequest = pendingObjectMaskToggleRequest
@@ -1655,10 +1568,7 @@ struct ARCameraView: UIViewRepresentable {
                     || !captureEngine.hasCompletedObjectRecognitionWarmup
                     ? objectMaskDepthSnapshot(from: frame)
                     : nil,
-                // What the operator is actually looking at. The processor cannot work this out from its
-                // own state — whether the last silhouette it segmented was shown or held back is decided
-                // here — and the tap that starts a measurement has to be resolved against the mask the
-                // operator aimed with, not against one they never saw.
+                // The mask the operator is looking at, which only this side knows (it may be held).
                 displayedLiveMaskBoundingBox: captureEngine.objectMaskPreview?
                     .layers
                     .first { $0.trackedObjectID == nil }?
@@ -1699,16 +1609,9 @@ struct ARCameraView: UIViewRepresentable {
                       let currentFrame = arView.session.currentFrame,
                       case .normal = currentFrame.camera.trackingState,
                       currentFrame.timestamp >= input.timestamp else {
-                    // A discarded pass can still have locked an object: `toggleLock` runs inside the
-                    // processor and has already appended its tracker by the time any of these
-                    // conditions is tested. Dropping the result silently left the selection pending
-                    // with nothing in flight to answer it — "Selecting object…" on screen, the Measure
-                    // button disabled, and no retry coming. Put the request back so the next pass can
-                    // act on it, and give up out loud rather than quietly once its time is up.
-                    // The processor's own bookkeeping releases the orphaned tracker and its colour on
-                    // its next pass, since neither the active object nor the new request names it.
-                    // None of these conditions is an answer to the question the press asked, so the
-                    // only thing that ends the retrying here is the deadline.
+                    // A discarded pass may still have locked an object inside the processor. Requeue the request
+                    // so the next pass handles it, until the deadline runs out. The processor releases any
+                    // orphaned tracker on its next pass.
                     if let submittedToggleRequest,
                        self.captureEngine.isObjectSelectionPending,
                        self.pendingObjectMaskToggleRequest == nil {
@@ -1751,11 +1654,7 @@ struct ARCameraView: UIViewRepresentable {
                     switch lockChange.kind {
                     case .added:
                         self.captureEngine.beginObjectMeasurement(id: lockChange.id)
-                        // `beginObjectMeasurement` has preconditions of its own, so asking is not the
-                        // same as it having happened. If it declined, the anchor and scene entity just
-                        // added belong to a measurement that does not exist: nothing will ever fit
-                        // against them, nothing will ever finish them, and the next lock would be the
-                        // second object anchored for the first one measured. Take them back out.
+                        // beginObjectMeasurement can refuse. If it did, remove the anchor and entity just added.
                         if self.captureEngine.activeObjectID != lockChange.id {
                             self.clearCaptureContent(for: lockChange.id)
                             if let anchor = self.objectMaskAnchors
@@ -1871,11 +1770,8 @@ struct ARCameraView: UIViewRepresentable {
                        $0.trackingOrientation
                            == self.objectMaskDisplayOrientation
                    }) {
-                    // The whole live mask — picture, its reference point, the point in the room it is
-                    // followed by, and the tracker seed — is one set of facts from one segmentation. If
-                    // the new mask is the same view as the one on screen, *none* of it is replaced. Taking
-                    // some and holding the rest is what left the mask twitching: the picture stayed put
-                    // while the point it was being positioned by moved to a new sample.
+                    // Hold or replace the whole live mask together (image, reference point, world point, tracker
+                    // seed). Replacing only part of it made the mask twitch.
                     let preview = self.previewByHoldingUnchangedLiveMask(
                         self.previewByAddingWorldReferences(
                             preview,
@@ -1928,16 +1824,9 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Attaches each mask picture to the room, so a later frame can work out how to draw it.
-        ///
-        /// A locked object already has an anchor and needs only the gauge built around it. Vision
-        /// identifies the *next* object before anything has anchored it, so its live mask has to find its
-        /// own point first: LiDAR is sampled at mask-covered points and the median surface distance
-        /// attached, which also gives preflight guidance a distance to report. Once selected, the fitted
-        /// centre remains authoritative.
-        ///
-        /// Both kinds end up with the same thing — three points in the room and where they were on screen
-        /// when the picture was taken — because both are drawn by the same transform.
+        /// Attaches each mask to world points so later frames can place it. Locked objects already have
+        /// an anchor. The live mask samples LiDAR inside the mask and uses the median depth, which also
+        /// gives the framing guidance a distance. Both end up with three gauge points.
         private func previewByAddingWorldReferences(
             _ preview: ObjectMaskPreview,
             frame: ARFrame,
@@ -1947,9 +1836,7 @@ struct ARCameraView: UIViewRepresentable {
             let orientation = interfaceOrientation(in: arView)
             let viewportSize = arView.bounds.size
             let sampleFractions: [CGFloat] = [0.28, 0.5, 0.72]
-            // Cleared first. A segmentation that finds no depth inside its mask must not leave the
-            // previous one's point behind to be adopted: the mask would then be positioned by a point
-            // belonging to somewhere else, which is a jump rather than a wobble.
+            // Clear first so a segmentation with no depth doesn't reuse the previous mask's point.
             pendingLiveMaskWorldPoint = nil
             pendingLiveMaskGaugeBasis = nil
 
@@ -1994,17 +1881,9 @@ struct ARCameraView: UIViewRepresentable {
                 samples.sort { $0.distance < $1.distance }
                 let sample = samples[samples.count / 2]
 
-                // Which of the nine probes is the median by distance changes from one segmentation to
-                // the next — the object is not flat, and depth noise reorders probes that are within a
-                // millimetre of each other. The picture is anchored to whichever point wins, so a change
-                // of winner moves the picture by the distance between two parts of the same object, for
-                // no reason in the world at all. That is a jump, not a wobble.
-                //
-                // The anchor already has a guard against this: a resample landing where the anchor
-                // already is, within noise, is not a move to act on. Applying the same test here keeps
-                // the reference point and the anchor telling one story — the anchor is kept, and the
-                // reference point becomes where that same anchor is *now*, which is what the picture
-                // being placed against it requires.
+                // The median probe can switch between segmentations, which would move the mask by the distance
+                // between two points on the object. If the new sample is within noise of the existing anchor,
+                // keep the anchor and use its current position as the reference.
                 let trackedAnchorPosition = liveMaskAnchor.map { anchor in
                     (frame.anchors.first { $0.identifier == anchor.identifier } ?? anchor)
                         .transform.translation
@@ -2025,15 +1904,10 @@ struct ARCameraView: UIViewRepresentable {
                     referenceDistance = simd_distance(cameraPosition, trackedAnchorPosition)
                 }
 
-                // Where this mask is in the room. From here on the mask is kept on the object by
-                // reprojecting this point every frame, which works at any distance and any apparent size
-                // — unlike Vision's object tracker, which gives up once the target is small in frame.
+                // From here on the mask follows this world point.
                 pendingLiveMaskWorldPoint = referenceWorldPoint
 
-                // Two more points, one baseline out along the reference camera's right and up axes, on
-                // the fronto-parallel plane through the object. Reprojected with the anchor they carry
-                // the rotation and the scale of the object's image directly, and leave a residual that
-                // says how much of the motion the drawn transform is not representing.
+                // Two gauge points one baseline along the reference camera's right and up axes.
                 let basis = MaskGaugeBasis(
                     origin: referenceWorldPoint,
                     cameraTransform: frame.camera.transform,
@@ -2059,13 +1933,8 @@ struct ARCameraView: UIViewRepresentable {
             return ObjectMaskPreview(layers: layers, timestamp: preview.timestamp)
         }
 
-        /// Builds a locked object's gauge around the anchor it already has.
-        ///
-        /// A locked picture is re-segmented every cycle with no hold, so its reference frame is at most
-        /// one cycle old and the transform it needs is small — but "small" is not "none", and a cycle is
-        /// up to a twelfth of a second of hand motion. It is drawn by the same fitted similarity as the
-        /// live mask so that there is one display model in the app rather than two, and so that rolling
-        /// the phone during a measurement turns the mask with the object instead of leaving it behind.
+        /// Builds a locked object's gauge around its anchor. Locked masks are re-segmented every cycle,
+        /// but use the same similarity fit as the live mask so rolling the phone still turns them.
         private func layerByAddingLockedObjectGauge(
             _ layer: ObjectMaskPreviewLayer,
             objectID: UUID,
@@ -2104,8 +1973,7 @@ struct ARCameraView: UIViewRepresentable {
             )
         }
 
-        /// Where a world point is on screen in this frame, in unit viewport coordinates, or nil if it is
-        /// behind the camera or projects to nonsense.
+        /// Unit viewport coordinates, or nil if the point is behind the camera.
         private func normalizedViewportPoint(
             of worldPoint: SIMD3<Float>,
             frame: ARFrame,
@@ -2134,9 +2002,7 @@ struct ARCameraView: UIViewRepresentable {
             return point
         }
 
-        /// The gauge basis reprojected into this frame. All three points have to land, because a
-        /// similarity fitted to two of them has no residual left to report and would claim a perfect fit
-        /// however wrong it was.
+        /// All three points must project, otherwise the fit has no residual.
         private func gaugeFrame(
             for basis: MaskGaugeBasis,
             frame: ARFrame,
@@ -2162,10 +2028,8 @@ struct ARCameraView: UIViewRepresentable {
             return MaskGaugeFrame(origin: origin, right: right, up: up)
         }
 
-        /// The live mask's gauge as it stands in this frame: rebased onto the anchor's current pose, then
-        /// reprojected. Both callers — the transform the picture is drawn with, and the residual that
-        /// decides whether it is still worth drawing — must read the same three points, or the picture
-        /// would be judged against a frame it was not placed by.
+        /// Live mask gauge in this frame, rebased on the anchor's current pose. Used for both the
+        /// transform and the residual so they agree.
         private func currentLiveMaskGaugeFrame(
             frame: ARFrame,
             in arView: ARView
@@ -2181,14 +2045,8 @@ struct ARCameraView: UIViewRepresentable {
             return gaugeFrame(for: current, frame: frame, in: arView)
         }
 
-        /// Drops the incoming live mask when it is the same view of the same object as the one already on
-        /// screen, leaving that one — and everything that positions it — exactly as it is.
-        ///
-        /// Vision re-segments several times a second and its silhouette is never quite the same twice, so
-        /// replacing the picture every time is a permanent shimmer. Size and position do not need the new
-        /// picture: the mask is followed through the world, which resizes and moves it continuously
-        /// between segmentations. Only a genuinely different view is worth swapping in, and a hold is
-        /// capped in time so a mask cannot go stale.
+        /// Drops the incoming live mask if it's the same view as the one on screen, so the outline doesn't
+        /// shimmer. World tracking keeps the held mask positioned in the meantime.
         private func previewByHoldingUnchangedLiveMask(
             _ preview: ObjectMaskPreview,
             frame: ARFrame,
@@ -2201,12 +2059,8 @@ struct ARCameraView: UIViewRepresentable {
             let onScreen = captureEngine.objectMaskPreview?.layers.first {
                 $0.trackedObjectID == nil
             }
-            // How far the picture on screen is from being a fair drawing of the object right now. It is
-            // placed by the best similarity through three of the object's points, so this is what that
-            // similarity cannot account for: out-of-plane rotation and perspective, in units of viewport
-            // height. Measured against the *held* picture's own reference frame, which is what is being
-            // argued about — not the incoming one, whose reference is this frame and whose residual is
-            // therefore zero by construction.
+            // Residual of the held mask, measured against its own reference frame (the incoming mask's
+            // residual would always be zero).
             let displayResidual: CGFloat? = {
                 guard let referenceGauge = onScreen?.referenceGauge,
                       let currentGauge = currentLiveMaskGaugeFrame(frame: frame, in: arView),
@@ -2227,21 +2081,12 @@ struct ARCameraView: UIViewRepresentable {
             ) else {
                 isHoldingLiveMask = false
                 liveMaskAcceptedTimestamp = preview.timestamp
-                // The incoming picture is going on screen, so the basis it was measured against becomes
-                // the one the display and the next residual are both read from. A cycle that produced no
-                // basis of its own leaves the previous one in place, for the same reason the anchor is
-                // left in place: the absence of a sample is not evidence that the object moved.
+                // The incoming mask is shown, so adopt its gauge. If it had none, keep the previous one.
                 if let pendingLiveMaskGaugeBasis {
                     liveMaskGaugeBasis = pendingLiveMaskGaugeBasis
                 }
-                // A miss this cycle (no depth inside the new silhouette) is left alone: the anchor
-                // already on the session keeps being reprojected exactly as it was. Apple's own
-                // guidance on ARAnchor is that adding one "helps ARKit optimize world-tracking
-                // accuracy in the area around that anchor" and that ARKit "might move that anchor
-                // when it optimizes its internal map" — so a resample landing back where the anchor
-                // already is, within noise, is not a move to act on: replacing the anchor would only
-                // throw away the refinement ARKit has been building around it. Only a resample that
-                // actually lands somewhere else earns a new anchor.
+                // Only replace the anchor if the new sample is somewhere else. ARKit refines anchors over time,
+                // and replacing one for a sample within noise would throw that away.
                 if let worldPoint = pendingLiveMaskWorldPoint {
                     let trackedPosition = liveMaskAnchor.map { anchor in
                         (frame.anchors.first { $0.identifier == anchor.identifier } ?? anchor)
@@ -2367,12 +2212,8 @@ struct ARCameraView: UIViewRepresentable {
                 guard let boundingBox = layer.trackingBoundingBox else {
                     continue
                 }
-                // A mask too small for Vision to track is followed through the world instead. Seeding the
-                // tracker with it only produces a decaying box, which is worse than no box at all.
-                //
-                // The tracker is deliberately still run for everything above that size: its box is no
-                // longer what places the mask, but it is what the centring advice and the finished
-                // object's snapshot bounds are read from.
+                // Masks too small for Vision's tracker follow the world point instead. Larger ones still use
+                // the tracker, because its box feeds the centring advice and snapshot bounds.
                 guard MaskTrackerEligibility.isTrackable(
                     boundingBox: layer.referenceViewportBoundingBox
                 ) else {
@@ -2421,9 +2262,7 @@ struct ARCameraView: UIViewRepresentable {
             updateLiveMaskTracking(frame: frame, in: arView)
         }
 
-        /// Reprojects the live mask's own point in the room, every frame. This is what keeps a small
-        /// object's mask on the object at the distance the accuracy rule asks for: ARKit can place a
-        /// world point on screen however few pixels the object covers.
+        /// Reprojects the live mask's world point every frame, which works however small the object is.
         private func updateLiveMaskTracking(frame: ARFrame, in arView: ARView) {
             guard let liveMaskAnchor,
                   captureEngine.objectMaskPreview?.layers.contains(where: {
@@ -2432,16 +2271,14 @@ struct ARCameraView: UIViewRepresentable {
                 captureEngine.updateLiveMaskTracking(nil)
                 return
             }
-            // ARKit keeps refining this anchor's pose every frame on its own, the same as a locked
-            // object's — read the live tracked copy, not the one from the moment it was added.
+            // Use the anchor from this frame, since ARKit keeps refining it.
             let trackedAnchor = frame.anchors.first {
                 $0.identifier == liveMaskAnchor.identifier
             } ?? liveMaskAnchor
             let worldPoint = trackedAnchor.transform.translation
             let viewportSize = arView.bounds.size
             guard viewportSize.width > 0, viewportSize.height > 0 else { return }
-            // A point behind the camera still projects, to nonsense. Turning away from the object would
-            // otherwise fling its mask across the screen before the mask was dropped.
+            // Points behind the camera still project, to garbage.
             let inCamera = frame.camera.transform.inverse * SIMD4<Float>(worldPoint, 1)
             guard inCamera.z < -0.01 else {
                 captureEngine.updateLiveMaskTracking(nil)
@@ -2470,10 +2307,8 @@ struct ARCameraView: UIViewRepresentable {
                         frame.camera.transform.translation,
                         worldPoint
                     ),
-                    // The same three points the picture's reference frame was taken from, reprojected
-                    // into this frame. The pair is what the drawn rotation, scale and offset are fitted
-                    // to; without it the overlay falls back to position alone, which is the model that
-                    // left a held mask sitting at its old angle over a turned object.
+                    // Current positions of the reference gauge points. Without them the overlay can only move the
+                    // mask, not rotate or scale it.
                     gauge: currentLiveMaskGaugeFrame(frame: frame, in: arView)
                 )
             )
@@ -2497,9 +2332,7 @@ struct ARCameraView: UIViewRepresentable {
                     cameraDistance: hint.cameraDistance,
                     color: state.color,
                     isMaskVisible: state.isMaskVisible,
-                    // Rebased onto the anchor's current pose before projecting, for the same reason the
-                    // live mask's is: ARKit refines an anchor for as long as it exists, and a refinement
-                    // moves the object, not one corner of it.
+                    // Rebased on the anchor's current pose, as for the live mask.
                     gauge: maskGaugeBasisByObjectID[hint.id].flatMap {
                         gaugeFrame(
                             for: $0.rebased(to: hint.worldPosition),
@@ -2511,23 +2344,12 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Space carving against one frame's silhouette, exactly.
+        /// Space carving against one frame's silhouette (visual hull). A point that is in view, not
+        /// occluded and outside the silhouette can't be part of the object. Everything comes from the
+        /// same frame, so the projection is exact.
         ///
-        /// Points are only ever added to an accumulator, so a frame on which the mask jumped to the
-        /// wrong segment leaves foreign points behind for the rest of the scan, and the box — the
-        /// literal extent of the points — grows to contain them. This is the standard silhouette
-        /// argument (visual hull / space carving): a point inside the frustum, unoccluded, and outside
-        /// the object's silhouette cannot be part of the object.
-        ///
-        /// Unlike `removeVisiblePointsOutsideCurrentMask`, which warps viewport coordinates by an
-        /// approximate scale-and-offset because its mask may be up to 0.2 s stale, everything used here
-        /// comes from one frame — silhouette, pose, intrinsics, depth — so the projection is exact and
-        /// needs no motion compensation at all.
-        ///
-        /// A point is removed after `minObservations` frames have independently placed it outside the
-        /// silhouette, mirroring the same constant that a point needs to be trusted in the first place:
-        /// evidence to drop a point is held to the standard as evidence to keep one. A single frame is
-        /// never enough, so one bad segmentation cannot erase a real surface.
+        /// A point is only removed after `minObservations` frames disagree with it, the same number it
+        /// needed to be accepted, so one bad segmentation can't erase real surface.
         private func carvePointsOutside(_ silhouette: ObjectMaskSilhouette, for objectID: UUID) {
             guard var accumulator = maskedAccumulators[objectID] else {
                 return
@@ -2547,11 +2369,8 @@ struct ARCameraView: UIViewRepresentable {
                 guard silhouette.isClearlyOutside(column: hit.column, row: hit.row) else {
                     continue
                 }
-                // Depth is measured to the nearest surface along the ray, so anything nearer than the
-                // point means the point is hidden this frame — including by the object's own front face
-                // when the point is on its far side. A hidden point is not evidence of empty space, so
-                // this frame says nothing about it and it keeps whatever doubt it already had. One voxel
-                // of slack absorbs sensor noise about "same surface".
+                // If something nearer was measured, the point is hidden in this frame and says nothing.
+                // One voxel of slack for sensor noise.
                 let measured = silhouette.depths[hit.row * silhouette.width + hit.column]
                 if measured > 0, measured < hit.depth - ObjectCapturePipeline.voxelSize {
                     continue
@@ -2566,9 +2385,7 @@ struct ARCameraView: UIViewRepresentable {
             }
 
             var counts = silhouetteDisagreementsByObject[objectID] ?? [:]
-            // A point that this frame agrees with loses its accumulated doubt: only *repeated*
-            // disagreement carves, and it has to be repeated without a frame vouching for the point
-            // in between.
+            // Agreement resets the count, so only consecutive disagreement carves.
             for key in Array(counts.keys) where !stillOutside.contains(key) {
                 counts.removeValue(forKey: key)
             }
@@ -2947,12 +2764,8 @@ struct ARCameraView: UIViewRepresentable {
             updatePointingAtFinishedObject(from: frame, in: arView)
         }
 
-        /// Whether the crosshair is on something already measured, so the button can say so.
-        ///
-        /// Worked out from the stored boxes rather than from tracking: a handful of ray-versus-box
-        /// tests per frame, against nothing per frame at all now that finished objects have been
-        /// dropped from the mask tracker. That is the whole point — the answer to "have I measured
-        /// this?" does not need Vision to keep following it around.
+        /// Whether the crosshair is on an already measured object, using ray tests against the stored
+        /// boxes rather than tracking.
         private func updatePointingAtFinishedObject(from frame: ARFrame, in arView: ARView) {
             let finalized = captureEngine.finalizedObjectIDs
             guard !finalized.isEmpty, captureEngine.activeObjectID == nil else {
@@ -2984,9 +2797,7 @@ struct ARCameraView: UIViewRepresentable {
             captureEngine.setPointingAtFinishedObject(isPointing)
         }
 
-        /// Ray against an oriented box, by putting the ray into the box's own frame and running the
-        /// usual slab test. Sampled along the ray rather than solved, because the box is small on
-        /// screen and a coarse answer is all a button label needs.
+        /// Ray against an oriented box, sampled along the ray. Coarse, but enough for a button label.
         private static func ray(
             origin: SIMD3<Float>,
             direction: SIMD3<Float>,
@@ -3048,11 +2859,7 @@ struct ARCameraView: UIViewRepresentable {
             )
         }
 
-        /// The live mask's own point in the room and on screen, in this frame.
-        ///
-        /// This is the anchor the mask picture is placed by, so it is the object the operator is looking
-        /// at, expressed in the frame the segmentation is about to run on rather than in the frame the
-        /// silhouette was cut in.
+        /// The live mask's world point and screen position in this frame.
         private func currentLiveMaskReference(
             frame: ARFrame,
             in arView: ARView
@@ -3086,20 +2893,10 @@ struct ARCameraView: UIViewRepresentable {
                 return nil
             }
 
-            // A press is answered on a later frame than the one it was aimed on: the first attempt is a
-            // frame or two after the tap, a retry can be four segmentations later, and the point itself
-            // was fixed against a picture that may already have been a hold when it was pressed. Left
-            // where it was, it drifts by however far the hand has moved — a few percent of the screen is
-            // enough to put it on the table behind the object, and `previewInstances` stops at whatever a
-            // probe on the point hits, so the table becomes the only candidate offered. That is both
-            // halves of the reported failure: a press that locks nothing and quietly hands the button
-            // back, and a press that locks something that is not the object.
-            //
-            // So the point is re-read from the mask's own anchor every attempt, which is the same anchor
-            // the picture on screen is being drawn by — the point and the picture cannot disagree. Only a
-            // request already aimed at that mask is moved: the RGB fallback lets the operator tap
-            // anywhere, and a tap that plainly means another part of the scene has to keep meaning it.
-            // `heldAimBoundsSlack` is this codebase's own "still the same mask" distance.
+            // The press is handled a few frames after the tap, by which time the hand has moved and the
+            // point could land on the table behind the object. Re-read it from the live mask's anchor on
+            // every attempt so it matches what's drawn. Only applies to presses aimed at the mask; RGB
+            // fallback taps elsewhere keep their position.
             let liveMask = currentLiveMaskReference(frame: frame, in: arView)
             let aimsAtLiveMask = liveMask.map {
                 hypot(
@@ -3116,12 +2913,8 @@ struct ARCameraView: UIViewRepresentable {
                 y: normalizedPoint.y * arView.bounds.height
             )
             let worldTransform: simd_float4x4
-            // The mask's anchor, when the press was aimed at the mask. ARKit has been refining it under
-            // the object since the preview first found depth inside the silhouette, and it was sampled
-            // from a point the mask was known to cover — where a fresh raycast at a screen point can
-            // just as easily return the surface behind a thin or open object. Apple's guidance on
-            // ARAnchor is that ARKit optimises world tracking around an anchor it has been given, so
-            // adopting the one already there keeps that refinement instead of discarding it.
+            // Reuse the live mask's anchor, which ARKit has been refining. A fresh raycast could hit the
+            // surface behind a thin object.
             if aimsAtLiveMask, let liveMask {
                 var anchorTransform = matrix_identity_float4x4
                 anchorTransform.columns.3 = SIMD4<Float>(liveMask.worldPosition, 1)
@@ -3405,11 +3198,8 @@ struct ARCameraView: UIViewRepresentable {
                     forKey: activeObjectID
                 )
             }
-            // An ARKit plane anchor is the best support evidence, not the only kind the app trusts:
-            // the box being drawn is already sitting on whatever `resolvedSupportHeight` returned,
-            // raycast or depth histogram included. Requiring the plane anchor here as well is what
-            // left small objects — the ones whose table ARKit is slowest to bound — measuring to
-            // 100% and then refusing to finish, with no manual finish to fall back on.
+            // Any support height counts here, not only ARKit plane anchors. Small objects' tables are often
+            // slow to get a plane anchor, and requiring one left measurements stuck at 100%.
             captureEngine.updateActiveSupportPlaneAvailability(
                 id: activeObjectID,
                 isAvailable: planeSupportMatch != nil
@@ -3421,9 +3211,7 @@ struct ARCameraView: UIViewRepresentable {
                 return
             }
 
-            // Do not spend the cleanup interval on a stale Vision result. Previously the timestamp
-            // advanced first and `removeVisiblePointsOutsideCurrentMask` then rejected the stale
-            // preview, so an unlucky phase between the two loops could prevent cleanup repeatedly.
+            // Only advance the timestamp once cleanup actually ran, so a stale preview doesn't keep skipping it.
             if frame.timestamp - lastAutomaticPointCleanupTimestamp >= 0.5,
                let preview = captureEngine.objectMaskPreview,
                abs(frame.timestamp - preview.timestamp) <= 0.2 {
@@ -4096,10 +3884,7 @@ struct ARCameraView: UIViewRepresentable {
             guard object.corners.count == 8 else {
                 return []
             }
-            // Dashed rear edges are a live-scan affordance, and each dash is its own entity. A
-            // finished box keeps its entities for the rest of the session, so 12 solid edges rather
-            // than up to 60 dashes is the difference between a scene that stays fast and one that
-            // gains hundreds of draw calls per object measured.
+            // Finished boxes use 12 solid edges instead of up to 60 dash entities, which keeps the scene fast.
             guard !captureEngine.finalizedObjectIDs.contains(objectID) else {
                 return Self.captureBoxEdges.map {
                     (start: object.corners[$0.0], end: object.corners[$0.1])
@@ -4503,11 +4288,8 @@ struct ARCameraView: UIViewRepresentable {
 
         private func classifyView(_ camera: simd_float4x4) -> ObjectCaptureEngine.ScanViewHint {
             let forwardY = -camera.columns.2.y
-            // A footprint taken from a steep three-quarter angle grows with segmentation/depth
-            // spill, which showed up as repeatable over-reading in accuracy tests. Reserve the top
-            // fit for a genuinely overhead view (within about 35° of vertical). The remaining useful
-            // downward-to-level range supplies height, so Full 3D accepts either an isometric or a
-            // lateral second view instead of forcing the phone exactly level with the object.
+            // Top fits only from a near overhead view (within about 35 degrees), since steep angles
+            // over-read the footprint. Anything else from downward to level can supply the height.
             if forwardY < -0.82 {
                 return .topDown
             }
@@ -4548,8 +4330,7 @@ struct ARCameraView: UIViewRepresentable {
                 capturedHeightByObject[id] = candidateHeight
             }
 
-            // The footprint of the current fit, expressed in the stored footprint's axis convention
-            // so that width and depth cannot swap places between frames.
+            // Use the stored footprint's axes so width and depth don't swap between frames.
             let aligned = alignFootprint(candidateFootprint, to: capturedFootprintByObject[id])
 
             switch view {
@@ -4572,9 +4353,7 @@ struct ARCameraView: UIViewRepresentable {
                 } else {
                     footprintStableTicks[id] = 0
                 }
-                // Stabilization decides only whether the scan has settled. Drawing or publishing
-                // its blended/deadband value makes the box geometrically different from the current
-                // full-cloud rectangle, which is visible at the far edge in a top view.
+                // Stabilisation only decides when the scan has settled; the drawn box is the current fit.
                 if (footprintStableTicks[id] ?? 0) >= Self.satisfiedTickCount {
                     footprintFromTopObjects.insert(id)
                 }
@@ -4599,33 +4378,11 @@ struct ARCameraView: UIViewRepresentable {
                 break
             }
 
-            // The drawn height follows the current fit exactly, whichever way the phone is pointing.
-            //
-            // It used to be seeded from the very first frame and then updated only while the view was
-            // classified `.side`. Hover over an object — which is `.topDown`, or the gap between the
-            // two — and the height stayed at whatever that first frame guessed, while the point cloud
-            // filled in and settled to the real extent underneath it. That is the top of the box
-            // hanging above the dots.
-            //
-            // Nothing here is gated, because nothing needs to be: the height is the highest point
-            // above the support plane, and how high a point is does not depend on where it was seen
-            // from. A deadband here could leave the top as much as 4 mm (or 3%) above the current
-            // cloud even after an outlying point had been mask-filtered. The convergence rule still
-            // uses its observation window; only the geometric box is kept exact. The paper-derived
-            // 2D footprint orientation and extents are untouched.
+            // The drawn height always follows the current fit. Height is the highest point above the
+            // support plane, which doesn't depend on viewing angle.
             capturedHeightByObject[id] = candidateHeight
-            // The drawn footprint follows the current fit for exactly the same reason, and used to
-            // carry exactly the same defect: it was published only while the view was classified
-            // `.topDown`, so approaching an object from any other angle drew whatever rectangle the
-            // first frame guessed — over a cloud that had since filled in and settled underneath it.
-            // That is the box standing off the dots on every side.
-            //
-            // Publishing it every frame cannot make the box shrink as the phone moves, because
-            // `fitted` is the fit over the *accumulated* cloud, not the current frame's: the masked
-            // accumulator retains points from every earlier view and is only ever `pruneTransient`-ed,
-            // so a face that has been seen stays seen. The view classification keeps its real job,
-            // which is deciding when width/depth have been observed well enough to call the scan
-            // settled — it just no longer decides what geometry is drawn.
+            // The footprint also follows the current fit. It's fitted to the accumulated cloud, so it won't
+            // shrink as the phone moves. The view classification only decides when the scan has settled.
             capturedFootprintByObject[id] = aligned
 
             if isActive {
@@ -4702,12 +4459,9 @@ struct ARCameraView: UIViewRepresentable {
             let heightStability = stabilize(previousHeight, candidateHeight)
             let center = stabilizePosition(previousFootprint.centerXZ, aligned.centerXZ)
             let axis = stabilizeOrientation(previousFootprint.widthAxis, aligned.widthAxis)
-            // Keep the comparison against the previous exact fit for stability, but publish the
-            // current fit itself. Liu/Zhang determines `aligned.widthAxis`; the application takes
-            // the full-cloud min/max extents, and neither should be altered by display smoothing.
+            // Compare against the previous fit for stability, but publish the current one unchanged.
             capturedFootprintByObject[id] = aligned
-            // As in Full 3D, render and publish the current fitted height. Smoothing this value made
-            // the upper face visibly detach from the point that defined it after mask cleanup.
+            // Publish the fitted height directly; smoothing left the top face above its points.
             capturedHeightByObject[id] = candidateHeight
 
             if width.stable && depth.stable && heightStability.stable
@@ -4915,11 +4669,7 @@ struct ARCameraView: UIViewRepresentable {
             timestamp: TimeInterval,
             for id: UUID
         ) -> Float? {
-            // Raycasts against ARKit's *estimated planes*, which come from plane detection and not
-            // from scene reconstruction. Gating this on the world mesh was always wrong, and became
-            // load-bearing the moment the mesh stopped being built by default: the support-height
-            // fallback silently switched off, so a scan could sit on "waiting for the surface"
-            // indefinitely and lean on the much heavier depth path instead.
+            // Raycasts against estimated planes, which come from plane detection, not scene reconstruction.
             guard sessionManager.isSceneDepthSupported,
                   let footprint else {
                 return nil
@@ -5091,25 +4841,9 @@ struct ARCameraView: UIViewRepresentable {
             return state.value
         }
 
-        /// Recomputes the drawn/recorded height directly whenever the support height's baseline moves
-        /// under an in-progress measurement — a rough estimate upgrading to a real ARKit plane match,
-        /// most visibly when tilting from a top-down view to an angle that finally sees the floor or
-        /// table.
-        ///
-        /// This used to shift the *previous* stored height by the support delta instead of recomputing
-        /// it, on the reasoning that the top of the box shouldn't visibly jump while an async re-fit is
-        /// in flight. But that only relabels whatever error the previous estimate already had — it does
-        /// nothing to correct it — and if the re-fit that follows comes back `.notEnoughMesh` (plausible
-        /// right after a support jump, since points that used to clear the old, too-low plane can fall
-        /// below the new one and drop out of the fit entirely), nothing else ever overwrites it:
-        /// `viewGatedBox`/`topViewBox`, which publish the true fit, run only on a *successful* re-fit.
-        /// The stale, algebraically-shifted guess is left standing indefinitely, and a measurement
-        /// finished while it stands records that guess.
-        ///
-        /// Recomputing here instead — highest accumulated point above the new support height, the exact
-        /// formula PSEUDOCODE.md §3.4 documents and the one the real fitter itself uses for height — means
-        /// there is no window where a support-height correction can leave a wrong number on screen no
-        /// matter what the follow-up re-fit does.
+        /// Recomputes the height when the support plane moves under an active measurement (for example
+        /// when a rough estimate is replaced by a real plane). Shifting the old value would keep its
+        /// error, and if the following re-fit fails nothing would correct it.
         private func preserveCapturedTop(
             whenSupportMovesFrom previous: Float?,
             to current: Float,
@@ -5296,12 +5030,8 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Points for objects still being worked on, thinned to a fixed budget.
-        ///
-        /// Finished objects are left out on purpose. Their box is already drawn, so the cloud only
-        /// added clutter — and because the budget is split evenly between objects, keeping them
-        /// meant the live object's cloud got sparser with every object saved, which read as the
-        /// points appearing at random.
+        /// Points for objects still being measured, thinned to a fixed budget. Finished objects already
+        /// show their box.
         private func displayedSelectionPoints() -> [SIMD3<Float>] {
             let finalized = captureEngine.finalizedObjectIDs
             let pointGroups = selectionPointsByObject.keys
@@ -5329,9 +5059,8 @@ struct ARCameraView: UIViewRepresentable {
             }
         }
 
-        /// Raw depth samples are what the operator should see, but the fitted cloud uses each
-        /// stable voxel's mean as well. Include the highest fitted mean when it sits above every raw
-        /// sample so the cyan cloud always contains the exact point that can set the upper face.
+        /// Raw depth samples, plus the highest voxel mean if it's above all of them, so the drawn cloud
+        /// always includes the point that sets the top face.
         private func selectionVisualizationPoints(
             for result: CaptureResult
         ) -> [SIMD3<Float>] {
@@ -5348,7 +5077,7 @@ struct ARCameraView: UIViewRepresentable {
             return points
         }
 
-        /// Which points to draw. See SelectionPointDisplay for why this is not a stride.
+        /// See SelectionPointDisplay.
         private func stableDisplaySubset(
             _ points: [SIMD3<Float>],
             limit: Int

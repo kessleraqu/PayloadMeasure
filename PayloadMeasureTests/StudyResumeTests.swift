@@ -1,14 +1,12 @@
 import XCTest
 @testable import PayloadMeasure
 
-// Picking a run back up after the app has gone away mid-session — a crash, a force-quit, a flat
-// battery. A run is written to disk from the moment it is created, so the question is only whether the
-// app offers to continue it instead of leaving the operator to start again from the beginning.
+// Resuming a run after the app quit mid-session (crash, force quit, battery).
 
 @MainActor
 final class StudyResumeTests: XCTestCase {
-    /// Every test starts a run under its own participant name and deletes it afterwards, because the
-    /// store reads and writes the app's real Documents folder.
+    /// Each test uses its own participant name and deletes the run afterwards, since the store uses
+    /// the real Documents folder.
     private var startedRunIDs: [UUID] = []
 
     override func tearDown() {
@@ -36,7 +34,7 @@ final class StudyResumeTests: XCTestCase {
         return (store, run)
     }
 
-    /// The state after a crash: the run is on disk, unfinished, and no run is active.
+    /// After a crash the run is on disk, unfinished, and nothing is active.
     func testAnUnfinishedRunOnDiskIsOfferedForResuming() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)
@@ -46,9 +44,8 @@ final class StudyResumeTests: XCTestCase {
         )
 
         let afterRelaunch = StudyStore()
-        // What is offered is whichever unfinished run is most recent, and other tests leave their own
-        // behind in the simulator, so this asserts the property rather than the identity: something is
-        // offered, this run is one of the candidates, and nothing finished or abandoned is ever offered.
+        // Other tests can leave unfinished runs in the simulator, so only check that something is offered,
+        // this run is a candidate, and finished or abandoned runs never are.
         let offered = try! XCTUnwrap(afterRelaunch.resumableRun)
         XCTAssertFalse(offered.isComplete)
         XCTAssertNil(offered.abandonedAt)
@@ -61,7 +58,7 @@ final class StudyResumeTests: XCTestCase {
     func testResumingRestoresTheRunOnItsUnfinishedPayloadAwaitingTheParticipant() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)
-        // Some time is spent measuring, then the app disappears.
+        // Some time spent measuring, then the app goes away.
         started.store.endCurrentPhase()
 
         let afterRelaunch = StudyStore()
@@ -81,13 +78,12 @@ final class StudyResumeTests: XCTestCase {
         XCTAssertNil(afterRelaunch.currentPhase, "No timer runs until Start is tapped.")
     }
 
-    /// Time already recorded is time the participant actually spent; resuming must not throw it away.
+    /// Time already recorded is kept when resuming.
     func testResumingKeepsTheTimeAlreadyRecorded() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)
         let box = try! XCTUnwrap(started.store.currentBox)
-        // The measuring phase is already running from the participant's Start tap; end it, then record
-        // half a minute of packing.
+        // Measuring already started with the participant's Start tap; end it and record 30 s of packing.
         started.store.endCurrentPhase()
         started.store.beginPhase(.pack, at: Date(timeIntervalSinceNow: -30))
         started.store.endCurrentPhase()
@@ -107,8 +103,7 @@ final class StudyResumeTests: XCTestCase {
         )
     }
 
-    /// A run the operator ended on purpose keeps its data but is never offered again. Otherwise the
-    /// setup screen would go on suggesting a session that was deliberately closed.
+    /// A run the operator cancelled keeps its data but isn't offered again.
     func testARunTheOperatorCancelledIsNotOfferedForResuming() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)
@@ -121,8 +116,7 @@ final class StudyResumeTests: XCTestCase {
         XCTAssertNotEqual(afterRelaunch.resumableRun?.id, mine.id)
     }
 
-    /// Objects finished before the crash are on disk, so the study keeps their dimensions even though
-    /// the payload has to be measured again.
+    /// Objects finished before the crash are saved, even though the payload is measured again.
     func testObjectsMeasuredBeforeTheCrashAreOnDisk() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)
@@ -156,11 +150,8 @@ final class StudyResumeTests: XCTestCase {
         )
     }
 
-    /// The box being resumed is measured again from nothing — its old objects belong to an AR
-    /// coordinate system the relaunch already threw away. Leaving them in place would let their stale
-    /// count block the progress safety net (`recordMeasurementProgress`) from persisting genuine
-    /// re-measurement until it happened to catch back up, on top of misrepresenting what the payload
-    /// currently holds.
+    /// The resumed payload starts with no objects, since the old ones belong to the lost AR session
+    /// and would block `recordMeasurementProgress`.
     func testResumingClearsStaleObjectsOnTheBoxBeingResumed() {
         let name = "resume-\(UUID().uuidString.prefix(8))"
         let started = makeStartedRun(named: name)

@@ -4,15 +4,8 @@ import CoreVideo
 import Observation
 import Vision
 
-// Loads the expensive frameworks before the operator needs them.
-//
-// Three things cost real time the first time they are touched: ARKit's capability queries, the
-// Vision segmentation model, and Metal's shader compilation behind RealityKit. Left alone they land
-// on the main thread at the worst moments — choosing a method, and the first measurement. This does
-// them off the main thread while the start screen is up.
-//
-// In:  start(), called when the app appears.
-// Out: progress from 0 to 1 and an isReady flag the start screen reads.
+// Touches ARKit, the Vision segmentation model and Metal once while the start screen is up,
+// so their first-use cost doesn't land on the main thread during the first measurement.
 
 @MainActor
 @Observable
@@ -25,7 +18,6 @@ final class AppWarmup {
     func start() {
         guard task == nil else { return }
         task = Task { [weak self] in
-            // ARKit: the first touch of these links the framework and queries the device.
             await Task.detached(priority: .userInitiated) {
                 _ = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
                 _ = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
@@ -34,8 +26,7 @@ final class AppWarmup {
             guard !Task.isCancelled else { return }
             self?.progress = 0.35
 
-            // Vision: the first request loads and compiles the segmentation model. Running it once
-            // on a scratch image moves that cost off the first real frame.
+            // Running the segmentation request once on a blank frame loads and compiles the model.
             await Task.detached(priority: .userInitiated) {
                 guard let buffer = Self.scratchPixelBuffer() else { return }
                 let handler = ImageRequestHandler(CIImage(cvPixelBuffer: buffer))
@@ -47,7 +38,6 @@ final class AppWarmup {
         }
     }
 
-    /// A mid-grey frame, large enough to exercise the real code path and small enough to be quick.
     private nonisolated static func scratchPixelBuffer() -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         let attributes: [CFString: Any] = [

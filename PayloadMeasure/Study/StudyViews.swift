@@ -1,12 +1,6 @@
 import SwiftUI
 
-// The screens that wrap a session in a user study: setup, the password gate, the results screen and
-// the archive of every run ever recorded.
-//
-// In:  StudyStore.
-// Out: on screen only, plus the text reports StudyStore writes.
-//
-// Saved runs can be deleted only through the archive's explicit red action and password gate.
+// Study screens: setup, password sheet, results and the archive of saved runs.
 
 // MARK: - Setup
 
@@ -27,7 +21,7 @@ struct StudySetupView: View {
     @State private var editedCatalogue: StudyBox?
     @State private var duplicateRun: StudyRun?
     @State private var showsOverwritePassword = false
-    /// One per payload, kept for the life of this screen so the lists redraw as they are edited.
+    /// One per payload, kept for the lifetime of the screen.
     @State private var catalogues: [StudyBox: BoxCatalogue] = [:]
 
     var body: some View {
@@ -78,12 +72,9 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    // Stages the run, then replaces this administrator form with the neutral
-                    // participant handoff. Timing and the workflow start only after that Start tap.
+                    // Saves the run and shows the participant handoff. Timing starts when the participant taps Start.
                     Button {
-                        // A repeated participant name almost always means the operator has typed the
-                        // wrong one, so it is refused rather than quietly making a second run that is
-                        // indistinguishable from the first in the archive.
+                        // A repeated name is almost always a typo, so refuse it.
                         if let existing = store.savedRun(named: name, inputMode: inputMode) {
                             duplicateRun = existing
                         } else {
@@ -101,9 +92,7 @@ struct StudySetupView: View {
                 }
 
                 Section {
-                    // No name, no record, no password on the way out. Everything above it still
-                    // applies: a test run is the selected condition on the selected payload size, so
-                    // what it shows is what a participant would get.
+                    // Test run with the selected condition and payload size.
                     Button {
                         store.startTestRun(box: firstBox, inputMode: inputMode)
                     } label: {
@@ -191,8 +180,7 @@ struct StudySetupView: View {
         }
     }
 
-    /// The first thing on the screen when a run was left unfinished — because after a crash, this is the
-    /// screen the operator is looking at while wondering whether the session is gone.
+    /// Shown first when a run was left unfinished, e.g. after a crash.
     @ViewBuilder
     private var resumeSection: some View {
         if let run = store.resumableRun {
@@ -288,8 +276,7 @@ struct StudySetupView: View {
 
 // MARK: - Participant handoff
 
-/// A deliberately neutral screen between the administrator's setup and the timed study. The
-/// participant sees no names, condition controls, payload choices, or saved study data.
+/// Neutral screen between setup and the timed study. Shows no names, conditions or saved data.
 struct StudyParticipantStartView: View {
     let store: StudyStore
     let onStart: () -> Void
@@ -424,7 +411,7 @@ struct StudyPasswordSheet: View {
 struct StudyResultsView: View {
     let run: StudyRun
     let store: StudyStore
-    /// Nil in the archive, where there is nothing to restart.
+    /// Nil in the archive, where there's nothing to restart.
     var onRestart: (() -> Void)? = nil
 
     @State private var showsRestartPassword = false
@@ -466,7 +453,7 @@ struct StudyResultsView: View {
         .navigationTitle("Study data")
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            // Automatic on arrival, as well as on demand below.
+            // Exported automatically on arrival as well.
             if store.exportReport(for: run) != nil {
                 exportNote = "Report saved to Files › PayloadMeasure › StudyRuns."
             }
@@ -619,8 +606,7 @@ struct StudyResultsView: View {
 
     private var exportSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Writes the txt, then opens the system save panel on it. Two steps in one button,
-            // because "download" means ending up with a file, not with a share sheet.
+            // Write the report, then open the save panel for it.
             Button {
                 downloadURL = store.exportReport(for: run)
                 if downloadURL != nil {

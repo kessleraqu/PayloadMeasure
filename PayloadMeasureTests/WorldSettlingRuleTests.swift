@@ -2,9 +2,8 @@ import ARKit
 import XCTest
 @testable import PayloadMeasure
 
-// When measuring is allowed to begin. ARKit reports normal tracking within a frame or two of starting,
-// while anchors and planes are still being corrected — measure then and the measurement is taken against
-// a coordinate system that is quietly moving.
+// When measuring may start. Tracking reports normal almost immediately, while anchors and planes
+// are still shifting.
 
 final class WorldSettlingRuleTests: XCTestCase {
     func testNormalTrackingAloneIsNotEnoughAtFirst() {
@@ -38,8 +37,7 @@ final class WorldSettlingRuleTests: XCTestCase {
         )
     }
 
-    /// The map only grows if the operator moves. A phone held perfectly still must not be locked out for
-    /// ever, so time alone is accepted eventually.
+    /// A phone held still won't extend the map, so time alone is accepted eventually.
     func testTimeAloneIsAcceptedAfterTheWaiver() {
         XCTAssertFalse(
             WorldSettlingRule.isSettled(
@@ -70,8 +68,7 @@ final class WorldSettlingRuleTests: XCTestCase {
         )
     }
 
-    /// The waiting message has to say which of the two things is being waited on, because they need
-    /// opposite behaviour from the operator: hold still, then move around.
+    /// The message says which condition is being waited on, since they need opposite actions.
     func testTheWaitingMessageAsksForTheRightThing() {
         XCTAssertTrue(
             WorldSettlingRule.waitingDetail(

@@ -1,30 +1,15 @@
 import Foundation
 
-// What happens in the first seconds after an object is selected.
+// Timing rules for the first seconds after an object is selected.
 //
-// In:  how long the measurement has been active, and whether it has produced anything yet.
-// Out: whether to abandon it, and whether the operator may cancel it by hand.
-//
-// Two separate problems, one clock:
-//
-// A selected object that never starts measuring leaves the participant holding a phone over an object
-// with nothing happening and nothing to press: the mask is locked, the guidance says hold still, and
-// the fit never publishes a first box. Three seconds is long enough to tell the difference between a
-// slow first fit and one that is not coming, and abandoning it puts the app straight back to looking
-// for an object — which is the state the participant can act in.
-//
-// The manual cancel has the opposite failure: offered immediately, it gets pressed while the
-// measurement is still perfectly normally getting started, and the participant learns to cancel rather
-// than to hold the phone still. It is therefore withheld for the first four seconds — by which point a
-// measurement that was not going to start has already been abandoned by the rule above.
+// If no box has been fitted after 3 s the measurement is abandoned and the app goes back to
+// looking for an object. Cancel is hidden for the first 4 s so it isn't pressed while a normal
+// measurement is still starting up.
 
 nonisolated enum MeasurementStartRule {
-    /// How long a selected object has to produce its first measurement.
     static let startGraceSeconds: TimeInterval = 3
-    /// How long before the operator may cancel by hand.
     static let cancelLockoutSeconds: TimeInterval = 4
 
-    /// True once a measurement that has produced nothing has had its three seconds.
     static func abandonsMeasurement(
         secondsActive: TimeInterval,
         hasMeasurement: Bool
@@ -38,11 +23,10 @@ nonisolated enum MeasurementStartRule {
         return secondsActive >= cancelLockoutSeconds
     }
 
-    /// Whole seconds still to wait before Cancel appears, for the button's own label.
+    /// Seconds left before Cancel appears, or nil once it is available.
     static func cancelCountdown(secondsActive: TimeInterval) -> Int? {
         guard !allowsCancel(secondsActive: secondsActive) else { return nil }
-        // Clamped before it becomes an Int. Converting an out-of-range Double to Int is a trap, and a
-        // clock that has gone backwards is exactly the sort of thing that would hand one over.
+        // Clamp before converting, a Double outside Int's range would trap.
         let remaining = (cancelLockoutSeconds - secondsActive).rounded(.up)
         return Int(min(max(remaining, 1), cancelLockoutSeconds.rounded(.up)))
     }

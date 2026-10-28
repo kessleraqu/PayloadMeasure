@@ -1,25 +1,15 @@
 import Foundation
 import simd
 
-// Choosing which of the measured surface points to draw.
+// Picks which of the measured surface points to draw.
 //
-// In:  the accumulated points for one object, and how many dots may be drawn.
-// Out: the subset to draw.
-//
-// The cloud grows all through a measurement, as more surface becomes stable. Picking every k-th
-// element of it — which is what this used to do — changes k whenever the count changes, and so
-// changes the entire drawn subset several times a second. The points were never random and the cloud
-// underneath was not moving, but the display churned as if both were.
-//
-// Selection is by a hash of the point's own voxel instead. Membership then depends only on the point
-// and the current budget, and because the budget's share can only shrink as the cloud grows, a dot
-// that drops out cannot come back. The display thins as the cloud fills in, rather than reshuffling.
-// The voxel, not the raw coordinate, is hashed so that depth jitter on the same bit of surface cannot
-// make a dot flicker.
+// Points are chosen by a hash of their voxel rather than every k-th element, so the drawn set
+// stays stable while the cloud grows. Since the per-point budget only shrinks, a dot that
+// disappears never comes back. Hashing the voxel instead of the raw position stops depth noise
+// from making dots flicker.
 
 nonisolated enum SelectionPointDisplay {
-    /// Fixed point of comparison for the hash split. Any power of two does; this one keeps the
-    /// arithmetic well inside UInt64.
+    /// Fixed-point scale for the hash threshold.
     static let scale: UInt64 = 1 << 16
 
     static func hash(x: Int32, y: Int32, z: Int32) -> UInt64 {
@@ -31,15 +21,8 @@ nonisolated enum SelectionPointDisplay {
         return finalised(value)
     }
 
-    /// Avalanche step, and the reason the dots came out in stripes.
-    ///
-    /// FNV ends on a multiply, and the low bits of a product depend only on the low bits of its
-    /// operands — bit 0 of the hash is bit 0 of the input, and so on up. Voxel keys march by one along
-    /// each axis, so `hash % 2^16` marched with them: whether a point was drawn became a periodic
-    /// function of its position, which is a set of stripes across the surface rather than a scatter.
-    ///
-    /// This is splitmix64's finaliser: two shift-xors around a multiply, which spreads every input bit
-    /// across the whole word so the low bits are as good as any other.
+    /// splitmix64 finaliser. Plain FNV ends on a multiply, so its low bits follow the input's low
+    /// bits and the selection came out in stripes; this mixes all bits.
     private static func finalised(_ value: UInt64) -> UInt64 {
         var mixed = value
         mixed ^= mixed >> 33
@@ -50,14 +33,8 @@ nonisolated enum SelectionPointDisplay {
         return mixed
     }
 
-    /// Up to `limit` items: the ones ranking lowest by hash, rather than the ones in the right places
-    /// in the array.
-    ///
-    /// One ordering throughout, deliberately. Filtering on `hash % scale` and then trimming on the
-    /// full hash — which is what this did first — are two different orders, so which item got trimmed
-    /// depended on what else happened to be in the array, and a dropped dot could come back. The rank
-    /// below is a total order fixed per item: the remainder decides, and the full hash only breaks
-    /// ties, so no two items compare equal and array order never enters into it.
+    /// Up to `limit` items, the ones with the lowest hash rank. The rank is a total order per item,
+    /// so array order never affects which items are kept.
     static func subset<Item>(
         _ items: [Item],
         limit: Int,
@@ -66,8 +43,7 @@ nonisolated enum SelectionPointDisplay {
         guard limit > 0 else { return [] }
         guard items.count > limit else { return items }
 
-        // Cheap first pass: throw away most of what cannot make the budget, in one O(n) sweep. The
-        // threshold can only fall as the cloud grows, so this pass alone can never re-admit anything.
+        // Cheap first pass that drops most items that can't make the budget.
         let threshold = UInt64(
             (Double(limit) / Double(items.count) * Double(scale)).rounded()
         )
@@ -80,9 +56,8 @@ nonisolated enum SelectionPointDisplay {
         return kept
     }
 
-    /// The measured box is fitted to the complete cloud, while only a small cloud is rendered.
-    /// Always retain the coordinate extremes so the visible dots still show the evidence that sets
-    /// the box boundary; fill the rest of the budget with the stable hash selection above.
+    /// Like `subset`, but always keeps the points at the coordinate extremes so the visible dots
+    /// still show what sets the box boundary.
     static func subsetPreservingCoordinateExtrema(
         _ points: [SIMD3<Float>],
         limit: Int,
@@ -114,8 +89,7 @@ nonisolated enum SelectionPointDisplay {
             }
         }
 
-        // Height first: this is the least visually obvious boundary when the upper point is lost in
-        // a thinned cloud. The remaining coordinate extremes make the same guarantee horizontally.
+        // Height first, it's the boundary most easily lost when the cloud is thinned.
         var requiredIndices: [Int] = []
         for descriptor in [
             (axis: 1, maximum: true),
@@ -145,9 +119,8 @@ nonisolated enum SelectionPointDisplay {
         return points.indices.compactMap { selected.contains($0) ? points[$0] : nil }
     }
 
-    /// Remainder first, then the whole hash to settle ties. Two different items can share a remainder
-    /// once there are thousands of them, and `sort` is not stable, so without the tie-break a pair of
-    /// dots either side of the cut-off could swap places from one update to the next.
+    /// Remainder first, full hash as tie-break. Without it two dots near the cut-off could swap
+    /// between updates because sort isn't stable.
     static func rank(_ left: UInt64, precedes right: UInt64) -> Bool {
         let leftRemainder = left % scale
         let rightRemainder = right % scale

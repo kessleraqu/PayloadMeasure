@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// A neutral participant-controlled boundary. Entering this screen must happen only after the
-/// previous phase has stopped; its button starts the next phase and then advances the UI.
+/// Neutral screen between phases. Shown after the previous phase has stopped; the button starts
+/// the next one.
 struct StudyPhaseHandoffView: View {
     let title: String
     let detail: String

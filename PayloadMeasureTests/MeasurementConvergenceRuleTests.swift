@@ -1,8 +1,7 @@
 import XCTest
 @testable import PayloadMeasure
 
-// Pins the stopping rule to the condition written at the top of MeasurementConvergence.swift and
-// repeated in PSEUDOCODE.md Part 5. If one of these fails, the documentation is now wrong.
+// Checks the stopping rule described at the top of MeasurementConvergence.swift.
 
 final class MeasurementConvergenceRuleTests: XCTestCase {
     private let coverage = MeasurementConvergenceMonitor.Coverage(
@@ -18,11 +17,11 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         XCTAssertEqual(configuration.intervalWidthFloorInMeters, 0.005, accuracy: 1e-9)
         XCTAssertEqual(configuration.intervalWidthRelative, 0.01, accuracy: 1e-9)
 
-        // Small dimension: the 5 mm floor governs, because 1% of 100 mm is only 1 mm.
+        // Small dimension: the 5 mm floor applies, since 1% of 100 mm is only 1 mm.
         XCTAssertEqual(configuration.halfWidthTolerance(forMean: 0.100), 0.0025, accuracy: 1e-9)
-        // Large dimension: the relative term takes over above 500 mm.
+        // Large dimension: the relative term applies above 500 mm.
         XCTAssertEqual(configuration.halfWidthTolerance(forMean: 0.800), 0.004, accuracy: 1e-9)
-        // The crossover is exactly where 1% equals the floor.
+        // Crossover where 1% equals the floor.
         XCTAssertEqual(configuration.halfWidthTolerance(forMean: 0.500), 0.0025, accuracy: 1e-9)
     }
 
@@ -32,8 +31,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         var monitor = MeasurementConvergenceMonitor()
         let configuration = MeasurementConvergenceMonitor.Configuration.default
 
-        // Perfectly noiseless samples: the precision test is satisfied immediately, so anything
-        // stopping this before the minimum could only be the sample count.
+        // Noiseless samples meet the precision test at once, so only the sample count can hold it back.
         for index in 0..<(configuration.minimumSampleCount - 1) {
             record(&monitor, value: 0.200, at: Double(index) * 0.05)
         }
@@ -46,7 +44,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         XCTAssertTrue(state.isConverged)
         XCTAssertEqual(state.basis, .precisionTarget)
 
-        // Far more than the window: still fine, and still reporting only the window's worth.
+        // Well past the window size, still only reporting the window.
         for index in 0..<200 {
             record(&monitor, value: 0.200, at: 6.0 + Double(index) * 0.05)
         }
@@ -59,7 +57,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
 
     func testNoisyMeasurementsDoNotFinishAndTheirHalfWidthIsReported() {
         var monitor = MeasurementConvergenceMonitor()
-        // ±20 mm alternating: s is far too large for a 2.5 mm half-width at 24 samples.
+        // +-20 mm alternating: far too noisy for a 2.5 mm half-width at 24 samples.
         for index in 0..<48 {
             record(&monitor, value: index.isMultiple(of: 2) ? 0.180 : 0.220, at: Double(index) * 0.05)
         }
@@ -70,17 +68,16 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         let halfWidth = try! XCTUnwrap(state.deviationInMeters)
         let tolerance = try! XCTUnwrap(state.toleranceInMeters)
         XCTAssertGreaterThan(halfWidth, tolerance)
-        // t·s/√n with s = 20 mm and n = 24 lands near 8 mm; assert the order of magnitude only.
+        // t * s / sqrt(n) with s = 20 mm and n = 24 is about 8 mm; only check the order of magnitude.
         XCTAssertGreaterThan(halfWidth, 0.005)
         XCTAssertLessThan(halfWidth, 0.015)
     }
 
     // MARK: - The drift test is separate from the precision test
 
-    /// δₙ is the gap between the two halves of the window, and for a ramp of step `k` over n samples
-    /// that is exactly k·n/2. At n = 24 the tolerance dₙ is max(5 mm, 1%·200 mm)/2 = 2.5 mm, so the
-    /// drift test turns over at a step of 2.5/12 ≈ 0.208 mm per frame. Both sides of that are checked,
-    /// because a threshold nobody has stood on either side of is not really tested.
+    /// For a ramp of step k the drift between window halves is k * n / 2. At n = 24 the tolerance is
+    /// max(5 mm, 1% of 200 mm) / 2 = 2.5 mm, so the cut-off is about 0.208 mm per frame. Both sides
+    /// are checked.
     func testASteadyRampIsRejectedOnlyOnceItsDriftExceedsTheTolerance() {
         func state(stepInMetres: Float) -> MeasurementConvergence {
             var monitor = MeasurementConvergenceMonitor()
@@ -90,7 +87,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
             return monitor.evaluate(coverage: coverage, now: 1.2)
         }
 
-        // 0.3 mm per frame: the halves are 3.6 mm apart, past the 2.5 mm tolerance.
+        // 0.3 mm per frame: halves 3.6 mm apart, over the tolerance.
         let drifting = state(stepInMetres: 0.0003)
         XCTAssertFalse(
             drifting.isConverged,
@@ -98,8 +95,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         )
         XCTAssertEqual(drifting.limitingFactor, .drifting)
 
-        // 0.1 mm per frame: 1.2 mm apart, inside the tolerance. Still a ramp, but a ramp small enough
-        // that the rule has declared it does not care — accepting it is the documented behaviour.
+        // 0.1 mm per frame: 1.2 mm apart, within tolerance, so accepted.
         let settled = state(stepInMetres: 0.0001)
         XCTAssertTrue(
             settled.isConverged,
@@ -137,9 +133,8 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         XCTAssertEqual(state.limitingFactor, .waitingForSupportPlane)
     }
 
-    /// The ten-second limit is an exit, not an exception: it may not declare a measurement converged
-    /// while the missing support plane would make the finish be refused. That combination is what left
-    /// small objects reading 100% for ever.
+    /// The time limit must not report convergence without a support plane, otherwise the finish is
+    /// refused and the measurement is stuck at 100%.
     func testTheTimeLimitDoesNotFinishAScanThatHasNoSupportPlane() {
         var monitor = MeasurementConvergenceMonitor()
         let configuration = MeasurementConvergenceMonitor.Configuration.default
@@ -148,7 +143,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
             hasSupportPlane: false,
             reportsSideViewSeparately: true
         )
-        // Deliberately noisy, and still arriving, so nothing but the clock could ever end this.
+        // Noisy and still arriving, so only the clock could end it.
         let elapsed = recordPastTheTimeLimit(&monitor)
         let state = monitor.evaluate(coverage: withoutPlane, now: elapsed)
         XCTAssertGreaterThanOrEqual(elapsed, configuration.timeLimit)
@@ -172,9 +167,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
         XCTAssertEqual(state.progress, 1, accuracy: 1e-9)
     }
 
-    /// Noisy observations arriving every 50 ms until past the ten-second limit: the precision test can
-    /// never be met and the stale-evidence exit can never fire, so the clock is the only exit left.
-    /// Returns the timestamp of the last observation.
+    /// Noisy observations every 50 ms until past the time limit. Returns the last timestamp.
     private func recordPastTheTimeLimit(
         _ monitor: inout MeasurementConvergenceMonitor
     ) -> TimeInterval {
@@ -197,7 +190,7 @@ final class MeasurementConvergenceRuleTests: XCTestCase {
     func testStaleEvidenceFinishesTheScanWithoutThePrecisionTest() {
         var monitor = MeasurementConvergenceMonitor()
         let configuration = MeasurementConvergenceMonitor.Configuration.default
-        // Only a handful of samples, and deliberately noisy, so precision is nowhere near met.
+        // A few noisy samples, so precision is nowhere near met.
         for index in 0..<configuration.pilotSampleCount {
             record(&monitor, value: index.isMultiple(of: 2) ? 0.180 : 0.230, at: Double(index) * 0.05)
         }

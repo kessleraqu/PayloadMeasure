@@ -1,12 +1,8 @@
 import XCTest
 @testable import PayloadMeasure
 
-// Reported directly: starting with the small box, the big box's time was recorded but its measurements
-// and photos were not. `StudyTransitionTests` already covers timing across both boxes exhaustively
-// (`testEveryPhaseIsTimedForBothBoxes`, `testSecondPayloadHasAWhiteHandoffAndIndependentTimers`), which
-// is presumably why the timing half of this was never seen to regress — but nothing in the suite checked
-// that `recordMeasurementProgress`, `recordCurrentBox`, or `storePhoto` actually reach the *second* box's
-// result rather than silently landing on the first, or on nothing. These tests close that gap directly.
+// Checks that measurements, the final snapshot and photos for the second payload are recorded
+// under the second payload, not the first. (Timing is covered in StudyTransitionTests.)
 @MainActor
 final class StudySecondBoxRecordingTests: XCTestCase {
     private var startedRunIDs: [UUID] = []
@@ -35,7 +31,7 @@ final class StudySecondBoxRecordingTests: XCTestCase {
         )
     }
 
-    /// A store with a run already started on the small box and the participant session begun.
+    /// A store with a run started on the small payload and the participant session begun.
     private func makeSmallBoxStore(_ label: String) throws -> StudyStore {
         let store = StudyStore()
         store.startRun(
@@ -50,8 +46,7 @@ final class StudySecondBoxRecordingTests: XCTestCase {
         return store
     }
 
-    /// The reported scenario, at store level: small box first, big box second, one object measured on
-    /// each. Both must show up under their own box afterwards.
+    /// Small payload first, big second, one object each. Both must be recorded under their own payload.
     func testMeasurementProgressReachesTheSecondBoxAfterAdvancing() throws {
         let store = try makeSmallBoxStore("second-box-progress")
         XCTAssertEqual(store.currentBox, .small, "Fixture check.")
@@ -79,9 +74,7 @@ final class StudySecondBoxRecordingTests: XCTestCase {
         )
     }
 
-    /// The packing screen's final snapshot — objects, loaded IDs, packing mode, balance — for the second
-    /// box specifically, since `recordCurrentBox` is the call that carries most of what a participant
-    /// actually did with a payload.
+    /// The final snapshot from the packing screen for the second payload.
     func testRecordCurrentBoxReachesTheSecondBoxAfterAdvancing() throws {
         let store = try makeSmallBoxStore("second-box-final")
 
@@ -118,13 +111,13 @@ final class StudySecondBoxRecordingTests: XCTestCase {
         XCTAssertEqual(bigResult.centreOfMassMillimetres, [150, 100, 75])
         XCTAssertEqual(bigResult.unbalancingIndexMillimetres, 12.0)
 
-        // And the small box's snapshot from before advancing must still be exactly what it was.
+        // The small payload's snapshot must be unchanged.
         let smallResult = try XCTUnwrap(run.result(for: .small))
         XCTAssertEqual(smallResult.objects.map(\.name), ["Small-box item"])
         XCTAssertEqual(smallResult.packingMode, "paper")
     }
 
-    /// A photo captured for the second box must be named and filed under the second box, not the first.
+    /// A photo for the second payload is named and filed under it.
     func testAPhotoStoredForTheSecondBoxIsNamedForTheSecondBox() throws {
         let store = try makeSmallBoxStore("second-box-photo")
         let runID = try XCTUnwrap(store.activeRun?.id)
@@ -156,12 +149,9 @@ final class StudySecondBoxRecordingTests: XCTestCase {
         )
     }
 
-    /// The mechanism behind the reported bug: `ContentView.startNextBox()` resets the capture engine —
-    /// collapsing its object list to empty — before deciding whether there even is a next box to advance
-    /// to. On the run's last box nothing afterwards moves `currentBoxIndex` or sets
-    /// `isAwaitingParticipantStart`, so `currentBox` keeps resolving to that box straight through the
-    /// reset. A stray SwiftUI `onChange` carrying that now-empty list, arriving after
-    /// `ArrangementView.recordCurrentBox` already saved the real objects, must not be able to erase them.
+    /// On the last payload, startNextBox resets the capture engine before checking for a next payload,
+    /// so `currentBox` still points at it. A late empty progress update must not erase what
+    /// recordCurrentBox already saved.
     func testAnEmptyProgressSnapshotCannotErodeTheLastBoxAfterItIsRecorded() throws {
         let store = try makeSmallBoxStore("second-box-race")
         store.advanceToNextBox()
@@ -178,8 +168,7 @@ final class StudySecondBoxRecordingTests: XCTestCase {
             unbalancingIndex: 4.5
         )
 
-        // The stray call `captureEngine.reset()` would trigger: the capture engine's object list is
-        // empty again, but `currentBox` still validly points at the box just recorded.
+        // The empty update triggered by captureEngine.reset().
         store.recordMeasurementProgress(objects: [])
 
         let run = try XCTUnwrap(store.activeRun)

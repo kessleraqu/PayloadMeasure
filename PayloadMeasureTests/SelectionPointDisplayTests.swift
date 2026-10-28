@@ -1,13 +1,8 @@
 import XCTest
 @testable import PayloadMeasure
 
-// The cyan dots looked like they were being scattered at random. They were not: the cloud is
-// accumulated and deterministic, but the display took every k-th point of it, and k changes every
-// time the cloud grows — so the whole drawn subset changed several times a second.
-//
-// What matters is that a dot which is being drawn keeps being drawn, and that one which has dropped
-// out does not come back. These tests hold the new selection to that, and show that the stride it
-// replaced fails it.
+// Point display selection: a drawn dot stays drawn as the cloud grows, and a dropped dot never
+// comes back. The old every-k-th stride is included for comparison.
 
 final class SelectionPointDisplayTests: XCTestCase {
     private func hash(_ value: Int) -> UInt64 {
@@ -31,12 +26,12 @@ final class SelectionPointDisplayTests: XCTestCase {
         }
     }
 
-    /// The property the old stride broke: growth must not bring a dropped point back.
+    /// A dropped point never comes back as the cloud grows.
     func testAPointThatDropsOutNeverComesBack() {
         var everDropped: Set<Int> = []
         var previous = Set(subset(Array(0..<700), limit: 600))
 
-        // The cloud fills in the way a real one does: the same points, plus new ones.
+        // The cloud grows like a real one: same points plus new ones.
         for count in stride(from: 800, through: 8_000, by: 200) {
             let drawn = Set(subset(Array(0..<count), limit: 600))
             everDropped.formUnion(previous.subtracting(drawn))
@@ -49,8 +44,7 @@ final class SelectionPointDisplayTests: XCTestCase {
         }
     }
 
-    /// Selection depends on the point, not on where it sits in the array, so the order the cloud
-    /// happens to arrive in cannot change what is on screen.
+    /// Array order doesn't affect which points are drawn.
     func testOrderOfTheCloudDoesNotChangeWhatIsDrawn() {
         let points = Array(0..<2_000)
         let forwards = Set(subset(points, limit: 600))
@@ -66,8 +60,7 @@ final class SelectionPointDisplayTests: XCTestCase {
         XCTAssertEqual(subset(points, limit: 600), subset(points, limit: 600))
     }
 
-    /// For contrast: the stride this replaced churns the whole display as the cloud grows. Without
-    /// this, the fix above looks like an arbitrary preference rather than a repair.
+    /// For comparison, the old stride changes the whole display as the cloud grows.
     func testTheOldStrideChurnedTheDisplay() {
         func stride(_ items: [Int], limit: Int) -> [Int] {
             guard items.count > limit else { return items }
@@ -85,18 +78,10 @@ final class SelectionPointDisplayTests: XCTestCase {
         )
     }
 
-    /// The dots came out in stripes, and this is the shape of that fault.
-    ///
-    /// FNV ends on a multiply, so the low bits of the hash are a near-linear function of the low bits of
-    /// the voxel key. Taking the remainder modulo a power of two therefore made "is this point drawn" a
-    /// periodic function of position — across a flat face, whole rows of voxels came out drawn and whole
-    /// rows came out empty.
-    ///
-    /// So what is measured is the density per row, per column and per diagonal of one face, against what
-    /// independent coin flips would give. A 1-D walk was tried first and is useless here: the unmixed
-    /// hash scores *better* than chance on neighbour agreement while still banding badly, so that test
-    /// passed on the broken hash. Measured over a face, the two are unmistakable — row sd 7.5 before the
-    /// avalanche step, 2.6 after, against a binomial 2.65.
+    /// The drawn points should be spread evenly over a face, not in stripes. Without the splitmix
+    /// finaliser the low hash bits follow the voxel key and whole rows come out empty. Measured as
+    /// density per row, column and diagonal against a binomial: row sd was 7.5 before the fix and
+    /// 2.6 after, against an expected 2.65.
     func testDrawnPointsAreEvenlySpreadAcrossAFaceRatherThanBanded() {
         let side = 64
         let keepOneIn = 8
@@ -117,8 +102,7 @@ final class SelectionPointDisplayTests: XCTestCase {
 
         let share = 1.0 / Double(keepOneIn)
         let binomial = (Double(side) * share * (1 - share)).squareRoot()
-        // Twice binomial: comfortably above the noise of an even spread, far below the 2.8× the
-        // unmixed hash produced.
+        // Twice the binomial sd: above normal noise, well below the 2.8x of the unmixed hash.
         let limit = 2 * binomial
 
         let rows = drawn.map { $0.count { $0 } }
@@ -131,7 +115,7 @@ final class SelectionPointDisplayTests: XCTestCase {
         XCTAssertLessThan(standardDeviation(columns), limit, "Banding along the columns.")
         XCTAssertLessThan(standardDeviation(diagonals), limit, "Banding along the diagonals.")
 
-        // And the budget has to be roughly honoured, not quietly biased low as the unmixed hash was.
+        // The budget should be roughly met, not biased low.
         let total = rows.reduce(0, +)
         XCTAssertEqual(
             Double(total),

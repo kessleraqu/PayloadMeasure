@@ -2,8 +2,8 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// Pins the behaviour that is claimed to come from the papers, so a later change cannot quietly turn
-// a cited procedure into something else. Each test names the clause it is protecting.
+// Checks the parts of the packing search that are taken from the papers. Each test names the
+// section it covers.
 
 final class BaldiPaperFidelityTests: XCTestCase {
 
@@ -55,14 +55,13 @@ final class BaldiPaperFidelityTests: XCTestCase {
             BaldiSearch.isBetterForSearch(centred, than: cornered, alpha: 0.9),
             "Between two one-package packings the better balanced one wins."
         )
-        // Unequal count: no admissible α can reverse it, because the penalty is below 1.
+        // Different count: the penalty is below 1, so no alpha can reverse it.
         XCTAssertTrue(BaldiSearch.isBetterForSearch(two, than: centred, alpha: 0.9))
         XCTAssertLessThan(two.normalisedUnbalancingIndex, 1.0000001)
     }
 
     func testAnUnbalancedPackingMayBeTheSearchIncumbent() {
-        // §5.3.3 branches on "if the best solution found so far is unfeasible", so BS is allowed to
-        // be unbalanced. The merit function must not silently forbid that.
+        // 5.3.3 allows the best solution to be unbalanced, so the merit function must too.
         let knapsack = BaldiKnapsack(size: SIMD3(400, 200, 200))
         let unbalancedPair = BaldiSolution(
             knapsack: knapsack,
@@ -150,10 +149,8 @@ final class BaldiPaperFidelityTests: XCTestCase {
     // MARK: - §5.2 balancing
 
     func testGravityCompactionIsVacuousUnderFullSupport() {
-        // §5.2 ends by compacting everything down the z axis. That step repairs mid-air placements,
-        // which full support already forbids: a package off the floor rests on top faces covering it
-        // completely, so it has nowhere to descend to. Lowering any package by any amount must break
-        // either overlap or support.
+        // 5.2 ends with gravity compaction. With full support nothing can move down, so lowering any
+        // package must break overlap or support.
         let knapsack = BaldiKnapsack(size: SIMD3(400, 200, 200))
         let stack = [
             placement(origin: SIMD3(0, 0, 0), size: SIMD3(100, 100, 50), mass: 2),
@@ -174,8 +171,7 @@ final class BaldiPaperFidelityTests: XCTestCase {
     }
 
     func testPaperBalancingUsesPackingOrderAndCentredUsesHeaviestFirst() {
-        // Same instance, same everything except the mode. §5.2 fixes no order, so paper mode takes
-        // packing order; heaviest-first belongs to the extension.
+        // Only the mode differs. Paper mode keeps packing order; centred moves heaviest first.
         let problem = twoPackageProblem()
         var paper = BaldiBalancer.Options()
         paper.mode = .paper
@@ -196,7 +192,7 @@ final class BaldiPaperFidelityTests: XCTestCase {
             options: centred
         )
 
-        // Both must stay legal whatever order they used.
+        // Both must stay valid.
         for result in [paperResult, centredResult] {
             XCTAssertTrue(BaldiVerticalSupport.allFullySupported(result))
             for first in result.indices {
@@ -205,7 +201,7 @@ final class BaldiPaperFidelityTests: XCTestCase {
                 }
             }
         }
-        // Centred keeps going after feasibility, so it should land at least as close to the target.
+        // Centred keeps going after feasibility, so it should end at least as close to the target.
         let target = problem.knapsack.idealCentreOfMass
         let paperDistance = simd_distance(BaldiBalancer.centreOfMass(of: paperResult), target)
         let centredDistance = simd_distance(BaldiBalancer.centreOfMass(of: centredResult), target)
@@ -235,8 +231,8 @@ final class BaldiPaperFidelityTests: XCTestCase {
     // MARK: - Liu / Zhang
 
     func testClosenessIsMaximisedSoTheChosenAxisHugsTheRectangle() {
-        // A rectangle rotated 30°. The fitter must recover that direction, which it can only do by
-        // taking the argmax of Zhang's β — the argmin would pick a diagonal.
+        // A rectangle rotated 30 degrees. Recovering it requires maximising Zhang's criterion;
+        // minimising would pick a diagonal.
         let angle = Float.pi / 6
         let axis = SIMD2<Float>(cos(angle), sin(angle))
         let perpendicular = SIMD2<Float>(-axis.y, axis.x)
@@ -254,14 +250,14 @@ final class BaldiPaperFidelityTests: XCTestCase {
 
         let found = OrientedBoundingBox.bestOrientation(of: points, minimumEdgeDistance: 0.005)
         let recovered = try! XCTUnwrap(found)
-        // Any of the rectangle's four edge directions is a correct answer.
+        // Any of the four edge directions is correct.
         let error = abs(atan2(recovered.y, recovered.x) - angle)
             .truncatingRemainder(dividingBy: .pi / 2)
         XCTAssertLessThan(min(error, .pi / 2 - error), 0.05, "Recovered axis is off by more than 3°.")
     }
 
     func testFullCloudExtentsDoNotChangeTheOrientationChosen() {
-        // The application measures extents from every point but must leave Liu's search untouched.
+        // Extents use every point, but Liu's orientation search must not change.
         var generator = SeededGenerator(state: 42)
         let angle: Float = 0.4
         let axis = SIMD2<Float>(cos(angle), sin(angle))
@@ -274,8 +270,7 @@ final class BaldiPaperFidelityTests: XCTestCase {
         }
 
         let fromEverything = OrientedBoundingBox.bestOrientation(of: points, minimumEdgeDistance: 0.005)
-        // Appending points strictly inside the hull cannot change the hull, so it cannot change the
-        // candidate directions either.
+        // Points inside the hull can't change the hull, so the candidate directions stay the same.
         let interior = points.map { $0 * 0.5 }
         let withInterior = OrientedBoundingBox.bestOrientation(
             of: points + interior,
@@ -285,15 +280,9 @@ final class BaldiPaperFidelityTests: XCTestCase {
         XCTAssertNotNil(withInterior)
     }
 
-    /// A captured fixture, not a hand-derived one: an asymmetric three-walled point cloud (one wall
-    /// of the rectangle unseen, the other three covered unevenly and only partially — a plausible
-    /// partial scan) at a true axis of 64.79°, generated by sweeping random asymmetric configurations
-    /// through the same pipeline this test calls (downsample, approximate-collinearity hull, both
-    /// closeness formulas) and keeping the one with the largest gap between the per-point closeness
-    /// formula [Z] specifies and the earlier per-axis-vote formula this codebase shipped with.
-    /// Confirmed offline that the per-axis vote recovers an axis roughly 11° off truth on this exact
-    /// cloud, while scoring each point's own nearest edge recovers it to within 2° — the regression
-    /// this test pins.
+    /// Captured fixture: an asymmetric partial scan (one side unseen, the others partly covered) with
+    /// a true axis of 64.79 degrees. A per-axis vote version of the closeness score was about 11
+    /// degrees off here; the per-point formula gets within 2.
     func testAnAsymmetricPartialScanRecoversTheTrueAxisNotTheVotedOne() throws {
         let points: [SIMD2<Float>] = [
         SIMD2<Float>(0.124241, -0.144525),
@@ -352,7 +341,7 @@ final class BaldiPaperFidelityTests: XCTestCase {
             .truncatingRemainder(dividingBy: .pi / 2)
         XCTAssertLessThan(
             min(error, .pi / 2 - error), 0.05,
-            "Recovered axis is off by more than 3°; the per-axis-vote regression would fail this by roughly 11°."
+            "Recovered axis is off by more than 3°."
         )
     }
 

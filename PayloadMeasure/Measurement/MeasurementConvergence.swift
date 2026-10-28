@@ -1,41 +1,22 @@
 import Foundation
 
-// Decides when a measurement has settled enough to offer an automatic finish.
+// Decides when a measurement has settled enough to finish automatically.
 //
-// In:  raw per-axis observations from each fit, with timestamps, plus what the current viewpoint
-//      can actually see.
-// Out: a convergence state with progress for the HUD, and whether the stopping rule has fired.
+// Over a sliding window of the last N = 24 observations of each dimension:
 //
-// THE RULE, exactly. Over the sliding window of the last N = 24 observations of one dimension:
+//     mean   x = (1/n) * sum(x_i)
+//     sd     s = sqrt(sum((x_i - x)^2) / (n - 1))
+//     CI     h = t(0.975, n-1) * s / sqrt(n)          95% half-width
+//     drift  d = |mean(second half) - mean(first half)|
+//     tol    e = max(5 mm, 1% of |x|) / 2
 //
-//     x̄ₙ = (1/n) Σ xᵢ
-//     sₙ = √( Σ(xᵢ − x̄ₙ)² / (n − 1) )                       Bessel-corrected sample s.d.
-//     hₙ = t₀.₉₇₅,ₙ₋₁ · sₙ / √n                              95% two-sided CI half-width
-//     δₙ = | mean(second half of window) − mean(first half) |
-//     dₙ = max(5 mm, 1% · |x̄ₙ|) / 2                          half of the declared interval width
+// The scan finishes when n >= 24, h <= e and d <= e hold for width, depth and height at once.
+// It also finishes if no new observation arrives for 2.5 s (with at least 4 samples), or after
+// 10 s regardless. All three exits need a support plane, since height is measured from it.
 //
-// and the scan finishes when, for width, depth AND height simultaneously:
-//
-//     n ≥ 24            ∧   hₙ ≤ dₙ            ∧   δₙ ≤ dₙ            ∧   a support plane exists
-//
-// There is a second exit: if no new observation has arrived for 2.5 s and at least 4 exist, the
-// measurement finishes on the grounds that no further waiting can tighten it. And a third: after
-// 10 s the reading is taken as it stands. Every exit still requires the support plane, because a
-// height measured from an unknown floor is not a measurement — and a bar that reads 100% while the
-// finish is being refused is how a stall looks to the person holding the phone, so the progress
-// shown is capped below completion until the support is known.
-//
-// PROVENANCE. Only the middle condition, hₙ ≤ dₙ, has a literature source: it is the fixed-width
-// sequential stopping form of Chow and Robbins (1965). It is *not* their procedure. They accumulate
-// every sample, which is what drives hₙ → 0 and gives the method its guarantee; this uses a fixed
-// 24-frame window, over which hₙ does not shrink with time but instead measures how consistent the
-// last 24 fits are. The window is deliberate — the quantity being estimated genuinely moves as new
-// faces of the object come into view, so a growing sample would average across a changing mean —
-// but it means the guarantee does not carry over. Chow and Robbins are the origin of the stopping
-// form, not of the rule implemented here.
-//
-// Everything else is project-defined: N = 24, the 95% level, the Student-t finite-sample quantile,
-// the 5 mm / 1% tolerance, the drift test δₙ, and the 2.5 s timeout.
+// The h <= e test is the fixed-width stopping rule from Chow and Robbins (1965), but applied to
+// a fixed window instead of the full sample, because the estimate shifts as new faces of the
+// object come into view. The window size, tolerance and timeouts are our own choices.
 
 nonisolated enum MeasurementAxis: Int, CaseIterable, Sendable {
     case width
@@ -70,7 +51,7 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
         case none
         case precisionTarget
         case evidenceExhausted
-        /// The ten-second limit ran out. The reading is whatever had been measured by then.
+        /// The 10 s limit was reached; the current reading is used.
         case timeLimit
     }
 
@@ -130,10 +111,7 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
                     : "Converged"
             )
         }
-        // No millimetres, no axis names, no seconds remaining. Which dimension is still moving and by
-        // how much is diagnostic detail: the person holding the phone can act on "keep it in view" and
-        // cannot act on "length ±3.2 mm → ±2.5 mm". The figures are still on the state for the info
-        // panel and the tests.
+        // The HUD only gets a short hint. The per-axis numbers are kept for the info panel and tests.
         return parts.joined(separator: " · ")
     }
 
@@ -172,27 +150,22 @@ nonisolated struct MeasurementConvergence: Equatable, Sendable {
 
 nonisolated struct MeasurementConvergenceMonitor: Sendable {
     struct Configuration: Sendable {
-        /// Length of the sliding window, and also the minimum before the rule may fire. Both are
-        /// project-defined engineering choices, not values from any paper.
+        /// Window length, and the minimum sample count before the rule can fire.
         var windowSize = 24
         var minimumSampleCount = 24
-        /// Below this the second exit is not offered at all.
+        /// Minimum samples before the timeout exit is allowed.
         var pilotSampleCount = 4
-        /// No new observation for this long means the estimator can no longer change.
         var evidenceTimeout: TimeInterval = 2.5
-        /// A measurement ends here whatever the statistics say. A participant should not be left
-        /// holding a phone over an object indefinitely because the last millimetre will not settle;
-        /// past this the reading is taken as it stands.
+        /// Hard limit on a measurement, whatever the statistics say.
         var timeLimit: TimeInterval = 10
 
-        /// Declared as the **total width** of the confidence interval, which is how it reads to an
-        /// operator: "this dimension is known to within 5 mm". The half-width tolerance the rule
-        /// actually tests against is half of it, because hₙ is one side of the interval.
+        /// Full width of the allowed confidence interval. The rule compares the half-width against
+        /// half of this.
         var intervalWidthFloorInMeters: Float = 0.005
         var intervalWidthRelative: Float = 0.01
 
-        /// dₙ = max(floor, relative · |x̄ₙ|) / 2. One combined tolerance, never two alternative
-        /// tests: the relative term governs large dimensions, the floor governs small ones.
+        /// max(floor, relative * |mean|) / 2. The relative term matters for large dimensions, the floor
+        /// for small ones.
         func halfWidthTolerance(forMean mean: Float) -> Float {
             max(intervalWidthFloorInMeters, intervalWidthRelative * abs(mean)) / 2
         }
@@ -212,7 +185,7 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
         2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042
     ]
     private static let normalQuantile95 = 1.960
-    /// Highest progress the HUD may show while the support plane is still missing.
+    /// Progress is capped here until a support plane exists.
     private static let progressCeilingWithoutSupport = 0.9
 
     private static func wholePercent(_ value: Double) -> Double {
@@ -243,8 +216,7 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
     private var axes: [AxisState]
     private var lastSampleTimestamp: TimeInterval?
     private var firstSampleTimestamp: TimeInterval?
-    /// The published progress never decreases. Both parts it is built from move both ways as evidence
-    /// arrives, and a bar that slides backwards reads as the app losing work it had already done.
+    /// Published progress never goes backwards, otherwise it looks like the app lost work.
     private var highWaterProgress: Double = 0
 
     init(configuration: Configuration = .default) {
@@ -317,11 +289,8 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
                 min(assessment.precisionRatio, assessment.plateauRatio)
             )
         } / Double(assessments.count)
-        // Three things push the bar along, and it takes whichever is furthest: how much of the rule is
-        // satisfied, how much of the ten seconds has gone, and how far it had already got. The time
-        // term is what makes it dependable — the measurement ends at the limit whatever the statistics
-        // are doing, so a bar that tracks the clock is a promise the app can always keep. The
-        // high-water term is what stops it sliding backwards when evidence is revised.
+        // Progress is the furthest of: how much of the rule is met, how much of the time limit has
+        // passed, and the previous high-water mark.
         let elapsedFraction = firstSampleTimestamp.map {
             configuration.timeLimit > 0
                 ? min(max((now - $0) / configuration.timeLimit, 0), 1)
@@ -331,13 +300,8 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
             highWaterProgress,
             max(min(coverageProgress, dimensionProgress), elapsedFraction)
         )
-        // Without a support plane no exit can fire, so the bar must not read as finished. It used to:
-        // the time term drove it to 100% after ten seconds while the finish was refused, which is
-        // exactly the stall a full bar promises is over.
-        // Published in whole percent, which is all the HUD shows. The underlying value moves with the
-        // clock, so publishing it exactly meant this state changed on every camera frame and redrew the
-        // whole overlay — the mask included — sixty times a second for a number that only ever appears
-        // rounded.
+        // Without a support plane no exit can fire, so don't show the bar as full.
+        // Rounded to whole percent so the overlay isn't redrawn on every frame.
         result.progress = Self.wholePercent(
             coverage.hasSupportPlane
                 ? highWaterProgress
@@ -361,10 +325,7 @@ nonisolated struct MeasurementConvergenceMonitor: Sendable {
            now - lastSampleTimestamp >= configuration.evidenceTimeout {
             return converged(result, basis: .evidenceExhausted)
         }
-        // The hard limit: past ten seconds the reading is taken as it stands. Conditional on the
-        // support plane like the other two exits, because without one the finish is refused further
-        // down the line — declaring convergence there only produced a measurement that claimed to be
-        // over and never ended.
+        // Time limit reached. Still needs the support plane, like the other exits.
         if coverage.hasSupportPlane,
            let firstSampleTimestamp,
            now - firstSampleTimestamp >= configuration.timeLimit {

@@ -1,25 +1,20 @@
 import Foundation
 import simd
 
-// The outer boxes and what happened to each measured object.
-//
-// In:  a measured size.
-// Out: the boxes it fits into, and a per-object state: which box the system assigned, that the
-//      object is a box already, or that nothing fits. Whatever it ends up in, not the raw
-//      measurement, is what gets packed.
+// Outer boxes and the preparation state of each measured object (assigned box, already a box, or
+// nothing fits). The packed size comes from the box, not the raw measurement.
 
 nonisolated enum PackagePreparationState: Sendable, Equatable {
     case unavailable
     case noStockedBoxFits
     case excludedBecauseNoStockedBoxFits
-    /// Left out on the operator's say-so rather than because nothing fits it. Needs no box, name or
-    /// weight, and is recorded as skipped.
+    /// Left out by the operator. Needs no box, name or weight.
     case skipped
     case needsFittingBox
     case needsName
     case needsPackedWeight
     case ready
-    /// The object needs no outer box: it is one already, and its measured size is the package size.
+    /// Already a box, so its measured size is the package size.
     case readyAsItsOwnBox
 
     var isComplete: Bool {
@@ -36,16 +31,14 @@ nonisolated enum PackagePreparationState: Sendable, Equatable {
 nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
     let id: String
     let name: String
-    /// The box's outside size, used for payload placement.
+    /// Outside size, used for placement.
     let outerSizeMillimetres: SIMD3<Double>
-    /// What actually fits in it, and what the operator sees as the box name.
+    /// Inside size, also shown as the box name.
     let usableInnerSizeMillimetres: SIMD3<Double>
 
-    /// Box sizes are taken as given: what is written on the box is its size. No wall allowance is
-    /// subtracted.
+    /// Sizes are taken as labelled, no wall allowance.
     static let wallThicknessMillimetres: Double = 0
 
-    /// A box is identified by its size, so that is its name.
     static func sized(
         outerSizeMillimetres: SIMD3<Double>,
         usableInnerSizeMillimetres: SIMD3<Double>? = nil
@@ -85,40 +78,6 @@ nonisolated struct PackingBoxPreset: Identifiable, Sendable, Hashable, Codable {
             * outerSizeMillimetres.z
     }
 
-    /// What the list starts as. Everything in it can be deleted, so this is only ever a starting
-    /// point; once the operator edits the list, theirs is the one that counts.
-    /// The boxes available for one payload module. The two modules carry different boxes, and the
-    /// practice payload uses the small module's, being the same size — see `catalogueOwner`.
-    static func defaultCatalog(for payload: StudyBox) -> [PackingBoxPreset] {
-        // Size, then what fits in it where the two differ. Two of these boxes were measured and are not
-        // what their size suggests: the 230 one takes 235, and the 40 one only takes 30.
-        let stock: [(size: SIMD3<Double>, fits: SIMD3<Double>?)]
-        switch payload {
-        case .big:
-            stock = [
-                (SIMD3(35, 22, 120), nil),
-                (SIMD3(75, 75, 230), SIMD3(75, 75, 235)),
-                (SIMD3(95, 95, 160), SIMD3(100, 100, 160)),
-                (SIMD3(100, 95, 85), nil),
-                (SIMD3(130, 100, 105), nil),
-            ]
-        case .small:
-            stock = [
-                (SIMD3(100, 75, 90), nil),
-                (SIMD3(120, 90, 40), SIMD3(120, 90, 30)),
-                (SIMD3(130, 100, 105), nil),
-            ]
-        }
-        return stock.compactMap {
-            PackingBoxPreset.sized(
-                id: identifier(for: $0.size),
-                outerSizeMillimetres: $0.size,
-                usableInnerSizeMillimetres: $0.fits
-            )
-        }
-    }
-
-    /// The size is the identity, so it is also the id.
     static func identifier(for size: SIMD3<Double>) -> String {
         String(format: "%.0fx%.0fx%.0f", size.x, size.y, size.z)
     }

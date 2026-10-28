@@ -71,8 +71,7 @@ final class PackingARVisualGeometryTests: XCTestCase {
         )
     }
 
-    /// A drag is a nudge across a table. Without a bound, one unlucky gesture put the module somewhere
-    /// it could not be seen or recovered from.
+    /// The drag offset is clamped and never NaN.
     func testDragOffsetIsBoundedAndNeverCarriesANonNumber() {
         let limit = PackingARVisualGeometry.maximumDragOffsetMetres
         let clamped = PackingARVisualGeometry.clampedDragOffset(
@@ -90,8 +89,7 @@ final class PackingARVisualGeometryTests: XCTestCase {
         XCTAssertEqual(nonNumbers.z, 0.25, accuracy: 0.000_001)
     }
 
-    /// One-to-one with the finger: the module moves by exactly as much as the point under the finger
-    /// moved across the table, and never off the table.
+    /// The module moves exactly as far as the finger did across the table.
     func testTheModuleMovesExactlyAsFarAsTheFingerDidAcrossTheSurface() {
         let moved = PackingARVisualGeometry.draggedOffset(
             from: SIMD3(0.10, 0, -0.20),
@@ -102,8 +100,7 @@ final class PackingARVisualGeometryTests: XCTestCase {
         XCTAssertEqual(moved.z, -0.35, accuracy: 0.000_001)
     }
 
-    /// Height is not the drag's business. Even if the unprojected points disagree vertically — they can,
-    /// by a millimetre or two — the module stays on the surface it was put down on.
+    /// Dragging never changes the height, even if the unprojected points differ slightly vertically.
     func testDraggingNeverLiftsOrSinksTheModule() {
         let moved = PackingARVisualGeometry.draggedOffset(
             from: SIMD3(0, 0, 0),

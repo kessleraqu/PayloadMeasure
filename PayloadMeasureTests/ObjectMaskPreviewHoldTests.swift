@@ -1,21 +1,14 @@
 import XCTest
 @testable import PayloadMeasure
 
-// When a freshly segmented live mask replaces the one on screen, and when it is left alone.
-//
-// The policy is to show the most complete recent silhouette of whatever is at the aim point. Vision does
-// not segment a complex object the same way twice — one frame it is one instance, the next it is the body
-// and the handle separately — so a good half of new masks are a *fragment* of what is already drawn.
-// Taking them is what made the preview pulse between the whole object and a piece of it. Nothing is lost
-// by holding: the mask is positioned and sized through the world every frame, so a slightly old silhouette
-// is still drawn in the right place at the right size. It is the same trade a *selected* object already
-// makes — one tracked instance, held while the phone moves — and that case is rock steady.
+// When a new live mask replaces the one on screen. Vision often returns only part of an object, so
+// smaller or similar masks are held; the held mask is still positioned through the world each frame.
 
 final class ObjectMaskPreviewHoldTests: XCTestCase {
     private let onScreen = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
 
     func testAFragmentOfWhatIsOnScreenDoesNotReplaceIt() {
-        // Vision split the object: this is its lower half, centred inside what is already drawn.
+        // Vision split the object: this is the lower half, inside what's already drawn.
         XCTAssertTrue(
             ObjectMaskPreviewHold.holdsExistingLayer(
                 existing: onScreen,
@@ -42,7 +35,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// More of the object has been found: that is a better silhouette and worth showing at once.
+    /// A materially larger mask is a better view and replaces it straight away.
     func testAMateriallyLargerMaskReplacesIt() {
         XCTAssertFalse(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -53,7 +46,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// The aim has moved to another object: take the new mask even though it is smaller.
+    /// The aim moved to another object, so take the new mask even if it's smaller.
     func testAMaskCentredElsewhereReplacesIt() {
         XCTAssertFalse(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -64,8 +57,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// However steady the scene, the picture is refreshed regularly: holding for ever would leave a
-    /// silhouette that no longer describes the object.
+    /// Even a perfectly still scene refreshes the mask after the time limit.
     func testTheHoldExpires() {
         XCTAssertTrue(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -83,7 +75,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// First mask of a scan, or one arriving after the mask was cleared: nothing to hold on to.
+    /// Nothing to hold when no mask is on screen yet.
     func testNothingIsHeldWhenThereIsNoMaskOnScreenYet() {
         XCTAssertFalse(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -103,10 +95,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
 
     // MARK: - What actually ends a hold
 
-    /// Elapsed time is a poor proxy for staleness, and it was the only test there used to be. The picture
-    /// is drawn by the best similarity through three of the object's points; the residual of that fit is
-    /// how much of the motion it is failing to draw, and it is measured, not guessed. Past the limit the
-    /// silhouette is no longer a fair drawing of the object whatever else argues for keeping it.
+    /// Once the fit residual passes the limit, the held mask is replaced.
     func testAPictureThatCanNoLongerBeDrawnFairlyIsReplaced() {
         XCTAssertFalse(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -127,8 +116,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// The other half of the same argument: a phone that has barely moved keeps its picture for the full
-    /// budget, which is what stops the shimmer the hold exists for.
+    /// A phone that has barely moved keeps the mask for the full time limit.
     func testAStillPhoneKeepsItsPictureForTheWholeBudget() {
         XCTAssertTrue(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -140,7 +128,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// No gauge, no measurement: the time backstop is then the only rule there is, and it still applies.
+    /// Without a gauge the time limit still applies.
     func testWithoutAResidualTheTimeBackstopStillEndsTheHold() {
         XCTAssertTrue(
             ObjectMaskPreviewHold.holdsExistingLayer(
@@ -171,7 +159,7 @@ final class ObjectMaskPreviewHoldTests: XCTestCase {
         )
     }
 
-    /// A hold age computed against the sentinel start value is enormous; it must read as "no hold".
+    /// A hold age computed from the sentinel start value must count as no hold.
     func testAnAbsurdHoldAgeIsNotAHold() {
         XCTAssertFalse(
             ObjectMaskPreviewHold.holdsExistingLayer(

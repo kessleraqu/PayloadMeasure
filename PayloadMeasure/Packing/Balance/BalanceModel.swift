@@ -1,16 +1,12 @@
 import Foundation
 import simd
 
-// The Balance arrangement: every package flat on the module floor, positions chosen so the loaded
-// centre of mass sits as close as possible to a target.
+// The Balance arrangement as a mixed-integer program. Every package sits on the module floor and
+// positions are chosen so the centre of mass is as close as possible to the target. The solver
+// decides position, orientation and relative order of each pair of packages together.
 //
-// In:  a PackingProblem — module geometry, target and axis weights, plus packages with size, mass,
-//      clearance and whether they may be tipped.
-// Out: a PackingModel wrapping a LinearProgram. Solving it decides each package's position,
-//      orientation and which side of each neighbour it sits on, all at once.
-//
-// PackingCuts adds inequalities that cut away symmetric or impossible arrangements without
-// changing the optimum. See METHODS.md for the derivation.
+// PackingCuts adds valid inequalities that remove symmetric or impossible arrangements without
+// changing the optimum.
 
 // MARK: - Coordinate system
 
@@ -828,7 +824,7 @@ nonisolated extension PackingModel {
                 for combination in impossible {
                     guard budget >= 1 else { return nil }
                     var terms: [(Int, Double)] = axisRelations.map { ($0, 1.0) }
-                    var indicators = 1 // the axis indicator, γ_axis1 + γ_axis2
+                    var indicators = 1 // axis indicator
                     if !combination.a.isEmpty {
                         terms.append(contentsOf: combination.a.map { ($0, 1.0) })
                         indicators += 1

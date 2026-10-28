@@ -2,30 +2,21 @@ import CoreGraphics
 import Foundation
 import simd
 
-// A controlled framing calibration: each object is measured once at five apparent sizes. Unlike the normal
-// accuracy test, every reading retains the independent variable that matters here — how much of the
-// viewport the object actually occupied — plus camera distance when ARKit can supply it.
+// Framing calibration: each object is measured once at five screen-fill levels. Each reading
+// stores the actual fill and, when available, the camera distance.
 
 enum FramingCalibrationProtocol {
-    /// Screen-occupancy targets calibrated from the previous run's observed fill/distance pairs.
-    /// They predict approximately 650, 550, 450, 350 and 300 mm for the same objects. Distance is
-    /// deliberately not an admission criterion; it remains an observed result of following these
-    /// five progressively larger guides. Older saved tests retain their stored schedule through
-    /// `FramingAccuracyRun.protocolFillPercentages`.
+    /// Fill targets. For the study objects these came out at roughly 650, 550, 450, 350 and 300 mm.
+    /// Older tests keep their own schedule in `FramingAccuracyRun.protocolFillPercentages`.
     static let targetFillPercentages: [Double] = [25, 30, 38, 53, 65]
     static let legacyTargetFillPercentages: [Double] = [20, 35, 50, 65, 80]
 
-    /// Where following those five guides actually put the phone, for the objects the study used, in the
-    /// same order as the levels above. An *observed result* and not a controlled variable — which is why
-    /// every threshold in `MeasurementFramingRule` is stated in fill and none of them in millimetres.
-    ///
-    /// It is written down rather than left in prose because one thing genuinely is decided on it: the
-    /// distance an operator is told to stand at before there is any mask on screen to compute a fill
-    /// from. `MeasurementFramingRuleTests` checks that recommendation against these numbers.
+    /// Observed distances for each fill level above, for the study objects. Used only for the
+    /// recommended standing distance (checked in `MeasurementFramingRuleTests`).
     static let observedDistanceMillimetres: [Double] = [650, 550, 450, 350, 300]
 
-    /// The on-screen guide is a physical square even when the renderer is rectangular. Returning it
-    /// in renderer-normalized coordinates lets the live mask and the visible guide use one test.
+    /// The guide is a square on screen, returned in renderer-normalised coordinates so the mask and
+    /// the guide can be compared directly.
     static func guideRect(
         targetFillPercent: Double,
         viewportSize: CGSize
@@ -63,9 +54,7 @@ enum FramingCalibrationProtocol {
         return "Frame size \(index + 1) of \(levels.count)"
     }
 
-    /// Both the guide and this calculation use the shorter viewport dimension. This keeps the five
-    /// physical squares square in portrait and landscape, instead of silently changing the protocol
-    /// when the phone rotates.
+    /// Uses the shorter viewport side so results don't change with orientation.
     static func fillPercent(
         boundingBox: CGRect,
         viewportSize: CGSize
@@ -147,9 +136,9 @@ struct FramingAccuracyRun: Codable, Identifiable, Sendable {
     var label: String
     var rounds: Int
     var workflowMode: MeasurementWorkflowMode
-    /// Present for the current protocol. `rounds` remains stored so older test files still decode.
+    /// `rounds` is still stored so older files decode.
     var objectCount: Int? = nil
-    /// Nil identifies tests saved before the larger-guide protocol was introduced.
+    /// Nil for tests saved before the current guide sizes.
     var protocolFillPercentages: [Double]? = nil
     var readings: [FramingAccuracyReading] = []
     var failures: [FramingAccuracyFailure] = []
@@ -175,8 +164,8 @@ struct FramingAccuracyRun: Codable, Identifiable, Sendable {
     var completedAttemptCount: Int { readings.count + failures.count }
     var isComplete: Bool { completedAttemptCount >= totalExpectedReadings }
 
-    /// Current tests run the five sizes in the same order once per object. Legacy repeated-round
-    /// tests retain their alternating order so saved protocols remain reproducible.
+    /// Current tests go through the five sizes once per object. Older tests keep their
+    /// alternating order.
     var nextSlot: FramingAccuracySlot? {
         guard completedAttemptCount < totalExpectedReadings else { return nil }
         let levelsForTest = resolvedTargetFillPercentages

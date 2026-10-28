@@ -1,12 +1,8 @@
 import SwiftUI
 import simd
 
-// One object, boxed and weighed on the spot. This is what "Box as you go" shows after each
-// measurement, and what the review list opens when a weight needs correcting.
-//
-// In:  the object, the capture engine and the packing store.
-// Out: writes the name, the own-box mark and the packed weight back through the engine and store.
-//      Calls onRescan when the operator wants to measure the object again.
+// Box and weight entry for one object. Shown after each measurement in "Box as you go", and from
+// the review list for corrections. `onRescan` measures the object again.
 
 struct PackageDetailsSheet: View {
     private enum FocusedField: Hashable {

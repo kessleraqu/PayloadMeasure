@@ -2,18 +2,13 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// What the box's height means, so the drawn box can be held to it.
-//
-// The complaint was that the top of the box floated above the point cloud. The fitter was not the
-// cause — it puts the top on the highest reading, as these check. The drawn box had come adrift from
-// it: its height was seeded on the first frame and then only refreshed while the view counted as a
-// side view, so hovering over an object left the first frame's guess on screen while the cloud settled
-// underneath. These tests fix the definition; the drawn box now follows the fit every frame.
+// The fitted height is the highest point above the support plane. The drawn box follows this
+// every frame.
 
 final class BoundingBoxHeightTests: XCTestCase {
     private let up = SIMD3<Float>(0, 1, 0)
 
-    /// A slab of points from `base` to `top`, wide enough to fit a rectangle to.
+    /// Points from `base` to `top`, wide enough to fit a rectangle to.
     private func slab(base: Float, top: Float, halfWidth: Float = 0.05) -> [SIMD3<Float>] {
         var points: [SIMD3<Float>] = []
         for xStep in 0...10 {
@@ -51,7 +46,7 @@ final class BoundingBoxHeightTests: XCTestCase {
         XCTAssertEqual(object.heightInMeters, 0.14, accuracy: 1e-5)
     }
 
-    /// Height is measured from the plane, so points below it cannot lift the top.
+    /// Height is measured from the plane, so points below it can't raise the top.
     func testAnObjectStandingProudOfThePlaneIsStillMeasuredFromThePlane() throws {
         let object = try XCTUnwrap(make(slab(base: 0.05, top: 0.2), groundHeight: 0))
         XCTAssertEqual(object.heightInMeters, 0.2, accuracy: 1e-5)
@@ -65,8 +60,8 @@ final class BoundingBoxHeightTests: XCTestCase {
         XCTAssertEqual(object.center.y + object.dimensions.z / 2, 0.8, accuracy: 1e-5)
     }
 
-    /// The enclosure set is the observed readings, which may reach higher than the voxel centres the
-    /// rectangle is fitted to. The box has to cover those too, or it would cut through its own points.
+    /// The enclosure set (raw readings) can reach above the voxel centres used for the fit, and the
+    /// box has to contain those too.
     func testTheEnclosureSetCanRaiseTheTopButNothingLowersIt() throws {
         let points = slab(base: 0.02, top: 0.14)
         let higher = try XCTUnwrap(

@@ -1,18 +1,11 @@
 import Foundation
 import simd
 
-// What a user study produces, and where it is kept.
-//
-// In:  the setup screen, then the measuring and packing screens as each box is completed.
-// Out: a StudyRun per participant, written to Documents/StudyRuns/<id>/ as run.json, one JPEG per
-//      object, and a plain-text report.
-//
-// Writes are append-only and there is deliberately no delete path anywhere in this file or the UI.
-// A run is written as soon as it is created and rewritten after every change, so a crash mid-study
-// loses at most the box in progress.
+// Data recorded during a user study. Each run is saved to Documents/StudyRuns/<name>/ as
+// run.json, one JPEG per object and a plain-text report. A run is written as soon as it is
+// created and after every change, so a crash loses at most the payload in progress.
 
-/// The two payload modules available to a study. The setup choice determines their order; every
-/// selected input condition completes both modules.
+/// The two payload modules. Every run goes through both; the setup decides the order.
 enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     case big
     case small
@@ -43,7 +36,7 @@ enum StudyBox: String, Codable, CaseIterable, Identifiable, Sendable {
     var other: StudyBox { self == .big ? .small : .big }
 }
 
-/// How object dimensions enter the otherwise identical preparation and optimisation workflow.
+/// How object dimensions are entered. Everything after that is the same.
 enum StudyInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case augmentedReality
     case manual
@@ -76,8 +69,7 @@ enum StudyInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// The selected measurement condition. `both` remains decodable for study files made before the
-/// AR and no-AR conditions were split into independent runs.
+/// `both` is only kept so older study files still decode.
 enum StudyInputPlan: String, Codable, CaseIterable, Identifiable, Sendable {
     case both
     case arOnly
@@ -104,7 +96,7 @@ enum StudyInputPlan: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// The three timed phases of one box.
+/// The three timed phases of a payload.
 enum StudyPhase: String, Codable, CaseIterable, Sendable {
     case measure
     case pack
@@ -127,13 +119,12 @@ struct StudyObjectRecord: Codable, Identifiable, Sendable {
     var assignedBoxName: String?
     var isOwnBox: Bool
     var hasEnforcedSize: Bool
-    /// Left out of this payload on the operator's say-so. Optional so study files written before skipping
-    /// existed still decode; those read as not skipped.
+    /// Optional so older files still decode (read as not skipped).
     var wasSkipped: Bool?
     var massKilograms: Double?
-    /// File name inside the run's photos folder, if a snapshot was captured.
+    /// File name in the run's photos folder.
     var photoFileName: String?
-    /// Nil when the object was left out of the plan.
+    /// Nil when the object wasn't included in the plan.
     var placementOriginMillimetres: [Double]?
 
     var measuredSizeText: String {
@@ -153,7 +144,7 @@ struct StudyObjectRecord: Codable, Identifiable, Sendable {
 struct StudyBoxResult: Codable, Identifiable, Sendable {
     var box: StudyBox
     var startedAt: Date
-    /// Optional so study files made before the manual condition existed remain decodable.
+    /// Optional so older files still decode.
     var inputMode: StudyInputMode? = nil
     var completedAt: Date?
     var phaseSeconds: [String: Double] = [:]
@@ -184,21 +175,18 @@ struct StudyRun: Codable, Identifiable, Sendable {
     var flow: String
     var firstBox: StudyBox
     var boxes: [StudyBoxResult] = []
-    /// Optional migration fields. Legacy runs were AR-only.
+    /// Optional for older AR-only runs.
     var inputPlan: StudyInputPlan? = nil
     var firstInputMode: StudyInputMode? = nil
-    /// New study runs complete both payload sizes. Nil preserves the one-payload interpretation of
-    /// AR-only/no-AR-only files recorded by the immediately preceding app version.
+    /// Nil for older single-payload runs.
     var includesBothPayloads: Bool? = nil
-    /// The run's own folder under StudyRuns, named after the run and made unique when the name is
-    /// already taken on disk. Nil for runs written before this existed: those still live in a folder
-    /// named after their id, and are still read from it.
+    /// Folder name under StudyRuns, made unique if needed. Nil for older runs, which live in a folder
+    /// named after their id.
     var folderName: String?
-    /// Set when the operator ends a run without finishing it. It is what separates a run the app was
-    /// *told* to stop from one it simply vanished in the middle of, and only the latter is offered for
-    /// resuming. Everything recorded is kept either way.
+    /// Set when the operator ends the run early. Only runs that stopped without this (e.g. a crash)
+    /// are offered for resuming.
     var abandonedAt: Date?
-    /// Seconds spent connecting the small and big payload boxes at the end of the run.
+    /// Time spent connecting the two payload boxes at the end of the run.
     var finalConnectionSeconds: Double?
 
     var isComplete: Bool {
@@ -271,8 +259,8 @@ extension StudyRun {
         return formatter
     }()
 
-    /// The run's name, as a name a file system will accept. Everything a path cannot carry becomes a
-    /// hyphen; brackets go too, because brackets are what makes a duplicate name unique.
+    /// Replaces anything that isn't safe in a file name with a hyphen. Brackets are removed too since
+    /// they're used for duplicate numbering.
     static func safeName(_ name: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " _-"))
         let cleaned = name
@@ -283,8 +271,7 @@ extension StudyRun {
         return cleaned.isEmpty ? "Run" : cleaned
     }
 
-    /// What this run's folder is called before any duplicate numbering: the participant's name and the
-    /// condition, which together are how a run is referred to on screen.
+    /// Participant name and condition, before any duplicate numbering.
     var exportBaseName: String {
         let condition: String
         switch inputPlan {
@@ -296,18 +283,16 @@ extension StudyRun {
         return Self.safeName(participantName + condition)
     }
 
-    /// The folder this run's files live in, relative to StudyRuns.
+    /// Relative to StudyRuns.
     var exportFolderName: String {
         folderName ?? id.uuidString
     }
 
-    /// One report, named after the run, sitting beside the photos folder inside the run's own folder.
     var reportFileName: String {
         "\(folderName ?? exportBaseName).txt"
     }
 
-    /// The old flat name, kept only so deleting a run can still clear a report written by an earlier
-    /// version at the top of StudyRuns.
+    /// Report name used by older versions at the top of StudyRuns, so deleting a run can remove it.
     var legacyReportFileName: String {
         let safe = participantName
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
@@ -324,8 +309,7 @@ extension StudyRun {
         return "payloadmeasure-\(safe.isEmpty ? "participant" : safe)\(conditionSuffix)-\(stamp).txt"
     }
 
-    /// The whole run as plain text. Written automatically when the run completes and re-writable on
-    /// demand from the results screen.
+    /// The full run as plain text. Written when the run completes and can be re-exported later.
     func reportText() -> String {
         var lines: [String] = []
         lines.append("PayloadMeasure user study")

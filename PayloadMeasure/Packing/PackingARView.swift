@@ -3,9 +3,8 @@ import RealityKit
 import SwiftUI
 import simd
 
-/// Small, renderer-independent spacing rules for the room-scale guide. Collision and placement keep
-/// the exact package dimensions; only the visible bars move inward far enough that touching packages
-/// never ask the depth buffer to draw two differently coloured surfaces at the same position.
+/// Spacing rules for the room-scale guide. Collision uses the exact package sizes; only the
+/// visible bars are inset so touching packages never draw two surfaces at the same depth.
 nonisolated enum PackingARVisualGeometry {
     static func packageInset(for outlineThickness: Float) -> Float {
         min(0.00075, max(0.00035, outlineThickness * 0.25))
@@ -22,7 +21,6 @@ nonisolated enum PackingARVisualGeometry {
         )
     }
 
-    /// Keeps each translucent face behind the edge bars and away from a neighbouring package's face.
     static func faceInset(for outlineThickness: Float) -> Float {
         packageInset(for: outlineThickness) + max(0.00035, outlineThickness * 0.15)
     }
@@ -37,12 +35,10 @@ nonisolated enum PackingARVisualGeometry {
         return (face < 0 ? -1 : 1) * magnitude
     }
 
-    /// How far the module may be slid from where it was put down. A drag is a nudge across a table,
-    /// not a throw across the building, and without a bound an unlucky gesture could put the module
-    /// tens of metres away — off screen, with no way back except placing it again.
+    /// Maximum drag distance from where the module was placed, so a bad gesture can't send it off
+    /// screen.
     static let maximumDragOffsetMetres: Float = 4
 
-    /// Keeps a dragged offset finite and within `maximumDragOffsetMetres` of the anchor.
     static func clampedDragOffset(_ offset: SIMD3<Float>) -> SIMD3<Float> {
         func bounded(_ value: Float) -> Float {
             guard value.isFinite else { return 0 }
@@ -51,37 +47,27 @@ nonisolated enum PackingARVisualGeometry {
         return SIMD3(bounded(offset.x), bounded(offset.y), bounded(offset.z))
     }
 
-    /// Where the module ends up after the finger has moved from one point on the table to another.
-    ///
-    /// The two world points come from unprojecting the touch onto the table itself, so the module keeps
-    /// up with the finger exactly, at any camera angle. What this replaced converted screen points into
-    /// metres through a fixed fudge factor and derived its two horizontal directions by normalising the
-    /// camera's axes — which collapses when the phone is held upright, because the axis being
-    /// normalised is then nearly vertical and its horizontal part is mostly noise. That is what made
-    /// the module wander off at odd angles and at the wrong speed.
+    /// New module offset after the finger moves between two points on the table. Both points are
+    /// found by unprojecting onto the table plane, so the module follows the finger at any angle.
     static func draggedOffset(
         from startOffset: SIMD3<Float>,
         startingAt startWorldPoint: SIMD3<Float>,
         following currentWorldPoint: SIMD3<Float>
     ) -> SIMD3<Float> {
         let delta = currentWorldPoint - startWorldPoint
-        // Vertical is not the drag's business: the module stays on the surface it was put down on.
+        // Dragging never changes the height.
         return clampedDragOffset(
             SIMD3(startOffset.x + delta.x, 0, startOffset.z + delta.z)
         )
     }
 }
 
-// The finished packing, placed on a real table at full size so the operator can walk around it while
-// loading.
+// The finished packing placed on a real table at full size, so the operator can walk around it
+// while loading. Tap a surface to place it, tap a package to see its name, and step through the
+// layers.
 //
-// In:  a verified BaldiSolution and the colours the rest of the screens use for each package.
-// Out: on screen only. Tap a surface to put the plan there, tap a package to read its name, step
-//      through the layers one at a time.
-//
-// The container is drawn as a thin open-topped green shell so you can see and reach into it. Layers
-// below the one being loaded stay visible but faint, so the stack reads as a stack without hiding
-// where the next package goes.
+// The container is an open-topped green wire shell. Layers below the current one are shown
+// faded so the stack is visible without hiding where the next package goes.
 
 struct PackingARView: View {
     let solution: BaldiSolution
@@ -236,9 +222,7 @@ struct PackingARView: View {
         .animation(.snappy(duration: 0.2), value: model.visibleLayerIndex)
     }
 
-    /// The answer to "which one is this?", at the size of the question. The name carries the package's
-    /// own colour and its guide number, so the box in the hand, the box on the screen and the numbered
-    /// step in the loading guide are obviously the same package.
+    /// Name label for the tapped package, in its colour and with its guide number.
     @ViewBuilder
     private var selectedPackageLabel: some View {
         if let placement = model.selectedPlacement {
@@ -283,18 +267,17 @@ final class PackingARModel {
     let solution: BaldiSolution
     let colours: [UUID: Color]
     let layers: [BaldiLoadingLayer]
-    /// The same numbering the printed loading guide uses, so "#3" means the same thing on both.
+    /// Same numbering as the loading guide.
     let numbering: [UUID: Int]
 
     private(set) var isPlaced = false
     private(set) var visibleLayerIndex = 0
     private(set) var selectedPackageID: UUID?
     private(set) var statusText = PackingARModel.searchingText
-    /// Set while the camera is being taken back from whatever else grabbed it.
     private(set) var cameraWarning: String?
-    /// Bumped whenever the AR side must rebuild what it is showing.
+    /// Incremented when the AR side needs to rebuild its content.
     private(set) var revision = 0
-    /// Bumped when the operator wants to place the module again.
+    /// Incremented when the operator wants to place the module again.
     private(set) var unplaceRevision = 0
 
     init(solution: BaldiSolution, colours: [UUID: Color]) {
@@ -352,12 +335,8 @@ final class PackingARModel {
         statusText = ""
     }
 
-    /// Set by the AR coordinator so that "Place again" tears the module down there and then.
-    ///
-    /// This used to be published as a revision for the coordinator to notice on its next SwiftUI update
-    /// pass. When that update did not arrive, the old payload stayed in the scene and its anchor stayed
-    /// in place — so the next tap hit the old module's packages instead of the table, and nothing could
-    /// be placed again. A button whose whole job is to remove something calls the code that removes it.
+    /// Set by the AR coordinator so "Place again" removes the module immediately instead of waiting
+    /// for a SwiftUI update.
     @ObservationIgnored var unplaceHandler: (() -> Void)?
 
     func unplace() {
@@ -369,12 +348,9 @@ final class PackingARModel {
         unplaceHandler?()
     }
 
-    /// Says where to aim, not just to wave the phone about: the surface is looked for under the middle
-    /// of the screen, so sweeping the room while pointing elsewhere finds nothing.
     static let searchingText = "Point the middle of the screen at the table or floor and move the phone slowly until the surface is found."
 
-    /// Whether a surface is under the middle of the screen right now, so the prompt can say when it is
-    /// worth tapping instead of leaving the operator to guess.
+    /// Whether a surface is under the screen centre right now.
     private(set) var isSurfaceReady = false
 
     func reportSurface(found: Bool) {
@@ -393,7 +369,6 @@ final class PackingARModel {
         cameraWarning = "Getting the camera back…"
     }
 
-    /// Frames have stopped arriving and nothing is being done automatically, so this says what to do.
     func reportCameraStalled() {
         cameraWarning = "The camera has stopped. Close this view and open it again."
     }
@@ -409,8 +384,7 @@ final class PackingARModel {
             selectedPackageID = nil
             return
         }
-        // Tapping the same package again clears it, so the label can be dismissed without hunting for
-        // an empty piece of table to tap.
+        // Tapping the same package again hides the label.
         selectedPackageID = selectedPackageID == packageID ? nil : packageID
     }
 }
@@ -426,15 +400,12 @@ private struct PackingARContainer: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UIView {
-        // SwiftUI owns a presentation-local wrapper. The single camera-backed ARView is mounted as
-        // its child by SharedARViewHost, avoiding ambiguous UIKit ownership when covers transition.
+        // SwiftUI owns this wrapper; SharedARViewHost mounts the shared ARView inside it.
         let container = UIView(frame: .zero)
         container.backgroundColor = .black
         container.isOpaque = true
         let view = context.coordinator.acquireView(mountingIn: container)
-        // Measurement may have left mesh debug drawing or occlusion enabled on this persistent
-        // renderer. Neither belongs in the loading guide; retaining them adds dark/flickering
-        // geometry and unnecessary GPU work behind the package outlines.
+        // Turn off mesh debug drawing and occlusion that measurement may have left enabled.
         view.debugOptions.remove(.showSceneUnderstanding)
         view.environment.sceneUnderstanding.options.remove(.occlusion)
         view.session.delegate = context.coordinator
@@ -451,8 +422,7 @@ private struct PackingARContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        // Defer synchronization until after SwiftUI's representable update transaction and coalesce
-        // repeated updates.
+        // Deferred until after SwiftUI's update and coalesced.
         context.coordinator.scheduleSync(with: model)
     }
 
@@ -462,9 +432,7 @@ private struct PackingARContainer: UIViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, ARSessionDelegate, UIGestureRecognizerDelegate {
-        /// Normally immutable for one presentation. It is still updated from `updateUIView` so a
-        /// coordinator can never keep driving an old model if SwiftUI reconciles more aggressively
-        /// than expected. The presentation ID above should make this a defensive path only.
+        /// Updated from updateUIView as a safeguard so the coordinator never drives an old model.
         private var model: PackingARModel
         private let sharedViewHost: SharedARViewHost?
         private var sharedViewLease: SharedARRendererOwnership.Lease?
@@ -473,13 +441,11 @@ private struct PackingARContainer: UIViewRepresentable {
         private var syncTask: Task<Void, Never>?
         private var requestedSyncRevision = 0
         private var anchor: AnchorEntity?
-        /// Child of the anchor. Everything is built into this so it can be turned without disturbing
-        /// the anchor's alignment with the real surface.
+        /// Child of the anchor holding all content, so it can be rotated without moving the anchor.
         private var contentRoot: Entity?
         private var packageEntities: [UUID: ModelEntity] = [:]
-        /// Each face is inset from both the exact collision volume and the opaque outline. This keeps
-        /// touching packages from sharing transparent faces while still giving each target a clear,
-        /// lightly coloured volume.
+        /// Faces are inset from the collision volume and the outline so touching packages don't share
+        /// transparent faces.
         private enum PackageVisualRole {
             case face
             case outline
@@ -493,23 +459,19 @@ private struct PackingARContainer: UIViewRepresentable {
         private var lastFrameTime: TimeInterval = 0
         private var lastFrameTimestamp: TimeInterval = 0
         private var turn: Float = 0
-        /// The content's offset inside the anchor when a one-finger drag began, and the point on the
-        /// table the finger started from. Movement is the difference between the two, so the module
-        /// follows the finger exactly.
+        /// Content offset and table point at the start of a one-finger drag.
         private var dragStartContentOffset: SIMD3<Float>?
         private var dragStartSurfacePoint: SIMD3<Float>?
         private var turnAtGestureStart: Float = 0
         private var twoFingerTurnAtStart: Float = 0
         private var twistIsActive = false
         private var suppressTwoFingerPanUntilEnd = false
-        /// The height of the surface last found under the middle of the screen. Placing prefers it, so
-        /// a tap lands on the surface the prompt was talking about rather than on a floor behind it.
+        /// Height of the surface last found under the screen centre. Placement prefers it.
         private var probedSurfaceHeight: Float?
-        /// The ARKit anchor the module hangs from. ARKit keeps it on the real surface across tracking
-        /// corrections, which a bare world transform is not.
+        /// ARKit anchor for the module, which keeps it on the surface across tracking corrections.
         private var placedWorldAnchor: ARAnchor?
 
-        /// Millimetres to metres. Everything in the packing is in millimetres.
+        /// Packing sizes are in millimetres.
         private let scale: Float = 0.001
 
         init(model: PackingARModel, sharedViewHost: SharedARViewHost?) {
@@ -576,10 +538,7 @@ private struct PackingARContainer: UIViewRepresentable {
             configuration.worldAlignment = .gravity
             configuration.planeDetection = [.horizontal]
             configuration.environmentTexturing = .none
-            // Plane detection without depth waits for enough visual features, which on a bare table
-            // can be most of a minute of sweeping — the measuring screens have always run with depth
-            // and find surfaces at once. Same hardware, same session; there was no reason for this
-            // screen to be the slow one.
+            // With scene depth, planes are found almost immediately, even on bare tables.
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                 configuration.frameSemantics.insert(.sceneDepth)
             }
@@ -592,8 +551,7 @@ private struct PackingARContainer: UIViewRepresentable {
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
             view.addGestureRecognizer(tap)
 
-            // One finger slides the module across the support plane; twisting with two fingers turns
-            // it about the vertical axis.
+            // One finger drags the module on the surface; a two-finger twist rotates it.
             let drag = UIPanGestureRecognizer(target: self, action: #selector(handleDrag))
             drag.minimumNumberOfTouches = 1
             drag.maximumNumberOfTouches = 1
@@ -602,9 +560,8 @@ private struct PackingARContainer: UIViewRepresentable {
             let twist = UIRotationGestureRecognizer(target: self, action: #selector(handleTwist))
             twist.delegate = self
             view.addGestureRecognizer(twist)
-            // Some users move two fingers as a pair without producing enough angular delta for
-            // UIRotationGestureRecognizer to begin. Treat that horizontal two-finger motion as yaw
-            // too, while a real twist remains the primary gesture.
+            // Also treat two fingers moving sideways together as rotation, since that often isn't enough
+            // to trigger UIRotationGestureRecognizer.
             let twoFingerTurn = UIPanGestureRecognizer(
                 target: self,
                 action: #selector(handleTwoFingerTurn)
@@ -629,22 +586,14 @@ private struct PackingARContainer: UIViewRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
-            // A one-finger pan may already be considering the first touch when the second finger
-            // lands. Let the rotation recognizer take over instead of losing that two-finger twist.
+            // Let rotation take over if the one-finger pan already started when the second finger lands.
             let pair = [gestureRecognizer, otherGestureRecognizer]
             return pair.contains { $0 is UIRotationGestureRecognizer }
                 && pair.contains { $0 is UIPanGestureRecognizer }
         }
 
-        /// Uses only a plane ARKit has actually detected. The infinite target is merely an extension
-        /// of that detected plane; estimated planes can be the floor behind a table and were the
-        /// reason a placement could appear underneath the surface.
-        ///
-        /// Planes classified as floors used to be rejected outright, to stop a tap on a table landing
-        /// on the floor visible behind it. That also made the guide impossible to use on a floor — and
-        /// ARKit calls plenty of large surfaces floors — so nothing ever locked. Results come back
-        /// nearest-first, so taking the first is already the surface under the finger; the height match
-        /// below does the rest of that job.
+        /// Only uses planes ARKit has actually detected; estimated planes could be the floor behind the
+        /// table. Results are nearest first, so the first hit is the surface under the finger.
         private func stableSurfaceHit(
             at point: CGPoint,
             in view: ARView,
@@ -667,12 +616,8 @@ private struct PackingARContainer: UIViewRepresentable {
             return nil
         }
 
-        /// Three times a second, is there a surface under the middle of the screen? One raycast, and it
-        /// is what lets the prompt say "ready" instead of leaving the operator tapping hopefully.
-        ///
-        /// It runs for the whole life of the coordinator. Placing the module used to stop it, and
-        /// nothing ever started it again — so after "Place again" no surface was ever found and the
-        /// module could not be put down a second time.
+        /// Raycasts from the screen centre three times a second so the prompt can say when a surface is
+        /// ready. Runs for the coordinator's whole lifetime so "Place again" works.
         private func startSurfaceProbe() {
             searchTimer?.invalidate()
             searchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
@@ -712,8 +657,7 @@ private struct PackingARContainer: UIViewRepresentable {
             installedGestureRecognizers.removeAll()
             clearPlacement()
             if let sharedViewHost, let sharedViewLease {
-                // A late dismantle from an old cover must not clear the measurement coordinator's
-                // delegate after it has already reacquired this shared ARView.
+                // A late dismantle must not clear the delegate once measurement owns the ARView again.
                 if sharedViewHost.owns(sharedViewLease) {
                     view.session.delegate = nil
                     sharedViewHost.release(sharedViewLease)
@@ -726,16 +670,13 @@ private struct PackingARContainer: UIViewRepresentable {
             self.view = nil
             sharedViewLease = nil
             model.unplaceHandler = nil
-            // Last, because clearing the placement arms the probe again for the next placement — and
-            // there is no next one after a detach.
+            // Last, since clearing the placement restarts the probe.
             stopSurfaceProbe()
         }
 
         // MARK: - Keeping the camera alive
 
-        /// Also the safety net for placement state. `unplaceHandler` does the work the moment the button
-        /// is pressed; this catches anything that changed the model without going through it, without
-        /// depending on a SwiftUI update pass arriving.
+        /// Also catches model changes that didn't go through `unplaceHandler`.
         nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
             Task { @MainActor [weak self] in
                 self?.sync()
@@ -763,14 +704,8 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Reports a stalled camera; it no longer tries to fix one.
-        ///
-        /// This used to call `session.run` again every couple of seconds while frames were not arriving.
-        /// That was a bad trade: re-running a session restarts its camera pipeline, so on a session that
-        /// was merely slow the watchdog produced exactly the flicker it was meant to prevent, several
-        /// times over. Interruption and failure are still handled through the delegate, which is the
-        /// path ARKit actually tells us about. If frames stop for another reason the operator is told,
-        /// and nothing is done behind their back.
+        /// Only reports a stalled camera. Re-running the session here caused flicker, and interruptions
+        /// are already handled through the delegate.
         private func checkForStalledCamera() {
             guard ownsSharedView, let view else { return }
             guard let timestamp = view.session.currentFrame?.timestamp else { return }
@@ -803,14 +738,8 @@ private struct PackingARContainer: UIViewRepresentable {
 
         // MARK: - Turning the module
 
-        /// One finger slides the module across the surface, which is what everyone tries first and
-        /// what every other AR app does. It used to turn it, which meant the module spun when you
-        /// tried to nudge it and there was no way to move it at all short of putting it down again.
-        ///
-        /// The module is moved by offsetting the content *inside* the anchor, never by writing to the
-        /// anchor itself. An anchor's transform belongs to ARKit — it is corrected as tracking improves
-        /// and rewritten wholesale after a relocalisation — so an app that also writes to it is in a
-        /// fight it cannot win, and the visible result is a module that jumps somewhere absurd.
+        /// One finger moves the module across the surface. The content is offset inside the anchor; the
+        /// anchor itself is left to ARKit, which keeps correcting it.
         @objc private func handleDrag(_ recogniser: UIPanGestureRecognizer) {
             guard ownsSharedView, let view, anchor != nil, let contentRoot else { return }
             switch recogniser.state {
@@ -832,8 +761,7 @@ private struct PackingARContainer: UIViewRepresentable {
                       ) else {
                     return
                 }
-                // The anchor's own rotation is identity, so its axes are the world's and a world-space
-                // movement can be applied to the child offset directly.
+                // The anchor has no rotation, so world-space movement applies directly to the child offset.
                 contentRoot.position = PackingARVisualGeometry.draggedOffset(
                     from: start,
                     startingAt: startSurfacePoint,
@@ -847,17 +775,14 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Where a point on screen meets the table the module is standing on. Unprojecting onto the
-        /// plane itself is what makes dragging one-to-one with the finger; it needs no plane polygon, so
-        /// it keeps working past the edge of what ARKit has mapped.
+        /// Where a screen point meets the table plane. Works past the edge of the mapped plane.
         private func surfacePoint(at point: CGPoint, in view: ARView) -> SIMD3<Float>? {
             guard let frame = view.session.currentFrame,
                   view.bounds.width > 0,
                   view.bounds.height > 0 else {
                 return nil
             }
-            // ARKit's own anchor transform, not the entity's: RealityKit adopts an anchor's transform on
-            // its own schedule, and a height read a frame too early would put the plane on the floor.
+            // Use the ARKit anchor's transform; the entity may not have caught up yet.
             guard let surfaceHeight = placedWorldAnchor?.transform.columns.3.y
                 ?? anchor?.transform.translation.y else {
                 return nil
@@ -899,14 +824,12 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Reliable fallback for a two-finger turn when the fingers travel together rather than
-        /// describing a clear twist. Eight milliradians per screen point keeps it controllable.
+        /// Two-finger pan as rotation, at 8 milliradians per point.
         @objc private func handleTwoFingerTurn(_ recogniser: UIPanGestureRecognizer) {
             guard ownsSharedView, contentRoot != nil else { return }
             switch recogniser.state {
             case .began:
-                // A real twist may end without the companion pan recognizer ever reaching `.ended`.
-                // Clear that gesture's suppression here so the next two-finger motion is never lost.
+                // A twist can end without the pan reaching .ended, so clear its suppression here.
                 if !twistIsActive {
                     suppressTwoFingerPanUntilEnd = false
                 }
@@ -930,8 +853,7 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Lets go on a right angle when it is nearly there. The module is being lined up with a real
-        /// table, and square is almost always what was meant.
+        /// Snaps to the nearest right angle when close.
         private func apply(turn newTurn: Float, settling: Bool) {
             var value = newTurn
             if settling {
@@ -979,9 +901,8 @@ private struct PackingARContainer: UIViewRepresentable {
             return sharedViewHost.owns(sharedViewLease)
         }
 
-        /// Takes the module out of the scene *and* out of the session. Removing the entity alone left
-        /// ARKit's anchor behind, and RealityKit will happily draw a previously bound anchor's content
-        /// again — which is why "Place again" appeared to leave the old payload standing there.
+        /// Removes both the entity and the ARKit anchor. Leaving the anchor let RealityKit draw the old
+        /// content again.
         private func clearPlacement() {
             if let anchor {
                 view?.scene.removeAnchor(anchor)
@@ -1002,7 +923,6 @@ private struct PackingARContainer: UIViewRepresentable {
             suppressTwoFingerPanUntilEnd = false
             probedSurfaceHeight = nil
             dragStartContentOffset = nil
-            // Whatever is being put down next needs a surface of its own found first.
             startSurfaceProbe()
         }
 
@@ -1014,7 +934,7 @@ private struct PackingARContainer: UIViewRepresentable {
                 place(at: point, in: view)
                 return
             }
-            // Naming a package: hit-test the rendered boxes.
+            // Hit-test the packages to show a name.
             guard let hit = view.entity(at: point) as? ModelEntity,
                   let match = packageEntities.first(where: { $0.value === hit }) else {
                 model.select(packageID: nil)
@@ -1024,9 +944,7 @@ private struct PackingARContainer: UIViewRepresentable {
         }
 
         private func place(at point: CGPoint, in view: ARView) {
-            // Prefer the surface the prompt was talking about — the one under the middle of the screen —
-            // and fall back to whatever was actually tapped. Insisting on the probed height meant a tap
-            // on a different but perfectly good surface did nothing at all.
+            // Prefer the probed surface, otherwise use whatever was tapped.
             let result = probedSurfaceHeight.flatMap {
                 stableSurfaceHit(at: point, in: view, matchingHeight: $0)
             } ?? stableSurfaceHit(at: point, in: view)
@@ -1035,13 +953,10 @@ private struct PackingARContainer: UIViewRepresentable {
                 return
             }
 
-            // Raycast orientation can carry a small tilt or arbitrary yaw. The module is meant to sit
-            // level and gets its yaw only from the two-finger gesture, so anchor it with translation
-            // alone in the gravity-aligned world frame.
+            // Translation only: the module should be level, and its yaw comes from the rotate gesture.
             var stableTransform = matrix_identity_float4x4
             stableTransform.columns.3 = result.worldTransform.columns.3
-            // A session anchor rather than a bare world transform: ARKit then owns keeping it on the
-            // real surface as tracking is refined, instead of the module drifting off the table.
+            // A session anchor, so ARKit keeps it on the surface as tracking improves.
             let worldAnchor = ARAnchor(name: Self.moduleAnchorName, transform: stableTransform)
             view.session.add(anchor: worldAnchor)
             let placed = AnchorEntity(anchor: worldAnchor)
@@ -1084,22 +999,18 @@ private struct PackingARContainer: UIViewRepresentable {
                 let colour = UIColor(colours(for: placement.id))
                 let boxSize = SIMD3(extent.x, extent.z, extent.y)
 
-                // This entity remains the exact full-size hit volume. Visible geometry is attached
-                // just inside it so touching targets never place two transparent faces at exactly the
-                // same depth.
+                // This entity is the full-size hit volume; the visible geometry sits just inside it.
                 let box = ModelEntity(
                     mesh: .generateBox(size: boxSize),
                     materials: [Self.unlitMaterial(colour)]
                 )
                 box.generateCollisionShapes(recursive: false)
                 box.model = nil
-                // Keep the selectable volume explicit after removing the render model. This also
-                // means the thin visual bars do not need their own collision shapes.
+                // Explicit collision shape, so the visual bars don't need their own.
                 box.components.set(
                     CollisionComponent(shapes: [.generateBox(size: boxSize)])
                 )
-                // Packing is z-up, RealityKit is y-up, and the shell is centred on the anchor, so
-                // the horizontal axes are offset by half the container's width and depth.
+                // Packing is z-up, RealityKit is y-up, and the shell is centred on the anchor.
                 box.position = SIMD3(
                     centre.x - size.x / 2,
                     centre.y,
@@ -1113,8 +1024,7 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Six separate low-opacity panels leave the interior genuinely clear. The previous closed
-        /// transparent cuboid accumulated front and back faces until the package looked fully yellow.
+        /// Six separate translucent panels. A closed transparent cuboid looked solid.
         private func addPackageFaces(
             size: SIMD3<Float>,
             colour: UIColor,
@@ -1153,7 +1063,7 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// Twelve solid bars keep the edges legible around the translucent filled target.
+        /// Twelve solid edge bars.
         private func addPackageOutline(
             size: SIMD3<Float>,
             colour: UIColor,
@@ -1168,18 +1078,9 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// The opening runs along the package's length, and the operator has to line the real box up
-        /// with it. Both L × W faces carry a centred line along measured length, so the same
-        /// orientation cue is visible from either side.
-        ///
-        /// Which faces those are depends on how the package was turned. `placement.size` is already in
-        /// container axes, so the box's own length, width and height can be pointing along any of them —
-        /// a package stood on its end has its l × w faces vertical. The first version marked the
-        /// horizontal faces regardless, which is why the line kept appearing on the w × h side.
-        ///
-        /// `rotation.sourceAxis[c]` gives the box's own axis carried by container axis `c`: 0 is its
-        /// length, 1 its width, 2 its height. The faces to mark are the two perpendicular to whichever
-        /// container axis carries axis 2, and the line runs along whichever carries axis 0.
+        /// Draws a line along the package's length on both L x W faces, matching the box opening.
+        /// `rotation.sourceAxis[c]` is the box axis (0 length, 1 width, 2 height) on container axis `c`,
+        /// so the marked faces are perpendicular to whichever container axis carries axis 2.
         private func addFaceMarkings(
             for placement: BaldiPlacement,
             on box: ModelEntity,
@@ -1187,8 +1088,7 @@ private struct PackingARContainer: UIViewRepresentable {
             colour: UIColor,
             id: UUID
         ) {
-            // The length/opening convention only describes one of our own catalogue presets: an
-            // object that already arrived as its own box was never given an opening to match.
+            // Objects that are their own box have no defined opening.
             guard !placement.isOwnBox,
                   let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return }
             let normal = axes.normal
@@ -1213,7 +1113,7 @@ private struct PackingARContainer: UIViewRepresentable {
                 among: model.solution.placements
             )
 
-            /// Packing is z-up, RealityKit is y-up, so the two vertical axes swap.
+            /// Packing is z-up, RealityKit is y-up.
             func realityKit(_ values: [Float]) -> SIMD3<Float> {
                 SIMD3(values[0], values[2], values[1])
             }
@@ -1224,8 +1124,7 @@ private struct PackingARContainer: UIViewRepresentable {
                 lineSize[width] = markerWidth
 
                 var lineAt = [Float](repeating: 0, count: 3)
-                // Sit wholly inside this package's true face. A marker on a touching face can no
-                // longer penetrate its neighbour or occupy the same depth as the neighbour's frame.
+                // Keep the marker inside this package's face so it can't poke into a neighbour.
                 lineAt[normal] = PackingARVisualGeometry.markerCentre(
                     face: face,
                     normalExtent: extent[normal],
@@ -1295,8 +1194,7 @@ private struct PackingARContainer: UIViewRepresentable {
             )
         }
 
-        /// A lower layer's edge frame must remain recognisable without adding more transparent edge
-        /// geometry. Its fill gets the lower opacity separately in `refreshLayerVisibility`.
+        /// Muted edge colour for finished layers. Their fill opacity is set in `refreshLayerVisibility`.
         private func mutedOpaque(_ colour: UIColor) -> UIColor {
             var hue: CGFloat = 0
             var saturation: CGFloat = 0
@@ -1329,8 +1227,7 @@ private struct PackingARContainer: UIViewRepresentable {
             max(0.0015, min(0.004, min(size.x, min(size.y, size.z)) * 0.035))
         }
 
-        /// Adds the twelve edges of a cuboid. Each edge is inset by half its thickness, so bars meet
-        /// at the corners without leaving coincident surfaces that can fight over the same depth.
+        /// The twelve edges of a cuboid, inset by half their thickness so they meet cleanly at corners.
         private func addBoxFrame(
             size: SIMD3<Float>,
             thickness: Float,
@@ -1369,9 +1266,7 @@ private struct PackingARContainer: UIViewRepresentable {
             }
         }
 
-        /// An open wire shell shows the payload bounds without putting five overlapping translucent
-        /// panels around the packages. The top has only its perimeter, so the operator can still see
-        /// and reach into the module.
+        /// Wire shell showing the module bounds. The top is open so the operator can see and reach in.
         private func addOpenTopShell(size: SIMD3<Float>, to anchor: Entity) {
             let shellSize = SIMD3(size.x, size.z, size.y)
             let thickness = max(0.0018, min(0.004, min(size.x, size.y) * 0.008))
@@ -1379,8 +1274,7 @@ private struct PackingARContainer: UIViewRepresentable {
             shell.position = SIMD3(0, size.z / 2, 0)
             anchor.addChild(shell)
             addBoxFrame(
-                // Keep the green shell just outside the usable volume. Packages at x/y/z = 0 then
-                // touch its inner edge instead of occupying the same pixels with another colour.
+                // Slightly outside the usable volume so packages at 0 touch its inner edge.
                 size: shellSize + SIMD3<Float>(repeating: thickness * 2),
                 thickness: thickness,
                 colour: .systemGreen,
@@ -1388,8 +1282,7 @@ private struct PackingARContainer: UIViewRepresentable {
             )
         }
 
-        /// The active layer keeps its package colours. Completed layers are muted and more transparent;
-        /// future layers are disabled.
+        /// Current layer in full colour, finished layers muted, future layers hidden.
         private func refreshLayerVisibility() {
             for (index, layer) in model.layers.enumerated() {
                 let isVisible = index <= model.visibleLayerIndex

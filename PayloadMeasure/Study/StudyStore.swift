@@ -2,24 +2,17 @@ import Foundation
 import Observation
 import simd
 
-// Holds the run in progress, times its phases, and keeps every finished run on disk forever.
+// Holds the run in progress, times its phases and stores finished runs under
+// Documents/StudyRuns/. Every change is saved straight away.
 //
-// In:  the setup screen starts a run; the measuring and packing screens mark phase boundaries and
-//      hand over each box's result.
-// Out: observable state for the study screens, plus files under Documents/StudyRuns/.
-//
-// Every mutation is written straight through, and a run is persisted the moment it is created rather
-// than when it finishes, so a crash mid-study loses at most the box in progress.
-//
-// `delete(runID:)` is the one destructive path, added on request and gated behind a password at every
-// call site. Nothing else removes a run, and there is no copy elsewhere: deleting is final.
+// `delete(runID:)` is the only way to remove a run and is password protected wherever it's used.
 
 @MainActor
 @Observable
 final class StudyStore {
-    /// Gate for finishing a payload or cancelling the selected study condition.
+    /// Needed to finish a payload or cancel the current condition.
     static let nextBoxPassword = "130802"
-    /// Gate for restarting the app from the results screen, and for opening the results screen.
+    /// Needed to open the results screen and to restart from it.
     static let restartPassword = "13820485"
 
     private(set) var activeRun: StudyRun?
@@ -29,12 +22,9 @@ final class StudyStore {
 
     /// Index into `activeRun.boxOrder`.
     private(set) var currentBoxIndex = 0
-    /// True while a throwaway test run is in progress. A test run has no participant, is never
-    /// written to disk, and can be left at any time without the study password. It replaced the
-    /// practice payload, which was a step inside a real run rather than a run of its own.
+    /// A throwaway run for trying the app: no participant, never saved, no password to leave.
     private(set) var isTestMode = false
-    /// True after the administrator has configured the run but before the participant taps the
-    /// neutral Start screen. No study timer or measuring workflow is active in this state.
+    /// The run is configured but the participant hasn't tapped Start yet. Nothing is timed.
     private(set) var isAwaitingParticipantStart = false
     private var phaseStartedAt: Date?
     private(set) var currentPhase: StudyPhase?
@@ -45,8 +35,7 @@ final class StudyStore {
 
     // MARK: - Current position
 
-    /// Nil before the participant's Start tap, so the configured payload cannot leak into a
-    /// pre-start timer.
+    /// Nil until the participant taps Start.
     var currentBox: StudyBox? {
         guard !isAwaitingParticipantStart,
               let activeRun,
@@ -54,20 +43,17 @@ final class StudyStore {
         return activeRun.boxOrder[currentBoxIndex]
     }
 
-    /// The payload shown on a neutral handoff screen. Unlike `currentBox`, this remains available
-    /// while timing is deliberately stopped.
+    /// Payload shown on the handoff screen. Unlike `currentBox` this is set while timing is stopped.
     var scheduledBox: StudyBox? {
         guard let activeRun,
               activeRun.boxOrder.indices.contains(currentBoxIndex) else { return nil }
         return activeRun.boxOrder[currentBoxIndex]
     }
 
-    /// Whether the measuring screens should be up at all.
     var hasActiveSession: Bool {
         activeRun != nil && !isAwaitingParticipantStart && currentBox != nil
     }
 
-    /// The module the plan is built for.
     var activeModuleSizeMillimetres: SIMD3<Double>? {
         currentBox?.sizeMillimetres
     }
@@ -77,7 +63,6 @@ final class StudyStore {
         return currentBoxIndex >= activeRun.boxOrder.count - 1
     }
 
-    /// Boxes resolve their condition from the schedule the run was started with.
     var currentInputMode: StudyInputMode {
         guard let activeRun else { return .augmentedReality }
         guard activeRun.inputModeOrder.indices.contains(currentBoxIndex) else {
@@ -129,9 +114,8 @@ final class StudyStore {
         run.firstInputMode = inputPlan == .arOnly
             ? .augmentedReality
             : inputPlan == .manualOnly ? .manual : inputPlan == .both ? firstInputMode : nil
-        // Fixed once, at the start: everything this run writes goes into this one folder, and the name
-        // is checked against what is on disk rather than against the app's own list. A folder left
-        // behind by a run that was deleted in the app is therefore never written into by a new one.
+        // Pick the folder name once, checked against what's actually on disk, so a new run never
+        // writes into a folder left over from a deleted one.
         run.folderName = Self.availableFolderName(base: run.exportBaseName)
         activeRun = run
         currentBoxIndex = 0
@@ -140,12 +124,8 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// A run that exists only while it is being used: no participant name, one payload, nothing
-    /// written to disk and no neutral handoff screen in front of it. It is the way to try the app —
-    /// or to show someone how it works — without a real run appearing in the archive.
-    ///
-    /// It takes the condition and the payload size chosen on the setup screen, so what it exercises
-    /// is exactly what a participant would get.
+    /// Starts a test run with the selected condition and payload size. Nothing is saved and there is
+    /// no handoff screen.
     func startTestRun(box: StudyBox, inputMode: StudyInputMode) {
         var run = StudyRun(
             id: UUID(),
@@ -155,8 +135,7 @@ final class StudyStore {
             flow: MeasurementFlow.batch.rawValue,
             firstBox: box
         )
-        // One payload rather than both: a test is left whenever the operator has seen enough, so a
-        // second payload would only ever be a screen nobody reaches.
+        // A single payload is enough for a test.
         run.includesBothPayloads = false
         run.inputPlan = inputMode == .augmentedReality ? .arOnly : .manualOnly
         run.firstInputMode = inputMode
@@ -164,19 +143,13 @@ final class StudyStore {
         currentBoxIndex = 0
         isTestMode = true
         isAwaitingParticipantStart = false
-        // Straight into the workflow, and straight past `persistActiveRun`: a test run never has a
-        // folder, so there is nothing for it to leave behind.
+        // Skips persistActiveRun: test runs have no folder.
         openCurrentBox()
     }
 
     // MARK: - Picking a run back up
 
-    /// A run on disk that was started and never finished, if there is one. A run is written from the
-    /// moment it is created and rewritten after every phase, so one of these is what a crash — or a
-    /// force-quit, or a flat battery — leaves behind.
-    ///
-    /// Only ever one is offered: the most recent. Two unfinished runs means something stranger has
-    /// happened than a crash, and guessing between them is worse than saying nothing.
+    /// The most recent run that was started but never finished (e.g. after a crash), if any.
     var resumableRun: StudyRun? {
         guard activeRun == nil else { return nil }
         return saved.first {
@@ -184,13 +157,9 @@ final class StudyStore {
         }
     }
 
-    /// Puts an unfinished run back in progress, on the first payload it had not finished.
-    ///
-    /// Everything already recorded is kept: the finished payloads, and the seconds already spent on
-    /// this one. What cannot be kept is the payload in progress — its measurements live in the AR
-    /// session's own coordinate system, which the relaunch threw away — so that payload is measured
-    /// again from the start. The participant is put back on the neutral Start screen rather than
-    /// straight into the camera.
+    /// Resumes an unfinished run at the first payload it hadn't finished. Finished payloads and time
+    /// already spent are kept. The payload in progress is measured again from scratch, because its
+    /// AR coordinates were lost with the relaunch.
     @discardableResult
     func resumeRun(_ run: StudyRun) -> Bool {
         guard activeRun == nil, !run.isComplete else { return false }
@@ -200,13 +169,8 @@ final class StudyStore {
         }
         guard let firstUnfinished else { return false }
         let resumedBox = run.boxOrder[firstUnfinished]
-        // Whatever objects were recorded for this box belong to the coordinate system the relaunch
-        // just threw away, so they are about to be measured again from nothing, not resumed one by
-        // one. Left in place, that stale, otherwise-valid-looking count is what the progress safety
-        // net in `recordMeasurementProgress` compares fresh measurements against — a participant who
-        // ends up re-measuring fewer objects than were staged before the crash would have every one
-        // of them silently refused until the count caught back up. Clearing it here is what makes
-        // "measured again from the start" true for the record as well as for the AR session.
+        // The objects recorded for this payload belong to the lost AR session and will be re-measured.
+        // Clear them, otherwise recordMeasurementProgress would refuse new snapshots with fewer objects.
         if let index = run.boxes.firstIndex(where: { $0.box == resumedBox }) {
             run.boxes[index].objects = []
             run.boxes[index].loadedObjectIDs = []
@@ -231,18 +195,11 @@ final class StudyStore {
         return true
     }
 
-    /// Snapshots the objects measured so far for the payload in progress, without touching anything the
-    /// loading plan owns. Called as each object is finished, so a crash costs at most the object being
-    /// measured at the time rather than the whole payload's dimensions.
+    /// Saves the objects measured so far for the payload in progress, so a crash only loses the
+    /// object being measured.
     ///
-    /// Finishing the run's *last* box does not invalidate `currentBox` the way advancing to a middle box
-    /// does — `startNextBox()` resets the capture engine (collapsing its object list to empty) before
-    /// deciding whether there even is a next box to advance to, and on the last box nothing afterwards
-    /// moves `currentBoxIndex` or sets `isAwaitingParticipantStart`. A stray call carrying that
-    /// now-empty list can therefore still land on the box that `recordCurrentBox` just correctly saved a
-    /// moment before, on every run's actual last box — which in a two-box study is always whichever box
-    /// was measured second. A progress snapshot exists to grow the record as objects are found, never to
-    /// erase ones already there, so it is never allowed to shrink what is already recorded.
+    /// Never shrinks the recorded list: after the last payload the capture engine is reset, and a
+    /// late call with an empty list must not wipe what recordCurrentBox just saved.
     func recordMeasurementProgress(objects: [StudyObjectRecord]) {
         guard let box = currentBox,
               var run = activeRun,
@@ -258,8 +215,7 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// Leaves the administrator-free handoff screen and starts the selected workflow. This is the
-    /// exact point at which the first timer starts.
+    /// Leaves the handoff screen and starts the first timer.
     func beginParticipantSession() {
         guard var run = activeRun, isAwaitingParticipantStart else { return }
         if currentBoxIndex == 0, run.boxes.isEmpty {
@@ -289,13 +245,11 @@ final class StudyStore {
         beginPhase(.measure)
     }
 
-    /// Called once the operator has cleared the password. Closes the current box and opens the next.
+    /// Called after the password. Closes the current payload and opens the next one.
     func advanceToNextBox() {
         guard activeRun != nil, !isOnLastBox else { return }
         endCurrentPhase()
-        // Read the run *after* ending the phase. Taking the copy first and writing it back at the end
-        // threw away the seconds the phase had just recorded, which is why the last phase of every
-        // box came out blank.
+        // Read the run after ending the phase, otherwise the phase's time is lost.
         guard var run = activeRun else { return }
         closeCurrentBox(in: &run)
         currentBoxIndex += 1
@@ -304,9 +258,9 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// Closes the last box and finalises the run: it joins `saved` and its report is written.
+    /// Closes the last payload, adds the run to `saved` and writes its report.
     func finishRun() {
-        // A test run has nothing to finish: it is never saved, and its exit is `clearActiveRun`.
+        // Test runs are never saved; they end through clearActiveRun.
         guard activeRun != nil, !isTestMode else { return }
         endCurrentPhase()
         guard var run = activeRun else { return }
@@ -328,8 +282,7 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// Dismisses a completed condition back to administrator setup while preserving the saved run
-    /// and its exported report. The other condition is deliberately not started automatically.
+    /// Returns to setup after a completed condition. The other condition isn't started automatically.
     func returnToSetupAfterCompletion() {
         guard activeRun?.isComplete == true else { return }
         activeRun = nil
@@ -340,8 +293,7 @@ final class StudyStore {
         phaseStartedAt = nil
     }
 
-    /// Whether a saved run already uses this participant name. Compared case- and space-insensitively,
-    /// because "P01" and "p01 " are the same participant to everyone except a string comparison.
+    /// Compares names ignoring case and surrounding spaces.
     func savedRun(named name: String, inputMode: StudyInputMode? = nil) -> StudyRun? {
         let wanted = Self.comparableName(name)
         guard !wanted.isEmpty else { return nil }
@@ -356,11 +308,7 @@ final class StudyStore {
         name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// Deletes a saved run and everything under it: the JSON, the photos and the report.
-    ///
-    /// This is here because it was asked for, behind `restartPassword`, and it is the one destructive
-    /// action in the app. It cannot be undone and there is no copy anywhere else, so every caller puts
-    /// the password in front of it.
+    /// Permanently deletes a saved run: JSON, photos and report.
     func delete(runID: UUID) {
         let deleted = run(withID: runID)
         let folder = runFolder(runID: runID)
@@ -375,8 +323,7 @@ final class StudyStore {
             phaseStartedAt = nil
         }
         try? FileManager.default.removeItem(at: folder)
-        // Earlier versions also left a copy of the report at the top of StudyRuns. Nothing writes one
-        // any more, but a run recorded back then still has one to clear.
+        // Older versions also wrote a report copy to the top of StudyRuns.
         if let legacyReportName {
             try? FileManager.default.removeItem(
                 at: Self.rootFolder.appendingPathComponent(legacyReportName)
@@ -385,11 +332,8 @@ final class StudyStore {
         lastExportURL = nil
     }
 
-    /// Clears the run in progress without touching anything already saved.
-    ///
-    /// The run is marked abandoned on the way out. It stays on disk with everything it recorded, but the
-    /// setup screen will not offer to continue it: this path is the operator saying the session is over,
-    /// which is a different thing from the app disappearing mid-measurement.
+    /// Clears the run in progress. It stays on disk marked as abandoned, so it won't be offered for
+    /// resuming.
     func clearActiveRun() {
         endCurrentPhase()
         if var run = activeRun, !run.isComplete, !isTestMode {
@@ -439,8 +383,7 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// Includes both already-persisted seconds and the live interval. Passing the TimelineView date
-    /// keeps rendering read-only and makes the boundary behaviour directly testable.
+    /// Saved seconds plus the running interval. Takes the date from TimelineView so it's testable.
     func elapsedSeconds(for phase: StudyPhase, at date: Date = Date()) -> Double {
         let recorded = currentBox
             .flatMap { activeRun?.result(for: $0)?.seconds(for: phase) }
@@ -453,8 +396,8 @@ final class StudyStore {
 
     // MARK: - Recording a box
 
-    /// Snapshots everything known about the current box. Safe to call repeatedly; the latest call
-    /// wins, so it can be called when the plan is first shown and again when the box is closed.
+    /// Saves everything known about the current payload. Can be called repeatedly; the last call
+    /// wins.
     func recordCurrentBox(
         objects: [StudyObjectRecord],
         loadedObjectIDs: [UUID],
@@ -477,11 +420,8 @@ final class StudyStore {
         persistActiveRun()
     }
 
-    /// Writes one object's photo into the run folder and returns the file name to store with it.
-    ///
-    /// Named after the object and the payload it was measured for, so the photos folder can be read by
-    /// a person. Object names are unique within a run, and re-recording the same box overwrites its own
-    /// photos, so the name identifies the file for the whole run.
+    /// Saves an object's photo in the run folder and returns its file name (object and payload
+    /// name, so the folder is readable).
     @discardableResult
     func storePhoto(_ data: Data, objectID: UUID, objectName: String? = nil) -> String? {
         guard !isTestMode, let run = activeRun else { return nil }
@@ -522,9 +462,7 @@ final class StudyStore {
 
     // MARK: - Export
 
-    /// One report, inside the run's own folder, named after the run. There used to be a second copy at
-    /// the top of StudyRuns as well; with a folder per run there is nothing left to dig through, and two
-    /// copies of the same report is how a folder becomes a mess.
+    /// Writes the run's report into its folder.
     @discardableResult
     func exportReport(for run: StudyRun) -> URL? {
         let folder = Self.runFolder(for: run)
@@ -544,8 +482,7 @@ final class StudyStore {
     // MARK: - Persistence
 
     private func persistActiveRun() {
-        // The single point where a test run is kept off the disk: it has state like any other run
-        // while it is in progress, and no file, folder or archive entry once it is over.
+        // Test runs are never written to disk.
         guard !isTestMode, let activeRun else { return }
         write(activeRun)
         if let index = saved.firstIndex(where: { $0.id == activeRun.id }) {
@@ -574,13 +511,12 @@ final class StudyStore {
 
     // StudyRuns/
     //   <Run name>/
-    //     <Run name>.txt      the whole run as text
-    //     run.json            what the app reads back
-    //     photos/             one JPEG per object, named after the object
-    //   <Run name>(1)/        a second run whose name was already taken
+    //     <Run name>.txt      report
+    //     run.json            data read back by the app
+    //     photos/             one JPEG per object
+    //   <Run name>(1)/        next run with the same name
     //
-    // Runs written before this layout are in a folder named after their id, and are still found there:
-    // `folderName` is what moved, and it is nil for those.
+    // Older runs live in a folder named after their id (`folderName` is nil).
 
     static func runFolder(for run: StudyRun) -> URL {
         rootFolder.appendingPathComponent(run.exportFolderName, isDirectory: true)
@@ -590,7 +526,6 @@ final class StudyStore {
         runFolder(for: run).appendingPathComponent("photos", isDirectory: true)
     }
 
-    /// Resolves a run's folder from its id, for the screens that only carry one.
     func runFolder(runID: UUID) -> URL {
         guard let run = run(withID: runID) else {
             return Self.rootFolder.appendingPathComponent(runID.uuidString, isDirectory: true)
@@ -603,8 +538,7 @@ final class StudyStore {
         return saved.first { $0.id == runID }
     }
 
-    /// The name to give a new run's folder: its own, or its own with a number in brackets when that is
-    /// taken. Everything already in StudyRuns counts as taken, whether or not the app still lists it.
+    /// Run name, or with a number in brackets if a folder with that name already exists.
     static func availableFolderName(base: String) -> String {
         let existing = (try? FileManager.default.contentsOfDirectory(
             atPath: rootFolder.path
@@ -612,8 +546,7 @@ final class StudyStore {
         return uniqueFolderName(base: base, taken: Set(existing))
     }
 
-    /// `Run`, then `Run(1)`, `Run(2)`, … Comparison ignores case, because two folders differing only in
-    /// case are the same folder on this file system and one run would then write over another.
+    /// `Run`, `Run(1)`, `Run(2)`, ... Case-insensitive because the file system is.
     static func uniqueFolderName(base: String, taken: Set<String>) -> String {
         let safeBase = StudyRun.safeName(base)
         let lowercased = Set(taken.map { $0.lowercased() })

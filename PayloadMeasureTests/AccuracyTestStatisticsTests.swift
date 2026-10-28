@@ -2,11 +2,8 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// The accuracy test's arithmetic, against figures worked out by hand.
-//
-// The two things worth guarding are the order the readings are asked for — object 1…X, then round
-// again — and the sorted axis matching, which is what stops an object being turned between rounds
-// from showing up as an error.
+// Accuracy test statistics checked against hand-calculated values, plus the reading order and the
+// sorted side matching.
 
 @MainActor
 final class AccuracyTestStatisticsTests: XCTestCase {
@@ -101,8 +98,8 @@ final class AccuracyTestStatisticsTests: XCTestCase {
 
     // MARK: - Per-axis figures
 
-    /// Reference 100 × 50 × 25, measured 1 mm over then 1 mm under on every side.
-    /// Per axis: mean = reference, bias 0, sd = √(2/1) = 1.4142, MAE 1, RMSE 1, r = 2.8 · sd.
+    /// Reference 100 x 50 x 25, measured 1 mm over then 1 mm under on every side. Per axis: mean equals
+    /// the reference, bias 0, sd = sqrt(2) = 1.4142, MAE 1, RMSE 1, r = 2.8 * sd.
     func testPerAxisFiguresMatchHandCalculation() throws {
         let test = run(
             objectCount: 1,
@@ -128,13 +125,13 @@ final class AccuracyTestStatisticsTests: XCTestCase {
             XCTAssertEqual(axis.repeatabilityLimit, 2.8 * 2.0.squareRoot(), accuracy: 1e-9)
         }
 
-        // Longest side first, whatever order the reference was typed in.
+        // Longest side first, whatever order the reference was entered in.
         XCTAssertEqual(object.axes.map(\.reference), [100, 50, 25])
         XCTAssertEqual(object.bias, 0, accuracy: 1e-9)
         XCTAssertEqual(object.rootMeanSquareError, 1, accuracy: 1e-9)
     }
 
-    /// A steady 2 mm over-read: bias 2, no scatter, RMSE equal to the bias.
+    /// Constant 2 mm over-read: bias 2, no scatter, RMSE equal to the bias.
     func testSystematicOverReadingShowsAsBiasWithNoScatter() throws {
         let test = run(
             objectCount: 1,
@@ -156,7 +153,7 @@ final class AccuracyTestStatisticsTests: XCTestCase {
         XCTAssertEqual(object.axes[1].relativeBiasPercent, 4, accuracy: 1e-9)
     }
 
-    /// The reason sides are sorted: the same object measured from a different side is not an error.
+    /// Measuring the object from a different side isn't an error.
     func testTurningTheObjectBetweenRoundsIsNotAnError() throws {
         let test = run(
             objectCount: 1,
@@ -198,7 +195,7 @@ final class AccuracyTestStatisticsTests: XCTestCase {
             references: [1: [100, 50, 25]]
         )
         let summary = AccuracyStatistics.summarise(test)
-        // Six errors, three of +3 and three of +1: mean 2, sd √(6/5) = 1.0954.
+        // Six errors, three of +3 and three of +1: mean 2, sd sqrt(6/5) = 1.0954.
         XCTAssertEqual(summary.readingCount, 2, "Two whole measurements.")
         XCTAssertEqual(
             summary.comparisonCount,

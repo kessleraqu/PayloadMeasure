@@ -1,11 +1,7 @@
 import Foundation
 
-// How the operator works through a load: measure everything and box it afterwards, or box each
-// object the moment it is measured.
-//
-// In:  chosen on the start screen.
-// Out: read by the HUD to decide whether the box-and-weight sheet appears after every measurement,
-//      and whether a finished object stays tracked so it can be edited by pointing at it.
+// Either measure everything first and box it afterwards, or box each object straight after
+// measuring it.
 
 enum MeasurementFlow: String, CaseIterable, Identifiable, Sendable {
     case batch
@@ -36,7 +32,6 @@ enum MeasurementFlow: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// A finished object only needs to stay tracked if you can still point at it and edit it.
     var tracksFinishedObjects: Bool {
         self == .batch
     }

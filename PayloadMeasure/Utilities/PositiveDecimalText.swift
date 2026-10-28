@@ -1,10 +1,7 @@
 import Foundation
 
-// Parsing and formatting for the positive decimal fields the operator types into, accepting either
-// a comma or a dot regardless of locale.
-//
-// In:  text.
-// Out: a positive Double, or nil when the text is not one.
+// Parses and formats the positive decimal fields the operator types into.
+// Accepts either a comma or a dot as separator, whatever the locale.
 
 nonisolated enum PositiveDecimalText {
     static func parse(_ text: String) -> Double? {

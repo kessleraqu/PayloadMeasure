@@ -4,11 +4,8 @@ import CoreVideo
 import Observation
 import simd
 
-// Owns the ARKit session: configuration, capability checks, interruption handling and suspension.
-//
-// In:  lifecycle calls from the view, and ARKit delegate callbacks.
-// Out: observable readiness flags the UI gates on - tracking state, scene depth, whether a usable
-//      support plane exists, and whether the session is currently suspended.
+// Owns the ARKit session: configuration, capability checks, interruptions and suspension.
+// Publishes the readiness flags the UI waits on (tracking, scene depth, support plane).
 
 @MainActor
 @Observable
@@ -28,8 +25,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private var suspensionReasons: Set<SuspensionReason> = []
     private var isSessionRunning = false
     private var automaticRecoveryAttempts = 0
-    /// When tracking last became normal, on the monotonic clock. Cleared whenever it stops being normal,
-    /// so the settling time is always the *continuous* run of good tracking.
+    /// When tracking last became normal. Reset whenever it drops, so the settling time is continuous.
     private var normalTrackingSince: TimeInterval?
     private var horizontalPlaneAnchorIDs: Set<UUID> = []
     private var verticalPlaneAnchorIDs: Set<UUID> = []
@@ -119,9 +115,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
     private(set) var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
     private(set) var isCoachingActive = false
     private(set) var isTrackingSuspended = false
-    /// The packing workflow owns the camera for its entire lifetime. ContentView uses this distinct
-    /// flag to remove the measurement ARView from the hierarchy, rather than merely pausing its
-    /// session and leaving a second RealityKit renderer underneath the packing renderer.
+    /// While packing is open, ContentView removes the measurement ARView entirely instead of just
+    /// pausing it, so there is only ever one renderer.
     private(set) var isPackingArrangementPresented = false
     private(set) var frameEpoch = 0
     private(set) var environmentReadiness: EnvironmentReadiness = .preparing(
@@ -210,12 +205,9 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             ? [.resetTracking, .removeExistingAnchors]
             : []
 
-        // A rebuilt view hierarchy means no packing sheet is on screen any more. That suspension
-        // reason is owned by a SwiftUI presentation, so if the view that set it is destroyed without
-        // the sheet being dismissed — exactly what happens when the study moves from one payload box
-        // to the next — nothing ever clears it. The session then stays paused forever and the HUD
-        // sits on "understanding environment" that never completes. Application inactivity is not
-        // cleared here: that one reflects real app state, not a presentation.
+        // A rebuilt view hierarchy means the packing sheet is gone. If the view that set this reason
+        // was destroyed without dismissing the sheet (moving to the next payload does that), nothing
+        // else would clear it and the session would stay paused.
         suspensionReasons.remove(.packingArrangement)
         isPackingArrangementPresented = false
         isTrackingSuspended = !suspensionReasons.isEmpty
@@ -237,8 +229,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
-        // Objects rest on horizontal surfaces, the coaching goal is a horizontal plane, and every
-        // consumer filters vertical planes out. Detecting them was pure cost.
+        // Only horizontal planes are used anywhere, so vertical detection is skipped.
         configuration.planeDetection = [.horizontal]
         configuration.environmentTexturing = .none
 
@@ -249,9 +240,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             isSceneDepthEnabled = false
         }
 
-        // The world mesh grows for as long as the session runs and is never cheap to maintain, and
-        // the only thing that reads it is the mesh/occlusion toggle, which is off by default. Build
-        // it on request rather than always.
+        // The scene mesh is expensive and only used by the mesh/occlusion toggle, which is off by default.
         if isSceneReconstructionSupported, wantsSceneMesh {
             configuration.sceneReconstruction = .mesh
             isSceneReconstructionEnabled = true
@@ -276,8 +265,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         }
     }
 
-    /// Turning the mesh on re-runs the session with scene reconstruction. Tracking and anchors are
-    /// kept, so the scan is not disturbed.
+    /// Re-runs the session with scene reconstruction. Tracking and anchors are kept.
     func setSceneMeshEnabled(_ isEnabled: Bool) {
         guard isSceneReconstructionSupported, wantsSceneMesh != isEnabled else { return }
         wantsSceneMesh = isEnabled
@@ -298,9 +286,8 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         activeSession = nil
         activeConfiguration = nil
         isSessionRunning = false
-        // detach is invoked by UIViewRepresentable.dismantleUIView during SwiftUI reconciliation.
-        // Publishing here causes "Modifying state during view update". Clear the visible coaching
-        // flag on the next turn, unless a new measurement renderer has already configured itself.
+        // Called from dismantleUIView, so publishing here would modify state during a view update.
+        // Clear the coaching flag on the next run loop instead.
         Task { @MainActor [weak self] in
             guard let self, self.activeSession == nil else { return }
             self.isCoachingActive = false
@@ -351,8 +338,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         )
     }
 
-    /// Accuracy protocols deliberately make consecutive readings independent. These helpers expose
-    /// only the two pieces the protocol needs without handing a SwiftUI screen ownership of ARSession.
+    /// Used by the accuracy tests so each reading starts from a fresh session.
     func restartTracking() {
         guard let activeSession else { return }
         restartTracking(activeSession)
@@ -607,8 +593,7 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
         let depthResolutionText = depthData.map {
             "\(CVPixelBufferGetWidth($0.depthMap)) × \(CVPixelBufferGetHeight($0.depthMap)) px"
         }
-        // While still preparing, readiness is re-examined on every frame: part of it is how long
-        // tracking has been normal, and a clock does not announce itself with a state change.
+        // While preparing, check every frame because part of readiness depends on elapsed time.
         guard worldMappingStatus != mappingStatus
                 || (receivedDepth && !hasReceivedSceneDepth)
                 || !environmentReadiness.isReady
@@ -752,8 +737,6 @@ final class ARSessionManager: NSObject, ARSessionDelegate {
             return
         }
 
-        // Tracking says normal within a frame or two of starting, while anchors and planes are still
-        // being corrected underneath whatever is measured against them. Wait for the world to settle.
         guard WorldSettlingRule.isSettled(
             normalTrackingSeconds: normalTrackingSeconds,
             mappingStatus: worldMappingStatus

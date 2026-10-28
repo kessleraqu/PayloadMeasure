@@ -3,15 +3,9 @@ import Observation
 import SwiftUI
 import simd
 
-// Shared state for the packing screens. Turns locked measurements into packing inputs, runs
-// whichever method is selected off the main actor, and holds the result the views read.
-//
-// In:  the measured objects from ObjectCaptureEngine, the operator's outer-box choices, and the
-//      module and solver settings.
-// Out: observable state — a PackingResult for Balance, a BaldiComparison for the 3D knapsack,
-//      plus a solving flag and a signature so a stale answer is never shown as current.
-//
-// A superseded solve is cancelled rather than left running; the AR session shares the CPU.
+// Shared state for the packing screens. Converts finished measurements into packing inputs, runs
+// the selected solver off the main actor and holds the result. A new solve cancels the previous
+// one, since it competes with the AR session for CPU.
 
 enum PackingApproach: String, CaseIterable, Identifiable, Sendable {
     case loadBalanced
@@ -35,17 +29,14 @@ final class PackingStore {
     var baldiOptions = BaldiOptions()
     private(set) var selectedBoxPresetIDsByObjectID: [UUID: String] = [:]
     private var noStockedBoxFitExclusionSizesByObjectID: [UUID: SIMD3<Double>] = [:]
-    /// Objects that are already boxed, so their measured size is the package size.
+    /// Objects that are already boxed.
     private(set) var objectsThatAreTheirOwnBox: Set<UUID> = []
-    /// Objects the operator has left out of this payload on purpose. Unlike the no-fit exclusion, this is
-    /// a decision rather than a measurement: a box does fit, or could, and it is being skipped anyway.
-    /// A skipped object needs no box, name or weight, is never given to the optimiser, and is recorded as
-    /// skipped so the study can tell it apart from one that was never measured.
+    /// Objects the operator chose to leave out. They need no box, name or weight, are not passed to
+    /// the solver, and are recorded as skipped.
     private(set) var skippedObjectIDs: Set<UUID> = []
-    /// Sizes typed in by hand, overriding both the measurement and the assigned box.
+    /// Sizes entered by hand, overriding the measurement and the assigned box.
     private(set) var forcedSizesByObjectID: [UUID: SIMD3<Double>] = [:]
-    /// The boxes for the payload being planned. Held by BoxCatalogue so that the setup screen and the
-    /// measuring screens edit one list per payload rather than a copy each.
+    /// Shared with the setup screen so both edit the same per-payload list.
     let boxes = BoxCatalogue()
 
     var boxPresets: [PackingBoxPreset] { boxes.presets }
@@ -104,8 +95,7 @@ final class PackingStore {
         }
     }
 
-    /// What the object occupies once packed: the assigned box outside, or the object itself when it
-    /// is already a box. The single answer both methods and the preparation screen work from.
+    /// The assigned box's outer size, or the object's own size if it is already a box.
     func packagedSizeMillimetres(
         for objectID: UUID,
         in engine: ObjectCaptureEngine
@@ -128,8 +118,7 @@ final class PackingStore {
         return size.allFiniteAndPositive ? size : nil
     }
 
-    /// A size the operator typed in. Wins over everything else, so a bad measurement does not stop
-    /// the load being planned.
+    /// A manually entered size, which overrides everything else.
     func forcedSize(for objectID: UUID, in engine: ObjectCaptureEngine) -> SIMD3<Double>? {
         guard engine.measuredObjectIDs.contains(objectID),
               let forced = forcedSizesByObjectID[objectID],
@@ -173,8 +162,7 @@ final class PackingStore {
 
     // MARK: - Box catalogue
 
-    /// Which payload is being planned. Switching it swaps in that payload's boxes and drops any
-    /// assignment made from the previous list.
+    /// Switches to that payload's box list and clears assignments from the previous one.
     func setPayload(_ payload: StudyBox) {
         guard payload != boxes.payload else {
             boxes.reload()
@@ -185,7 +173,7 @@ final class PackingStore {
         invalidateResults()
     }
 
-    /// Picks up edits made elsewhere — the setup screen writes to the same per-payload list.
+    /// Picks up edits made on the setup screen.
     func reloadBoxes() {
         boxes.reload()
         dropAssignmentsWithoutABox()
@@ -320,8 +308,7 @@ final class PackingStore {
         return needsNoBox ? .readyAsItsOwnBox : .ready
     }
 
-    /// Assigns the smallest fitting box to every object that has not been given one. The operator
-    /// does not choose a box; they are told which one to use.
+    /// Gives every unassigned object the smallest box it fits in.
     func assignBoxesAutomatically(in engine: ObjectCaptureEngine) {
         var changed = false
         for objectID in engine.measuredObjectIDs {
@@ -390,8 +377,7 @@ final class PackingStore {
             && engine.measuredObjectIDs.contains(objectID)
     }
 
-    /// Leaves an object out of this payload, or puts it back. Skipping drops the box choice with it: the
-    /// object is not being packed, so a box assigned to it is not a fact about anything.
+    /// Skipping an object also clears its box.
     func setSkipped(_ isSkipped: Bool, for objectID: UUID, in engine: ObjectCaptureEngine) {
         guard engine.measuredObjectIDs.contains(objectID) else { return }
         let changed = isSkipped
@@ -415,10 +401,8 @@ final class PackingStore {
         return boxPresets.first(where: { $0.id == presetID })
     }
 
-    /// Every catalogue size that fits this object and is not already carrying a different one. A
-    /// preset stands for one physical box, not an unlimited supply of its size, so once it is assigned
-    /// it drops out of every other object's choices until it is freed again — by that object being
-    /// skipped, marked as its own box, given a forced size, or removed outright.
+    /// Catalogue boxes that fit this object and aren't already assigned to another one. Each entry is
+    /// a single physical box.
     func fittingBoxPresets(
         for objectID: UUID,
         in engine: ObjectCaptureEngine
@@ -475,7 +459,6 @@ final class PackingStore {
         invalidateResults()
         return true
     }
-
 
     func clearPreparation(for objectID: UUID) {
         let removedPreset = selectedBoxPresetIDsByObjectID.removeValue(forKey: objectID) != nil
@@ -543,9 +526,7 @@ final class PackingStore {
         }
     }
 
-    /// Rounded to the micrometre. The measurement arrives as Float metres, so 0.4 m reaches this as
-    /// 400.000006 mm; package sizes are rounded up to whole millimetres, and without this every
-    /// object that is its own box would grow a millimetre on every axis out of nothing.
+    /// Rounded to the micrometre so float noise doesn't add a millimetre when sizes are rounded up.
     private func measuredSizeMillimetres(_ captured: CapturedObject) -> SIMD3<Double> {
         captured.sizeMillimetres
     }

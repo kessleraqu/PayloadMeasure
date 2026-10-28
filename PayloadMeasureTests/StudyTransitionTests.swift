@@ -2,10 +2,8 @@ import XCTest
 import ARKit
 @testable import PayloadMeasure
 
-// The study moves from one payload box to the next by rebuilding the view hierarchy. That destroys
-// the view which had presented the packing sheet, so the sheet's dismissal callback never runs and
-// nothing clears the suspension reason it set. Before this was fixed the AR session stayed paused
-// for the whole second box and the HUD sat on "understanding environment" forever.
+// Moving to the next payload rebuilds the view hierarchy, so the packing sheet's onDismiss never
+// runs. The suspension reason it set has to be cleared anyway, or the AR session stays paused.
 
 @MainActor
 final class StudyTransitionTests: XCTestCase {
@@ -27,7 +25,7 @@ final class StudyTransitionTests: XCTestCase {
         manager.setPackingArrangementPresented(true)
         XCTAssertTrue(manager.isTrackingSuspended)
 
-        // No dismissal happens — the view is simply gone, as it is between boxes.
+        // No dismissal, the view is just gone.
         manager.configure(ARSession())
 
         XCTAssertFalse(
@@ -37,7 +35,7 @@ final class StudyTransitionTests: XCTestCase {
     }
 
     func testApplicationInactivitySurvivesAReconfigure() {
-        // That reason describes real app state rather than a presentation, so it must not be cleared.
+        // This reason reflects real app state, so it must stay.
         let manager = ARSessionManager()
         manager.setApplicationActive(false)
         XCTAssertTrue(manager.isTrackingSuspended)
@@ -106,8 +104,7 @@ final class StudyTransitionTests: XCTestCase {
         XCTAssertEqual(previousRun.inputModeOrder, [.manual, .manual])
     }
 
-    /// A run always waits on the neutral Start screen: there is no practice payload in front of it
-    /// any more, and the payload must not open — or start timing — before the participant taps.
+    /// A run always waits on the Start screen; nothing opens or is timed before the participant taps.
     func testTheFirstBoxOpensOnlyWhenTheParticipantStarts() {
         let store = StudyStore()
         store.startRun(
@@ -126,10 +123,7 @@ final class StudyTransitionTests: XCTestCase {
         XCTAssertEqual(store.activeRun?.boxes.count, 1)
     }
 
-    /// Test mode is a run nobody is being measured by: it starts on the condition and payload chosen
-    /// on the setup screen, skips the participant handoff, and leaves nothing behind. The last part
-    /// is the one that matters — a test that reached the archive would be indistinguishable from a
-    /// participant's run in the data.
+    /// Test mode uses the chosen condition and payload, skips the handoff, and writes nothing to disk.
     func testTestModeRunsTheChosenPayloadAndIsNeverWrittenToDisk() throws {
         let store = StudyStore()
         let savedBefore = store.saved.map(\.id)
@@ -149,7 +143,7 @@ final class StudyTransitionTests: XCTestCase {
         XCTAssertTrue(store.isOnLastBox)
         XCTAssertEqual(store.activeRun?.participantName, "")
 
-        // Everything a real run would record is refused.
+        // Nothing a real run would record is accepted.
         let testRunID = try XCTUnwrap(store.activeRun?.id)
         store.beginPhase(.pack)
         store.recordCurrentBox(
@@ -173,7 +167,7 @@ final class StudyTransitionTests: XCTestCase {
             "A test run is not something to be offered back."
         )
 
-        // Read from disk rather than from this store: persistence is the thing being checked.
+        // Read back from disk, since persistence is what's being checked.
         let reloaded = StudyStore()
         XCTAssertFalse(
             reloaded.saved.contains { $0.id == testRunID },
@@ -181,9 +175,7 @@ final class StudyTransitionTests: XCTestCase {
         )
     }
 
-    /// Boxing and loading the payload were showing as "—" on the results screen and in the report.
-    /// The measuring phase was started for us, but nothing ever started the other two, so they were
-    /// never written. Each of the three has to end up in the file for both boxes.
+    /// All three phases have to be timed and saved for both payloads.
     func testEveryPhaseIsTimedForBothBoxes() throws {
         let store = StudyStore()
         store.startRun(
@@ -195,7 +187,7 @@ final class StudyTransitionTests: XCTestCase {
         store.beginParticipantSession()
 
         for _ in 0..<2 {
-            // What the screens do: measure, then the preparation stage, then the arrangement.
+            // Same order as the screens: measure, prepare, arrange.
             store.beginPhase(.pack)
             store.beginPhase(.payload)
             if store.isOnLastBox {
@@ -219,8 +211,8 @@ final class StudyTransitionTests: XCTestCase {
             }
         }
 
-        // The report has to carry them too, and a dash on a timing line is how a missing one shows
-        // up. Only the timing lines are checked: box headings contain a dash of their own.
+        // Missing times show up as a dash in the report. Only check timing lines, since headings
+        // contain a dash too.
         let timingLines = run.reportText()
             .components(separatedBy: "\n")
             .filter { line in
@@ -252,7 +244,7 @@ final class StudyTransitionTests: XCTestCase {
         store.beginParticipantSession()
         XCTAssertEqual(store.currentPhase, .measure, "Only the participant's Start tap begins measuring.")
 
-        // Remove the tiny real interval opened by beginParticipantSession, then use controlled dates.
+        // End the short interval from beginParticipantSession, then use fixed dates.
         store.endCurrentPhase()
         let baseline = store.elapsedSeconds(for: .measure)
         let start = Date().addingTimeInterval(100)

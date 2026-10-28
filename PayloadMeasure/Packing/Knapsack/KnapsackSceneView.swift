@@ -2,11 +2,8 @@ import SceneKit
 import SwiftUI
 import UIKit
 
-// Drawings for the 3D knapsack result: a rotatable SceneKit view of the whole load, and flat
-// per-layer footprints for the step-by-step loading guide.
-//
-// In:  a BaldiSolution, a colour per package and the current selection.
-// Out: on screen only.
+// Drawings for the 3D knapsack result: a rotatable SceneKit view of the whole load and flat
+// per-layer footprints for the loading guide.
 
 nonisolated struct BaldiLoadingLayer: Identifiable {
     let index: Int
@@ -62,19 +59,16 @@ nonisolated enum BaldiLoadingGuide {
     }
 }
 
-/// Which way a package's measured length is pointing once placed. Length is the box's longest side
-/// and runs parallel to its opening, so this is what the operator lines up when loading.
+/// Direction of a placed package's length, which runs parallel to its opening. This is what the
+/// operator lines up when loading.
 nonisolated enum BaldiOpeningMarker {
     static func containerAxis(for placement: BaldiPlacement) -> Int {
         placement.rotation.sourceAxis.firstIndex(of: 0) ?? 0
     }
 
-    /// Container-space axes for the package's two L x W faces and their centre line.
-    ///
-    /// `sourceAxis[c]` is the measured package axis carried by container axis `c`. The two
-    /// L x W faces are therefore normal to measured height (axis 2), while the line on them runs
-    /// along measured length (axis 0). Keeping this mapping in one place prevents the 3D guide from
-    /// silently treating every package as though its L x W faces were horizontal.
+    /// Container axes for the package's two L x W faces and their centre line. `sourceAxis[c]` is
+    /// the package axis on container axis `c`, so the L x W faces are normal to package axis 2 and
+    /// the line runs along package axis 0.
     static func faceAxes(
         for placement: BaldiPlacement
     ) -> (normal: Int, length: Int, width: Int)? {
@@ -85,8 +79,7 @@ nonisolated enum BaldiOpeningMarker {
         return (normal, length, width)
     }
 
-    /// L × W faces that touch another package. Their orientation line remains useful, but is dotted
-    /// to show that the physical face is covered rather than exposed.
+    /// L x W faces touching another package. Their line is drawn dotted.
     static func coveredFaceSigns(
         for placement: BaldiPlacement,
         among placements: [BaldiPlacement],
@@ -157,8 +150,7 @@ struct BaldiPlanView: View {
             .accessibilityHint("Returns the packing to its original camera angle and zoom.")
         }
         .overlay(alignment: .bottom) {
-            // Whichever package was tapped, said loudly and in that package's own colour. A caption in
-            // the corner made the operator hunt for the answer to the question they had just asked.
+            // Show the tapped package's name prominently, in its own colour.
             if let placement = selectedPlacement {
                 let colour = colours[placement.id] ?? .accentColor
                 VStack(spacing: 3) {
@@ -297,12 +289,8 @@ struct BaldiLayerFootprintView: View {
         highlightedPackageID = highlightedPackageID == placement.id ? nil : placement.id
     }
 
-    /// Shades the opening side of the footprint and rules a darker line straight across the package
-    /// along its length, which is the direction the operator has to line the box up with.
-    ///
-    /// Drawn only for a package boxed from the catalogue: the line marks the length/opening
-    /// convention of one of *our* presets, which is not a fact about an object that already arrived
-    /// as its own box — nothing chose an opening for it to match.
+    /// Shades the opening side and draws a line along the package's length. Only for boxes from the
+    /// catalogue, since objects that are their own box have no defined opening.
     private func drawOpeningMarker(
         for placement: BaldiPlacement,
         in rect: CGRect,
@@ -312,7 +300,7 @@ struct BaldiLayerFootprintView: View {
         let axis = BaldiOpeningMarker.containerAxis(for: placement)
         guard rect.width >= 11, rect.height >= 11 else { return }
 
-        // Length is vertical, so neither the opening side nor the length shows in a plan view.
+        // Length is vertical, so nothing to show in plan view.
         if axis == 2 {
             let inset = min(3.5, min(rect.width, rect.height) * 0.16)
             context.stroke(
@@ -485,10 +473,8 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         }
     }
 
-    /// SwiftUI may call `updateUIView` for surrounding scroll and animation state which has nothing
-    /// to do with this scene. Removing and recreating the complete node tree on every such update
-    /// produced a blank/double-rendered frame while the user rotated it. Rebuild only when a value
-    /// which changes the drawing has actually changed.
+    /// SwiftUI calls updateUIView for unrelated changes too. Rebuilding the scene every time caused
+    /// blank frames while rotating, so only rebuild when the drawing actually changes.
     private func rebuildContentIfNeeded(
         in view: SCNView,
         coordinator: Coordinator,
@@ -528,8 +514,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
             )
         }
 
-        // Build off-tree, then swap both trees in one transaction. SceneKit never renders the
-        // half-built scene and there is no implicit fade between two identical sets of geometry.
+        // Build off-tree and swap in one transaction, so a half-built scene is never rendered.
         let previous = root.childNode(withName: "packing-content", recursively: false)
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0
@@ -552,8 +537,7 @@ private struct BaldiPackingSceneView: UIViewRepresentable {
         let key = SCNLight()
         key.type = .directional
         key.intensity = 650
-        // This is an instructional diagram, not a photorealistic render. Shadow maps on adjacent
-        // cuboids caused dark seams and shimmer as the camera moved.
+        // No shadows: they caused seams and shimmer between adjacent boxes.
         key.castsShadow = false
         keyNode.light = key
         keyNode.eulerAngles = SCNVector3(-0.85, 0.65, 0)
@@ -672,8 +656,7 @@ private struct PackagePresentation {
     let isHighlighted: Bool
     let hasPackageHighlight: Bool
 
-    /// Visible boxes stay opaque. Muting by colour rather than alpha avoids SceneKit having to sort
-    /// six transparent faces for every touching package on every camera frame.
+    /// Mute by colour instead of alpha so SceneKit doesn't have to depth-sort transparent faces.
     var softening: CGFloat {
         if isHighlighted { return 0 }
         return hasPackageHighlight ? 0.52 : 0.06
@@ -696,7 +679,7 @@ private enum SceneBuilder {
             lightingModel: .constant
         )
         let floorNode = SCNNode(geometry: floor)
-        // Its top sits a hair below the package bottoms rather than intersecting them.
+        // Slightly below the package bottoms to avoid z-fighting.
         floorNode.position.y = Float(
             -metrics.containerHeight / 2 - metrics.edgeThickness / 2 - metrics.edgeThickness * 0.02
         )
@@ -731,9 +714,8 @@ private enum SceneBuilder {
         let domainDepth = max(CGFloat(domainSize.y) * metrics.scale, minimumDomainSide)
         let domainCentre = metrics.point((lower + upper) / 2)
 
-        // A transparent enclosing solid tinted whichever package faces happened to be behind it and
-        // had to be depth-sorted on every camera move. The wireframe communicates the same admissible
-        // region without changing any package colour.
+        // Wireframe instead of a transparent solid, which tinted the packages behind it and needed
+        // sorting on every camera move.
         addBoxEdges(
             width: domainWidth,
             height: domainHeight,
@@ -857,7 +839,7 @@ private enum SceneBuilder {
         )
     }
 
-    /// A darker tone of the same hue, so the marker still reads as part of its package.
+    /// Darker tone of the same hue.
     private static func darkened(_ colour: UIColor, by amount: CGFloat) -> UIColor {
         var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
         guard colour.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha) else {
@@ -905,10 +887,8 @@ private enum SceneBuilder {
         root.addChildNode(textNode)
     }
 
-    /// Matches the AR package without adding geometry on top of, inside, or outside the cuboid.
-    /// Both true L x W faces get a shaded material with a centred length line baked into it. Because
-    /// these are the SCNBox's own faces, touching packages cannot create coplanar marker surfaces or
-    /// have a marker protrude into their neighbour.
+    /// Same look as the AR package. The length line is baked into the material of both L x W faces,
+    /// so no extra geometry can poke into neighbouring packages.
     private static func packageMaterials(
         for placement: BaldiPlacement,
         among allPlacements: [BaldiPlacement],
@@ -923,10 +903,9 @@ private enum SceneBuilder {
             base.emission.contents = colour.withAlphaComponent(0.32)
         }
 
-        // SCNBox material order is front(+z), right(+x), back(-z), left(-x), top(+y), bottom(-y).
+        // SCNBox material order: front(+z), right(+x), back(-z), left(-x), top(+y), bottom(-y).
         var result = Array(repeating: base, count: 6)
-        // The length/opening convention only describes one of our own catalogue presets: an object
-        // that already arrived as its own box was never given an opening to match.
+        // Objects that are their own box have no defined opening.
         guard !placement.isOwnBox,
               let axes = BaldiOpeningMarker.faceAxes(for: placement) else { return result }
         let markedFaces: [(index: Int, sign: Int)]
@@ -957,10 +936,8 @@ private enum SceneBuilder {
         return result
     }
 
-    /// No highlight wash here, unlike the package's other faces: an emission tint over this baked
-    /// texture is what used to fade the line out right when selecting a package was supposed to make
-    /// it easier to read. Selection is already shown unambiguously by the highlighted edges
-    /// `addBoxEdges` draws around the whole package, so the opening line stays at full contrast.
+    /// No highlight tint on this face, it washed out the line. Selection is already shown by the
+    /// highlighted edges.
     private static func markedFaceMaterial(
         colour: UIColor,
         lineIsHorizontal: Bool,
@@ -1065,14 +1042,12 @@ private enum SceneBuilder {
         lightingModel: SCNMaterial.LightingModel
     ) -> SCNMaterial {
         let material = SCNMaterial()
-        // Alpha comes only from the explicit `opacity` argument. UIColor system roles often carry
-        // an implicit alpha of their own; letting that leak into intersecting edge rods recreated
-        // the dark-corner sorting artefact even when `transparency` was one.
+        // Alpha comes only from `opacity`. System colours can carry their own alpha, which caused
+        // sorting artefacts at the edges.
         material.diffuse.contents = colour.withAlphaComponent(1)
         material.transparency = opacity
         material.lightingModel = lightingModel
-        // All geometry built here is closed. Drawing back faces made transparent boxes accumulate
-        // their colour twice and change darkness as SceneKit's sort order changed.
+        // All geometry is closed, and double-sided transparent faces got their colour applied twice.
         material.isDoubleSided = false
         if opacity < 1 {
             material.transparencyMode = .singleLayer

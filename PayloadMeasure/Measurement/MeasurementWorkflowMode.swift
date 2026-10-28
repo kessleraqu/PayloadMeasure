@@ -1,6 +1,6 @@
 import Foundation
 
-// The two automatic measurement methods the operator can choose between in Information.
+// The two automatic measurement methods.
 
 enum MeasurementWorkflowMode: String, CaseIterable, Identifiable, Sendable, Codable {
     case spatial3D
@@ -35,8 +35,8 @@ enum MeasurementWorkflowMode: String, CaseIterable, Identifiable, Sendable, Coda
         }
     }
 
-    /// Short protocol text used by the accuracy test. Full 3D deliberately needs two viewpoints:
-    /// an overhead view for the footprint, then either an isometric or lateral view for height.
+    /// Protocol text for the accuracy test. Full 3D needs two views: overhead for the footprint,
+    /// then isometric or lateral for the height.
     var accuracyInstruction: String {
         switch self {
         case .spatial3D:

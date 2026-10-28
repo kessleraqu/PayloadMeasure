@@ -1,10 +1,7 @@
 import SwiftUI
 
-// The first thing shown on launch: pick how to work through a load. Nothing runs until one is
-// chosen, so the AR session does not start behind this screen.
-//
-// In:  nothing.
-// Out: the chosen MeasurementFlow. Shown again only after a full reset or a relaunch.
+// Launch screen where the operator picks a measurement flow. The AR session only starts after
+// a choice is made.
 
 struct StartView: View {
     let warmup: AppWarmup
@@ -66,7 +63,6 @@ struct StartView: View {
                     }
                 }
 
-                // Only shown when there is genuinely something left to wait for.
                 if !warmup.isReady {
                     VStack(spacing: 7) {
                         ProgressView(value: warmup.progress)
@@ -101,7 +97,7 @@ struct StartView: View {
         }
     }
 
-    /// Tapping before the frameworks are loaded queues the choice rather than freezing on it.
+    /// If the frameworks are still loading, the choice is queued instead of blocking the UI.
     private func choose(_ flow: MeasurementFlow) {
         guard warmup.isReady else {
             pendingFlow = flow

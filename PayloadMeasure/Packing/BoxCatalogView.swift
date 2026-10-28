@@ -1,28 +1,16 @@
 import SwiftUI
 import simd
 
-// The boxes the system chooses from for one payload, and the form for adding more.
+// Box list for one payload, with a form for adding boxes. Changes are saved and invalidate the
+// current arrangement.
 //
-// In:  a BoxCatalogue, which is per payload.
-// Out: on screen only. The list survives relaunch, every box can be deleted, and changing it invalidates
-//      the current arrangement.
-//
-// Every box carries two sizes, and this is the one screen that shows both, because it is the one screen
-// where they can be edited:
-//
-//   • the interior size     — what an object has to fit inside, and the box's displayed name
-//   • the outer footprint   — what the loading plan places in the payload
-//
-// They are the same figure for almost every box. Two of the stocked ones were measured and are not what
-// their size suggests, which is the whole reason the two are kept apart. Everywhere in the app, boxes are
-// referred to by their interior size.
-//
-// Reached both from the setup screen, before a run starts, and from the measuring screens. Both edit the
-// same saved list for that payload; `onChange` is how the measuring side learns to re-solve.
+// Each box has an interior size (what has to fit inside it, also used as its name) and an outer
+// footprint (what gets placed in the payload). They are usually the same; two of the stocked
+// boxes were measured and differ. Opened from both the setup screen and the measuring screens.
 
 struct BoxCatalogView: View {
     let catalogue: BoxCatalogue
-    /// Called after every edit. Nil from the setup screen, where nothing is solved yet.
+    /// Called after every edit so the plan can be re-solved. Nil on the setup screen.
     var onChange: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
@@ -104,8 +92,6 @@ struct BoxCatalogView: View {
                             .foregroundStyle(.orange)
                     }
                 }
-
-                resetSection
             }
             .navigationTitle(titleText)
             .navigationBarTitleDisplayMode(.inline)
@@ -185,19 +171,6 @@ struct BoxCatalogView: View {
         catalogue.remove(id: id)
         onChange?()
     }
-
-    private var resetSection: some View {
-        Section {
-            Button("Put the standard boxes back") {
-                catalogue.resetToDefaults()
-                onChange?()
-            }
-            .disabled(catalogue.isDefault)
-        } footer: {
-            Text("Restores this payload's standard list.")
-        }
-    }
-
 
     private func millimetres(
         _ title: String,

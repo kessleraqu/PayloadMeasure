@@ -1,15 +1,11 @@
 import Foundation
 import simd
 
-// Knapsack, packages, placements and the feasibility rules everything else is judged against.
-//
-// In:  container size and centre-of-mass domain, plus measured packages (size in whole mm, mass in kg).
-// Out: value types only. BaldiVerifier.verify returns a pass/fail verdict with a list of
-//      human-readable violations; nothing here draws or mutates app state.
+// Knapsack, packages, placements and the feasibility rules.
 //
 // A packing is feasible when every package is inside the container, no two overlap, every package
-// off the floor has its whole bottom face carried by the packages under it, and the cargo centre of
-// mass falls inside the domain. See BALDI_NOTES.md for how each rule maps to the two papers.
+// above the floor has its whole bottom face supported, and the cargo centre of mass lies inside
+// the target domain. Based on Baldi et al.
 
 nonisolated enum BaldiPackingMode: String, Sendable, Equatable, Hashable, CaseIterable, Identifiable {
     /// Stop as soon as the centre of mass reaches the domain, moving packages only locally.
@@ -32,12 +28,11 @@ nonisolated struct BaldiItem: Sendable, Identifiable {
     var name: String
     var size: SIMD3<Int>
     var mass: Double
-    /// The object itself, not a box chosen for it. Carried through to the placement only so the
-    /// loading guide knows not to draw an opening line nobody chose an orientation for; the solver
-    /// itself treats every item identically regardless of this flag.
+    /// The object is already a box. Only used by the loading guide (no opening line is drawn); the
+    /// solver ignores it.
     var isOwnBox: Bool = false
 
-    /// Every package counts the same, so the objective is simply how many get loaded.
+    /// All packages are worth the same, so the objective is the number loaded.
     var profit: Double { 1 }
 
     var volume: Int { size.x * size.y * size.z }
@@ -88,7 +83,7 @@ nonisolated struct BaldiKnapsack: Sendable, Equatable {
     }
 }
 
-/// One of the six ways a box can sit with its faces parallel to the container walls.
+/// One of the six axis-aligned orientations of a box.
 nonisolated struct BaldiRotation: Sendable, Hashable {
     /// Which package axis ends up on each container axis.
     var sourceAxis: [Int]
@@ -101,7 +96,7 @@ nonisolated struct BaldiRotation: Sendable, Hashable {
         SIMD3(item[sourceAxis[0]], item[sourceAxis[1]], item[sourceAxis[2]])
     }
 
-    /// Packages are treated as uniform, so the centre of mass is the middle of the box.
+    /// Packages are assumed uniform, so the centre of mass is the box centre.
     func centreOfMassOffset(of item: SIMD3<Int>) -> SIMD3<Double> {
         let rotated = size(of: item)
         return SIMD3(Double(rotated.x) / 2, Double(rotated.y) / 2, Double(rotated.z) / 2)
@@ -120,7 +115,7 @@ nonisolated struct BaldiProblem: Sendable {
     var knapsack: BaldiKnapsack
     var items: [BaldiItem]
 
-    /// Splits off packages that cannot fit in any rotation. They are reported, not silently lost.
+    /// Separates packages that don't fit in any orientation so they can be reported.
     func partitionByFit() -> (fitting: [BaldiItem], oversized: [BaldiItem]) {
         var fitting: [BaldiItem] = []
         var oversized: [BaldiItem] = []
@@ -142,14 +137,12 @@ nonisolated struct BaldiProblem: Sendable {
 nonisolated struct BaldiPlacement: Sendable, Identifiable {
     var id: UUID
     var name: String
-    /// Bottom-left-back corner. Continuous, because the balancing stage can land between millimetres.
+    /// Bottom-left-back corner. Not integer, since balancing can move packages by fractions of a mm.
     var origin: SIMD3<Double>
     var rotation: BaldiRotation
     var size: SIMD3<Int>
     var mass: Double
-    /// The object itself, not a box chosen for it — see `BaldiItem.isOwnBox`. The length/opening
-    /// convention `BaldiOpeningMarker` draws is a fact about the app's own box presets, and does not
-    /// hold for whatever the object already arrived packaged in.
+    /// See `BaldiItem.isOwnBox`. The opening marker only applies to the app's own box presets.
     var isOwnBox: Bool = false
 
     var extent: SIMD3<Double> { SIMD3(Double(size.x), Double(size.y), Double(size.z)) }
@@ -195,7 +188,7 @@ nonisolated struct BaldiSolution: Sendable {
         return moment / mass
     }
 
-    /// Tie-break for centred mode only. Package count stays the objective.
+    /// Tie-break in centred mode. The package count is still the main objective.
     var centreOfMassDistanceToIdeal: Double {
         guard !placements.isEmpty else { return .infinity }
         let centre = centreOfMass
@@ -206,8 +199,8 @@ nonisolated struct BaldiSolution: Sendable {
         return distance.isFinite ? distance : .infinity
     }
 
-    /// Spread of the loaded packages' own centres about the ideal point. Reported for comparison
-    /// with the source paper; the search does not use it.
+    /// Spread of package centres around the ideal point. Reported for comparison with the paper,
+    /// not used by the search.
     var unbalancingIndex: Double {
         guard loadedCount > 0 else { return 0 }
         let ideal = knapsack.idealCentreOfMass
@@ -218,11 +211,9 @@ nonisolated struct BaldiSolution: Sendable {
         return (total / Double(loadedCount)).squareRoot()
     }
 
-    /// U from eq. (4) rescaled by the knapsack's half-diagonal, so it is dimensionless and cannot
-    /// exceed 1. Needed only because this application fixes p_i = 1: Baldi's benchmark profits run
-    /// to six figures, so raw millimetre U is negligible beside P, whereas here it would swamp a
-    /// package count. Normalised, the penalty stays below 1 and orders equal-count packings without
-    /// ever outvoting a package. Application-specific scaling, not part of eq. (24).
+    /// U from eq. (4) divided by the knapsack's half-diagonal, so it lies in [0, 1]. Needed because
+    /// all profits are 1 here, so the raw value in mm would outweigh the package count. Our own
+    /// scaling, not part of the paper.
     var normalisedUnbalancingIndex: Double {
         let extent = SIMD3<Double>(
             Double(knapsack.size.x),
@@ -234,7 +225,7 @@ nonisolated struct BaldiSolution: Sendable {
         return min(unbalancingIndex / halfDiagonal, 1)
     }
 
-    /// Baldi eq. (24): F = P − αU. P is eq. (1), which with p_i = 1 is the loaded-package count.
+    /// Baldi eq. (24): F = P - alpha * U, where P is the number of loaded packages.
     func merit(alpha: Double) -> Double {
         guard loadedCount > 0 else { return 0 }
         return profit - alpha * normalisedUnbalancingIndex
@@ -265,10 +256,10 @@ nonisolated struct BaldiSupportReport: Sendable {
     }
 }
 
-/// A package is supported when its whole bottom face is covered, either by the floor or by the top
-/// faces it touches. Contact areas are unioned rather than summed so tolerance cannot double-count.
+/// A package is supported when its whole bottom face rests on the floor or on packages below.
+/// Contact areas are unioned, not summed, so overlaps aren't counted twice.
 nonisolated enum BaldiVerticalSupport {
-    /// Absorbs floating-point noise only; not a measurement allowance.
+    /// Floating-point tolerance only.
     static let contactTolerance = 1e-6
 
     private struct Rectangle {
@@ -349,8 +340,7 @@ nonisolated enum BaldiVerticalSupport {
         reports(for: placements, tolerance: tolerance).allSatisfy(\.isFullySupported)
     }
 
-    /// Sweep along x, merging y intervals in each slab. There are only ever a handful of
-    /// rectangles, so the straightforward version beats a sweep-line structure for readability.
+    /// Simple sweep along x, merging y intervals per slab. Fine for the handful of rectangles here.
     private static func unionArea(of rectangles: [Rectangle], tolerance: Double) -> Double {
         guard !rectangles.isEmpty else { return 0 }
         let xCoordinates = rectangles.flatMap { [$0.minX, $0.maxX] }.sorted()
@@ -399,8 +389,8 @@ nonisolated struct BaldiVerification: Sendable {
     var supportReports: [BaldiSupportReport]
 }
 
-/// Re-derives every property from the placements alone, so a bug in the search cannot vouch for
-/// itself. Nothing reaches the screen until this passes.
+/// Checks every rule again from the placements alone, independent of the search. Results are only
+/// shown if this passes.
 nonisolated enum BaldiVerifier {
     static func verify(_ solution: BaldiSolution, against problem: BaldiProblem) -> BaldiVerification {
         var violations: [String] = []

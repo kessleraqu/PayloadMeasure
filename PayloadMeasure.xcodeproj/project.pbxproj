@@ -21,24 +21,9 @@
 		B1D100012FF4000000000001 /* PayloadMeasureTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PayloadMeasureTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Packing/METHODS.md,
-				Packing/NOTES.md,
-				PROJECT_CONTEXT.md,
-			);
-			target = ACDB56ED2FF2805400508C46 /* PayloadMeasure */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		ACDB56F02FF2805400508C46 /* PayloadMeasure */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				AC99C6962FF2C101006EBB3A /* Exceptions for "PayloadMeasure" folder in "PayloadMeasure" target */,
-			);
 			path = PayloadMeasure;
 			sourceTree = "<group>";
 		};

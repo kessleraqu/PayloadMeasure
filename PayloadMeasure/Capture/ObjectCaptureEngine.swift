@@ -3,19 +3,14 @@ import Foundation
 import Observation
 import simd
 
-// The measurement session's state: which object is being measured, which are finished, their names
-// and weights, and everything the HUD reads.
-//
-// In:  fit results and guidance from the AR coordinator, and operator actions from the overlay.
-// Out: observable state. Also raises workflow requests - finalize, reactivate, remove - that the
-//      coordinator acts on.
+// State of the measurement session: the active object, finished objects with their names and
+// weights, and everything the HUD shows. Also raises finalize/reactivate/remove requests that the
+// AR coordinator handles.
 
 nonisolated enum ObjectFramingGuidance: String, Sendable, Equatable, CaseIterable {
     case moveCloser
     case moveFarther
-    /// The object runs off the edge of the frame. A distance instruction is the wrong advice here —
-    /// backing away from something that is off to one side does not bring it into view, which is why
-    /// "move further" used to be given and then appear to do nothing.
+    /// The object runs off the edge of the frame, so the advice is to re-centre rather than step back.
     case centre
     case okay
 }
@@ -61,30 +56,21 @@ final class ObjectCaptureEngine {
     private(set) var visibleObjectMaskCount = 0
     private(set) var objectMaskMarkers: [ObjectMaskMarker] = []
     private(set) var objectMaskDisplayBoundingBoxes: [UUID: CGRect] = [:]
-    /// Bounds of the AR viewport that produced the normalized boxes. Accuracy calibration needs the
-    /// real renderer size, not the safe-area size of a SwiftUI overlay.
+    /// Size of the AR viewport the normalised boxes refer to (not the SwiftUI safe area).
     private(set) var objectMaskViewportSize: CGSize = .zero
     private(set) var objectMaskFeedbackText: String?
     private(set) var objectMaskToggleRequest: ObjectMaskToggleRequest?
     private(set) var objectWorkflowRequest: ObjectWorkflowRequest?
     private(set) var isObjectSelectionPending = false
-    /// Why the last press did not become a measurement, or nil when nothing has failed since.
-    ///
-    /// The reasons were already being written down, into `objectMaskFeedbackText` — but that is read
-    /// only from the information panel, which is closed while measuring. So a press that failed showed
-    /// the operator nothing whatsoever: the Measure button disappeared, nothing happened, and the button
-    /// came back. That is indistinguishable from a fault even on the occasions when the app is behaving
-    /// exactly as designed, and it is the experience this exists to end. The instruction banner reads it.
+    /// Why the last Measure press didn't start a measurement. Shown in the instruction banner,
+    /// nil when nothing has failed.
     private(set) var lastSelectionFailure: String?
-    /// When to stop saying it, on the monotonic clock. A failed press is news for as long as the
-    /// operator is still standing where they pressed; a minute later it is a stale complaint about
-    /// something they have long since moved on from.
+    /// Uptime after which the failure notice is dropped.
     private var selectionFailureExpiry: TimeInterval = 0
     private(set) var statusText = defaultPrompt
     private(set) var isMeshVisible = false
     private(set) var showsSelectedPoints = true
-    // The mask is shown from the start. It is the clearest sign that the app has found the object and
-    // is working on the right thing, so hiding it by default left the operator guessing.
+    // Shown by default, it's the clearest sign the app has found the right object.
     private(set) var showsLiveMaskPreview = true
     private(set) var showsSelectedObjectMaskPreview = true
     private(set) var showsBoundingBoxes = true
@@ -103,8 +89,8 @@ final class ObjectCaptureEngine {
     private var lockedMaskLayersByID: [UUID: ObjectMaskPreviewLayer] = [:]
     private var lockedMaskLayerOrder: [UUID] = []
     private var liveMaskLayer: ObjectMaskPreviewLayer?
-    /// Where the live mask's own point in the room currently projects to. This, and not Vision's object
-    /// tracker, is what keeps the live mask on its object between segmentations.
+    /// Current screen position of the live mask's world anchor. Keeps the mask on the object between
+    /// segmentations.
     private(set) var liveMaskTracking: ObjectMaskWorldTracking?
     private var objectMaskMarkerMissCounts: [UUID: Int] = [:]
 
@@ -121,12 +107,10 @@ final class ObjectCaptureEngine {
     private(set) var isTopViewAligned = false
     private(set) var topMeasurementStable = false
     private(set) var hasDefinitiveSupportPlaneForActiveObject = false
-    /// True when the crosshair is on an object that has already been measured. Set from the AR side
-    /// out of the stored boxes; no tracking is involved.
+    /// True when the crosshair is on an already measured object.
     private(set) var isPointingAtFinishedObject = false
     private(set) var framingGuidance: ObjectFramingGuidance?
-    /// Whether the object being framed fills more of the screen than the framing study found accurate.
-    /// Advice only — nothing checks it before starting, continuing or finishing a measurement.
+    /// The framed object fills more of the screen than the framing study found accurate. Advisory.
     private(set) var isFramedTooClose = false
     private var candidateFramingGuidance: ObjectFramingGuidance?
     private var candidateFramingGuidanceCount = 0
@@ -137,23 +121,18 @@ final class ObjectCaptureEngine {
     // MARK: - Automatic lock
 
     private(set) var convergence: MeasurementConvergence = .idle
-    /// When the active measurement began, on the monotonic clock. Both the "it never started" rule and
-    /// the cancel lock-out are read off it.
+    /// Uptime when the active measurement started.
     private var activeMeasurementStartedAt: TimeInterval?
-    /// Whole seconds until Cancel is offered, or nil once it is. Coarse on purpose: every published
-    /// change here redraws the camera overlay.
+    /// Whole seconds until Cancel is offered. Kept coarse so the overlay isn't redrawn constantly.
     private(set) var cancelCountdownSeconds: Int?
-    /// False for the first few seconds of a measurement. Cancelling instantly was the wrong habit to
-    /// teach: a measurement barely under way looks stuck, and the app already restarts one that is.
+    /// False for the first few seconds of a measurement.
     private(set) var canCancelActiveMeasurement = false
     private(set) var isAutomaticLockEnabled = true
     private(set) var automaticLockRequest: UUID?
     private(set) var automaticLockRequestRevision = 0
     private var convergenceMonitor = MeasurementConvergenceMonitor()
-    /// When each object was last offered for an automatic finish.
     private var automaticLockOfferTimestamps: [UUID: TimeInterval] = [:]
-    /// How long to wait before offering the same object again. There is no manual Finish on the
-    /// camera screen, so an offer the overlay could not act on must not be the only one it gets.
+    /// Offers are repeated, since there is no manual Finish button on the camera screen.
     private static let automaticLockRetryInterval: TimeInterval = 1
 
     var isAutomaticLockDisarmedForActiveObject: Bool {
@@ -194,7 +173,6 @@ final class ObjectCaptureEngine {
     }
 
     func refreshConvergence() {
-        // Before anything is judged about how well the measurement is going: is it going at all?
         guard !abandonMeasurementIfItNeverStarted() else {
             return
         }
@@ -214,9 +192,8 @@ final class ObjectCaptureEngine {
         requestAutomaticLockIfConverged()
     }
 
-    /// Drops a measurement that never produced anything, and puts the app back to looking for an
-    /// object. Also keeps `canCancelActiveMeasurement` in step with the clock, because both answers come
-    /// from the same elapsed time. Returns true when the measurement was abandoned.
+    /// Abandons a measurement that never produced a box and also updates
+    /// `canCancelActiveMeasurement`. Returns true if the measurement was dropped.
     @discardableResult
     private func abandonMeasurementIfItNeverStarted() -> Bool {
         guard let id = activeObjectID, let startedAt = activeMeasurementStartedAt else {
@@ -228,9 +205,7 @@ final class ObjectCaptureEngine {
         if canCancelActiveMeasurement != allowsCancel {
             canCancelActiveMeasurement = allowsCancel
         }
-        // Published as whole seconds, and only while something is waiting on them. This runs on every
-        // camera frame: publishing a Double here redrew the entire overlay — mask included — sixty times
-        // a second, which is both the flicker and a great deal of work for a number nobody reads.
+        // Published as whole seconds only; this runs every frame.
         let countdown = MeasurementStartRule.cancelCountdown(secondsActive: secondsActive)
         if cancelCountdownSeconds != countdown {
             cancelCountdownSeconds = countdown
@@ -243,8 +218,6 @@ final class ObjectCaptureEngine {
         }
         cancelActiveMeasurement()
         statusText = "That did not start measuring. Aim at the object again and tap Measure."
-        // Same reasoning as every other way a press can come to nothing: the operator watched the
-        // button disappear, and has to be told why it came back.
         failObjectSelection(statusText)
         return true
     }
@@ -256,10 +229,8 @@ final class ObjectCaptureEngine {
               let id = activeObjectID else {
             return
         }
-        // The offer used to be made exactly once per object. Anything that stopped the overlay acting
-        // on it — standing too close, a sheet in the way, tracking dropping for a frame — stranded
-        // the measurement at "converged" with no way to finish it. So keep offering, slowly. A
-        // successful finish clears the active object, which ends this by itself.
+        // Keep re-offering every second. Anything that blocked the overlay for a frame (a sheet, a
+        // tracking drop) would otherwise leave the measurement stuck at "converged".
         let now = ProcessInfo.processInfo.systemUptime
         if let offered = automaticLockOfferTimestamps[id],
            now - offered < Self.automaticLockRetryInterval {
@@ -348,9 +319,7 @@ final class ObjectCaptureEngine {
             && capturedObjectsByID[focusedCaptureID] != nil
     }
 
-    /// Editing is offered only while the operator is actually pointing at a finished object, so the
-    /// focus has to be backed by a marker visible in this frame rather than by whatever was last
-    /// looked at.
+    /// Editing is only offered while a finished object's marker is visible in the current frame.
     var canEditFocusedObject: Bool {
         guard canReactivateFocusedObject, let focusedCaptureID else { return false }
         return objectMaskMarkers.contains { $0.id == focusedCaptureID }
@@ -466,8 +435,8 @@ final class ObjectCaptureEngine {
         showsObjectMaskMarkers.toggle()
     }
 
-    /// Restores the live measurement presentation used by the framing test: segmentation mask,
-    /// cyan admitted points, detected-object marker, and the fitted 3D box.
+    /// Restores the full measurement visuals for the framing test: mask, admitted points, object
+    /// marker and the fitted box.
     func showMeasurementVisuals() {
         showsLiveMaskPreview = true
         showsSelectedObjectMaskPreview = true
@@ -519,9 +488,7 @@ final class ObjectCaptureEngine {
                 }
                 lockedMaskLayersByID[id] = layer
             } else {
-                // Whether an unchanged live mask is held back is decided on the AR side, where the
-                // picture, the point it is followed by and the tracker seed are held or replaced
-                // together. Anything that arrives here is meant to be shown.
+                // Whether to hold back an unchanged mask is decided on the AR side, so show whatever arrives.
                 if let liveMaskLayer, liveMaskLayer.id != layer.id {
                     objectMaskDisplayBoundingBoxes.removeValue(
                         forKey: liveMaskLayer.id
@@ -529,11 +496,8 @@ final class ObjectCaptureEngine {
                 }
                 liveMaskLayer = layer
             }
-            // A fresh mask image is authoritative about where it belongs, so the tracked box goes back
-            // to its reference the moment the image arrives. Keeping the old tracked box instead meant
-            // the mask was drawn offset by however far the tracker had drifted since the *previous*
-            // image, and then snapped back on the tracker's next pass — a small jump several times a
-            // second, which is what the drifting, twitching mask actually was.
+            // A new mask image defines where it belongs, so reset the tracked box to its reference.
+            // Keeping the old box drew the mask offset by the tracker's drift and made it twitch.
             if let referenceBoundingBox = layer.referenceViewportBoundingBox {
                 objectMaskDisplayBoundingBoxes[layer.id] = referenceBoundingBox
             }
@@ -542,8 +506,7 @@ final class ObjectCaptureEngine {
         refreshFramingGuidance()
     }
 
-    /// Where the live mask's point in the room is on screen now. Published only when it has actually
-    /// moved a little: it is refreshed every camera frame, and the overlay redraws whenever it changes.
+    /// Only republished when it moved noticeably, since every change redraws the overlay.
     func updateLiveMaskTracking(_ tracking: ObjectMaskWorldTracking?) {
         guard let tracking else {
             if liveMaskTracking != nil { liveMaskTracking = nil }
@@ -555,22 +518,17 @@ final class ObjectCaptureEngine {
            abs(existing.normalizedViewportPoint.y - tracking.normalizedViewportPoint.y)
                < Self.liveMaskTrackingEpsilon,
            abs(existing.cameraDistance - tracking.cameraDistance) < 0.002,
-           // The anchor sitting still does not mean the picture should. Rolling the phone about the
-           // point it is anchored to moves neither the point nor the distance, and only the gauge
-           // records it — testing the anchor alone would hold the mask at its old angle through exactly
-           // the motion the gauge was added to draw.
+           // Also compare the gauge: rolling the phone around the anchor doesn't move the anchor itself.
            gaugesAreWithinEpsilon(existing.gauge, tracking.gauge) {
             return
         }
         liveMaskTracking = tracking
     }
 
-    /// A fifth of a percent of the screen. Below that, moving the mask is invisible and republishing it
-    /// only costs a redraw.
+    /// 0.2% of the screen.
     private static let liveMaskTrackingEpsilon: CGFloat = 0.002
 
-    /// Whether two gauge frames are close enough that redrawing between them would show nothing. One
-    /// having a gauge and the other not is a change, because it decides which display model applies.
+    /// A gauge appearing or disappearing counts as a change, since it switches display model.
     private func gaugesAreWithinEpsilon(
         _ existing: MaskGaugeFrame?,
         _ incoming: MaskGaugeFrame?
@@ -654,9 +612,7 @@ final class ObjectCaptureEngine {
     }
 
     func updateObjectMaskTracking(visibleCount: Int, markers: [ObjectMaskMarker]) {
-        // Once per segmentation rather than once per frame: the notice needs to go away on its own, and
-        // this is the slowest regular beat that still does it promptly. Publishing it from the frame
-        // callback would redraw the whole overlay, mask included, to retire one line of text.
+        // Checked once per segmentation, not every frame, to avoid redrawing the overlay.
         if lastSelectionFailure != nil,
            ProcessInfo.processInfo.systemUptime >= selectionFailureExpiry {
             clearSelectionFailure()
@@ -692,9 +648,8 @@ final class ObjectCaptureEngine {
         }
     }
 
-    /// Ends a selection that did not become a measurement, and leaves the reason somewhere the operator
-    /// will actually see it. Every path that hands the Measure button back goes through here, so none of
-    /// them can do it silently.
+    /// Every path that gives the Measure button back goes through here, so the operator always sees
+    /// a reason.
     private func failObjectSelection(_ reason: String) {
         isObjectSelectionPending = false
         objectMaskFeedbackText = reason
@@ -703,8 +658,6 @@ final class ObjectCaptureEngine {
             + Self.selectionFailureNoticeSeconds
     }
 
-    /// Drops the notice once it has been answered — by a fresh press, by a measurement starting, or by
-    /// simply having been on screen long enough.
     private func clearSelectionFailure() {
         selectionFailureExpiry = 0
         if lastSelectionFailure != nil {
@@ -712,7 +665,6 @@ final class ObjectCaptureEngine {
         }
     }
 
-    /// How long the banner keeps explaining a failed press.
     private static let selectionFailureNoticeSeconds: TimeInterval = 8
 
     func reportObjectLockNeedsSurface() {
@@ -848,8 +800,7 @@ final class ObjectCaptureEngine {
         return id
     }
 
-    /// Throws away the measurement in progress and deselects the object. It was never finalized, so
-    /// nothing is kept — same teardown as removing a finished object.
+    /// Discards the measurement in progress and deselects the object. Nothing is kept.
     func cancelActiveMeasurement() {
         guard let id = activeObjectID else { return }
 
@@ -890,7 +841,7 @@ final class ObjectCaptureEngine {
         objectMaskFeedbackText = "Measurement cancelled. Aim at an object to start again."
     }
 
-    /// Two packages with the same name are indistinguishable in a loading plan.
+    /// Names must be unique, otherwise packages can't be told apart in the loading plan.
     func isNameAvailable(_ name: String, excluding id: UUID?) -> Bool {
         let candidate = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !candidate.isEmpty else { return false }
@@ -960,9 +911,8 @@ final class ObjectCaptureEngine {
 
     // MARK: - Manual study input
 
-    /// Creates the same finalized measurement record that AR capture would create, but from ruler or
-    /// calliper dimensions. Packing consumes `CapturedObject` dimensions only, so keeping one shared
-    /// representation makes every later screen and optimizer identical across study conditions.
+    /// Creates the same record AR capture would, from ruler or calliper dimensions, so every later
+    /// screen works the same for every study condition.
     @discardableResult
     func addManualMeasurement(
         name: String,
@@ -987,9 +937,8 @@ final class ObjectCaptureEngine {
         return id
     }
 
-    /// Measurement and preparation are deliberately separate study phases. Manual entry therefore
-    /// creates an unnamed object; the participant names it beside the box and weight controls, just
-    /// as they do after AR measurement.
+    /// Manual objects are created unnamed; the participant names them during preparation, same as
+    /// after AR measurement.
     @discardableResult
     func addManualMeasurement(sizeMillimetres: SIMD3<Double>) -> UUID? {
         guard let object = Self.manualCapturedObject(sizeMillimetres: sizeMillimetres) else {
@@ -1312,12 +1261,11 @@ final class ObjectCaptureEngine {
             return nil
         }
 
-        // Genuinely filling the frame: backing away is the only thing that helps.
         if boundingBox.width >= 0.85 || boundingBox.height >= 0.85 {
             return .moveFarther
         }
 
-        // Running off an edge without filling the frame is an aiming problem, not a distance one.
+        // Off an edge without filling the frame: an aiming problem, not a distance one.
         let edgeMargin: CGFloat = 0.03
         if boundingBox.minX <= edgeMargin
             || boundingBox.minY <= edgeMargin
@@ -1326,27 +1274,20 @@ final class ObjectCaptureEngine {
             return .centre
         }
 
-        // Small in the frame, so closer really does help. Note what is *not* here: whether the fit has
-        // enough detail yet. That used to return "move closer" too, which meant a dark or glancing
-        // surface asked the operator to close in on something already close enough, and then the size
-        // threshold asked them to back off again — the pair of them chasing each other. Thin evidence
-        // is reported by the progress bar, not as a distance instruction.
+        // Small in frame, so moving closer helps. Thin evidence is shown on the progress bar instead of
+        // as a distance hint, otherwise "closer" and "further" end up fighting each other.
         if max(boundingBox.width, boundingBox.height) < 0.28 {
             return .moveCloser
         }
         return .okay
     }
 
-    /// The apparent size of an object sits near a threshold for much of a scan, and recomputing the
-    /// advice every mask update made it alternate between "move closer" and "move further" frame by
-    /// frame — unusable, and it makes the operator chase it. A new instruction has to agree with
-    /// itself for several consecutive updates before it is published; going quiet is immediate,
-    /// because stale advice is worse than none.
+    /// A new instruction must repeat for this many updates before it's shown, otherwise it flips
+    /// between "closer" and "further" near the threshold. Clearing advice is immediate.
     private static let framingGuidanceHoldCount = 4
 
-    /// The mask being framed right now: the object under measurement, or the one the crosshair is on
-    /// before anything has been selected. The advice is about the object, so it is read from the
-    /// object's own mask rather than from anything under the crosshair or on the surface beneath it.
+    /// Mask of the object being framed: the active object, or the one under the crosshair before
+    /// anything is selected.
     private var framedObjectViewportBoundingBox: CGRect? {
         if let activeObjectID {
             return objectMaskDisplayBoundingBoxes[activeObjectID]
@@ -1386,19 +1327,12 @@ final class ObjectCaptureEngine {
             candidateFramingGuidance = nil
             candidateFramingGuidanceCount = 0
             framingGuidance = nil
-            // The too-close state is deliberately not cleared here. It is recomputed in full by
-            // `refreshTooCloseAdvice` at the top of every call, and already reads false whenever there
-            // is no mask to measure — whereas clearing it here tied it to the *centring* advice, which
-            // is a different question and is only ever published for an object under measurement. That
-            // coupling was invisible while nothing read the flag; now that the banner does, it would
-            // blink the warning off every time the centring advice lapsed.
+            // Don't clear the too-close flag here; refreshTooCloseAdvice recomputes it on every call.
             return
         }
 
-        // Publish at once when there is no advice yet, when the advice is "you are framed", or when
-        // the fit itself has just reported a change in how much detail it has. Only advice that
-        // changed because the object's apparent size re-crossed a threshold has to prove itself —
-        // that is the one that oscillates, because the size sits near a boundary for most of a scan.
+        // Only advice caused by the object's apparent size crossing a threshold needs debouncing.
+        // Everything else is published straight away.
         let detailChanged = measurementDetailStatus != lastPublishedDetailStatus
         if framingGuidance == nil || updatedGuidance == .okay || detailChanged {
             candidateFramingGuidance = nil

@@ -1,12 +1,8 @@
 import Foundation
 import simd
 
-// Runs the Balance arrangement and checks the answer.
-//
-// In:  a PackingProblem plus PackingOptions (time limits, which cut families to use).
-// Out: a PackingResult — the placements, the achieved centre of mass and its deviation, whether
-//      optimality was proven, and an independent geometry check. Balance first, then a second pass
-//      that squeezes the load together without giving any balance back.
+// Solves the Balance arrangement and verifies the result. First optimises balance, then runs a
+// second pass that compacts the load without making the balance worse.
 
 nonisolated struct PlacedPackage: Sendable, Identifiable {
     var id: UUID

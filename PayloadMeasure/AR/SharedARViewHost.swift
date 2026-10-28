@@ -3,13 +3,11 @@ import RealityKit
 import SwiftUI
 import UIKit
 
-// One RealityKit renderer for every camera-backed screen in the app.
+// One ARView shared by every camera screen in the app.
 //
-// iOS can leave the camera background of a later ARView on an old texture when another ARView has
-// already existed earlier in the presentation hierarchy. Tracking and raycasts can still be live,
-// which makes that failure look exactly like a still photograph laid over working AR. Reusing the
-// same ARView (and therefore the same CAMetalLayer and ARSession) avoids that renderer hand-off
-// entirely. The measurement and packing coordinators take turns owning it.
+// On iOS 26 a second ARView created later in the presentation hierarchy can get stuck showing
+// an old camera texture while tracking keeps running underneath. Reusing the same ARView avoids
+// that. The measurement and packing coordinators take turns owning it.
 
 nonisolated enum SharedARRendererRole: Equatable, Sendable {
     case measurement
@@ -17,7 +15,7 @@ nonisolated enum SharedARRendererRole: Equatable, Sendable {
     case lidarCapture
 }
 
-/// Pure ownership state, separate from UIKit so the important stale-release rule can be tested.
+/// Ownership bookkeeping, kept free of UIKit so it can be unit tested.
 nonisolated struct SharedARRendererOwnership: Equatable, Sendable {
     struct Lease: Equatable, Sendable {
         let id: UUID
@@ -35,8 +33,8 @@ nonisolated struct SharedARRendererOwnership: Equatable, Sendable {
         return lease
     }
 
-    /// Returns true only for the current owner. A late dismantle from an old SwiftUI presentation
-    /// must never pause the session after a new presentation has acquired it.
+    /// Only the current owner can release. A late dismantle from an old presentation must not
+    /// pause the session for the new owner.
     mutating func release(_ lease: Lease) -> Bool {
         guard activeLease == lease else { return false }
         activeLease = nil
@@ -72,8 +70,8 @@ final class SharedARViewHost {
         lease: SharedARRendererOwnership.Lease,
         timestamp: TimeInterval?
     )?
-    /// True at launch and after a real payload boundary. Merely closing the loading workflow for the
-    /// same payload must not reset its measurements or world coordinates.
+    /// Set at launch and at payload boundaries. Closing the packing flow for the same payload
+    /// keeps the existing world.
     private var measurementWorldReset = MeasurementWorldResetRequest()
 
     init() {
@@ -84,9 +82,8 @@ final class SharedARViewHost {
         )
         view.backgroundColor = .black
         view.isOpaque = true
-        // A lease starts on an opaque frame. The live feed is rebound only after ARKit has produced
-        // a frame newer than the one used by the previous screen; otherwise RealityKit can keep the
-        // previous role's last camera texture even while tracking and raycasts continue to advance.
+        // Start black and only rebind the camera feed once ARKit delivers a new frame, otherwise the
+        // previous owner's last texture can stay on screen.
         view.environment.background = .color(.black)
         self.view = view
     }
@@ -97,16 +94,13 @@ final class SharedARViewHost {
         onRevocation: @escaping () -> Void
     ) -> SharedARRendererOwnership.Lease {
         if let revokeCurrentOwner {
-            // Normal flow dismantles the old representable first. If SwiftUI overlaps presentation
-            // transactions, synchronously ask the old coordinator to cancel its tasks/timers,
-            // remove overlays/gestures, detach its manager and release its lease before reassignment.
-            // Merely stealing the ARSession would leave that old coordinator able to mutate the new
-            // owner's renderer later.
+            // If SwiftUI overlaps two presentations, make the old coordinator clean up and release its
+            // lease now, so it can't touch the renderer after the new owner takes over.
             self.revokeCurrentOwner = nil
             revokeCurrentOwner()
         }
         if ownership.activeLease != nil {
-            // Defensive fallback if a coordinator disappeared without honoring revocation.
+            // Fallback in case a coordinator went away without handling revocation.
             view.session.delegate = nil
             view.session.pause()
             removeAllSceneAnchors()
@@ -125,9 +119,8 @@ final class SharedARViewHost {
         return lease
     }
 
-    /// Rebinds RealityKit's camera texture only after `session.run` has yielded a genuinely new
-    /// ARFrame. Waiting on the timestamp is important: assigning `.cameraFeed()` immediately can
-    /// bind the still-valid texture from the screen that just released the renderer.
+    /// Rebinds the camera feed once `session.run` has produced a new frame. Doing it immediately
+    /// can pick up the texture left by the previous screen.
     func activateCameraFeed(
         for lease: SharedARRendererOwnership.Lease
     ) {
@@ -176,8 +169,7 @@ final class SharedARViewHost {
         cameraFeedActivationTask?.cancel()
         cameraFeedActivationTask = nil
         cameraFeedBaseline = nil
-        // Drop RealityKit's reference to the previous camera texture before another screen starts.
-        // The next owner stays black until `activateCameraFeed` observes its first fresh ARFrame.
+        // Drop the old camera texture. The next owner stays black until activateCameraFeed runs.
         view.environment.background = .color(.black)
         view.session.delegate = nil
         view.session.pause()

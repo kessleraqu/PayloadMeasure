@@ -1,12 +1,7 @@
 import Foundation
 
-// Entry point for the 3D knapsack. Validates the instance, runs the heuristic, and refuses to hand
-// back anything the independent verifier rejects.
-//
-// In:  a BaldiProblem and BaldiOptions.
-// Out: a BaldiResult carrying the packing, the verifier's findings, any oversized packages and
-//      operator-readable error strings. `solveBoth` runs the two packing modes concurrently so the
-//      screen can show them side by side.
+// Entry point for the 3D knapsack. Validates the input, runs the heuristic and only returns
+// packings the verifier accepts. `solveBoth` runs both packing modes concurrently.
 
 nonisolated struct BaldiOptions: Sendable, Equatable {
     var heuristic = BaldiSearchOptions()

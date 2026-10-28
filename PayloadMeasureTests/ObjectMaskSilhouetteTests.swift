@@ -2,17 +2,14 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// ObjectMaskSilhouette is the negative evidence a frame carries: which directions the object is *not*
-// in, in a form a world point can be tested against by exact projection. It exists because points are
-// only ever added to an accumulator, so a frame on which the mask jumped to the wrong segment leaves
-// foreign points behind permanently — and the box, being the literal extent of the points, grows to
-// contain them.
+// ObjectMaskSilhouette tests: projecting world points into a frame's mask, and the carving
+// predicate that removes points outside it.
 final class ObjectMaskSilhouetteTests: XCTestCase {
     private let width = 64
     private let height = 48
     private let focal: Float = 60
 
-    /// Camera at the origin looking down −z, the convention `maskedWorldSurface` unprojects with.
+    /// Camera at the origin looking down -z, as in `maskedWorldSurface`.
     private func silhouette(
         objectRect: (xRange: Range<Int>, yRange: Range<Int>)?,
         depthEverywhere: Float,
@@ -39,8 +36,7 @@ final class ObjectMaskSilhouetteTests: XCTestCase {
         )
     }
 
-    /// A world point straight ahead must land on the principal point, and its depth must come back as
-    /// the distance along the view axis. If this is wrong every carve decision is wrong.
+    /// A point straight ahead lands on the principal point, with depth along the view axis.
     func testAPointStraightAheadProjectsToThePrincipalPoint() throws {
         let target = silhouette(objectRect: nil, depthEverywhere: 0)
         let hit = try XCTUnwrap(target.pixel(for: SIMD3<Float>(0, 0, -0.5)))
@@ -51,7 +47,7 @@ final class ObjectMaskSilhouetteTests: XCTestCase {
 
     func testOffAxisPointsProjectToTheExpectedSideOfTheImage() throws {
         let target = silhouette(objectRect: nil, depthEverywhere: 0)
-        // +x in camera space is to the right; +y is up, which is a *smaller* row index.
+        // +x is right; +y is up, which is a smaller row index.
         let right = try XCTUnwrap(target.pixel(for: SIMD3<Float>(0.1, 0, -0.5)))
         let up = try XCTUnwrap(target.pixel(for: SIMD3<Float>(0, 0.1, -0.5)))
         XCTAssertGreaterThan(right.column, width / 2)
@@ -67,15 +63,14 @@ final class ObjectMaskSilhouetteTests: XCTestCase {
         XCTAssertNil(target.pixel(for: SIMD3<Float>(10, 0, -0.5)), "Far off to the side.")
     }
 
-    /// The projection has to follow the camera pose, not assume the origin — a silhouette is only ever
-    /// used together with the pose of the frame it came from.
+    /// The projection must use the camera pose, not assume the origin.
     func testProjectionRespectsTheCameraPose() throws {
         var translated = matrix_identity_float4x4
         translated.columns.3 = SIMD4<Float>(1, 0, 0, 1)
         let target = silhouette(
             objectRect: nil, depthEverywhere: 0, cameraTransform: translated
         )
-        // The camera has moved +1 in x, so the world point at x = 1 is now straight ahead.
+        // The camera moved +1 in x, so x = 1 is now straight ahead.
         let hit = try XCTUnwrap(target.pixel(for: SIMD3<Float>(1, 0, -0.5)))
         XCTAssertEqual(hit.column, width / 2)
         XCTAssertEqual(hit.row, height / 2)
@@ -90,14 +85,12 @@ final class ObjectMaskSilhouetteTests: XCTestCase {
         XCTAssertFalse(target.isClearlyOutside(column: 30, row: 22))
     }
 
-    /// The decisive property: a point exactly on the mask boundary must NOT be carveable, because a
-    /// segmentation edge wobbles by a pixel between frames and would otherwise erase real surface.
+    /// A point on the mask boundary must not be carvable, since edges wobble by a pixel between frames.
     func testAPixelOnTheBoundaryIsNotClearlyOutside() {
         let target = silhouette(
             objectRect: (20 ..< 40, 15 ..< 30), depthEverywhere: 0.5
         )
-        // Immediately outside the object on the left edge: its +x neighbour is object, so it is on the
-        // boundary and must be spared.
+        // Just outside the left edge: its +x neighbour is inside, so it's on the boundary and kept.
         XCTAssertTrue(target.isObject[22 * width + 20], "Fixture check: 20 is inside.")
         XCTAssertFalse(target.isObject[22 * width + 19], "Fixture check: 19 is outside.")
         XCTAssertFalse(
@@ -117,8 +110,7 @@ final class ObjectMaskSilhouetteTests: XCTestCase {
         )
     }
 
-    /// An empty mask must still be usable: every pixel is outside. (Whether a frame with no object at
-    /// all should be trusted is the caller's decision, made by requiring repeated disagreement.)
+    /// An empty mask still works: every pixel is outside.
     func testAnEmptySilhouetteReportsEverythingOutside() {
         let target = silhouette(objectRect: nil, depthEverywhere: 0.5)
         XCTAssertTrue(target.isClearlyOutside(column: 0, row: 0))

@@ -2,13 +2,9 @@ import XCTest
 import simd
 @testable import PayloadMeasure
 
-// The box must be exactly the smallest box containing the points it was given — §3.4's literal
-// extremes. These tests exist because an earlier attempt at rejecting depth artifacts *inside* the
-// fitter, on projection distance alone, silently deleted thin real features: a prong or a handle
-// projects onto an axis as a few points set apart from the bulk, which is indistinguishable from an
-// artifact once the image-space neighbourhood has been thrown away. Artifact rejection belongs
-// upstream, in image space, where a sample can be tested against its own depth neighbours
-// (`ObjectMaskProcessor.maskedWorldSurface`); by the time a point reaches the fitter it is evidence.
+// The box is the smallest box containing all given points. Thin parts like prongs or handles
+// must not be dropped as outliers here; artifact filtering happens earlier in image space
+// (`ObjectMaskProcessor.maskedWorldSurface`).
 final class ThinFeatureExtentTests: XCTestCase {
     private let up = SIMD3<Float>(0, 1, 0)
 
@@ -23,8 +19,7 @@ final class ThinFeatureExtentTests: XCTestCase {
         }
     }
 
-    /// A jittered box surface, as a scan of a box-shaped object actually arrives: no two readings on
-    /// a face land on exactly the same value.
+    /// A box surface with jitter, like a real scan.
     private func jitteredBoxSurface(
         halfWidth: Float,
         halfDepth: Float,
@@ -73,8 +68,7 @@ final class ThinFeatureExtentTests: XCTestCase {
         return points
     }
 
-    /// The reported regression, at the level it was seen: a thin part sticking out of one wall is
-    /// drawn as points but was being left outside the box.
+    /// A thin part sticking out of one side has to be inside the box.
     func testAThinProtrusionIsInsideTheMeasuredBox() throws {
         let halfWidth: Float = 0.15
         let halfDepth: Float = 0.10
@@ -84,8 +78,7 @@ final class ThinFeatureExtentTests: XCTestCase {
             halfWidth: halfWidth, halfDepth: halfDepth, base: base, top: top, seed: 11
         )
 
-        // A thin prong reaching 30 mm past the +x wall: sparse, as a thin feature genuinely is, and
-        // therefore exactly what a projection-space "isolated run" rule mistakes for an artifact.
+        // A sparse prong reaching 30 mm past the +x wall.
         let prongTip = halfWidth + 0.030
         var prong: [SIMD3<Float>] = []
         var x = halfWidth
@@ -107,7 +100,7 @@ final class ThinFeatureExtentTests: XCTestCase {
             "The box must reach the tip of the thin protrusion, not stop at the main body."
         )
 
-        // Stated the way the user checks it: every drawn point is inside the drawn box.
+        // Every drawn point is inside the drawn box.
         for point in points {
             XCTAssertTrue(
                 object.contains(point, tolerance: 0.002),
@@ -138,8 +131,7 @@ final class ThinFeatureExtentTests: XCTestCase {
         }
     }
 
-    /// `ObjectBoundingBox.enclosing` is the cross-frame merge; it must also contain everything it is
-    /// handed, and never shrink the box it is given.
+    /// `ObjectBoundingBox.enclosing` must contain everything it's given and never shrink the box.
     func testEnclosingContainsEveryRetainedPointAndNeverShrinks() {
         let dimensions = SIMD3<Float>(0.30, 0.20, 0.12)
         let previous = CapturedObject(
@@ -151,7 +143,7 @@ final class ThinFeatureExtentTests: XCTestCase {
             sampleCount: 0
         )
         let retained: [SIMD3<Float>] = [
-            SIMD3(0.18, 0.06, 0),      // 30 mm past the +x wall: a real thin feature
+            SIMD3(0.18, 0.06, 0),      // 30 mm past the +x wall
             SIMD3(0, 0.06, 0.05),
             SIMD3(-0.05, 0.02, -0.05)
         ]

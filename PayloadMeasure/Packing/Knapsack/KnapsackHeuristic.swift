@@ -1,18 +1,15 @@
 import Foundation
 import simd
 
-// The packing search itself, in the order it runs:
+// The packing search (Baldi et al.), in the order it runs:
 //
-//   1. sorting        — six ways of ordering the packages before they are placed
-//   2. construction   — drop packages one at a time onto extreme points, best fit first
-//   3. balancing      — slide packages around to pull the cargo centre of mass into its domain
-//   4. search loop    — reorder, repack, keep the best fully verified result until time runs out
+//   1. sorting       six ways of ordering the packages
+//   2. construction  place packages one by one on extreme points, best fit first
+//   3. balancing     move packages to bring the centre of mass into its domain
+//   4. search loop   reorder and repack, keeping the best verified result until time runs out
 //
-// In:  a BaldiProblem plus BaldiSearchOptions (time limit, scoring constants, packing mode).
-// Out: BaldiSearchResult, whose `solution` is the best packing that passed every feasibility
-//      rule. It may be empty; that means none was found in the time given, not that none exists.
-//
-// Nothing here is random beyond a fixed seed, so the same input always gives the same packing.
+// The returned solution may be empty, which means nothing was found in time, not that nothing
+// exists. Randomness uses a fixed seed, so results are reproducible.
 
 // MARK: - Sorting
 
@@ -30,8 +27,7 @@ nonisolated enum BaldiAttribute: Sendable {
     }
 }
 
-/// Each criterion buckets packages by one attribute, then orders within a bucket by another.
-/// Both run high to low.
+/// Buckets packages by one attribute, then sorts within each bucket by another. Both descending.
 nonisolated enum BaldiSortingCriterion: String, Sendable, CaseIterable {
     case areaSpecificWeight = "a-sw"
     case areaProfit = "a-p"
@@ -58,7 +54,7 @@ nonisolated enum BaldiSortingCriterion: String, Sendable, CaseIterable {
 }
 
 nonisolated enum BaldiSorting {
-    /// Bucket width as a percentage of the attribute range, so 20 gives five buckets.
+    /// Bucket width as a percentage of the attribute range (20 gives five buckets).
     static let defaultTheta: Double = 20
 
     static func clusterIndex(
@@ -86,7 +82,7 @@ nonisolated enum BaldiSorting {
         let clustered = criterion.clusteredAttribute
         let sorted = criterion.sortedAttribute
 
-        // Area buckets span the whole container floor; the other attributes span the package range.
+        // Area buckets span the container floor; the others span the package range.
         let minimum: Double
         let maximum: Double
         if clustered == .area {
@@ -129,8 +125,7 @@ nonisolated struct BaldiExtremePoint: Sendable, Hashable {
     var residualSpace: SIMD3<Double>
 }
 
-/// A packing being built up. `canPlace` is the only gate: a package has to be inside the container,
-/// clear of everything else and fully supported before it is allowed in.
+/// A packing under construction. `canPlace` checks containment, overlap and full support.
 nonisolated struct BaldiPacking: Sendable {
     let knapsack: BaldiKnapsack
     let extent: SIMD3<Double>
@@ -159,7 +154,7 @@ nonisolated struct BaldiPacking: Sendable {
         return BaldiVerticalSupport.report(for: placement, among: placements).isFullySupported
     }
 
-    /// Rechecked here so a caller that forgets `canPlace` cannot break the invariant.
+    /// Checks again in case a caller skipped `canPlace`.
     @discardableResult
     mutating func place(item: BaldiItem, rotation: BaldiRotation, at point: BaldiExtremePoint) -> Bool {
         guard canPlace(item: item, rotation: rotation, at: point) else { return false }
@@ -212,8 +207,8 @@ nonisolated struct BaldiPacking: Sendable {
         return true
     }
 
-    /// Each of the three far corners of the new package, slid back along the two axes it does not
-    /// extend along, gives a new corner to try later.
+    /// Projects the three far corners of the new package back along the other two axes to create new
+    /// extreme points.
     private mutating func appendGeneratedPoints(for placement: BaldiPlacement) {
         let origin = placement.origin
         let maximum = placement.maximum
@@ -302,8 +297,8 @@ nonisolated struct BaldiPacking: Sendable {
     }
 }
 
-/// Walks the ordered packages and puts each one on the corner and rotation that leaves the least
-/// slack around it. Anything that fits nowhere is discarded.
+/// Places each package at the extreme point and rotation with the least slack around it. Packages
+/// that fit nowhere are dropped.
 nonisolated enum BaldiConstruction {
     static func pack(order: [BaldiItem], knapsack: BaldiKnapsack) -> BaldiSolution {
         var packing = BaldiPacking(knapsack: knapsack)
@@ -349,20 +344,16 @@ nonisolated enum BaldiConstruction {
 
 // MARK: - Balancing
 
-/// Baldi §5.2, eqs. (25)–(29). Moves one package at a time so the cargo centre of mass travels
-/// towards the target, revalidating the whole arrangement each time because moving a low package
-/// can strand the ones above it.
+/// Baldi 5.2, eqs. (25)-(29). Moves one package at a time to shift the centre of mass towards the
+/// target, revalidating the whole packing after each move since moving a low package can leave
+/// those above it unsupported.
 ///
-/// Gravity compaction, the last sentence of §5.2, is deliberately absent and is *not* simply
-/// dropped. It exists to repair the mid-air placements Baldi's model permits. Here every accepted
-/// arrangement already satisfies full bottom-face support, which means each package off the floor
-/// rests on top faces that cover it completely — so no package has anywhere to descend to, and
-/// compaction is provably a no-op. `testGravityCompactionIsVacuousUnderFullSupport` pins that down.
+/// The gravity compaction step from 5.2 is left out: with full bottom-face support enforced,
+/// nothing can drop any further (see `testGravityCompactionIsVacuousUnderFullSupport`).
 nonisolated enum BaldiBalancer {
     nonisolated struct Options: Sendable, Equatable {
         var mode: BaldiPackingMode = .paper
-        /// §5.2 names "a maximum number of iterations has been reached" as a stopping condition but
-        /// never values it. 50 is an implementation parameter.
+        /// The paper doesn't give a value; 50 is our choice.
         var maximumIterations = 50
 
         init() {}
@@ -379,9 +370,8 @@ nonisolated enum BaldiBalancer {
               isSpatiallyValid(placements, in: knapsack) else { return placements }
         var current = placements
         let target = knapsack.idealCentreOfMass
-        // §5.2's move is taken as printed, without an improvement test, so a run of them can drift.
-        // Keeping the best arrangement seen means the procedure never hands back something worse
-        // than it was given; balanced always beats unbalanced, then closeness to target.
+        // The move has no improvement check, so keep the best arrangement seen (balanced first, then
+        // closest to target).
         var best = placements
         var bestIsBalanced = knapsack.containsCentreOfMass(centreOfMass(of: placements))
         var bestQuality = simd_distance_squared(centreOfMass(of: placements), target)
@@ -402,8 +392,7 @@ nonisolated enum BaldiBalancer {
                knapsack.containsCentreOfMass(centreOfMass(of: current)) { break }
             var movedAnything = false
 
-            // §5.2 says only "it moves one item after another". Paper mode therefore takes them in
-            // packing order — neutral and deterministic. Heaviest-first is a centred-mode choice.
+            // Paper mode keeps packing order; centred mode moves the heaviest packages first.
             let order: [Int] = options.mode == .centred
                 ? current.indices.sorted { current[$0].mass > current[$1].mass }
                 : Array(current.indices)
@@ -419,7 +408,7 @@ nonisolated enum BaldiBalancer {
                 guard item.mass.isFinite, item.mass > 0,
                       totalMass.isFinite, totalMass > 0 else { continue }
 
-                // Where this package alone would have to go to land the centre of mass on target.
+                // Where this package would need to be to put the centre of mass on target.
                 let desiredItemCentre = item.centreOfMass + (target - centre) * totalMass / item.mass
                 let desiredOrigin = desiredItemCentre - item.extent / 2
 
@@ -432,8 +421,8 @@ nonisolated enum BaldiBalancer {
 
                 let clamped = simd_clamp(desiredOrigin, domain.lower, domain.upper)
 
-                // The move §5.2 actually prescribes: r′ᵢ if it lies in Dᵢ, otherwise the point that
-                // best approximates it on each axis. Taken whenever full support permits it.
+                // The move from 5.2: the target point if it lies in the package's domain, otherwise the closest
+                // point on each axis. Used whenever it keeps full support.
                 if let relocated = prescribedMove(
                     of: index,
                     to: clamped,
@@ -447,8 +436,8 @@ nonisolated enum BaldiBalancer {
                     continue
                 }
 
-                // Only reached when the prescribed point is unsupported, which is a consequence of
-                // adding Junqueira's rule. Fall back to the nearest arrangement that improves.
+                // The paper's move was unsupported (only possible because we add the support rule), so try the
+                // nearest arrangement that improves.
                 let candidates: [SIMD3<Double>]
                 switch options.mode {
                 case .paper:
@@ -477,8 +466,7 @@ nonisolated enum BaldiBalancer {
         return best
     }
 
-    /// Applies §5.2's own relocation. No improvement test — eq. (28) already aims the centre of mass
-    /// at the target — but the whole packing has to stay valid, and a balanced packing has to stay
+    /// Applies the 5.2 relocation. The packing must stay valid, and a balanced packing must stay
     /// balanced.
     private static func prescribedMove(
         of index: Int,
@@ -516,7 +504,7 @@ nonisolated enum BaldiBalancer {
         var upper: SIMD3<Double>
     }
 
-    /// Bounded by whatever the package would run into on each axis from where it currently sits.
+    /// Limited by whatever the package would run into on each axis.
     private static func localCandidateDomain(
         for index: Int,
         in placements: [BaldiPlacement],
@@ -550,8 +538,8 @@ nonisolated enum BaldiBalancer {
         return CandidateDomain(lower: lower, upper: upper)
     }
 
-    /// The whole container. Neighbours are not folded in because centred mode picks a new resting
-    /// place rather than a path to slide along; the result is validated afterwards either way.
+    /// The whole container. Centred mode picks a new spot rather than sliding, and the result is
+    /// validated afterwards.
     private static func containerDomain(
         for item: BaldiPlacement,
         knapsack: BaldiKnapsack
@@ -564,8 +552,8 @@ nonisolated enum BaldiBalancer {
         return CandidateDomain(lower: .zero, upper: upper)
     }
 
-    /// Desired point first, then the same point at each available support height, then one-axis
-    /// moves, then a capped grid of coordinates taken from the faces of the other packages.
+    /// Target point first, then the same point at each support height, then one-axis moves, then a
+    /// capped grid from the faces of other packages.
     private static func centredCandidateOrigins(
         for index: Int,
         desired: SIMD3<Double>,
@@ -632,10 +620,8 @@ nonisolated enum BaldiBalancer {
         return result
     }
 
-    /// Reached only when the support rule rejects §5.2's own destination, which cannot happen in
-    /// Baldi because Baldi has no support rule. Kept deliberately minimal: the same point at each
-    /// height something could rest on, and nothing else. The larger neighbourhood belongs to the
-    /// centred extension.
+    /// Only used when the support rule rejects the paper's destination. Tries the same point at each
+    /// height something could rest on.
     private static func supportedFallbackOrigins(
         for index: Int,
         desired: SIMD3<Double>,
@@ -781,16 +767,14 @@ nonisolated enum BaldiBalancer {
 
 nonisolated struct BaldiSearchOptions: Sendable, Equatable {
     var timeLimitSeconds: Double = 5
-    /// How hard a score is pushed down when a loaded package looks like a poor use of space, and up
-    /// when an unloaded one looks promising. Both adapt as the search runs.
-    /// Baldi §5.3.2 α and §5.3.4's initial value. Also the penalty in eq. (24): the paper reuses the
-    /// symbol for both and §5.2 points at §5.3 for its value.
+    /// Baldi 5.3.2 alpha (score decrease) and the penalty in eq. (24), which the paper uses the same
+    /// symbol for.
     var scoreDecrease: Double = 0.1
-    /// Baldi §5.3.2 β.
+    /// Baldi 5.3.2 beta.
     var scoreIncrease: Double = 0.1
-    /// Packages loaded by the opening solution start with this multiple of the base score.
+    /// Packages in the initial solution start with this multiple of the base score.
     var loadedScoreFactor: Double = 3
-    /// Rounds without an improvement before the scores are reset and shuffled.
+    /// Rounds without improvement before scores are reset and shuffled.
     var nonImprovingLimit = 1000
     var reinitialisationPairFraction: Double = 0.05
     var clusterTheta: Double = BaldiSorting.defaultTheta
@@ -822,7 +806,7 @@ nonisolated enum BaldiSearch {
         }
     }
 
-    /// Packs once under each of the six orderings and keeps the best.
+    /// Packs once with each of the six orderings and keeps the best.
     static func constructInitialSolution(
         _ problem: BaldiProblem,
         options: BaldiSearchOptions
@@ -962,7 +946,7 @@ nonisolated enum BaldiSearch {
                 }
             }
 
-            // Last step of the §5 loop, and the position Fig. 6 draws it in: every iteration.
+            // Last step of every iteration, as in Fig. 6 of the paper.
             parameterUpdate(
                 best: searchBest,
                 knapsack: problem.knapsack,
@@ -986,9 +970,8 @@ nonisolated enum BaldiSearch {
         )
     }
 
-    /// "If CS is better than BS" from the §5 step list. Paper mode is eq. (24) and nothing else, so
-    /// an unbalanced packing can be the incumbent — which is what §5.3.3's "if the best solution is
-    /// unfeasible" branch presupposes. Centred adds its own objective; see the extension note.
+    /// "If CS is better than BS" from section 5. Paper mode uses eq. (24) only, so an unbalanced
+    /// packing can be the incumbent. Centred mode adds its own objective.
     static func isBetterForSearch(
         _ candidate: BaldiSolution,
         than incumbent: BaldiSolution,
@@ -1004,14 +987,12 @@ nonisolated enum BaldiSearch {
         let candidateMerit = candidate.merit(alpha: alpha)
         let incumbentMerit = incumbent.merit(alpha: alpha)
         guard candidateMerit.isFinite, incumbentMerit.isFinite else { return candidateMerit.isFinite }
-        // Strictly greater, with a floor so a tie cannot flip on floating-point noise.
+        // Small epsilon so ties don't flip on floating-point noise.
         return candidateMerit > incumbentMerit + 1e-12
     }
 
-    /// Application-level safety wrapper, not part of Baldi. BS above may be infeasible, but the
-    /// screen must never be shown a packing that is not balanced and fully supported, so the
-    /// feasible incumbent is tracked separately and is what gets returned. It never influences
-    /// which packings the search builds or keeps.
+    /// Not part of Baldi: tracks the best balanced, fully supported packing separately, since that's
+    /// what gets shown. It doesn't influence the search.
     static func isBetterFeasible(
         _ candidate: BaldiSolution,
         than incumbent: BaldiSolution,
@@ -1054,8 +1035,8 @@ nonisolated enum BaldiSearch {
         return items.map { loaded.contains($0.id) ? options.loadedScoreFactor * $0.profit : $0.profit }
     }
 
-    /// Demotes the loaded package making the poorest use of its volume, promotes the most promising
-    /// unloaded one, then swaps the two so they trade places in the next ordering.
+    /// Demotes the loaded package with the worst use of volume, promotes the most promising unloaded
+    /// one, and swaps them in the next ordering.
     private static func scoreUpdate(
         scores: inout [Double],
         items: [BaldiItem],
@@ -1110,14 +1091,9 @@ nonisolated enum BaldiSearch {
         }
     }
 
-    /// §5.3.3, third paragraph, verbatim: "If the best solution found so far is unfeasible, α = 2α
-    /// and β = 2β. If the best solution is feasible, α = α/2 and β = β/2, if the center of mass lies
-    /// into the central half of its feasibility domain, while they are unchanged otherwise." Both
-    /// parameters do move together — that is the paper's rule, not an assumption made here.
-    ///
-    /// The clamp is an implementation detail: §5.3.2 requires α, β ∈ (0,1), and unbounded doubling
-    /// from 0.1 leaves that interval on the fourth infeasible round, at which point (1 − α)·s would
-    /// turn a score negative.
+    /// Baldi 5.3.3: if the best solution is infeasible, double alpha and beta; if it is feasible and
+    /// the centre of mass is in the central half of its domain, halve them; otherwise leave them.
+    /// Clamped to (0, 1) as 5.3.2 requires, otherwise a score could go negative.
     private static func parameterUpdate(
         best: BaldiSolution,
         knapsack: BaldiKnapsack,
@@ -1146,7 +1122,6 @@ nonisolated enum BaldiSearch {
         }
     }
 
-    /// Exposed so the tests can pin §5.3.3's rule directly.
     static func parameterUpdateForTesting(
         best: BaldiSolution,
         knapsack: BaldiKnapsack,

@@ -6,10 +6,9 @@ import RealityKit
 import SwiftUI
 import UIKit
 
-// An independent camera utility for recording exactly one ARFrame in three aligned forms: RGB,
-// registered LiDAR depth points, and the two combined. It borrows the app's one shared RealityKit renderer only
-// while this full-screen tool is visible and asks measurement to start a fresh AR world afterwards.
-// It does not read or mutate study, measurement, package, or packing state.
+// Standalone tool that captures a single ARFrame as RGB, LiDAR depth points, and both combined,
+// and exports them as PDFs. It borrows the shared ARView while open and asks for a fresh AR
+// world afterwards. It doesn't touch study, measurement or packing state.
 
 // MARK: - Screen
 
@@ -270,7 +269,7 @@ final class LiDARCaptureController {
         exportMessage = nil
         let orientation = interfaceOrientation
 
-        // Yield once so the shutter becomes a progress indicator before image and PDF rendering begins.
+        // Yield once so the shutter turns into a spinner before rendering starts.
         Task { @MainActor [weak self, frame] in
             await Task.yield()
             guard let self else { return }
@@ -403,8 +402,7 @@ private struct LiDARCombinedCameraView: UIViewRepresentable {
             let arView = sharedViewHost.view
             self.arView = arView
             priorDebugOptions = arView.debugOptions
-            // This utility draws only the current depth points. Clear any debug geometry left by a
-            // previous renderer owner, then restore the exact prior options when closing.
+            // Hide any debug geometry from the previous owner; the original options are restored on close.
             arView.debugOptions.remove(.showSceneUnderstanding)
             arView.debugOptions.remove(.showAnchorGeometry)
 
@@ -456,7 +454,7 @@ private struct LiDARCombinedCameraView: UIViewRepresentable {
             guard let lease else { return }
             self.lease = nil
             sharedViewHost.release(lease)
-            // The utility's AR world is intentionally disposable. A later measurement must not inherit it.
+            // Don't let the next measurement reuse this world.
             sharedViewHost.requestNewMeasurementWorld()
         }
 
@@ -499,8 +497,7 @@ nonisolated enum LiDARDepthPalette {
     @MainActor
     static func color(for bucket: Int, alpha: CGFloat) -> UIColor {
         let normalized = CGFloat(bucket) / CGFloat(bucketCount - 1)
-        // Depths through 15 cm stay violet, 15–60 cm traverse the visible spectrum, and every
-        // depth at or beyond 60 cm stays in the final red bucket.
+        // Violet up to 15 cm, spectrum from 15 to 60 cm, red beyond.
         return UIColor(
             hue: 0.78 * (1 - normalized),
             saturation: 0.9,
@@ -513,8 +510,8 @@ nonisolated enum LiDARDepthPalette {
 nonisolated enum LiDARPointScatter {
     static let maximumCellFraction: Float = 0.32
 
-    /// A stable sub-cell offset. The point still represents the depth sample at this row/column;
-    /// only its display position moves slightly so ARKit's raster does not look like graph paper.
+    /// Small fixed jitter so the depth grid doesn't look like graph paper. Only the display position
+    /// changes.
     static func offset(row: Int, column: Int, sampleStride: Int) -> SIMD2<Float> {
         let rowBits = UInt32(truncatingIfNeeded: row)
         let columnBits = UInt32(truncatingIfNeeded: column)

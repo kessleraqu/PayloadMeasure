@@ -1,14 +1,8 @@
 import SwiftUI
 import simd
 
-// The accuracy test screens: set the test up, measure the objects round after round, then type in the
-// real sizes and read the figures.
-//
-// In:  AccuracyStore.
-// Out: on screen only, plus the text reports AccuracyStore writes.
-//
-// Every screen has a way back to the main page, including while measuring — the test is written to
-// disk after each reading, so leaving and coming back loses nothing.
+// Accuracy test screens: setup, measuring, and entering reference sizes to see the results.
+// The test is saved after every reading, so it's safe to leave at any point.
 
 struct AccuracySiteView: View {
     let store: AccuracyStore
@@ -102,8 +96,8 @@ private struct AccuracySetupView: View {
 private struct AccuracyMeasureView: View {
     let store: AccuracyStore
 
-    // Its own session manager and engine keep accuracy data separate from a study. The underlying
-    // RealityKit renderer is shared, because creating a second renderer is unreliable on iOS 26.
+    // Separate session manager and engine so accuracy data stays apart from the study. The ARView
+    // itself is shared.
     @State private var sessionManager = ARSessionManager()
     @State private var aimerState = AimerState()
     @State private var captureEngine = ObjectCaptureEngine()
@@ -339,8 +333,7 @@ private struct AccuracyMeasureView: View {
             )
     }
 
-    /// Finishes the measurement, files the size, then throws the object away again. Keeping it would
-    /// grow the scene and slow every later reading down, and the test only ever needs the numbers.
+    /// Finishes the measurement, stores the size and removes the object so the scene doesn't grow.
     private func saveReading() {
         guard let id = captureEngine.lockActiveObject(),
               let captured = captureEngine.capturedObjectsByID[id] else {
@@ -504,8 +497,7 @@ private struct AccuracyResultsView: View {
     }
 }
 
-/// One object's reference size. Kept as its own view so each set of three fields owns its own text
-/// state and typing in one does not redraw the whole results list.
+/// Separate view so each row owns its text state and typing doesn't redraw the whole list.
 private struct AccuracyReferenceRow: View {
     let store: AccuracyStore
     let objectNumber: Int
@@ -549,7 +541,6 @@ private struct AccuracyReferenceRow: View {
         third = PositiveDecimalText.format(values[2], maximumFractionDigits: 2) ?? ""
     }
 
-    /// Same parser the weight fields use, so a comma works as a decimal mark here too.
     private func commit() {
         let values = [first, second, third].compactMap(PositiveDecimalText.parse)
         guard values.count == 3 else {

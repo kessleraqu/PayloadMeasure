@@ -1,9 +1,8 @@
 import XCTest
 @testable import PayloadMeasure
 
-// The layout under Documents/StudyRuns: one folder per run, named after the run, with the photos in a
-// folder beside the report. Two runs must never share a folder, because the second one would write
-// over the first one's report and photos.
+// Folder layout under Documents/StudyRuns: one folder per run, named after it, with photos next to
+// the report. Two runs must never share a folder.
 
 @MainActor
 final class StudyExportLayoutTests: XCTestCase {
@@ -14,8 +13,7 @@ final class StudyExportLayoutTests: XCTestCase {
         )
     }
 
-    /// The numbering the run folders use: Run, Run(1), Run(2) — and Run2 is a different name, not the
-    /// second Run.
+    /// Run, Run(1), Run(2). Run2 is a different name.
     func testATakenNameGetsTheNextNumberInBrackets() {
         XCTAssertEqual(
             StudyStore.uniqueFolderName(base: "Run", taken: ["Run"]),
@@ -31,8 +29,7 @@ final class StudyExportLayoutTests: XCTestCase {
         )
     }
 
-    /// A folder left behind by a run deleted in the app still counts as taken: the whole point of
-    /// checking the disk rather than the app's own list.
+    /// A leftover folder from a deleted run still counts as taken.
     func testGapsInTheNumberingAreNotFilled() {
         XCTAssertEqual(
             StudyStore.uniqueFolderName(base: "Run", taken: ["Run", "Run(2)"]),
@@ -44,8 +41,7 @@ final class StudyExportLayoutTests: XCTestCase {
         )
     }
 
-    /// Two names differing only in case are one folder on this file system, so they must not both be
-    /// handed out.
+    /// Names differing only in case are the same folder on this file system.
     func testNamesThatDifferOnlyInCaseAreTreatedAsTheSameFolder() {
         XCTAssertEqual(
             StudyStore.uniqueFolderName(base: "run", taken: ["RUN"]),
@@ -56,7 +52,7 @@ final class StudyExportLayoutTests: XCTestCase {
     func testNamesArePathSafeAndNeverEmpty() {
         XCTAssertEqual(StudyStore.uniqueFolderName(base: "P01/02", taken: []), "P01-02")
         XCTAssertEqual(StudyStore.uniqueFolderName(base: "  ", taken: []), "Run")
-        // Brackets are what makes a duplicate unique, so a name may not bring its own.
+        // Brackets are reserved for duplicate numbering.
         XCTAssertEqual(StudyStore.uniqueFolderName(base: "P01(1)", taken: []), "P01-1")
     }
 
@@ -87,7 +83,7 @@ final class StudyExportLayoutTests: XCTestCase {
         )
     }
 
-    /// Runs recorded before the per-run folders keep reading from the folder named after their id.
+    /// Older runs without a folder name still resolve to their id folder.
     func testRunsWithoutAFolderNameStillResolveToTheirIdFolder() {
         let id = UUID()
         let run = StudyRun(

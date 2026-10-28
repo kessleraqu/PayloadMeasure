@@ -1,11 +1,7 @@
 import SwiftUI
 
-// To-scale drawing of a Balance arrangement: a plan looking down on the module floor and an
-// elevation from the side, both on the same horizontal scale so a package lines up with its own
-// footprint.
-//
-// In:  a PackingSolution and a colour per package.
-// Out: on screen only.
+// To-scale drawing of a Balance arrangement: a plan view and a side elevation sharing the same
+// horizontal scale.
 
 struct PackingPlanView: View {
     let solution: PackingSolution

@@ -1,8 +1,8 @@
 import SwiftUI
 import simd
 
-// Camera-free counterpart to the AR measurement screen. It creates finalized measurements in the
-// shared capture engine, then hands the same engine to package preparation and both optimizers.
+// Manual counterpart to the AR measurement screen. Creates finished measurements in the same
+// capture engine, so preparation and packing work the same way.
 
 struct ManualMeasurementView: View {
     let captureEngine: ObjectCaptureEngine
@@ -44,10 +44,7 @@ struct ManualMeasurementView: View {
             .safeAreaInset(edge: .bottom) { preparationButton }
         }
         .onAppear(perform: configurePackingStore)
-        // The form is a sheet rather than a card on the page. As a card it sat between the header
-        // and the list looking like part of the page, and operators asked where they were supposed
-        // to put the object's details while looking straight at it. A "+" that opens a form on top
-        // of everything else cannot be mistaken for anything other than what it is.
+        // A sheet makes it obvious where to enter the object's details.
         .sheet(isPresented: $showsObjectEntry) {
             ManualObjectEntrySheet(
                 nameText: $nameText,
@@ -132,7 +129,7 @@ struct ManualMeasurementView: View {
                     Label("Reset this payload", systemImage: "arrow.counterclockwise")
                 }
                 Button(role: .destructive) {
-                    // Nothing to protect in a test run: no participant, no record, no password.
+                    // Test runs don't need the password.
                     if study.isTestMode {
                         onRunCancelled()
                     } else {
@@ -150,8 +147,7 @@ struct ManualMeasurementView: View {
             .accessibilityLabel("Manual measurement options")
         }
 
-        // The same action as the card below, kept where it is reachable once the list is long
-        // enough to have scrolled the card away.
+        // Same as the add button, but still reachable when the list has scrolled.
         ToolbarItem(placement: .topBarTrailing) {
             Button(action: beginAddingObject) {
                 Image(systemName: "plus")
@@ -181,8 +177,6 @@ struct ManualMeasurementView: View {
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 
-    /// The one obvious thing to press. Deliberately large, deliberately alone, and deliberately not
-    /// styled like the "Start packing" bar at the foot of the screen.
     private var addObjectButton: some View {
         Button(action: beginAddingObject) {
             HStack(spacing: 12) {
@@ -354,15 +348,14 @@ struct ManualMeasurementView: View {
         study.beginPhase(.measure)
     }
 
-    /// Opens the entry form for a new object. Any half-typed draft from a cancelled edit is cleared
-    /// first, so the form is never opened showing someone else's object.
+    /// Opens the entry form with any leftover draft cleared.
     private func beginAddingObject() {
         clearDraft()
         showsObjectEntry = true
     }
 
-    /// True when the object was saved and the form can close. False leaves the form up with
-    /// `validationMessage` explaining why — closing on a refusal would throw away what was typed.
+    /// Returns false and sets `validationMessage` if the object couldn't be saved, keeping the form
+    /// open so nothing typed is lost.
     @discardableResult
     private func saveDraft() -> Bool {
         validationMessage = nil
@@ -453,10 +446,8 @@ struct ManualMeasurementView: View {
     }
 }
 
-/// The name and size of one object, asked for on top of everything else.
-///
-/// It owns its own focus rather than borrowing the presenting screen's: focus does not reliably
-/// cross a sheet boundary, and a field that cannot be focused is a field that cannot be typed into.
+/// Name and size entry for one object. Manages its own focus because focus doesn't reliably
+/// cross a sheet boundary.
 private struct ManualObjectEntrySheet: View {
     private enum Field: Hashable {
         case name
@@ -527,7 +518,7 @@ private struct ManualObjectEntrySheet: View {
                 }
                 if focusedField != nil {
                     ToolbarItemGroup(placement: .keyboard) {
-                        // The dimensions use a decimal pad, which has no return key of its own.
+                        // Decimal pads have no return key.
                         Spacer()
                         Button("Done") { focusedField = nil }
                     }

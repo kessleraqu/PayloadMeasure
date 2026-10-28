@@ -1,11 +1,8 @@
 import SwiftUI
 import simd
 
-// Everything the arrangement depends on that is not measured: module size, clearances, the balance
-// target and domain, and the solver time limits. Defaults describe the 600 x 200 x 100 mm module.
-//
-// In:  PackingStore.
-// Out: on screen only; edits write straight back to the store and invalidate the current result.
+// Non-measured inputs for the arrangement: module size, clearances, balance target and solver
+// time limits. Defaults are for the 600 x 200 x 100 mm module. Edits invalidate the current result.
 
 struct ArrangementSettingsView: View {
     @Bindable var store: PackingStore
@@ -269,8 +266,7 @@ struct ArrangementSettingsView: View {
 
     // MARK: - Fields
 
-    /// Typed straight in, whole millimetres, 1 to 999. No stepper: reaching a module dimension one
-    /// tap at a time is not usable.
+    /// Whole millimetres, 1 to 999, typed directly.
     private func moduleMeasurement(_ title: String, value: Binding<Double>) -> some View {
         LabeledContent(title) {
             HStack(spacing: 6) {

@@ -1,10 +1,8 @@
 import XCTest
 @testable import PayloadMeasure
 
-// Pressing Measure and having the button come back is the whole reported failure, and the part of it
-// that is the app's fault twice over: once for not starting, and once for not saying so. Every path
-// that ends a pending selection without a measurement has to leave a reason behind, and every path that
-// answers one has to take the reason away again.
+// Every path that ends a selection without starting a measurement must leave a reason for the
+// operator, and every path that answers one must clear it.
 
 @MainActor
 final class SelectionFailureNoticeTests: XCTestCase {
@@ -35,8 +33,7 @@ final class SelectionFailureNoticeTests: XCTestCase {
             XCTAssertNotNil(
                 engine.lastSelectionFailure,
                 """
-                \(ending.name): the operator watched the Measure button disappear and reappear. \
-                Handing it back without a reason is the failure they reported as the app doing nothing.
+                \(ending.name) gave the Measure button back without a reason.
                 """
             )
             XCTAssertNil(engine.activeObjectID)
@@ -53,7 +50,7 @@ final class SelectionFailureNoticeTests: XCTestCase {
         XCTAssertTrue(engine.isObjectSelectionPending)
         XCTAssertNil(
             engine.lastSelectionFailure,
-            "The last press has been answered by this one; the banner must not still be arguing about it."
+            "A new press should clear the previous failure notice."
         )
     }
 
@@ -80,8 +77,7 @@ final class SelectionFailureNoticeTests: XCTestCase {
         let reason = engine.lastSelectionFailure
         XCTAssertNotNil(reason)
 
-        // The notice retires itself on this tick, but only once it is old. Retiring on the very next
-        // segmentation would put it back to being invisible, which is the bug.
+        // The notice clears itself here, but only once it's old enough to have been read.
         for _ in 0 ..< 12 {
             engine.updateObjectMaskTracking(visibleCount: 0, markers: [])
         }

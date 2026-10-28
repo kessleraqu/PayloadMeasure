@@ -1,8 +1,7 @@
 import XCTest
 @testable import PayloadMeasure
 
-// The first seconds after an object is selected: when the app gives up on a measurement that never
-// started, and when the operator is allowed to give up on one by hand.
+// When the app abandons a measurement that never starts, and when manual cancel becomes available.
 
 final class MeasurementStartRuleTests: XCTestCase {
     func testTheThresholdsAreThreeAndFourSeconds() {
@@ -30,7 +29,7 @@ final class MeasurementStartRuleTests: XCTestCase {
         )
     }
 
-    /// Once there is a measurement, however rough, the scan is under way and the stopping rule owns it.
+    /// Once there's any measurement, the stopping rule takes over.
     func testAMeasurementThatStartedIsNeverAbandonedByThisRule() {
         XCTAssertFalse(
             MeasurementStartRule.abandonsMeasurement(
@@ -47,7 +46,7 @@ final class MeasurementStartRuleTests: XCTestCase {
         XCTAssertTrue(MeasurementStartRule.allowsCancel(secondsActive: 12))
     }
 
-    /// The button says how long is left, and it never says "0 s" while still refusing to work.
+    /// The countdown never shows "0 s" while Cancel is still unavailable.
     func testTheCountdownCountsWholeSecondsAndDisappearsWhenCancelIsAllowed() {
         XCTAssertEqual(MeasurementStartRule.cancelCountdown(secondsActive: 0), 4)
         XCTAssertEqual(MeasurementStartRule.cancelCountdown(secondsActive: 1.2), 3)
@@ -55,8 +54,7 @@ final class MeasurementStartRuleTests: XCTestCase {
         XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: 4))
     }
 
-    /// A clock that has gone backwards, or a value that is not a number at all, must not reach an Int
-    /// conversion: that traps, and trapping in the middle of a measurement is a crash.
+    /// Negative or NaN elapsed times must not reach the Int conversion.
     func testAbsurdElapsedTimesAreSurvivedRatherThanConverted() {
         XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: .nan))
         XCTAssertNil(MeasurementStartRule.cancelCountdown(secondsActive: .infinity))

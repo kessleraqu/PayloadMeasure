@@ -2,11 +2,9 @@ import Foundation
 import Observation
 import simd
 
-// Shape of the centre aimer, driven by whatever surface the camera is pointing at.
-//
-// In:  updateAimerSurface, called each frame by the AR coordinator with the raycast result.
-// Out: observable values the overlay reads to squash, rotate and scale the aimer ring so it lies
-//      flat on the surface. Small changes are ignored so the ring does not jitter.
+// Shape of the centre aimer. The AR coordinator feeds it the raycast result each frame and the
+// overlay uses it to tilt and scale the ring to lie on the surface. Small changes are ignored to
+// avoid jitter.
 
 @MainActor
 @Observable

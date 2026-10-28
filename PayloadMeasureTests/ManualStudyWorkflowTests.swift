@@ -142,9 +142,7 @@ final class ManualStudyWorkflowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(packages.first?.massKilograms), 0.25, accuracy: 1e-12)
     }
 
-    /// The manual screen names an object as it is entered, with the object in hand — the same moment the
-    /// AR screen asks. The size-only entry point is still there for the sizes-first path, and a name given
-    /// later survives a size correction.
+    /// Objects are named on entry. A name given later must survive a size correction.
     func testAManualObjectKeepsItsNameThroughASizeCorrection() throws {
         let engine = ObjectCaptureEngine()
         let id = try XCTUnwrap(
@@ -198,7 +196,7 @@ final class ManualStudyWorkflowTests: XCTestCase {
         XCTAssertTrue(report.contains("Input tools : Manual measurement"))
         XCTAssertTrue(report.contains("Input     : Manual measurement"))
         XCTAssertFalse(report.contains("Input     : AR measurement"))
-        // The condition is part of the run's name, so it is part of its folder and its report.
+        // The condition is part of the run name, folder and report.
         XCTAssertEqual(run.exportBaseName, "report no AR")
         XCTAssertTrue(run.reportFileName.hasPrefix("report no AR"))
         XCTAssertTrue(run.reportFileName.hasSuffix(".txt"))

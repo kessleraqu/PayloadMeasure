@@ -1,12 +1,9 @@
 import SwiftUI
 import UIKit
 
-// Step-by-step screen the operator works through before loading. The system assigns the smallest
-// fitting box to every object; the operator is told which one to use, weighs the sealed package,
-// and moves on. Neutral handoff screens separate measuring, packing and loading inside the sheet.
-//
-// In:  PackingStore and the capture engine.
-// Out: on screen only. Writes names, packed weights, own-box marks and exclusions into the store.
+// Step-by-step preparation before loading. Each object gets the smallest box it fits in; the
+// operator packs it, weighs the sealed package and moves on. Handoff screens separate measuring,
+// packing and loading.
 
 struct PreparationView: View {
     let captureEngine: ObjectCaptureEngine
@@ -86,12 +83,8 @@ private struct PackingPreparationView: View {
     private struct Draft {
         var nameText: String
         var packedWeightText: String
-        /// Whether this object had no saved name when its draft was first created. Decided once and
-        /// never recomputed from the live text: the name field's own visibility used to be driven by
-        /// whether `nameText` was empty, so typing the very first letter made the field non-empty and
-        /// therefore made SwiftUI remove it from the view tree mid-keystroke — which is what "only
-        /// allows one letter, then locks" actually was. The field stays up for as long as this object
-        /// has gone without a saved name, however much has been typed into it.
+        /// Whether the object had no name when the draft was created. Fixed at creation: deriving it from
+        /// the live text would remove the name field after the first keystroke.
         let arrivedWithoutName: Bool
     }
 
@@ -104,8 +97,7 @@ private struct PackingPreparationView: View {
     @State private var currentIndex = 0
     @State private var drafts: [UUID: Draft] = [:]
     @State private var validationMessage: String?
-    /// Which fields Next refused. A message at the bottom of the screen is easy to miss; the field
-    /// that is actually empty is not.
+    /// Fields Next rejected, highlighted in place.
     @State private var invalidFields: Set<FocusedField> = []
 
     private var objectIDs: [UUID] {
@@ -131,11 +123,7 @@ private struct PackingPreparationView: View {
             .background(Color(.systemGroupedBackground))
             .navigationTitle("Prepare packages")
             .navigationBarTitleDisplayMode(.inline)
-            // Both are in the navigation bar rather than at the foot of the screen, because the
-            // foot of the screen is where the keyboard is: with a weight being typed on every
-            // object, a bottom bar spends most of this screen either covered or squeezed against
-            // the keyboard's own row. Up here they are in the same place whatever the keyboard is
-            // doing, and neither can be reached by a stray thumb near the keys.
+            // Buttons go in the navigation bar so the keyboard never covers them.
             .toolbar {
                 if isReady, let currentObjectID {
                     ToolbarItem(placement: .topBarLeading) {
@@ -169,8 +157,7 @@ private struct PackingPreparationView: View {
 
                 if focusedField != nil {
                     ToolbarItemGroup(placement: .keyboard) {
-                        // The weight field is a decimal pad with no return key, so closing the
-                        // keyboard needs a button of its own.
+                        // Decimal pads have no return key.
                         Spacer()
                         Button("Done") { focusedField = nil }
                             .accessibilityHint("Closes the keyboard.")
@@ -185,9 +172,7 @@ private struct PackingPreparationView: View {
         let canPrepare = store.isItsOwnBox(objectID, in: captureEngine)
             || !store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty
 
-        // Sized to fit an iPhone 13 without scrolling: the photo is a thumbnail beside the name
-        // rather than a banner above it, and every card carries one line of guidance at most. The
-        // ScrollView stays only so accessibility text sizes still reach the bottom.
+        // Fits an iPhone 13 without scrolling. The ScrollView is only there for large text sizes.
         return ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 progressHeader
@@ -197,8 +182,7 @@ private struct PackingPreparationView: View {
                     skippedCard(for: objectID)
                 } else if canPrepare {
                     boxCard(for: objectID)
-                    // The weight is the only thing to type here now — the name is given while measuring,
-                    // where the object is in the operator's hands.
+                    // The name is given while measuring, so only the weight is entered here.
                     detailsCard(for: objectID)
                     ownBoxCard(for: objectID)
                 } else {
@@ -326,9 +310,6 @@ private struct PackingPreparationView: View {
                     }
                 }
             }
-            // The "already a box" switch used to live here, under the assigned box size. Next to an
-            // instruction to put the object in a box, a tick box about boxes reads as "done that" —
-            // which is not what it means at all. It is now its own card at the bottom.
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -342,8 +323,7 @@ private struct PackingPreparationView: View {
         }
     }
 
-    /// The weight, and — only if the object somehow arrived without one — its name. Naming happens while
-    /// measuring, with the object in hand; asking again here would be asking twice.
+    /// Weight, plus the name if the object somehow arrived without one.
     private func detailsCard(for objectID: UUID) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Weigh the finished package", systemImage: "scalemass")
@@ -409,18 +389,13 @@ private struct PackingPreparationView: View {
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
     }
 
-    /// True only when something has gone wrong upstream: both measuring paths name an object as it is
-    /// entered. Kept as a way out rather than a dead end.
-    ///
-    /// Reads the flag captured once in the draft, not the live `nameText` — the field this decides the
-    /// visibility of is the very field that edits `nameText`, so testing the live value hid the field
-    /// after its first keystroke.
+    /// Only true if something went wrong upstream, since both measuring paths ask for a name. Uses
+    /// the flag stored in the draft, not the live text (see `arrivedWithoutName`).
     private func needsName(for objectID: UUID) -> Bool {
         drafts[objectID]?.arrivedWithoutName ?? isUnnamed(captureEngine.name(for: objectID))
     }
 
-    /// An object the operator set aside while measuring. It needs no box, no name and no weight; it is
-    /// recorded as skipped and left out of the loading plan.
+    /// An object skipped while measuring. Recorded as skipped and left out of the plan.
     private func skippedCard(for objectID: UUID) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("Skipped", systemImage: "arrow.uturn.forward")
@@ -484,7 +459,6 @@ private struct PackingPreparationView: View {
         invalidFields.contains(field) ? .red : .clear
     }
 
-    /// Deliberately last, quiet, and phrased as a question about the object rather than as a task.
     private func ownBoxCard(for objectID: UUID) -> some View {
         let isOwnBox = store.isItsOwnBox(objectID, in: captureEngine)
 
@@ -535,12 +509,7 @@ private struct PackingPreparationView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // The skip is spelled out and given its own button rather than left to a "Continue" that
-            // says nothing about what it does. Skipping is the honest outcome for an over-measured
-            // object: it is not boxed, and it is not loaded — which is exactly why this button is
-            // small, quiet and last. It used to be the big orange one at the top of the card, and a
-            // card about a problem with a prominent button on it reads as "press this to fix it".
-            // The one thing it must not become is an easy accident.
+            // Kept small and at the bottom so skipping isn't done by accident.
             Button {
                 skip(objectID: objectID)
             } label: {
@@ -575,16 +544,14 @@ private struct PackingPreparationView: View {
             RoundedRectangle(cornerRadius: 18)
                 .stroke(Color.orange.opacity(0.7), lineWidth: 2)
         }
-        // Deliberately `.contain` rather than `.combine`: the card holds the Skip button and the
-        // already-a-box switch, and combining them into one element would put both out of reach.
+        // .contain so the Skip button and the switch stay reachable separately.
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
             "\(displayName(for: objectID)) does not fit any available box."
         )
     }
 
-    /// What the navigation bar's button can fit next to a title. The spelled-out version is still
-    /// what VoiceOver reads.
+    /// Short title for the navigation bar. VoiceOver reads the full one.
     private func compactNextActionTitle(for objectID: UUID) -> String {
         let isLastObject = currentIndex == objectIDs.count - 1
         if !store.isSkipped(objectID, in: captureEngine),
@@ -625,9 +592,7 @@ private struct PackingPreparationView: View {
             : "Next object"
     }
 
-    /// Everything here depends on a finished measurement, so nothing is editable until the objects
-    /// have actually arrived. Showing the fields greyed out invites typing into them; showing this
-    /// instead says plainly that there is nothing to do yet.
+    /// Nothing is editable until the measured objects have arrived.
     private var isReady: Bool {
         !captureEngine.measuredObjectIDs.isEmpty
             && !captureEngine.isObjectSelectionPending
@@ -733,9 +698,7 @@ private struct PackingPreparationView: View {
         (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Leaves an object out for good: it is marked as fitting no box, so it is neither boxed nor placed
-    /// in the payload, and it needs no name or weight. For an object that fits nothing, this is what
-    /// Next does too — the button just says so plainly.
+    /// Leaves an object out: no box, no placement, no name or weight needed.
     private func skip(objectID: UUID) {
         focusedField = nil
         validationMessage = nil
@@ -755,15 +718,13 @@ private struct PackingPreparationView: View {
         validationMessage = nil
         invalidFields = []
 
-        // A skipped object has already been dealt with: nothing is asked of it.
         if store.isSkipped(objectID, in: captureEngine) {
             advanceAfterCurrentObject()
             return
         }
 
-        // Only exclude an object that actually needs a box and has none. An object marked "already
-        // a box" needs no outer box, so excluding it here would throw away the name and weight just
-        // typed and leave it permanently incomplete.
+        // Only exclude objects that need a box and don't have one. Objects that are already a box would
+        // otherwise lose the name and weight just entered.
         let needsNoBox = store.isItsOwnBox(objectID, in: captureEngine)
         if !needsNoBox, store.fittingBoxPresets(for: objectID, in: captureEngine).isEmpty {
             guard store.markExcludedBecauseNoStockedBoxFits(
@@ -777,8 +738,7 @@ private struct PackingPreparationView: View {
             return
         }
 
-        // Both fields are checked before returning, so an operator who left both blank is told about
-        // both at once rather than being sent back a second time for the other one.
+        // Check both fields so the operator sees everything that's missing at once.
         let name = drafts[objectID]?.nameText
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let weightText = drafts[objectID]?.packedWeightText ?? ""
@@ -824,15 +784,14 @@ private struct PackingPreparationView: View {
         if currentIndex < objectIDs.count - 1 {
             currentIndex += 1
         } else {
-            // Assign first: the box list may have changed since an object was last looked at.
+            // The box list may have changed, so assign first.
             store.assignBoxesAutomatically(in: captureEngine)
             let missing = store.packagesMissingPreparation(from: captureEngine)
             guard let firstMissing = missing.first else {
                 onComplete()
                 return
             }
-            // Name what is actually missing, and go there, rather than blocking with a message the
-            // operator cannot act on.
+            // Jump to the first missing field instead of only showing a message.
             let names = missing
                 .map { captureEngine.name(for: $0) ?? "an unnamed object" }
                 .joined(separator: ", ")

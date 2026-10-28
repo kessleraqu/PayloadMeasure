@@ -4,13 +4,10 @@ import Foundation
 import simd
 import UIKit
 
-// Turns LiDAR depth into a measured box. Pure computation, no ARKit session and no UI.
+// Turns LiDAR depth samples into a measured box. Pure computation, no ARKit session or UI.
 //
-// In:  depth samples admitted by the object mask, plus the support plane beneath the object.
-// Out: a CapturedObject - dimensions, centre, axes and corners - or a reason it could not be fitted.
-//
-// The stages run in order: accumulate points, voxelise, cluster, then fit a box. Full 3D uses a
-// convex-hull fit over every visible surface; Top does the same from a single overhead view.
+// Pipeline: accumulate points, voxelise, cluster, fit a box. Full 3D fits a convex hull over all
+// visible surfaces; Top does the same from a single overhead view.
 
 nonisolated struct CapturedObject: Sendable {
     let dimensions: SIMD3<Float>
@@ -24,10 +21,8 @@ nonisolated struct CapturedObject: Sendable {
     var depthInMeters: Float { dimensions.y }
     var heightInMeters: Float { dimensions.z }
 
-    /// The measured size in millimetres, rounded to the micrometre first. Without that rounding a
-    /// 0.4 m edge arrives as 400.000006 mm and anything that later takes a ceiling gains a whole
-    /// millimetre. Defined here so the packing side and the accuracy test cannot disagree about what
-    /// "the measured size" is.
+    /// Size in millimetres, rounded to the micrometre so float noise (400.000006 mm) doesn't push a
+    /// later ceiling up by a whole millimetre. Packing and the accuracy test both use this.
     var sizeMillimetres: SIMD3<Double> {
         let raw = SIMD3(
             Double(widthInMeters) * 1000,
@@ -139,7 +134,6 @@ nonisolated enum ObjectCapturePipeline {
     private static let supportRadius: Float = 0.24
     static let supportExclusionMargin: Float = 0.025
     private static let supportRingWidth: Float = 0.22
-
 
     static func capture(
         objectPoints: [AccumulatedDepthPoint],
@@ -953,22 +947,12 @@ nonisolated struct PointAccumulator: Sendable {
         stablePoints
     }
 
-    /// The same evidence, expressed in a corrected world frame.
+    /// Re-expresses the accumulated points in a corrected world frame.
     ///
-    /// ARKit refines an anchor's pose for as long as it exists, and Apple's own note on `ARAnchor` is
-    /// that it "might move that anchor when it optimizes its internal map". What that correction says is
-    /// that the *estimate of the room* has changed, not that the object moved in it — so every point
-    /// recorded against the old estimate is still evidence, just expressed in the wrong frame. The
-    /// answer to a change of frame is to transform the data into the new one, which is what this does.
-    ///
-    /// It is exact for the rigid correction ARKit hands over: a rigid map is affine, so the mean of the
-    /// transformed observations is the transform of their mean, and the running means are carried across
-    /// without touching the observation counts that earned them.
-    ///
-    /// Two source voxels can quantise into one after the transform. They are merged rather than dropped —
-    /// sums and counts add, and the first of them to arrive keeps the stable identity — so no observation
-    /// is lost. `stableKeys` is walked in its existing order because `stablePoints` is reservoir-sampled
-    /// with a fixed seed, and that sample is a function of array order; see `remove(_:)`.
+    /// When ARKit refines an anchor the points are still valid, just in the old frame, so they are
+    /// transformed rather than thrown away. The correction is rigid, so the running means carry over
+    /// exactly. Voxels that land in the same cell are merged. `stableKeys` keeps its order because
+    /// the reservoir sample in the box fitter depends on it (see `remove(_:)`).
     func transformed(by matrix: simd_float4x4) -> PointAccumulator {
         var result = PointAccumulator(voxelSize: voxelSize, maxVoxels: maxVoxels)
         result.generation = generation
@@ -1055,24 +1039,11 @@ nonisolated struct PointAccumulator: Sendable {
         return removedCount
     }
 
-    /// Removes a batch of voxels without disturbing the relative order of the stable points that
-    /// survive.
+    /// Removes a batch of voxels while keeping the remaining stable points in their original order.
     ///
-    /// `OrientedBoundingBox.uniformDownsample` reservoir-samples `stablePointsSnapshot()` with a fixed
-    /// seed specifically so that the same accumulated cloud reproduces the same orientation search —
-    /// reservoir sampling's initial fill is a literal prefix of the array, so which points end up in
-    /// that sample is a function of array *order*, not just array *content*. An order that reshuffles
-    /// on every removal — as a swap-remove necessarily does, since it plugs the gap with whatever
-    /// element currently sits last — hands the orientation search an effectively different, arbitrary
-    /// subsample on any frame that removes anything, even when the underlying cloud has barely changed.
-    /// That is indistinguishable from the fit itself being unstable, and removal is no longer a rare
-    /// event now that `ARCameraView.carvePointsOutside` can call it every frame: this is what "the
-    /// bounding box rotates wildly" actually was.
-    ///
-    /// Kept as one O(n) compaction per call rather than a swap-remove per key: removal already happens
-    /// at most once per frame with a batch of keys, so one pass over the array is cheaper than as many
-    /// order-preserving single-element removes as there are keys, and it is the only way to guarantee
-    /// the survivors' relative order is untouched.
+    /// The orientation search reservoir-samples the stable points with a fixed seed, so the result
+    /// depends on array order. A swap-remove reshuffles the array and made the fitted box rotate from
+    /// frame to frame. One compaction pass per batch keeps the order and is O(n).
     private mutating func remove(_ keys: [Key]) {
         for key in keys {
             samples[key] = nil
@@ -1513,19 +1484,15 @@ nonisolated enum ObjectBoundingBox {
     }
 }
 
-// The bounding-box fitter. The two halves are kept apart on purpose:
-//
-//   `bestOrientation`  is Liu, Liu and Zhang's Algorithm 2 with Zhang's closeness criterion, and
-//                      nothing else. It answers only "which way is the box turned", which is all
-//                      the paper claims to answer.
-//   `make`             is this application: it takes that orientation and builds a measured box
-//                      from it — extents from the full cloud, height from the support plane, longer
-//                      horizontal side named width. None of that is from the paper.
+// Bounding-box fitting, in two parts:
+//   bestOrientation  Liu, Liu and Zhang's Algorithm 2 with Zhang's closeness criterion. Only
+//                    finds the box's rotation.
+//   make             Builds the measured box from that rotation: extents from the full cloud,
+//                    height from the support plane, longer horizontal side as width.
 nonisolated enum OrientedBoundingBox {
-    /// N_max in Algorithm 2. See PSEUDOCODE.md §3.2, "Why 100, precisely."
+    /// N_max in Algorithm 2.
     static let maximumOrientationPointCount = 100
-    /// τ. Liu's own recommendation: "produces almost the same results as using accurate
-    /// convex-hull points".
+    /// Collinearity tolerance, the value recommended by Liu et al.
     static let approximateCollinearitySine: Float = 0.01
     private static let geometricEpsilon: Float = 1e-6
 
@@ -1560,7 +1527,6 @@ nonisolated enum OrientedBoundingBox {
             SIMD2<Float>(simd_dot($0, basis.first), simd_dot($0, basis.second))
         }
 
-        // --- Liu Algorithm 2 ends here. Everything below is this application. ---
         guard let direction = bestOrientation(
             of: stablePoints2D,
             minimumEdgeDistance: max(minimumEdgeDistance, geometricEpsilon)
@@ -1568,10 +1534,8 @@ nonisolated enum OrientedBoundingBox {
             return nil
         }
 
-        // Extents come from every point, not the sample Liu works from. Liu states it "omit[s] the
-        // size information" and warns size is what missing points damage most; a downsample discards
-        // disproportionately the extreme points, which are exactly the ones that set the extents.
-        // Application-specific extension; it cannot affect the orientation chosen above.
+        // Extents come from all points, not the downsampled set, since downsampling tends to drop the
+        // extreme points that define the size.
         guard var fit = rectangleFit(points: stablePoints2D, axis: direction) else {
             return nil
         }
@@ -1591,9 +1555,7 @@ nonisolated enum OrientedBoundingBox {
 
         let width = fit.widthMaximum - fit.widthMinimum
         let depth = fit.depthMaximum - fit.depthMinimum
-        // The top is the highest point measured, literally — same reasoning as `rectangleFit`: a thin
-        // upright feature is not separable from an artifact by height alone, and the image-space edge
-        // test upstream has already had the only look at that question worth taking.
+        // The top is the highest measured point. Thin features have already been filtered in image space.
         var highestProjection = groundHeight
         for point in points {
             highestProjection = max(highestProjection, simd_dot(point, upAxis))
@@ -1638,9 +1600,8 @@ nonisolated enum OrientedBoundingBox {
         )
     }
 
-    /// Liu, Liu and Zhang, Algorithm 2, with Zhang's closeness as the criterion. Returns the best
-    /// candidate direction as a unit vector rather than an angle — algebraically the same as their
-    /// `atan2`, and it avoids a wrap at ±π.
+    /// Liu, Liu and Zhang, Algorithm 2, using Zhang's closeness criterion. Returns a unit direction
+    /// instead of an angle to avoid wrapping at +-pi.
     static func bestOrientation(
         of points2D: [SIMD2<Float>],
         minimumEdgeDistance: Float
@@ -1670,9 +1631,7 @@ nonisolated enum OrientedBoundingBox {
         return (first, simd_normalize(simd_cross(up, first)))
     }
 
-    /// Liu says "uniformly downsampled" without saying how. Reservoir sampling gives a uniformly
-    /// random subset and is seeded so a scan reproduces; the choice of method is an implementation
-    /// detail.
+    /// Seeded reservoir sampling, so the same scan gives the same result.
     private static func uniformDownsample(
         _ points: [SIMD2<Float>],
         maximumCount: Int
@@ -1790,23 +1749,11 @@ nonisolated enum OrientedBoundingBox {
         return bestAxis
     }
 
-    /// Zhang, Xu, Dong and Dolan's closeness criterion, reference [15] of Liu. β = Σᵢ 1/max(min(D₁ᵢ,
-    /// D₂ᵢ), d₀), where D₁ᵢ = min(c1_max − c1ᵢ, c1ᵢ − c1_min) is point i's own distance to whichever
-    /// side of axis 1 it is nearer to, and D₂ᵢ the same for axis 2 — a per-point nearest-edge distance,
-    /// not a single edge chosen for the whole axis. Matches both Zhang's own definition and the
-    /// reference open-source transcriptions of it (e.g. Autoware's and PythonRobotics' L-shape fitters).
-    /// An earlier version of this function chose one edge per axis for every point at once, by an
-    /// aggregate sum-of-squares vote across the whole cloud — plausible from a casual reading of the
-    /// vectorised "argmin(‖max C1 − C1‖, ‖C1 − min C1‖)" notation some summaries use, but it discards
-    /// half of a full-perimeter cloud's evidence: any point nearer the edge the vote didn't pick gets
-    /// scored against the far edge instead of its own near one. That single-axis vote is a materially
-    /// different computation from Zhang's, verified by direct comparison against the per-point formula
-    /// on synthetic asymmetric box clouds, and has been corrected to the per-point form below.
-    ///
-    /// Note the comparison direction separately. Liu's Algorithm 2 initialises `S = INT_MAX` and keeps
-    /// `Scur < S`, i.e. minimises. This implementation maximises, because the criterion it cites is
-    /// defined and used by Zhang as a maximisation objective — β grows as the points hug the
-    /// rectangle. The two papers disagree; this follows the one that defines the criterion.
+    /// Closeness criterion from Zhang, Xu, Dong and Dolan:
+    ///     beta = sum_i 1 / max(min(D1_i, D2_i), d0)
+    /// where D1_i is point i's distance to the nearer edge along axis 1, and D2_i the same for
+    /// axis 2. Higher is better, so this maximises (Liu's pseudocode minimises, but Zhang defines the
+    /// criterion as a maximisation).
     private static func closenessScore(
         points: [SIMD2<Float>],
         axis: SIMD2<Float>,
@@ -1844,16 +1791,9 @@ nonisolated enum OrientedBoundingBox {
         return score
     }
 
-    /// The literal extremes of the projected cloud, as §3.4 describes: the box is exactly the
-    /// smallest rectangle containing every point it was given, and nothing is discarded here.
-    ///
-    /// Outlier rejection deliberately does **not** live at this stage. A depth artifact and a thin
-    /// real feature — a prong, a handle, a tab — look identical once projected onto an axis: both are
-    /// a few points set apart from the bulk. They are only distinguishable in image space, by whether
-    /// the sample sits across a depth discontinuity from its neighbours, and that test is already
-    /// applied there (`ObjectMaskProcessor.maskedWorldSurface`) before a point ever reaches this
-    /// function. Re-testing here on projection distance alone cannot recover that information, and in
-    /// practice removes thin parts of real objects.
+    /// Smallest rectangle containing every projected point. No outlier rejection here: thin parts of
+    /// real objects look like outliers once projected, so filtering happens earlier in image space
+    /// (`ObjectMaskProcessor.maskedWorldSurface`).
     private static func rectangleFit(
         points: [SIMD2<Float>],
         axis: SIMD2<Float>

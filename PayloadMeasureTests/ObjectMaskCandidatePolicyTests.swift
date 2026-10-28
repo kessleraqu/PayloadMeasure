@@ -35,9 +35,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// The fallback is the aim window and nothing wider. An instance Vision found somewhere else in
-    /// the frame is not a candidate at all, which is what stopped the preview jumping to an object at
-    /// the edge of the screen.
+    /// The fallback only widens to the aim window, never to the whole frame.
     func testNothingIsOfferedWhenTheAimWindowIsEmpty() {
         XCTAssertTrue(
             ObjectMaskCandidatePolicy.previewInstances(
@@ -59,8 +57,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// A small object's mask does not always sit under a hand-held crosshair, so a little slack has
-    /// to count as pointing at it.
+    /// Small masks don't always sit under a hand-held crosshair, so allow a little slack.
     func testMaskJustOutsideTheCrosshairStillCountsAsAimedAt() {
         let slack = ObjectMaskCandidatePolicy.aimBoundsSlack
         XCTAssertTrue(
@@ -87,9 +84,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
 
     // MARK: - Staying on the same object between segmentations
 
-    /// Vision renumbers its instances every frame, so the mask already on screen has to be recognised
-    /// by where it is. Without this the preview is re-decided several times a second and two similar
-    /// candidates swap places — the flicker.
+    /// Instances are renumbered every frame, so the mask on screen is matched by position.
     func testTheOverlappingCandidateContinuesTheMaskOnScreen() {
         let previous = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
         let instance = ObjectMaskCandidatePolicy.continuation(
@@ -113,8 +108,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// A candidate that only clips the corner of the previous mask is a different object, not the same
-    /// one moved.
+    /// Clipping a corner of the previous mask doesn't make it the same object.
     func testASlightOverlapDoesNotCountAsTheSameObject() {
         XCTAssertNil(
             ObjectMaskCandidatePolicy.continuation(
@@ -126,9 +120,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// Vision splits a complex object differently every frame. A piece of what was on screen shares little
-    /// of the *union* but sits almost wholly inside it, and is obviously the same object; judging by the
-    /// union made the preview swap between the whole and the piece.
+    /// A piece of the mask on screen counts as the same object, even though its IoU is low.
     func testAPieceOfTheMaskOnScreenIsTheSameObject() {
         let onScreen = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
         let piece = CGRect(x: 0.42, y: 0.50, width: 0.16, height: 0.09)
@@ -145,7 +137,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// When the object comes back in pieces, the re-pick takes the largest of them rather than the first.
+    /// When the object comes back in pieces, the largest one wins.
     func testTheMostCompletePieceWins() {
         let onScreen = CGRect(x: 0.40, y: 0.40, width: 0.20, height: 0.20)
         XCTAssertEqual(
@@ -209,8 +201,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// Letting go later than it takes hold: one threshold for both makes the mask blink on and off while
-    /// the crosshair sits on the edge of an object.
+    /// The release threshold is looser than the acquire threshold, so the mask doesn't blink at an edge.
     func testAMaskIsHeldAtADistanceThatWouldNotHaveAcquiredIt() {
         let aim = CGPoint(x: 0.5, y: 0.5)
         let justOutside = CGRect(
@@ -238,21 +229,21 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
     // MARK: - When the held mask lets go
 
     func testHeldMaskWinsCloseCallsIncludingWhenTheCrosshairIsInsideBoth() {
-        // Nothing else is aimed at at all.
+        // Nothing else is aimed at.
         XCTAssertTrue(
             ObjectMaskCandidatePolicy.keepsHeldMask(
                 heldAimDistance: 0.02,
                 challengerAimDistance: nil
             )
         )
-        // Crosshair inside the held mask; a challenger is inside it too. Ties go to what is on screen.
+        // Crosshair inside both masks: ties go to the one on screen.
         XCTAssertTrue(
             ObjectMaskCandidatePolicy.keepsHeldMask(
                 heldAimDistance: 0,
                 challengerAimDistance: 0
             )
         )
-        // Both slightly off the crosshair: still no reason to swap.
+        // Both slightly off the crosshair: no reason to switch.
         XCTAssertTrue(
             ObjectMaskCandidatePolicy.keepsHeldMask(
                 heldAimDistance: 0.03,
@@ -261,7 +252,7 @@ final class ObjectMaskCandidatePolicyTests: XCTestCase {
         )
     }
 
-    /// The one case the hold must lose: the crosshair has moved right inside another object.
+    /// The hold only loses when the crosshair moves well inside another object.
     func testHeldMaskLetsGoWhenTheCrosshairIsInsideAnotherObject() {
         XCTAssertFalse(
             ObjectMaskCandidatePolicy.keepsHeldMask(

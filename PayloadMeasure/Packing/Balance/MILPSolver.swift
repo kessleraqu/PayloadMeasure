@@ -2,13 +2,9 @@ import Foundation
 
 // Bounded-variable simplex and branch and bound, used by the Balance arrangement.
 //
-// In:  a LinearProgram — variables with bounds and integrality, rows with lower/upper limits, and a
-//      linear objective to minimise.
-// Out: Simplex gives an optimal vertex or a status saying why not; BranchAndBound gives the best
-//      integer point it found plus a dual bound, so the caller can tell proven from merely good.
-//
-// The tableau is dense and updated in place, which drifts, so it is rebuilt from the basis
-// periodically and the ratio test prefers large pivots. Both matter on big-M rows.
+// Branch and bound returns the best integer solution found plus a dual bound, so the caller can
+// tell a proven optimum from a good one. The dense tableau is rebuilt from the basis periodically
+// to limit numerical drift, and the ratio test prefers large pivots (matters for big-M rows).
 
 nonisolated struct LinearProgram: Sendable {
     nonisolated struct Variable: Sendable {

@@ -1,7 +1,7 @@
 import Foundation
 
-/// One palette shared by AR masks, anchors, measured boxes, manual objects, and both packing views.
-/// A study payload is limited to 15 objects, so no colour has to repeat within a payload.
+/// Colours shared by the AR masks, boxes, manual objects and packing views. A payload has at
+/// most 15 objects, so colours never repeat within one.
 nonisolated enum ObjectColourPalette {
     static let colours: [ObjectMaskDisplayColor] = [
         ObjectMaskDisplayColor(red: 1.00, green: 0.78, blue: 0.12),

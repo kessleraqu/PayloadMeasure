@@ -1,14 +1,10 @@
 import SwiftUI
 
-// Operator-facing result for the 3D knapsack. Pick a packing mode, inspect it, then load one
-// complete layer at a time from the floor upward.
-//
-// In:  a BaldiComparison from the store.
-// Out: on screen only.
+// Result screen for the 3D knapsack: choose a packing mode, inspect it, then load it layer by
+// layer from the floor up.
 
-/// One coordinator/model lifetime for a room-scale AR presentation. The camera renderer itself is
-/// deliberately shared across the app; this identity only prevents SwiftUI from retaining old
-/// placement state when the room view is opened again.
+/// Gives each opening of the room-scale AR view a fresh identity so old placement state isn't
+/// kept. The ARView itself is shared across the app.
 nonisolated struct PackingARPresentation: Identifiable, Sendable {
     let id: UUID
     let solution: BaldiSolution
@@ -26,9 +22,7 @@ struct BaldiResultView: View {
     @Binding var highlightedPackageID: UUID?
 
     @State private var selectedMode: BaldiPackingMode = .paper
-    /// Every opening gets a fresh model and coordinator lease. The single ARView/CAMetalLayer is
-    /// reused intentionally, because creating a later RealityKit renderer is what can strand its
-    /// camera background on an old texture on iOS 26.
+    /// A new model and coordinator per opening, on the shared ARView.
     @State private var augmentedPresentation: PackingARPresentation?
     @State private var showsDetails = false
 
@@ -41,13 +35,9 @@ struct BaldiResultView: View {
             if let solution = verifiedSolution,
                let verification = result.verification {
                 headline(solution)
-                // Where the plan is put on the real table, that is the only place it is shown. The
-                // on-screen drawing was a second, smaller, hand-rotated copy of the thing already
-                // standing on the table at full size, and having both invites loading from the one
-                // that is easier to look at rather than the one that is where the boxes go.
-                //
-                // The no-AR condition has no table view, so there the drawing is all there is and it
-                // stays. That asymmetry is the condition being compared, not an oversight.
+                // In the AR condition the plan is only shown on the real table, so participants load from the
+                // full-size version. The no-AR condition keeps the on-screen drawing; that difference is part of
+                // what's being compared.
                 if allowsRoomScaleAR {
                     placeOnTableButton
                 } else {
@@ -68,7 +58,7 @@ struct BaldiResultView: View {
         }
         .onChange(of: selectedMode) { _, _ in
             highlightedPackageID = nil
-            // Picking the other algorithm is a decision, so get out of the way and show its result.
+            // Close the details after switching so the new result is visible.
             showsDetails = false
         }
         .fullScreenCover(item: $augmentedPresentation) { presentation in
@@ -77,9 +67,8 @@ struct BaldiResultView: View {
         }
     }
 
-    /// Deliberately the whole of the top of the screen: a count, a warning if one is needed, and the
-    /// way into everything else. Settings, the algorithm switch, the balance figures and the package
-    /// list all live behind the info button so the 3D view and the room button stay above the fold.
+    /// Top of the screen: the package count, a warning if needed, and the info button. Everything else
+    /// is in the details sheet so the 3D view stays visible.
     private func headline(_ solution: BaldiSolution) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
@@ -106,7 +95,6 @@ struct BaldiResultView: View {
         }
     }
 
-    /// Everything that used to crowd the result screen.
     private var detailsSheet: some View {
         NavigationStack {
             ScrollView {
@@ -137,8 +125,7 @@ struct BaldiResultView: View {
         .presentationDragIndicator(.visible)
     }
 
-    /// Puts the finished plan on the real table at full size. Opens and closes freely; nothing about
-    /// the plan changes while it is open.
+    /// Shows the plan on the real table at full size. Doesn't change the plan.
     private var placeOnTableButton: some View {
         Button {
             guard let solution = verifiedSolution else { return }
@@ -206,8 +193,7 @@ struct BaldiResultView: View {
         }
     }
 
-    /// Where the load actually balances, and how spread out it is. The spread is the source paper's
-    /// unbalancing index, reported so a run can be compared against its published figures.
+    /// Centre of mass and the paper's unbalancing index, for comparison with the published results.
     @ViewBuilder
     private func balanceFigures(_ solution: BaldiSolution) -> some View {
         let centre = solution.centreOfMass
@@ -266,7 +252,6 @@ struct BaldiResultView: View {
 
     private static let openingInstructionText =
         "The shaded side is the box opening. The dark line runs the length of the box, its longest side, parallel to that opening. Turn the physical package until both match before loading."
-
 
     // MARK: - Sequential loading
 

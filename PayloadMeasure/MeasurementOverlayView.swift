@@ -1,27 +1,22 @@
 import SwiftUI
 import UIKit
 
-// The HUD over the camera: status, guidance, saved objects, and the controls that drive a scan.
-//
-// In:  session manager, aimer state and capture engine.
-// Out: on screen only. Operator actions go back through the capture engine.
+// The HUD over the camera: status, guidance, saved objects and the scan controls. Actions go back
+// through the capture engine.
 
-/// A measured object's id, made presentable by `sheet(item:)`.
+/// Wraps an object id so it can be used with `sheet(item:)`.
 struct IdentifiedObjectID: Identifiable, Hashable {
     let id: UUID
 }
 
-struct MesOverlayView: View {
+struct MeasurementOverlayView: View {
     private enum ObjectDetailsContext {
         case finalize(UUID)
         case edit(UUID)
     }
 
-    /// What the banner is telling the operator to do. There is deliberately no distance state at
-    /// all: framing is recorded with every measurement and reported by the study's own tools, and an
-    /// instruction to step back — which cannot be met for every object — is one more thing to read
-    /// while holding a phone over something. Nothing about distance is gated, so nothing about it is
-    /// said here.
+    /// What the banner tells the operator to do. Distance is never enforced, so there's no state for it
+    /// apart from the too-close warning.
     private enum MeasurementInstruction: Equatable {
         case preparing
         case findObject
@@ -32,9 +27,7 @@ struct MesOverlayView: View {
         case pointDown
         case useSideView
         case findSurface
-        /// The framing study's own finding, said out loud. `MeasurementFramingRule` has always been
-        /// computed every frame and, until now, read by nothing — so the one thing the study
-        /// established about how to hold the phone was the one thing the operator was never told.
+        /// From `MeasurementFramingRule`.
         case tooClose
     }
 
@@ -49,12 +42,11 @@ struct MesOverlayView: View {
     @Binding var workflowMode: MeasurementWorkflowMode
     let flow: MeasurementFlow
     let study: StudyStore
-    /// Clears everything and starts this same payload again. Does not move the study on: pressing
-    /// Reset must never take a participant to the next box, and must never skip the password.
+    /// Clears everything and restarts the same payload. Never advances the study.
     let onFullReset: () -> Void
-    /// Called from inside the loading plan, behind the study password, when this payload is done.
+    /// Called from the loading plan (password protected) when the payload is done.
     let onPayloadFinished: () -> Void
-    /// Abandons the whole run and goes back to the start screen. Behind the study password.
+    /// Cancels the run and returns to the start screen. Password protected.
     let onRunCancelled: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -86,11 +78,9 @@ struct MesOverlayView: View {
         !sessionManager.isCoachingActive
     }
 
-    // Each group below is deliberately type-erased before another group of modifiers is attached.
-    // One continuous expression made Xcode's editor type-checker time out even when a command-line
-    // build succeeded. The timeout then produced misleading follow-on errors such as "Cannot find
-    // StudyStore in scope". These named boundaries also keep the runtime view type shallow enough for
-    // an iPhone's smaller main-thread stack.
+    // Each group is wrapped in AnyView before more modifiers are added. As one long expression the
+    // type checker in Xcode timed out and showed unrelated errors, and the shallower view type is
+    // also easier on the main thread stack.
     private var animatedLayers: AnyView {
         AnyView(
             ZStack {
@@ -148,22 +138,16 @@ struct MesOverlayView: View {
                 lockFeedback.prepare()
             }
         }
-        // Watches the array of IDs, not its count: a count can mask a real change (one object
-        // finalized while another is dropped in the same update leaves the count unchanged, and
-        // SwiftUI's onChange only fires when the watched value itself differs). This is the only
-        // thing standing between a mid-box crash and losing every object measured on this box so
-        // far — study.recordMeasurementProgress is the per-object safety net; the authoritative,
-        // complete record is written once by ArrangementView.recordCurrentBox when the box closes.
+        // Watch the IDs rather than the count, which can stay the same when one object is finished and
+        // another removed in the same update.
         .onChange(of: captureEngine.measuredObjectIDs) { _, _ in
             recordMeasurementProgress()
         }
         )
     }
 
-    /// Writes the dimensions of everything measured so far into the run on disk, as each object is
-    /// finished. The full record — names, weights, where each package ended up — is written when the
-    /// payload is closed; this is so that a crash in the middle of a payload costs the object being
-    /// measured at the time rather than all of them.
+    /// Saves the dimensions measured so far after each object, so a crash mid-payload loses at most
+    /// one object. The full record is written when the payload is closed.
     private func recordMeasurementProgress() {
         guard !study.isTestMode, study.currentBox != nil else { return }
         let records = captureEngine.measuredObjectIDs.map { id in
@@ -215,8 +199,7 @@ struct MesOverlayView: View {
                 store: packingStore,
                 onRescan: { rescan(entry.id) }
             )
-            // In the one-by-one method this sheet *is* the boxing and weighing step, so it is timed
-            // as such and the clock goes back to measuring when it closes.
+            // In the one-by-one flow this sheet is the packing step, so it's timed as packing.
             .onAppear { study.beginPhase(.pack) }
             .onDisappear { study.beginPhase(.measure) }
         }
@@ -267,8 +250,6 @@ struct MesOverlayView: View {
     }
 
     private var objectDetailsAlertLayer: AnyView {
-        // Names belong to the packing/weight phase. Keeping this explicit wrapper preserves the
-        // shallow view type without allowing measurement completion to present a naming alert.
         AnyView(workflowSheetLayer)
     }
 
@@ -369,8 +350,8 @@ struct MesOverlayView: View {
     }
 
     private func prepareForAppearance() async {
-        // A SwiftUI `.task` may begin in the same run-loop turn in which its view is installed.
-        // Yield once so these observable writes never occur inside the view-update transaction.
+        // A .task can start in the same run loop turn the view is installed, so yield before writing
+        // observable state.
         await Task.yield()
         guard !Task.isCancelled else { return }
 
@@ -380,7 +361,7 @@ struct MesOverlayView: View {
             packingStore.module.widthMillimetres = size.y
             packingStore.module.heightMillimetres = size.z
         }
-        // Use the current payload's own catalogue and pick up edits made on the setup screen.
+        // Use this payload's box list, including edits made on the setup screen.
         packingStore.setPayload(study.catalogueOwner)
     }
 
@@ -389,8 +370,7 @@ struct MesOverlayView: View {
         if !isAutomaticCaptureSupported, workflowMode == .top {
             workflowMode = .spatial3D
         }
-        // Measurements now finish only through the convergence rule; the manual Finish control has
-        // deliberately been removed from the participant-facing camera screen.
+        // Measurements only finish through the convergence rule; there's no manual Finish button.
         captureEngine.setAutomaticLockEnabled(true)
     }
 
@@ -404,21 +384,17 @@ struct MesOverlayView: View {
         showsPackingWorkflow = true
     }
 
-    /// Leaving the loading plan means the load is done. Rather than drop back into a half-used
-    /// session — which is what made the app feel worse afterwards — offer to clear everything.
     private func handlePackingWorkflowDismissal() {
-        // Back to measuring for the same box. Moving on is done from inside the plan, behind a
-        // password, so closing the sheet by accident cannot end a participant's box.
+        // Back to measuring the same payload. Moving on happens inside the plan, behind the password.
         study.beginPhase(.measure)
     }
 
     private func handlePackingWorkflowPresentationChange(_ isPresented: Bool) {
-        // The phase is started by PreparationView's own stages rather than here, so that boxing and
-        // loading the payload are timed separately.
+        // PreparationView starts its own phases so boxing and loading are timed separately.
         sessionManager.setPackingArrangementPresented(isPresented)
     }
 
-    /// Camera-space content: masks, markers, the aimer and the levelling prompt.
+    /// Camera-space content: masks, markers, aimer and the levelling prompt.
     private var liveContentLayer: AnyView {
         guard showsLiveOverlay else { return AnyView(EmptyView()) }
         return AnyView(
@@ -464,12 +440,7 @@ struct MesOverlayView: View {
                         measureButton
                     } else if isAutomaticCaptureSupported,
                               captureEngine.isObjectSelectionPending {
-                        // The press takes a segmentation pass or two to be answered, and a retry a few
-                        // more. Without this the button simply disappears for that time and the operator
-                        // is given nothing at all to look at — which is why a press that then failed was
-                        // read as the app having done nothing, and why one that succeeded was read as
-                        // luck. Same size and same place as the button it replaces, so the row does not
-                        // jump.
+                        // Shown while the press is being processed, in the same place as the button so nothing jumps.
                         startingMeasurementNotice
                     }
 
@@ -501,8 +472,7 @@ struct MesOverlayView: View {
         } else {
             HStack(alignment: .top, spacing: 10) {
                 if study.isTestMode {
-                    // Nothing here is recorded, and it should be impossible to mistake a test for a
-                    // run that is being kept.
+                    // Make it obvious that nothing is being recorded.
                     Label("Test mode", systemImage: "testtube.2")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 11)
@@ -529,7 +499,6 @@ struct MesOverlayView: View {
         }
     }
 
-    /// Controls that are not part of the measuring flow itself.
     @ViewBuilder
     private var testingControls: some View {
         if captureEngine.activeObjectID != nil || captureEngine.canReset {
@@ -553,22 +522,10 @@ struct MesOverlayView: View {
             || !captureEngine.hasCompletedObjectRecognitionWarmup
     }
 
-    /// Where a live mask is on screen *now*, rather than where it was when its silhouette was cut.
-    ///
-    /// `referenceViewportBoundingBox` and `referenceAnchorPoint` both describe the frame the mask was
-    /// segmented in. That frame is not the frame the operator is looking at: an unchanged mask is held
-    /// for up to `ObjectMaskPreviewHold.maximumHoldSeconds` and drawn through the world by
-    /// `MaskDisplayTransform` for every frame in between, so by the time Measure is pressed the
-    /// reference geometry can be most of a second of hand motion out of date. Both decisions taken from
-    /// it here — whether to offer the button at all, and which point the press is resolved against —
-    /// are decisions about the picture on screen, so they have to be taken in the picture's current
-    /// place.
-    ///
-    /// `liveMaskTracking` is that picture's own anchor reprojected into the current frame. It is
-    /// published every frame and, being a point in the room rather than a tracked box, holds at any
-    /// apparent size — which is exactly the case (a small object at measuring range) where the Vision
-    /// display box stops being refreshed. So it leads, and the reference box is carried along by the
-    /// same displacement instead of being used where it was taken.
+    /// Where a live mask is on screen now, rather than in the frame it was segmented in. A held mask
+    /// can be most of a second old, so the button and the press both use `liveMaskTracking` (the
+    /// mask's anchor reprojected into the current frame) and shift the reference box by the same
+    /// amount.
     private func onScreenMask(_ layer: ObjectMaskPreviewLayer) -> (boundingBox: CGRect?, point: CGPoint) {
         let trackedPoint = layer.trackedObjectID == nil
             ? captureEngine.liveMaskTracking?.normalizedViewportPoint
@@ -595,13 +552,10 @@ struct MesOverlayView: View {
         return (box, point)
     }
 
-    /// Only what the crosshair is on may be offered for measurement. The mask processor already
-    /// refuses to preview anything else, and this repeats the rule in viewport terms because it is
-    /// the Measure button and the distance guide that act on it.
+    /// Only the object under the crosshair can be measured.
     private func isUnderCrosshair(_ layer: ObjectMaskPreviewLayer) -> Bool {
         let centre = CGPoint(x: 0.5, y: 0.5)
-        // Deliberately looser than the image-space rule: viewport and image coordinates do not scale
-        // alike, and this gate exists to reject the object at the edge, not to second-guess the mask.
+        // Looser than the image-space rule; this only needs to reject objects at the edge.
         let slack = ObjectMaskCandidatePolicy.aimWindowRadius
         let onScreen = onScreenMask(layer)
         if let box = onScreen.boundingBox {
@@ -626,12 +580,8 @@ struct MesOverlayView: View {
             }
     }
 
-
-    /// Anything masked can be measured. Framing is advice, not a gate: an object filling more of the
-    /// screen than the study found accurate gets told so — see `MeasurementFramingRule` — but an object
-    /// whose mask is on screen can be measured from wherever the operator is standing. Enforcing it meant
-    /// a small object, which has to be closer before there is anything to work with, could be masked and
-    /// still refuse to be measured, which is not a rule the operator can do anything about.
+    /// Any masked object can be measured. Being too close is only a warning (see
+    /// `MeasurementFramingRule`).
     private var automaticMeasurementCandidate: AutomaticMeasurementCandidate? {
         guard isAutomaticCaptureSupported,
               showsLiveOverlay,
@@ -655,17 +605,12 @@ struct MesOverlayView: View {
         if captureEngine.isObjectSelectionPending {
             return .holdStill
         }
-        // A masked object is measurable, so that is what the banner says — unless it is filling more of
-        // the screen than any framing the study found accurate, in which case stepping back is both the
-        // more useful instruction and the only one the data supports. It is still not a gate: the
-        // Measure button stays exactly where it was and works exactly as it did.
+        // Masked objects are measurable. If it's too close, say so, but the Measure button still works.
         if automaticMeasurementCandidate != nil {
             return captureEngine.isFramedTooClose ? .tooClose : .readyToMeasure
         }
-        // Only once there is nothing to press. While the object is still masked and measurable the
-        // operator is better served by being told so; the failure is carried in the detail line
-        // underneath instead, which is where `readyToMeasure` puts everything that is worth knowing but
-        // is not the next thing to do.
+        // Only shown when there's nothing to press. While the object is measurable the failure goes in
+        // the detail line instead.
         if captureEngine.activeObjectID == nil,
            !captureEngine.isObjectSelectionPending,
            captureEngine.lastSelectionFailure != nil {
@@ -679,9 +624,7 @@ struct MesOverlayView: View {
             case .waitingForSupportPlane: return .findSurface
             case .needsTopView: return .pointDown
             case .needsSideView: return .useSideView
-            // Only in place of "hold still". The three states above are what the stopping rule is
-            // actually waiting for, and a measurement that cannot finish outranks one that will
-            // finish a little less accurately.
+            // The states above block finishing, so they take priority over the too-close warning.
             default: return captureEngine.isFramedTooClose ? .tooClose : .holdStill
             }
         }
@@ -709,16 +652,12 @@ struct MesOverlayView: View {
         }
     }
 
-    /// The line under the title, or nothing. The state that fills the banner with colour carries no
-    /// detail at all: it is read at a glance, from arm's length, while the phone is being held over
-    /// an object, and a paragraph underneath is what the instruction competes with.
+    /// Subtitle under the banner title. The solid banner has none so it can be read at a glance.
     private var measurementInstructionDetail: String? {
         measurementInstruction == .holdStill ? nil : instructionDetailText
     }
 
-    /// What the operator can do about the press that did not take, in the words the engine used when it
-    /// gave up. Deliberately not paraphrased here: the reasons differ — no surface, no mask, recognition
-    /// still warming up, the object limit — and only the one that actually happened is useful.
+    /// Shows the engine's own reason for the failed press.
     private var selectionFailureDetail: String? {
         guard captureEngine.activeObjectID == nil,
               !captureEngine.isObjectSelectionPending,
@@ -732,10 +671,7 @@ struct MesOverlayView: View {
         switch measurementInstruction {
         case .preparing:
             return "The app is preparing the camera and object recognition."
-        // Where to stand belongs here, on the two states the operator is in while there is nothing on
-        // screen yet. Fill cannot be quoted to someone with no mask to measure, so this is the one
-        // place the study's observed distances are the right thing to say — and with the mask now
-        // held back until a measurement starts, it is the only standing cue about framing there is.
+        // No mask yet, so the recommended distance is the only framing hint available.
         case .findObject:
             return workflowMode == .top
                 ? "Aim at one complete object from above, point the phone straight down, and stand about \(MeasurementFramingRule.recommendedDistanceText)."
@@ -768,8 +704,6 @@ struct MesOverlayView: View {
 
     private var measurementInstructionColor: Color {
         switch measurementInstruction {
-        // Holding still used to be red, which put the alarm colour on the state the operator reaches
-        // when everything is going right.
         case .holdStill: .green
         case .pointDown, .useSideView, .findSurface: .yellow
         case .pressDidNotTake, .tooClose: .orange
@@ -793,7 +727,6 @@ struct MesOverlayView: View {
         }
     }
 
-    /// The one state that is the whole banner rather than a line in it.
     private var isSolidInstructionBanner: Bool {
         measurementInstruction == .holdStill
     }
@@ -848,9 +781,7 @@ struct MesOverlayView: View {
         }
     }
 
-    /// Only objects still being worked on. A finished object already has its box drawn in the scene,
-    /// and a dot on top of it just adds clutter — the engine still keeps the marker, because that is
-    /// how it knows whether a saved object is on screen and can be remeasured.
+    /// Only objects still being measured. Finished objects already show their box.
     private var liveObjectMaskMarkers: [ObjectMaskMarker] {
         captureEngine.objectMaskMarkers.filter {
             !captureEngine.finalizedObjectIDs.contains($0.id)
@@ -990,12 +921,7 @@ struct MesOverlayView: View {
         .glassEffect(.regular, in: .rect(cornerRadius: 18))
     }
 
-    /// How far along the measurement is, and what to do about it, as one thing instead of two.
-    ///
-    /// It used to be a thin bar with a percentage beside it and a separate "move closer" chip
-    /// underneath. Two rows, both easy to miss, often saying the same thing. This is a ring with the
-    /// percentage in the middle and a single instruction next to it, and it is the only place the
-    /// distance advice appears.
+    /// Progress ring with the percentage and a single instruction next to it.
     @ViewBuilder
     private var measuringProgress: some View {
         let convergence = captureEngine.convergence
@@ -1023,7 +949,7 @@ struct MesOverlayView: View {
         }
     }
 
-    /// Nil hides the number, which is what happens before there is anything to be a percentage of.
+    /// Nil hides the number.
     private func progressRing(_ progress: Double?) -> some View {
         let clamped = min(max(progress ?? 0, 0), 1)
         return ZStack {
@@ -1051,20 +977,14 @@ struct MesOverlayView: View {
         .frame(width: 52, height: 52)
     }
 
-    /// Distance advice, but only once a measurement is under way — before that the object is not
-    /// being tracked and any advice would be guesswork.
-    /// Only the centring advice remains here. Distance is no longer one of the things this card tells the
-    /// operator to fix, because the measurement is not waiting on it.
+    /// Centring advice, only while a measurement is running.
     private var measuringGuidance: ObjectFramingGuidance? {
         guard captureEngine.activeObjectID != nil else { return nil }
         return captureEngine.framingGuidance == .centre ? .centre : nil
     }
 
-    /// Whatever the stopping rule is actually waiting for. Width and depth are only measured looking
-    /// down and height only from the side, so a measurement can sit at the same percentage for a long
-    /// time purely because the phone has not been where it needs to be — and saying "hold steady"
-    /// then is worse than saying nothing. The recommended distance is added underneath rather than
-    /// replacing any of it.
+    /// Says what the stopping rule is waiting for. Width and depth need a top view and height a side
+    /// view, so this tells the operator where to move.
     private var measuringTitle: String {
         switch measuringGuidance {
         case .centre: "Aim at it"
@@ -1079,8 +999,7 @@ struct MesOverlayView: View {
         }
     }
 
-    /// No distance sentence here any more: being too close is said once, by the red banner at the
-    /// top of the screen, rather than a second time in small type down here.
+    /// Being too close is shown in the top banner, not repeated here.
     private var measuringAdvice: String {
         measuringAdviceText
     }
@@ -1234,9 +1153,7 @@ struct MesOverlayView: View {
                 .gesture(
                     SpatialTapGesture()
                         .onEnded { value in
-                            // LiDAR studies use the explicit Measure button after the framing
-                            // preflight. Direct tapping remains only for the RGB fallback, which has
-                            // no depth-derived readiness state.
+                            // With LiDAR the Measure button is used; tapping only applies to the RGB fallback.
                             guard !isAutomaticCaptureSupported else { return }
                             guard captureEngine.activeObjectID == nil,
                                   !captureEngine.isObjectSelectionPending else {
@@ -1282,19 +1199,9 @@ struct MesOverlayView: View {
         .ignoresSafeArea()
     }
 
-    /// Whether any mask picture belongs on screen at all.
-    ///
-    /// Nothing is drawn until a measurement is actually running. Before that the operator is choosing
-    /// an object, and the live mask was the loudest thing on the screen while being the least
-    /// trustworthy: it is re-segmented from scratch several times a second, jumps between neighbouring
-    /// objects, and — held between segmentations and drawn through the world by `MaskDisplayTransform`
-    /// — is a picture of a slightly older frame. Aiming is what the crosshair, the "Ready to measure"
-    /// banner and the Measure button appearing are for; a shape that shimmers over the scene taught the
-    /// operator to chase it instead.
-    ///
-    /// Selection is untouched by this. `automaticMeasurementCandidate` and `lockCandidate` read the mask
-    /// *layers*, which are still computed every frame; only the drawing is withheld. The object that
-    /// gets measured is the same object it was before.
+    /// Masks are only drawn while a measurement is running. Before that the live mask flickers
+    /// between objects and distracts from aiming. Selection still uses the mask layers, only the
+    /// drawing is hidden.
     private var showsMaskPictures: Bool {
         captureEngine.activeObjectID != nil
     }
@@ -1304,8 +1211,7 @@ struct MesOverlayView: View {
         if showsMaskPictures, let preview = captureEngine.objectMaskPreview {
             ZStack {
                 ForEach(preview.layers, id: \.id) { layer in
-                    // Only the presence of a mask is animated, never where it is: see the transition on
-                    // `trackedObjectMaskPreview`.
+                    // Only fade masks in and out, never animate their position.
                     if let trackedObjectID = layer.trackedObjectID {
                         if captureEngine.showsSelectedObjectMaskPreview,
                            captureEngine.activeObjectID == trackedObjectID,
@@ -1334,24 +1240,14 @@ struct MesOverlayView: View {
         }
     }
 
-    /// Which masks are on screen, and nothing about where they are. Scoping the fade to this is what keeps
-    /// it from animating the mask's position, which would leave it trailing the object.
+    /// Keyed on which masks are shown, not where, so the fade doesn't animate position.
     private var maskPresenceKey: [UUID] {
         captureEngine.objectMaskPreview?.layers.map(\.id) ?? []
     }
 
-    /// How to place this mask picture on the camera image in this frame.
-    ///
-    /// World tracking first, always: three of the object's own points in the room, reprojected by ARKit,
-    /// and the best similarity — rotation, isotropic scale, translation — fitted to where they were when
-    /// the picture was taken and where they are now. See `MaskDisplayTransform` for why three points and
-    /// why a similarity.
-    ///
-    /// Vision's object tracker is the fallback and contributes position only. It has a minimum target
-    /// size in frame, and a small object at the 45–65 cm the accuracy rule asks for is under it — so its
-    /// box stops following and decays, which is what made the mask lag on small objects and pulse
-    /// between two sizes when its size was believed. Its box is axis-aligned besides, so there is no
-    /// angle in it to take.
+    /// How to place a mask image on the current frame. Uses world tracking (see
+    /// `MaskDisplayTransform`) when possible. Vision's tracker is the fallback and only gives a
+    /// position, since it loses small objects and its box has no rotation.
     private func maskTransform(
         for layer: ObjectMaskPreviewLayer,
         marker: ObjectMaskMarker?,
@@ -1372,8 +1268,7 @@ struct MesOverlayView: View {
         )
     }
 
-    /// Where this layer's gauge points are right now: the live mask's come from its own anchor, a locked
-    /// object's from its marker.
+    /// Current gauge points: from the live mask's anchor, or a locked object's marker.
     private func currentGauge(
         for layer: ObjectMaskPreviewLayer,
         marker: ObjectMaskMarker?
@@ -1407,10 +1302,7 @@ struct MesOverlayView: View {
                 Image(decorative: layer.image, scale: 1, orientation: .up)
                     .resizable()
                     .frame(width: proxy.size.width, height: proxy.size.height)
-                    // Scale and rotation share an anchor, so they commute and the order they are written
-                    // in does not change the result. The offset has to come after both: it is the
-                    // translation left over once the picture has been turned and resized about that
-                    // anchor, and applying it first would move the pivot with it.
+                    // Scale and rotation share the anchor so their order doesn't matter. The offset must come last.
                     .scaleEffect(
                         x: tracked?.scale.width ?? 1,
                         y: tracked?.scale.height ?? 1,
@@ -1428,23 +1320,17 @@ struct MesOverlayView: View {
         .ignoresSafeArea()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-        // A short fade on the way in and out. Vision does lose an object for a moment now and then, and
-        // an instant cut to nothing and back is read as a fault; the same gap crossfaded is read as the
-        // mask settling. Deliberately a transition and not an animation on the position: animating that
-        // would put the mask permanently a fraction of a second behind the object.
+        // Short fade so a brief segmentation dropout doesn't look like a glitch.
         .transition(.opacity)
     }
 
     private var infoPanel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-            // Reset is destructive enough that it belongs behind this deliberate information view,
-            // rather than alongside the participant's measuring controls.
+            // Reset is kept in the info view, away from the participant's controls.
             testingControls
 
-            // Abandoning a real run is the operator's decision, never the participant's, so it is
-            // behind the study password like every other way out of a payload. A test run has no
-            // participant to keep out and nothing to protect, so it is simply left.
+            // Cancelling a real run needs the study password. Test runs can just be left.
             Button {
                 if study.isTestMode {
                     onRunCancelled()
@@ -1727,8 +1613,7 @@ struct MesOverlayView: View {
                 accessibilityActionRow(showsTitles: false)
             }
         } else {
-            // Every button here is optional, so the row's width swings a lot. Rather than let it
-            // run off the edge of the phone, drop the labels when the full set will not fit.
+            // The set of buttons varies, so drop labels if the full row doesn't fit.
             ViewThatFits(in: .horizontal) {
                 actionRow(showsTitles: true)
                 actionRow(showsTitles: false)
@@ -1809,9 +1694,8 @@ struct MesOverlayView: View {
         .accessibilityValue("\(Int((progress * 100).rounded())) percent")
     }
 
-    /// Shown over the live camera until the environment is ready. The camera is deliberately visible
-    /// behind it: the instruction is something to do *with* the camera, and watching the scene move
-    /// is what tells the operator the phone is actually working.
+    /// Shown over the live camera until the environment is ready. The camera stays visible so the
+    /// operator can see the phone is working.
     @ViewBuilder
     private var preparingPrompt: some View {
         if isPreparingToMeasure, !showsPanel {
@@ -1844,7 +1728,7 @@ struct MesOverlayView: View {
         return "Object detection is warming up. Keep the objects in view."
     }
 
-    /// Shown while the phone is not level enough to measure. Nothing else appears until it is.
+    /// Shown while the phone isn't level enough to measure.
     @ViewBuilder
     private var levellingPrompt: some View {
         if isAutomaticCaptureSupported,
@@ -1873,8 +1757,7 @@ struct MesOverlayView: View {
         }
     }
 
-    /// Sized by its content, never by a hard width, so a row of these can shrink instead of being
-    /// clipped by the screen.
+    /// Sized by content so a row can shrink instead of clipping.
     private func actionLabel(
         _ title: String,
         systemImage: String,
@@ -1902,12 +1785,7 @@ struct MesOverlayView: View {
         .contentShape(Capsule())
     }
 
-    /// Only offered while a measurement is running, and it discards that measurement outright.
-    ///
-    /// Withheld for the first seconds of one. Offered from the first frame, it was pressed while the
-    /// measurement was still normally getting started, which taught cancelling instead of holding the
-    /// phone still — and a measurement that really is not starting is restarted by the app before this
-    /// button appears at all.
+    /// Discards the running measurement. Hidden for the first seconds (see `MeasurementStartRule`).
     @ViewBuilder
     private func cancelMeasurementButton(showsTitle: Bool) -> some View {
         if isAutomaticCaptureSupported, captureEngine.activeObjectID != nil {
@@ -2298,9 +2176,7 @@ struct MesOverlayView: View {
         return "Remove \(name)?"
     }
 
-    /// Distance is not checked here either. A measurement taken from wherever the operator was standing
-    /// has to be allowed to finish there: refusing the finish because the phone is close is how a
-    /// measurement ended up complete and unable to end.
+    /// Distance isn't checked here, so a measurement can always finish where it was taken.
     private func presentAutomaticLockIfRequested() {
         guard let id = captureEngine.automaticLockRequest,
               captureEngine.activeObjectID == id,
@@ -2327,7 +2203,7 @@ struct MesOverlayView: View {
             return
         }
         pendingDetailsObjectID = nil
-        // Boxing happens per object in this flow, so the full sheet replaces the name-only alert.
+        // In this flow each object is boxed straight away, so show the full sheet.
         guard flow != .sequential else {
             packageDetails = IdentifiedObjectID(id: id)
             return
@@ -2336,8 +2212,7 @@ struct MesOverlayView: View {
         objectDetailsContext = .finalize(id)
     }
 
-    /// Puts a finished object back into measurement. The review list and the details sheet both
-    /// use it, so an object can be corrected without being deleted and measured from scratch.
+    /// Sends a finished object back to measurement so it can be corrected without deleting it.
     private func rescan(_ id: UUID) {
         showsSavedObjects = false
         captureEngine.focusFinalizedObject(id: id)
@@ -2362,10 +2237,8 @@ struct MesOverlayView: View {
         objectNameText = ""
     }
 
-    /// Backing out of the name prompt cancels the measurement it belongs to. Finishing commits the
-    /// dimensions before the prompt appears, so without this the object would be kept unnamed and
-    /// the operator would have no obvious way to be rid of it. Editing an existing object is
-    /// different — there Cancel means "leave the name as it was".
+    /// Cancelling the name prompt cancels the measurement too, otherwise an unnamed object would be
+    /// left behind. When editing an existing object, Cancel just keeps the old name.
     private func cancelObjectDetailsEntry() {
         if case .finalize(let id) = objectDetailsContext,
            captureEngine.finalizedObjectIDs.contains(id) {
@@ -2655,7 +2528,7 @@ struct MesOverlayView: View {
 }
 
 #Preview {
-    MesOverlayView(
+    MeasurementOverlayView(
         sessionManager: ARSessionManager(),
         aimerState: AimerState(),
         captureEngine: ObjectCaptureEngine(),

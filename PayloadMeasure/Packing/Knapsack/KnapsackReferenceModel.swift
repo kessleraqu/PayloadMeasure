@@ -1,15 +1,11 @@
 import Foundation
 import simd
 
-// REFERENCE ONLY - not the method the app runs.
+// Reference only, not used by the app.
 //
-// The source paper's exact mixed-integer model, kept so the formulation can be inspected next to
-// the paper. It does not encode the full-support rule, so it cannot certify the packings the app
-// actually produces. Two printed equations had to be repaired to be solvable at all; METHODS.md
-// records which and why.
-//
-// In:  a BaldiProblem.
-// Out: a LinearProgram plus the variable indices needed to read a solver point back as placements.
+// The paper's mixed-integer model, kept so the formulation can be compared with the paper. It
+// doesn't include the full-support rule, so it can't validate the app's packings. Two of the
+// printed equations needed fixing to be solvable; (16) is noted below.
 
 nonisolated struct BaldiReferenceModel: Sendable {
     var program: LinearProgram
@@ -43,7 +39,7 @@ nonisolated enum BaldiReferenceModelBuilder {
 
         var program = LinearProgram()
 
-        // (18) t_i ∈ {0,1}. The objective (5) maximises Σ p_j t_j; the solver minimises, so the
+        // (18) t_i in {0,1}. (5) maximises sum p_j t_j; the solver minimises, so profits are negated.
         var selection: [Int] = []
         for (index, item) in items.enumerated() {
             let variable = program.addBinary(name: "t_\(index)")
@@ -51,7 +47,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             selection.append(variable)
         }
 
-        // (17) χ^δ_i ≥ 0. The upper bound S^δ is implied by (8) and stated explicitly so that every
+        // (17) x_i >= 0, with the upper bound S from (8) set explicitly.
         var position: [[Int]] = []
         for index in 0..<count {
             var perAxis: [Int] = []
@@ -67,7 +63,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             position.append(perAxis)
         }
 
-        // (20) ρ_ir ∈ {0,1}.
+        // (20) rho_ir in {0,1}.
         var rotationVariables: [[Int]] = []
         for index in 0..<count {
             var perRotation: [Int] = []
@@ -77,7 +73,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             rotationVariables.append(perRotation)
         }
 
-        // (19) b^δ_ij ∈ {0,1}, for every ordered pair i ≠ j and every dimension.
+        // (19) b_ij in {0,1} for every ordered pair i != j and every axis.
         var precedence: [[[Int]?]] = Array(
             repeating: Array(repeating: nil, count: count),
             count: count
@@ -90,7 +86,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (6) Σ_j w_j d_j h_j t_j ≤ W D H. Redundant with (8), but the paper keeps it because it
+        // (6) volume constraint. Redundant with (8) but kept as in the paper.
         let knapsackVolume = Double(max(knapsack.volume, 1))
         program.addLessOrEqual(
             name: "capacity",
@@ -100,7 +96,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             value: 1
         )
 
-        // (16) Σ_r ρ_ir = t_i, the repaired form; `Σ_r ρ_ir = 1` as printed.
+        // (16) sum_r rho_ir = t_i. The paper prints = 1, which forces every item to be loaded.
         for index in 0..<count {
             var terms: [(Int, Double)] = rotationVariables[index].map { ($0, 1.0) }
             if !usesPrintedRotationEquality {
@@ -113,7 +109,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             )
         }
 
-        // (8) χ^δ_i + Σ_r s^δ_ir ρ_ir ≤ S^δ, divided by S^δ.
+        // (8) x_i + sum_r s_ir rho_ir <= S, divided by S.
         for (index, item) in items.enumerated() {
             for axis in 0..<3 {
                 var terms: [(Int, Double)] = [(position[index][axis], 1)]
@@ -130,7 +126,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (7) Σ_δ (b^δ_ij + b^δ_ji) ≥ t_i + t_j − 1, i < j.
+        // (7) sum over axes of (b_ij + b_ji) >= t_i + t_j - 1, for i < j.
         for i in 0..<count {
             for j in (i + 1)..<count {
                 var terms: [(Int, Double)] = []
@@ -144,7 +140,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (9) and (10). For the ordered pair (i, j): χ^δ_i + size_i − χ^δ_j + M·b^δ_ij ≤ M.
+        // (9) and (10): for the pair (i, j), x_i + size_i - x_j + M * b_ij <= M.
         for i in 0..<count {
             for j in 0..<count where i != j {
                 for axis in 0..<3 {
@@ -167,7 +163,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (11) χ^δ_i ≤ M t_i.
+        // (11) x_i <= M * t_i.
         for index in 0..<count {
             for axis in 0..<3 {
                 program.addLessOrEqual(
@@ -178,7 +174,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (12) b^δ_ij ≤ t_i and (13) b^δ_ji ≤ t_j.
+        // (12) b_ij <= t_i and (13) b_ji <= t_j.
         for i in 0..<count {
             for j in 0..<count where i != j {
                 for axis in 0..<3 {
@@ -191,7 +187,7 @@ nonisolated enum BaldiReferenceModelBuilder {
             }
         }
 
-        // (14) and (15): the balancing constraints.
+        // (14) and (15): balancing constraints.
         for axis in 0..<3 {
             let scale = totalMass * extent[axis]
             var moment: [(Int, Double)] = []

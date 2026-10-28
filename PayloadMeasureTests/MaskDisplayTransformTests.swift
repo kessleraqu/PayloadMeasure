@@ -3,22 +3,15 @@ import SwiftUI
 import XCTest
 @testable import PayloadMeasure
 
-// Placing a mask picture taken a moment ago onto the camera image now.
-//
-// The mask is followed through the world: three of the object's own points, reprojected by ARKit each
-// frame, and the least-squares similarity fitted to where they were against where they are. Vision's
-// object tracker cannot do this job — it has a minimum target size in frame and a small object at the
-// 40–50 cm the accuracy rule asks for is under it — so it survives only as a position-only fallback.
-//
-// The cases below are the four motions a similarity can represent exactly (still, slide, dolly, roll),
-// then the one it cannot (out-of-plane rotation), which is the case the residual exists to report.
+// The mask follows three world points per object, fitted with a least-squares similarity. These
+// cover the four motions a similarity represents exactly (still, slide, dolly, roll) and the one
+// it can't (out-of-plane rotation), where the residual should show up.
 
 final class MaskDisplayTransformTests: XCTestCase {
     private let origin = CGPoint(x: 0.5, y: 0.5)
     private let legLength: CGFloat = 0.1
 
-    /// A gauge frame from height-normalised offsets, so a test can be written in the isotropic units the
-    /// fit works in and still hand over the anisotropic unit-viewport coordinates the type carries.
+    /// Builds a gauge from height-normalised offsets and converts to unit viewport coordinates.
     private func gauge(
         originOffset: CGPoint = .zero,
         right: CGPoint,
@@ -38,8 +31,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         )
     }
 
-    /// The frame as it is when the picture is taken: one leg to the right, one leg up the screen. Screen
-    /// coordinates put y downwards, so "up" is negative.
+    /// One leg right and one leg up. Screen y points down, so up is negative.
     private func referenceGauge(aspect: CGFloat = 1) -> MaskGaugeFrame {
         gauge(
             right: CGPoint(x: legLength, y: 0),
@@ -48,8 +40,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         )
     }
 
-    /// Rotating a screen offset clockwise, which is the direction SwiftUI's `rotationEffect` turns for a
-    /// positive angle and therefore the direction this transform has to report.
+    /// Clockwise rotation, matching SwiftUI's rotationEffect for positive angles.
     private func rotatedClockwise(_ point: CGPoint, by radians: CGFloat) -> CGPoint {
         CGPoint(
             x: point.x * cos(radians) - point.y * sin(radians),
@@ -93,8 +84,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         XCTAssertEqual(transform.residual, 0, accuracy: 1e-6)
     }
 
-    /// Backing away to twice the distance halves the object on screen, so the gauge legs halve, and so
-    /// does the mask — pivoted on the object's own point, which is where the object actually is.
+    /// Twice the distance halves the gauge and the mask, pivoting on the object's point.
     func testBackingAwayHalvesTheMaskAboutTheObjectsOwnPoint() throws {
         let transform = try XCTUnwrap(
             MaskDisplayTransform.following(
@@ -115,9 +105,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         XCTAssertEqual(transform.residual, 0, accuracy: 1e-6)
     }
 
-    /// The case the old model could not represent at all. Rolling the phone turns the object in the
-    /// image, and with no rotation term the picture kept its old angle over a turned object — which is
-    /// what "the mask looks rotated" was.
+    /// Rolling the phone turns the object in the image, so the mask has to turn too.
     func testRollingThePhoneTurnsTheMaskWithTheObject() throws {
         let angle: CGFloat = .pi / 6
         let transform = try XCTUnwrap(
@@ -163,9 +151,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         XCTAssertEqual(transform.residual, 0, accuracy: 1e-6)
     }
 
-    /// Unit viewport coordinates are anisotropic — a unit of x is a different distance on screen from a
-    /// unit of y — so the fit has to be done in a metric where they are not, or a rotation on a tall
-    /// phone screen would be read as a rotation of some other size.
+    /// Unit viewport coordinates aren't isotropic, so the angle must come out the same on a tall screen.
     func testARotationIsTheSameAngleOnANonSquareScreen() throws {
         let aspect: CGFloat = 9.0 / 19.5
         let angle: CGFloat = .pi / 4
@@ -187,9 +173,8 @@ final class MaskDisplayTransformTests: XCTestCase {
 
     // MARK: - The motion it cannot represent, and says so
 
-    /// Tilting the phone foreshortens one axis and not the other. No similarity can do that, so the fit
-    /// splits the difference and the residual is what is left over. This is the quantity that ends a
-    /// hold: a wall clock cannot tell this frame from a still one, and this can.
+    /// Tilting foreshortens one axis only, which a similarity can't model. The residual should be
+    /// large enough to end a hold.
     func testOutOfPlaneTiltLeavesAResidualLargeEnoughToEndAHold() throws {
         let transform = try XCTUnwrap(
             MaskDisplayTransform.following(
@@ -208,8 +193,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         )
     }
 
-    /// The counterpart: motion that *is* a similarity, however large, leaves nothing over, so a steady
-    /// hand sweeping across a table does not cost the picture a needless refresh.
+    /// Large motion that is a similarity leaves no residual, so the mask isn't refreshed needlessly.
     func testLargeButSimilarMotionLeavesNoResidual() throws {
         let transform = try XCTUnwrap(
             MaskDisplayTransform.following(
@@ -270,8 +254,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         )
     }
 
-    /// A gauge whose legs are a few pixels long cannot resolve an angle: the variance of the estimate
-    /// goes as one over the leg length squared, so reprojection noise would arrive on screen as spin.
+    /// Gauge legs only a few pixels long can't give a reliable angle.
     func testAGaugeTooSmallToCarryAnAngleIsRefused() {
         let shortLeg = MaskDisplayTransform.minimumGaugeLeg / 2
         XCTAssertNil(
@@ -326,9 +309,7 @@ final class MaskDisplayTransformTests: XCTestCase {
 
     // MARK: - The fallback
 
-    /// The tracker box moves the mask and never resizes or turns it. Its size is the thing Vision gets
-    /// wrong as a target gets small — scaling by it produced the appear-shrink-reappear pulse — and an
-    /// axis-aligned box has no angle in it to take.
+    /// The tracker box only moves the mask, never resizes or rotates it.
     func testTheTrackerBoxFallbackMovesButNeverResizes() throws {
         let transform = try XCTUnwrap(
             MaskDisplayTransform.sliding(
@@ -357,8 +338,7 @@ final class MaskDisplayTransformTests: XCTestCase {
 
     // MARK: - The gauge in the room
 
-    /// The baseline is a fraction of the distance, so the gauge subtends the same angle at any range and
-    /// the rotation estimate does not degrade with distance for no reason but the choice of a constant.
+    /// The baseline scales with distance so the gauge covers the same angle at any range.
     func testTheGaugeBaselineGrowsWithDistance() throws {
         var cameraTransform = matrix_identity_float4x4
         let nearBasis = try XCTUnwrap(
@@ -379,8 +359,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         let farLeg = simd_length(farBasis.right - farBasis.origin)
         XCTAssertEqual(Double(farLeg / nearLeg), 3, accuracy: 1e-4)
 
-        // And the legs stay square to each other, so the fit is equally well conditioned in every
-        // direction rather than favouring whichever axis happened to be longer.
+        // The legs stay perpendicular, so the fit is equally conditioned in both directions.
         XCTAssertEqual(
             simd_dot(nearBasis.right - nearBasis.origin, nearBasis.up - nearBasis.origin),
             0,
@@ -397,9 +376,7 @@ final class MaskDisplayTransformTests: XCTestCase {
         )
     }
 
-    /// ARKit refines an anchor's pose for as long as it exists. That correction moves the object, so it
-    /// moves all three gauge points equally; applying it to the anchor alone would read a map
-    /// optimisation as the object turning, and draw it.
+    /// An anchor correction moves all three gauge points together.
     func testRebasingMovesTheWholeGaugeRigidly() throws {
         let basis = try XCTUnwrap(
             MaskGaugeBasis(
@@ -424,7 +401,7 @@ final class MaskDisplayTransformTests: XCTestCase {
                 boundingBox: CGRect(x: 0.4, y: 0.4, width: side, height: side)
             )
         )
-        // The small object in the study, at the distance the accuracy rule asks for.
+        // The small study object at the recommended distance.
         XCTAssertFalse(
             MaskTrackerEligibility.isTrackable(
                 boundingBox: CGRect(x: 0.47, y: 0.47, width: 0.06, height: side - 0.01)

@@ -2,15 +2,8 @@ import Foundation
 import Observation
 import simd
 
-// Holds the accuracy test in progress and keeps every finished one on disk.
-//
-// In:  the setup screen starts a test; the measuring screen adds one reading at a time; the results
-//      screen supplies the reference sizes.
-// Out: observable state for the accuracy screens, plus files under Documents/AccuracyTests/.
-//
-// Written through on every change, so leaving the test half way — which the operator is explicitly
-// allowed to do — loses nothing and the test can be picked up again. As with the study data, there is
-// no delete path.
+// Holds the accuracy test in progress and saves every test under Documents/AccuracyTests/.
+// Saved after every change, so a test can be left halfway and resumed.
 
 @MainActor
 @Observable
@@ -29,7 +22,6 @@ final class AccuracyStore {
 
     // MARK: - Where the test is up to
 
-    /// The object and pass the next reading belongs to.
     var nextSlot: (
         objectNumber: Int,
         pass: Int,
@@ -67,21 +59,18 @@ final class AccuracyStore {
         archiveActiveTest()
     }
 
-    /// Puts a test from the archive back in progress, so it can be finished or have its reference
-    /// sizes filled in later.
+    /// Reopens a saved test so it can be continued or have reference sizes added.
     func resume(_ test: AccuracyTestRun) {
         activeTest = test
     }
 
-    /// Leaves the test alone on disk and clears the screen.
     func closeActiveTest() {
         activeTest = nil
     }
 
     // MARK: - Recording
 
-    /// Appends one reading in the slot the test is waiting for. Ignored once the test is full, so a
-    /// stray extra measurement cannot corrupt the order.
+    /// Adds a reading to the next slot. Ignored once the test is full.
     @discardableResult
     func record(sizeMillimetres: SIMD3<Double>) -> Bool {
         guard var test = activeTest, let slot = test.nextSlot else { return false }
@@ -104,8 +93,7 @@ final class AccuracyStore {
         return true
     }
 
-    /// Throws away the last reading, for when a measurement was obviously wrong. The only removal in
-    /// the app, and it is deliberately limited to the reading just taken.
+    /// Removes the last reading, e.g. after an obviously bad measurement.
     func undoLastReading() {
         guard var test = activeTest, !test.readings.isEmpty else { return }
         test.readings.removeLast()
@@ -139,7 +127,7 @@ final class AccuracyStore {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let url = folder.appendingPathComponent(test.reportFileName)
             try test.reportText().write(to: url, atomically: true, encoding: .utf8)
-            // A copy at the top of the folder too, so it is easy to find in Files.
+            // Also copy the report to the top of the folder so it's easy to find in Files.
             try? test.reportText().write(
                 to: Self.rootFolder.appendingPathComponent(test.reportFileName),
                 atomically: true,
